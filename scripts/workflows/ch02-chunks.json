@@ -1,0 +1,1520 @@
+[
+ {
+  "topic": "01-rest-and-web-api",
+  "lines": 723,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 59,
+    "what": "Section 2. Core concepts (chapter extensions) (part 1)",
+    "n": 1
+   },
+   {
+    "from": 60,
+    "to": 118,
+    "what": "Section 2. Core concepts (chapter extensions) (part 2)",
+    "n": 2
+   },
+   {
+    "from": 119,
+    "to": 177,
+    "what": "Section 2. Core concepts (chapter extensions) (part 3)",
+    "n": 3
+   },
+   {
+    "from": 178,
+    "to": 236,
+    "what": "Section 2. Core concepts (chapter extensions) (part 4)",
+    "n": 4
+   },
+   {
+    "from": 237,
+    "to": 295,
+    "what": "Section 2. Core concepts (chapter extensions) (part 5)",
+    "n": 5
+   },
+   {
+    "from": 296,
+    "to": 358,
+    "what": "Section 2. Core concepts (chapter extensions) (part 6)",
+    "n": 6
+   },
+   {
+    "from": 359,
+    "to": 422,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 1)",
+    "n": 7
+   },
+   {
+    "from": 423,
+    "to": 486,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 2)",
+    "n": 8
+   },
+   {
+    "from": 487,
+    "to": 550,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 3)",
+    "n": 9
+   },
+   {
+    "from": 551,
+    "to": 614,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 4)",
+    "n": 10
+   },
+   {
+    "from": 615,
+    "to": 678,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 5)",
+    "n": 11
+   },
+   {
+    "from": 679,
+    "to": 723,
+    "what": "Section 8. Self-test",
+    "n": 12
+   }
+  ]
+ },
+ {
+  "topic": "02-authentication-and-authorization",
+  "lines": 752,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 59,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 60,
+    "to": 118,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 119,
+    "to": 177,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 178,
+    "to": 236,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 237,
+    "to": 295,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 296,
+    "to": 356,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 357,
+    "to": 413,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 7
+   },
+   {
+    "from": 414,
+    "to": 470,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 8
+   },
+   {
+    "from": 471,
+    "to": 527,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 9
+   },
+   {
+    "from": 528,
+    "to": 584,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 10
+   },
+   {
+    "from": 585,
+    "to": 641,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 11
+   },
+   {
+    "from": 642,
+    "to": 703,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 12
+   },
+   {
+    "from": 704,
+    "to": 752,
+    "what": "Section 9. Self-test",
+    "n": 13
+   }
+  ]
+ },
+ {
+  "topic": "03-api-design-principles",
+  "lines": 794,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 58,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 59,
+    "to": 116,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 117,
+    "to": 174,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 175,
+    "to": 232,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 233,
+    "to": 290,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 291,
+    "to": 348,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 349,
+    "to": 410,
+    "what": "Section 2. Core concepts (part 7)",
+    "n": 7
+   },
+   {
+    "from": 411,
+    "to": 466,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 1)",
+    "n": 8
+   },
+   {
+    "from": 467,
+    "to": 522,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 2)",
+    "n": 9
+   },
+   {
+    "from": 523,
+    "to": 578,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 3)",
+    "n": 10
+   },
+   {
+    "from": 579,
+    "to": 634,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 4)",
+    "n": 11
+   },
+   {
+    "from": 635,
+    "to": 690,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 5)",
+    "n": 12
+   },
+   {
+    "from": 691,
+    "to": 747,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 6)",
+    "n": 13
+   },
+   {
+    "from": 748,
+    "to": 794,
+    "what": "Section 8. Self-test",
+    "n": 14
+   }
+  ]
+ },
+ {
+  "topic": "04-api-security",
+  "lines": 804,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 56,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 57,
+    "to": 112,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 113,
+    "to": 168,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 169,
+    "to": 224,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 225,
+    "to": 280,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 281,
+    "to": 336,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 337,
+    "to": 398,
+    "what": "Section 2. Core concepts (part 7)",
+    "n": 7
+   },
+   {
+    "from": 399,
+    "to": 457,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 8
+   },
+   {
+    "from": 458,
+    "to": 516,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 9
+   },
+   {
+    "from": 517,
+    "to": 575,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 10
+   },
+   {
+    "from": 576,
+    "to": 634,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 11
+   },
+   {
+    "from": 635,
+    "to": 693,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 12
+   },
+   {
+    "from": 694,
+    "to": 752,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 13
+   },
+   {
+    "from": 753,
+    "to": 804,
+    "what": "Section 9. Self-test",
+    "n": 14
+   }
+  ]
+ },
+ {
+  "topic": "05-api-versioning",
+  "lines": 766,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 61,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 62,
+    "to": 122,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 123,
+    "to": 183,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 184,
+    "to": 244,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 245,
+    "to": 305,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 306,
+    "to": 367,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 368,
+    "to": 424,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 1)",
+    "n": 7
+   },
+   {
+    "from": 425,
+    "to": 481,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 2)",
+    "n": 8
+   },
+   {
+    "from": 482,
+    "to": 538,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 3)",
+    "n": 9
+   },
+   {
+    "from": 539,
+    "to": 595,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 4)",
+    "n": 10
+   },
+   {
+    "from": 596,
+    "to": 652,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 5)",
+    "n": 11
+   },
+   {
+    "from": 653,
+    "to": 714,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 6)",
+    "n": 12
+   },
+   {
+    "from": 715,
+    "to": 766,
+    "what": "Section 8. Self-test",
+    "n": 13
+   }
+  ]
+ },
+ {
+  "topic": "06-api-testing",
+  "lines": 822,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 60,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 61,
+    "to": 120,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 121,
+    "to": 180,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 181,
+    "to": 240,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 241,
+    "to": 300,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 301,
+    "to": 360,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 361,
+    "to": 423,
+    "what": "Section 2. Core concepts (part 7)",
+    "n": 7
+   },
+   {
+    "from": 424,
+    "to": 480,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 8
+   },
+   {
+    "from": 481,
+    "to": 537,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 9
+   },
+   {
+    "from": 538,
+    "to": 594,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 10
+   },
+   {
+    "from": 595,
+    "to": 651,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 11
+   },
+   {
+    "from": 652,
+    "to": 708,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 12
+   },
+   {
+    "from": 709,
+    "to": 769,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 13
+   },
+   {
+    "from": 770,
+    "to": 822,
+    "what": "Section 9. Self-test",
+    "n": 14
+   }
+  ]
+ },
+ {
+  "topic": "07-api-documentation",
+  "lines": 804,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 55,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 56,
+    "to": 110,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 111,
+    "to": 165,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 166,
+    "to": 220,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 221,
+    "to": 275,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 276,
+    "to": 330,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 331,
+    "to": 391,
+    "what": "Section 2. Core concepts (part 7)",
+    "n": 7
+   },
+   {
+    "from": 392,
+    "to": 452,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 8
+   },
+   {
+    "from": 453,
+    "to": 513,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 9
+   },
+   {
+    "from": 514,
+    "to": 574,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 10
+   },
+   {
+    "from": 575,
+    "to": 635,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 11
+   },
+   {
+    "from": 636,
+    "to": 696,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 12
+   },
+   {
+    "from": 697,
+    "to": 757,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 13
+   },
+   {
+    "from": 758,
+    "to": 804,
+    "what": "Section 9. Self-test",
+    "n": 14
+   }
+  ]
+ },
+ {
+  "topic": "08-graphql",
+  "lines": 717,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 56,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 57,
+    "to": 112,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 113,
+    "to": 168,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 169,
+    "to": 224,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 225,
+    "to": 280,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 281,
+    "to": 339,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 340,
+    "to": 394,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 7
+   },
+   {
+    "from": 395,
+    "to": 449,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 8
+   },
+   {
+    "from": 450,
+    "to": 504,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 9
+   },
+   {
+    "from": 505,
+    "to": 559,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 10
+   },
+   {
+    "from": 560,
+    "to": 614,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 11
+   },
+   {
+    "from": 615,
+    "to": 669,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 12
+   },
+   {
+    "from": 670,
+    "to": 717,
+    "what": "Section 9. Self-test",
+    "n": 13
+   }
+  ]
+ },
+ {
+  "topic": "09-webhooks",
+  "lines": 777,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 64,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 65,
+    "to": 128,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 129,
+    "to": 192,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 193,
+    "to": 256,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 257,
+    "to": 320,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 321,
+    "to": 388,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 389,
+    "to": 444,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 7
+   },
+   {
+    "from": 445,
+    "to": 500,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 8
+   },
+   {
+    "from": 501,
+    "to": 556,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 9
+   },
+   {
+    "from": 557,
+    "to": 612,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 10
+   },
+   {
+    "from": 613,
+    "to": 668,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 11
+   },
+   {
+    "from": 669,
+    "to": 726,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 12
+   },
+   {
+    "from": 727,
+    "to": 777,
+    "what": "Section 9. Self-test",
+    "n": 13
+   }
+  ]
+ },
+ {
+  "topic": "10-websockets",
+  "lines": 807,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 63,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 64,
+    "to": 126,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 127,
+    "to": 189,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 190,
+    "to": 252,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 253,
+    "to": 315,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 316,
+    "to": 383,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 384,
+    "to": 449,
+    "what": "Section 5. Interview-ready summary",
+    "n": 7
+   },
+   {
+    "from": 450,
+    "to": 510,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 8
+   },
+   {
+    "from": 511,
+    "to": 571,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 9
+   },
+   {
+    "from": 572,
+    "to": 632,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 10
+   },
+   {
+    "from": 633,
+    "to": 693,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 11
+   },
+   {
+    "from": 694,
+    "to": 754,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 12
+   },
+   {
+    "from": 755,
+    "to": 807,
+    "what": "Section 9. Self-test",
+    "n": 13
+   }
+  ]
+ },
+ {
+  "topic": "11-soap",
+  "lines": 757,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 56,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 57,
+    "to": 112,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 113,
+    "to": 168,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 169,
+    "to": 224,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 225,
+    "to": 280,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 281,
+    "to": 341,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 342,
+    "to": 400,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 7
+   },
+   {
+    "from": 401,
+    "to": 459,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 8
+   },
+   {
+    "from": 460,
+    "to": 518,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 9
+   },
+   {
+    "from": 519,
+    "to": 577,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 10
+   },
+   {
+    "from": 578,
+    "to": 636,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 11
+   },
+   {
+    "from": 637,
+    "to": 700,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 12
+   },
+   {
+    "from": 701,
+    "to": 757,
+    "what": "Section 9. Self-test",
+    "n": 13
+   }
+  ]
+ },
+ {
+  "topic": "12-mqtt",
+  "lines": 832,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 56,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 57,
+    "to": 112,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 113,
+    "to": 168,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 169,
+    "to": 224,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 225,
+    "to": 284,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 285,
+    "to": 374,
+    "what": "Section 2.2 of the same RFC defines resumption with a pre-shared key, where \"the key derived from the initial handshake is used to bootstrap the cryptographic state instead of a full handshake\"",
+    "n": 6
+   },
+   {
+    "from": 375,
+    "to": 442,
+    "what": "Section 4.4 of the spec makes reconnecting with Clean Start 0 to an existing session the only circumstance in which a server is required to resend unacknowledged QoS 1 and QoS 2 publishes",
+    "n": 7
+   },
+   {
+    "from": 443,
+    "to": 498,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 1)",
+    "n": 8
+   },
+   {
+    "from": 499,
+    "to": 554,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 2)",
+    "n": 9
+   },
+   {
+    "from": 555,
+    "to": 610,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 3)",
+    "n": 10
+   },
+   {
+    "from": 611,
+    "to": 666,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 4)",
+    "n": 11
+   },
+   {
+    "from": 667,
+    "to": 722,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 5)",
+    "n": 12
+   },
+   {
+    "from": 723,
+    "to": 778,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 6)",
+    "n": 13
+   },
+   {
+    "from": 779,
+    "to": 832,
+    "what": "Section 8. Self-test",
+    "n": 14
+   }
+  ]
+ },
+ {
+  "topic": "13-event-driven-architecture",
+  "lines": 755,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 65,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 66,
+    "to": 130,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 131,
+    "to": 195,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 196,
+    "to": 260,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 261,
+    "to": 329,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 330,
+    "to": 390,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 6
+   },
+   {
+    "from": 391,
+    "to": 451,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 7
+   },
+   {
+    "from": 452,
+    "to": 512,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 8
+   },
+   {
+    "from": 513,
+    "to": 573,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 9
+   },
+   {
+    "from": 574,
+    "to": 634,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 10
+   },
+   {
+    "from": 635,
+    "to": 699,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 11
+   },
+   {
+    "from": 700,
+    "to": 755,
+    "what": "Section 9. Self-test",
+    "n": 12
+   }
+  ]
+ },
+ {
+  "topic": "14-bff-and-aggregation",
+  "lines": 991,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 61,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 62,
+    "to": 122,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 123,
+    "to": 183,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 184,
+    "to": 244,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 245,
+    "to": 305,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 306,
+    "to": 369,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 370,
+    "to": 425,
+    "what": "Section 2.3 says access tokens SHOULD be audience-restricted to a specific resource server, or if that is not feasible to a small set of them, and states that every resource server is obliged to verify for every request whether the token was meant for it and MUST refuse the request if it was not (part 1)",
+    "n": 7
+   },
+   {
+    "from": 426,
+    "to": 481,
+    "what": "Section 2.3 says access tokens SHOULD be audience-restricted to a specific resource server, or if that is not feasible to a small set of them, and states that every resource server is obliged to verify for every request whether the token was meant for it and MUST refuse the request if it was not (part 2)",
+    "n": 8
+   },
+   {
+    "from": 482,
+    "to": 537,
+    "what": "Section 2.3 says access tokens SHOULD be audience-restricted to a specific resource server, or if that is not feasible to a small set of them, and states that every resource server is obliged to verify for every request whether the token was meant for it and MUST refuse the request if it was not (part 3)",
+    "n": 9
+   },
+   {
+    "from": 538,
+    "to": 593,
+    "what": "Section 2.3 says access tokens SHOULD be audience-restricted to a specific resource server, or if that is not feasible to a small set of them, and states that every resource server is obliged to verify for every request whether the token was meant for it and MUST refuse the request if it was not (part 4)",
+    "n": 10
+   },
+   {
+    "from": 594,
+    "to": 650,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 11
+   },
+   {
+    "from": 651,
+    "to": 707,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 12
+   },
+   {
+    "from": 708,
+    "to": 764,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 13
+   },
+   {
+    "from": 765,
+    "to": 821,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 14
+   },
+   {
+    "from": 822,
+    "to": 878,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 15
+   },
+   {
+    "from": 879,
+    "to": 937,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 16
+   },
+   {
+    "from": 938,
+    "to": 991,
+    "what": "Section 9. Self-test",
+    "n": 17
+   }
+  ]
+ },
+ {
+  "topic": "15-server-sent-events",
+  "lines": 828,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 62,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 63,
+    "to": 124,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 125,
+    "to": 186,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 187,
+    "to": 248,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 249,
+    "to": 310,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 311,
+    "to": 372,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 373,
+    "to": 437,
+    "what": "Section 2. Core concepts (part 7)",
+    "n": 7
+   },
+   {
+    "from": 438,
+    "to": 493,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 1)",
+    "n": 8
+   },
+   {
+    "from": 494,
+    "to": 549,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 2)",
+    "n": 9
+   },
+   {
+    "from": 550,
+    "to": 605,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 3)",
+    "n": 10
+   },
+   {
+    "from": 606,
+    "to": 661,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 4)",
+    "n": 11
+   },
+   {
+    "from": 662,
+    "to": 717,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 5)",
+    "n": 12
+   },
+   {
+    "from": 718,
+    "to": 776,
+    "what": "Section 6. Interview Cross-Questioning Drill (part 6)",
+    "n": 13
+   },
+   {
+    "from": 777,
+    "to": 828,
+    "what": "Section 9. Self-test",
+    "n": 14
+   }
+  ]
+ },
+ {
+  "topic": "16-api-management",
+  "lines": 968,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 57,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 58,
+    "to": 114,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 115,
+    "to": 171,
+    "what": "Section 2. Core concepts (part 3)",
+    "n": 3
+   },
+   {
+    "from": 172,
+    "to": 228,
+    "what": "Section 2. Core concepts (part 4)",
+    "n": 4
+   },
+   {
+    "from": 229,
+    "to": 285,
+    "what": "Section 2. Core concepts (part 5)",
+    "n": 5
+   },
+   {
+    "from": 286,
+    "to": 342,
+    "what": "Section 2. Core concepts (part 6)",
+    "n": 6
+   },
+   {
+    "from": 343,
+    "to": 399,
+    "what": "Section 2. Core concepts (part 7)",
+    "n": 7
+   },
+   {
+    "from": 400,
+    "to": 456,
+    "what": "Section 2. Core concepts (part 8)",
+    "n": 8
+   },
+   {
+    "from": 457,
+    "to": 513,
+    "what": "Section 2. Core concepts (part 9)",
+    "n": 9
+   },
+   {
+    "from": 514,
+    "to": 570,
+    "what": "Section 2. Core concepts (part 10)",
+    "n": 10
+   },
+   {
+    "from": 571,
+    "to": 628,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 1)",
+    "n": 11
+   },
+   {
+    "from": 629,
+    "to": 686,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 2)",
+    "n": 12
+   },
+   {
+    "from": 687,
+    "to": 744,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 3)",
+    "n": 13
+   },
+   {
+    "from": 745,
+    "to": 802,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 4)",
+    "n": 14
+   },
+   {
+    "from": 803,
+    "to": 860,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 5)",
+    "n": 15
+   },
+   {
+    "from": 861,
+    "to": 918,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 6)",
+    "n": 16
+   },
+   {
+    "from": 919,
+    "to": 968,
+    "what": "Section 8. Self-test",
+    "n": 17
+   }
+  ]
+ },
+ {
+  "topic": "17-advanced-auth",
+  "lines": 969,
+  "chunks": [
+   {
+    "from": 1,
+    "to": 64,
+    "what": "Section 2. Core concepts (part 1)",
+    "n": 1
+   },
+   {
+    "from": 65,
+    "to": 128,
+    "what": "Section 2. Core concepts (part 2)",
+    "n": 2
+   },
+   {
+    "from": 129,
+    "to": 191,
+    "what": "Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the ath claim equals the hash of that access token (part 1)",
+    "n": 3
+   },
+   {
+    "from": 192,
+    "to": 254,
+    "what": "Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the ath claim equals the hash of that access token (part 2)",
+    "n": 4
+   },
+   {
+    "from": 255,
+    "to": 317,
+    "what": "Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the ath claim equals the hash of that access token (part 3)",
+    "n": 5
+   },
+   {
+    "from": 318,
+    "to": 380,
+    "what": "Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the ath claim equals the hash of that access token (part 4)",
+    "n": 6
+   },
+   {
+    "from": 381,
+    "to": 443,
+    "what": "Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the ath claim equals the hash of that access token (part 5)",
+    "n": 7
+   },
+   {
+    "from": 444,
+    "to": 506,
+    "what": "Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the ath claim equals the hash of that access token (part 6)",
+    "n": 8
+   },
+   {
+    "from": 507,
+    "to": 575,
+    "what": "Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the ath claim equals the hash of that access token (part 7)",
+    "n": 9
+   },
+   {
+    "from": 576,
+    "to": 631,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 1)",
+    "n": 10
+   },
+   {
+    "from": 632,
+    "to": 687,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 2)",
+    "n": 11
+   },
+   {
+    "from": 688,
+    "to": 743,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 3)",
+    "n": 12
+   },
+   {
+    "from": 744,
+    "to": 799,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 4)",
+    "n": 13
+   },
+   {
+    "from": 800,
+    "to": 855,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 5)",
+    "n": 14
+   },
+   {
+    "from": 856,
+    "to": 914,
+    "what": "Section 5. Interview Cross-Questioning Drill (part 6)",
+    "n": 15
+   },
+   {
+    "from": 915,
+    "to": 969,
+    "what": "Section 8. Self-test",
+    "n": 16
+   }
+  ]
+ }
+]
