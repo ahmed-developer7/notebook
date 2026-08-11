@@ -1,0 +1,1020 @@
+# Advanced Auth — OAuth 2.1, DPoP, FAPI, Token Introspection
+
+> [Mastery Guide](../README.md) › [API Development](./README.md)
+
+| Status | Priority | Phase | Last reviewed |
+|---|---|---|---|
+| Not Started | High | Phase 4 — Auth & API Security | 2026-05-08 |
+
+## Contents
+- [Why it matters](#why-it-matters)
+- [Core concepts](#core-concepts)
+  - [OAuth 2.1 — what changed from 2.0](#oauth-21--what-changed-from-20)
+  - [PKCE for all flows (no exceptions)](#pkce-for-all-flows-no-exceptions)
+  - [Mix-up attacks and code injection — the iss response parameter (RFC 9207)](#mix-up-attacks-and-code-injection--the-iss-response-parameter-rfc-9207)
+  - [Native apps — RFC 8252 and the redirect another app can claim](#native-apps--rfc-8252-and-the-redirect-another-app-can-claim)
+  - [Sender-constrained tokens — mTLS, DPoP](#sender-constrained-tokens--mtls-dpop)
+  - [DPoP in depth](#dpop-in-depth)
+  - [The ath claim — binding a proof to one access token](#the-ath-claim--binding-a-proof-to-one-access-token)
+  - [DPoP nonces — the server decides what counts as fresh](#dpop-nonces--the-server-decides-what-counts-as-fresh)
+  - [mTLS in practice — RFC 8705 and the proxy that eats the certificate](#mtls-in-practice--rfc-8705-and-the-proxy-that-eats-the-certificate)
+  - [Token introspection (RFC 7662)](#token-introspection-rfc-7662)
+  - [Token revocation (RFC 7009)](#token-revocation-rfc-7009)
+  - [Token status lists — revocation you can check offline](#token-status-lists--revocation-you-can-check-offline)
+  - [JWT validation vs introspection — when each](#jwt-validation-vs-introspection--when-each)
+  - [Access-token typing — RFC 9068 and the at+jwt header](#access-token-typing--rfc-9068-and-the-atjwt-header)
+  - [Continuous Access Evaluation and claims challenges](#continuous-access-evaluation-and-claims-challenges)
+  - [Refresh token rotation and reuse detection](#refresh-token-rotation-and-reuse-detection)
+  - [Back-channel logout — ending the session, not just the token](#back-channel-logout--ending-the-session-not-just-the-token)
+  - [FAPI — Financial-grade API profile](#fapi--financial-grade-api-profile)
+  - [PAR — Pushed Authorization Requests](#par--pushed-authorization-requests)
+  - [JAR / RAR — JWT Authorization Requests / Rich Authorization Requests](#jar--rar--jwt-authorization-requests--rich-authorization-requests)
+  - [Resource indicators (RFC 8707) — one token, one API](#resource-indicators-rfc-8707--one-token-one-api)
+  - [Token exchange (RFC 8693)](#token-exchange-rfc-8693)
+  - [Workload identity federation — client credentials without a client secret](#workload-identity-federation--client-credentials-without-a-client-secret)
+  - [Delegated authorization for AI agents](#delegated-authorization-for-ai-agents)
+  - [Step-up authentication](#step-up-authentication)
+  - [Passkeys, WebAuthn and FIDO2](#passkeys-webauthn-and-fido2)
+  - [When there is no browser — the device grant and CIBA](#when-there-is-no-browser--the-device-grant-and-ciba)
+- [Code & diagrams](#code--diagrams)
+- [Common pitfalls](#common-pitfalls)
+- [Interview-ready summary](#interview-ready-summary)
+- [Interview Cross-Questioning Drill](#interview-cross-questioning-drill)
+- [Cheat Sheet](#cheat-sheet)
+- [Walkthrough](#walkthrough--stolen-mobile-token-replayed-from-desktop)
+- [Self-test](#self-test)
+- [Cross-references](#cross-references)
+- [Sources](#sources)
+
+---
+
+## Why it matters
+
+The base [Authentication & Authorization](./02-authentication-and-authorization.md) file covers the working knowledge of JWT, OIDC, OAuth 2.0 flows, and ASP.NET Core Identity. This file extends with the **2026 advanced surface** — the topics that come up in senior interviews at security-conscious orgs (banks, healthcare, fintech, IdPs) and that pop up when standard JWT bearer auth isn't enough:
+
+- **OAuth 2.1** consolidates a decade of best practices and deprecates flows that turned out unsafe.
+- **DPoP** and **mTLS** sender-constrain tokens so a stolen access token can't be replayed by an attacker.
+- **PAR / JAR / RAR** push authorization request integrity into the protocol itself.
+- **Token introspection** lets resource servers validate opaque tokens against the auth server.
+- **FAPI** is the bank-grade profile required by Open Banking and similar regulated ecosystems.
+- **Step-up authentication** raises the assurance level for sensitive operations.
+
+Senior backend engineers working on identity, payments, healthcare, or anything regulated need this vocabulary. It's also where weaker candidates fall apart in interviews — "validate the JWT" is correct but insufficient when the question is "how do you prevent token replay?"
+
+When NOT to apply: typical CRUD apps with low-value tokens (a leaked session lets someone post a comment, not move money). Standard JWT bearer + httpOnly cookies + short expiry is fine. The advanced patterns earn their cost only when token theft consequences are severe.
+
+## Core concepts
+
+### OAuth 2.1 — what changed from 2.0
+
+**OAuth 2.1** is a consolidation draft (effectively the de facto standard in 2026 — most modern IdPs implement it). Key differences:
+
+| OAuth 2.0 | OAuth 2.1 |
+|---|---|
+| Multiple flows including Implicit, Resource Owner Password | **Implicit and ROPC removed** (insecure) |
+| PKCE optional for public clients | **PKCE mandatory for all clients** including confidential |
+| Bearer tokens in URL query parameters allowed | **Forbidden** — body or header only |
+| Refresh tokens for public clients allowed without rotation | **Sender-constrained or rotated** required |
+| Various non-normative best practices spread across BCPs | **Security BCP guidance folded into the 2.1 draft** |
+
+Two caveats worth stating precisely in an interview. First, 2.1 is still an IETF draft — the *published* document to cite is **RFC 9700 (BCP 240, January 2025), OAuth 2.0 Security Best Current Practice**, which carries most of the same guidance and is what auditors and spec-literate interviewers will reference. Second, no product "defaults to OAuth 2.1 conformance": Duende IdentityServer, Microsoft.Identity.Web and Microsoft Entra ID (formerly Azure AD) implement most of these behaviours — PKCE is on by default, for instance — but Entra ID still supports ROPC and still exposes an implicit-grant toggle on app registrations for legacy apps. Conformance is a per-deployment configuration question, not a version number.
+
+### PKCE for all flows (no exceptions)
+
+**PKCE = Proof Key for Code Exchange** (RFC 7636).
+
+The original Auth Code flow had an attack: an attacker who intercepts the authorization code (e.g., on a public client) could redeem it for tokens. PKCE binds the code to a secret only the original client knows.
+
+```
+Client generates:
+  code_verifier  = high-entropy random string (43-128 chars)
+  code_challenge = BASE64URL(SHA256(code_verifier))
+
+Step 1 (auth request):
+  client → auth server: code_challenge + code_challenge_method=S256
+
+Step 2 (callback with code):
+  auth server → client: authorization_code
+
+Step 3 (token exchange):
+  client → auth server: authorization_code + code_verifier
+  auth server: SHA256(code_verifier) == code_challenge?  ✓ → issue tokens
+```
+
+**OAuth 2.1**: PKCE is mandatory for *every* client — public *and* confidential. Defense-in-depth: even if a client secret leaks, attackers still need the verifier.
+
+In .NET, `UsePkce` is a property on `OpenIdConnectOptions` in the **`Microsoft.AspNetCore.Authentication.OpenIdConnect`** package (not on `Microsoft.IdentityModel.Protocols.OpenIdConnect`, which is the protocol/message library). It defaults to `true` in modern versions, and Duende's client libraries apply PKCE automatically too.
+
+### Mix-up attacks and code injection — the iss response parameter (RFC 9207)
+
+PKCE defends against an attacker who *intercepts* your authorization code. Two related attacks work the other way round, and it is worth being able to name both.
+
+**Authorization code injection.** The attacker obtains a code — from a leaked log line, a referrer header, a shoulder-surfed URL — and instead of redeeming it, starts their own login on the same client and, in the authorization response, replaces the code just issued to them with the stolen one. The client redeems the injected code, and the victim's account ends up bound to the attacker's session. RFC 9700, *Best Current Practice for OAuth 2.0 Security*, states that public clients MUST use PKCE and that for confidential clients PKCE is RECOMMENDED. It works here because the injected code was issued against a different `code_challenge`, so the verifier the client sends does not match. RFC 9700 allows one alternative to PKCE, and note carefully who it is for: *confidential* OpenID Connect clients MAY instead validate the `nonce` inside the ID token obtained from the token endpoint, disregarding every token unless and until that check succeeds. The same section is explicit that this is not an option for public clients — `nonce` does not protect their authorization codes, because an attacker holding a public client's code does not need to inject it anywhere; they can call the token endpoint with it directly.
+
+**Mix-up.** RFC 9700's precondition is a client that interacts with two or more authorization servers where at least one is under the attacker's control — which is exactly the multi-IdP architecture Drill 15 describes. The user starts at the attacker's server, which redirects them onward to the honest one with the client ID swapped. The user authenticates for real, the honest server issues a genuine code, and the client — believing this flow belonged to the attacker's server — posts that code to the attacker's token endpoint, together with the `code_verifier` and whatever client credentials it uses there. Notice what that means: PKCE is not the countermeasure, because the client hands over the verifier itself.
+
+The fix is issuer identification. RFC 9207, *OAuth 2.0 Authorization Server Issuer Identification*, adds an `iss` parameter to the authorization response carrying the issuer identifier of the server that created that response. Clients that support the specification MUST extract that value and compare it — by simple string comparison — to the issuer identifier of the server they sent the request to, and MUST reject the response if it does not match. There is a second half that is easy to drop: where the server's metadata sets `authorization_response_iss_parameter_supported`, the client MUST also reject any authorization response that arrives *without* an `iss` parameter. Checking the value only when one happens to be present is not the requirement, and an attacker who can suppress the parameter is exactly who that clause is aimed at. RFC 9700 offers a second, lower-tech defence alongside it: use a distinct redirect URI per issuer, and check the response arrived at the right one. Underneath both sits the same requirement — the client MUST store, for each authorization request, the issuer it sent that request to, and bind that to the user agent.
+
+Interview framing: this is a client-side bug with a server-side hint. The authorization server can only offer the `iss` parameter; the client is what has to check it, and a client library that ignores it leaves the whole mitigation on the floor.
+
+> 🌍 **In the real world**: a B2B SaaS product lets every customer plug in their own OIDC issuer through a self-service settings page. That page creates attacker-controlled authorization servers by design — anyone who can sign up can register an issuer URL they own. If the app uses one redirect URI for all tenants and never checks `iss`, a customer on the free tier can begin a login against their own issuer, bounce the user onward to a real corporate IdP, and receive a code that the application will obligingly post straight back to them.
+
+### Native apps — RFC 8252 and the redirect another app can claim
+
+RFC 8252, published as BCP 212, is *OAuth 2.0 for Native Apps* — the document mobile teams are meant to have read and mostly haven't.
+
+It gives a native app three ways to receive the authorization response. A private-use URI scheme, such as `com.example.app:/oauth2redirect/`. A claimed HTTPS URI, which the operating system routes to the app because the app proved it owns the domain — Android App Links, iOS Universal Links. Or, for desktop apps, a loopback redirect on `127.0.0.1` with a port the app chooses.
+
+The first of those has a specific hole, and naming it is what separates a senior answer from "the code could be intercepted". Multiple apps can typically register the same private-use scheme, and which app receives the code is indeterminate. So a malicious app installed on the same phone can register your scheme and win. RFC 8252 says app-claimed `https` scheme redirects are less susceptible to URI interception and that native apps SHOULD use them over the other options where possible, because there the operating system enforces domain ownership.
+
+Two more rules from the same document. Native apps MUST NOT use embedded user-agents to perform authorization requests — the reason given is blunt: the app hosting the embedded user-agent can access the user's full authentication credential. In practice that means the platform's in-app browser tab, Custom Tabs on Android or the system authentication session on iOS, and never a web view your own code controls. And public native app clients MUST implement PKCE, with authorization servers required to support it for such clients.
+
+Those two combine usefully. With PKCE in place, an app that hijacks your custom scheme captures a code it cannot redeem, so the attack degrades from account takeover to a broken sign-in. That is a real improvement and not a reason to stay on custom schemes.
+
+> 🌍 **In the real world**: a bank ships `bankname://oauth` as its redirect and forgets about it. Years later a free-wallpapers app registers the same scheme. The customer taps "sign in", authenticates genuinely at the bank, and the wallpaper app receives the redirect. Moving to a Universal Link is a two-sided change — the app's association file has to be served from the bank's own domain, which means a web team, a release and a security review — which is precisely why teams defer it, and why "have you moved off private-use schemes yet?" is a question worth being on the right side of.
+
+### Sender-constrained tokens — mTLS, DPoP
+
+**Bearer tokens are like cash** — whoever has it can spend it. If your access token leaks (XSS, network sniffing, log exposure), the attacker has the same access you do.
+
+**Sender-constrained tokens** bind the token to a key only the legitimate client controls. Two approaches:
+
+1. **Mutual TLS (mTLS)** — client presents a certificate during the TLS handshake. Auth server records the cert thumbprint inside the token. Resource server checks `cnf.x5t#S256` claim against the connection cert.
+2. **DPoP (Demonstrating Proof of Possession)** — client signs a JWT proving possession of a key per request. Auth server records the key's thumbprint in the token; resource server validates the DPoP proof matches.
+
+mTLS is heavyweight (cert provisioning, rotation) — used in B2B + FAPI. DPoP is application-layer and needs no PKI — the usual choice for mobile, and for browser apps that hold tokens at all. Note the ordering for SPAs: the Browser-Based Apps BCP's first recommendation is still the BFF pattern, where tokens never reach the browser (see Drill 10); DPoP is what you reach for when they must.
+
+### DPoP in depth
+
+**DPoP** (RFC 9449) lets a token be sender-constrained without TLS infrastructure.
+
+**Flow**:
+```
+Client generates an asymmetric key pair (kept in memory or secure storage).
+
+For every request:
+  1. Build a DPoP JWT:
+     Header:  { typ: "dpop+jwt", alg: "ES256", jwk: <public key> }
+     Payload: { jti: <unique-id>, htm: "POST", htu: "https://api/orders", iat: <now> }
+     Signed with the private key.
+  
+  2. Send request:
+       Authorization: DPoP <access_token>
+       DPoP: <dpop-proof-jwt>
+  
+Server verifies:
+  - DPoP JWT signature with the public key (from the JWT header).
+  - jti not seen recently (replay protection — short cache).
+  - htm and htu match the request method and URL.
+  - iat is recent (≤60 seconds old).
+  - Hash of the public key matches the access token's cnf.jkt claim.
+  
+If all pass: trust the request.
+```
+
+**What DPoP buys you**: a stolen access token alone is useless. The attacker also needs the private key, which never leaves the client.
+
+**Adoption in 2026**: Microsoft Entra ID supports DPoP for confidential clients; Duende IdentityServer has full support; RFC 9700 recommends sender-constrained access tokens (mTLS or DPoP) wherever token leakage is a realistic risk; major OAuth libraries in JS (oauth4webapi) and .NET expose DPoP helpers.
+
+### The ath claim — binding a proof to one access token
+
+The proof sketched above carries four claims: a unique identifier, the HTTP method, the HTTP target URI, and an issued-at time. Read RFC 9449 section 4.2 and there is a fifth, and it is the one candidates leave out. It is called `ath`, the access token hash, and its value MUST be the base64url encoding of the SHA-256 hash of the ASCII encoding of the associated access token's value. Section 4.3 turns that into a check on the receiving side: where an access token is presented with the proof, the server ensures the value of the `ath` claim equals the hash of that access token.
+
+Say the two bindings aloud, because they point in opposite directions and you need both. The access token's `cnf.jkt` — read that as "confirmation claim, JWK thumbprint" — says *this token belongs to that key*. The proof's `ath` says *this proof was made for that token*. Without `ath`, a proof asserts only that the holder of some key wants to perform this method against this URI at roughly this time. Any access token bound to the same key satisfies it. That matters as soon as a client holds more than one token on the same key — different scopes, different audiences — and it matters a great deal more if proofs ever end up somewhere they can be read back, such as a gateway access log or a request-tracing tool.
+
+So when you are asked how a resource server validates DPoP, do not offer the five-line sketch above as the whole answer. RFC 9449 section 4.3 enumerates twelve things the receiving server MUST ensure. Beyond the familiar ones — signature verifies against the `jwk` in the proof's own header, `htm` and `htu` match the request, the creation time is inside an acceptable window — the list includes that there is not more than one `DPoP` header field, that the `typ` header is `dpop+jwt`, that `alg` is a registered asymmetric algorithm and not `none`, that the embedded `jwk` does not contain a private key, and, when the proof accompanies an access token, both that `ath` equals the hash of that token and that the token's bound key matches the proof's key. Two things worth saying precisely. The `alg`/`typ`/private-key header checks are the same class of defence as Drill 8's algorithm allow-list, applied to the proof rather than the access token. And remembering `jti` values is *not* one of the twelve: replay defence lives in section 11.1, where the RFC's tone is permissive — servers *can* store `jti` per target URI, and a strict single-use check "may not always be feasible in practice" when several servers behind one endpoint share no state.
+
+> 🌍 **In the real world**: a team rolls out DPoP and, during the rollout, turns on full request-header logging at the gateway so they can debug proof failures. For that fortnight every DPoP proof the system saw is sitting in a log store that a much wider group of engineers can query. With `ath` validated, each of those proofs is welded to one specific, short-lived access token. Without it, any captured proof can be paired with any other token bound to the same key, and the issued-at freshness window is the only thing left standing between the log reader and a valid request.
+
+### DPoP nonces — the server decides what counts as fresh
+
+The proof described so far is fresh because the client says so. It stamps an issued-at time and the server accepts anything inside a window. That is a bet on the client's clock, and it obliges the server to remember every proof identifier for the width of that window — which is pitfall 7 in this file, stated as a problem with no standard answer given. RFC 9449 sections 8 and 9 are the standard answer: let the server supply the freshness value.
+
+An authorization server MAY supply a nonce for the client to include in its proofs. When it wants one, it rejects the token request with HTTP 400 using `use_dpop_nonce` as the error code, and includes a `DPoP-Nonce` HTTP header carrying the value to use on the next request. The nonce is opaque to the client — it is not meant to be parsed or predicted. The client is then expected to retry its token request with a proof that includes the supplied value in a `nonce` claim. Resource servers can do the same at their end; the difference is the challenge, which there is HTTP 401 with a `WWW-Authenticate: DPoP` value alongside the `DPoP-Nonce` header. It is up to each server when to issue a new value, and the client keeps using the one it holds until it is given a fresh one.
+
+Two consequences are worth saying out loud. First, the nonces issued by an authorization server and by a resource server are different values, and each is only accepted by the server that issued it — so a client library must key them separately, and one shared cache is a bug waiting for a support ticket. Second, and this is the operational point: any DPoP client you ship has to implement the retry, because a server can begin requiring nonces at any time without warning you. A client that treats a 400 carrying `use_dpop_nonce` as a terminal failure will pass every test you write and break the day someone upstream changes a setting.
+
+The reason to want this on the server side is that it converts a guess into a fact. With a client-asserted timestamp you are picking a window wide enough to tolerate the worst clock you support and narrow enough that your replay cache fits in memory — two constraints pulling against each other. With a server-issued nonce, the server knows exactly when the value was minted and when it stopped being current, so the replay window becomes a decision rather than a compromise.
+
+> 🌍 **In the real world**: an identity team switches nonces on at the token endpoint after a load test shows the proof-identifier cache has become the largest thing in their Redis cluster. Mobile clients built on a maintained library pick up the retry and nobody notices anything. One internal service, whose DPoP support was hand-rolled during a hack week, starts returning 500s to its callers, because a 400 from the token endpoint had been mapped to "the auth server is down". The code fix is a dozen lines. The incident is an hour long, entirely because nobody had read section 8.
+
+### mTLS in practice — RFC 8705 and the proxy that eats the certificate
+
+RFC 8705, *OAuth 2.0 Mutual-TLS Client Authentication and Certificate-Bound Access Tokens*, is two mechanisms in one document, and interviewers usually want them separated.
+
+The first is client authentication, in two flavours. `tls_client_auth` is the PKI method: the authorization server validates the certificate chain and matches the certificate's subject distinguished name or a subject alternative name against values registered for that client. `self_signed_tls_client_auth` dispenses with chain validation entirely — the client registers its certificates through the ordinary `jwks` or `jwks_uri` parameters, and authentication succeeds if the certificate presented during the handshake matches one of the certificates registered for that client. The second mechanism is token binding: the access token carries a `cnf` claim whose `x5t#S256` member is the base64url-encoded SHA-256 hash of the DER encoding of the X.509 certificate. Read that member as "certificate thumbprint" rather than spelling it out.
+
+Now the part that decides whether any of this survives contact with production. RFC 8705 says an authorization server or resource server MAY choose to terminate TLS connections at a load balancer, reverse proxy or other network intermediary — and then states that how the client certificate metadata is securely communicated between the intermediary and the application server is out of scope of the specification. That sentence is where deployments break. Your ingress completes the handshake, your application receives a plain HTTP request, and the thumbprint check fails against a certificate that is no longer present anywhere in what the application can see.
+
+The usual mechanism is a header. Envoy's is `x-forwarded-client-cert`, which can carry elements including `Hash` (the SHA-256 digest of the client certificate), `Cert` and `Chain` (the certificate and chain in URL-encoded PEM), `Subject`, `Issuer`, `URI`, `DNS` and `By`. Envoy's `forward_client_cert_details` setting decides the behaviour — sanitise, forward only, append and forward, sanitise and set, always forward only — and the header is sanitised by default, so forwarding it is something you switch on deliberately.
+
+Switching it on moves your trust boundary, and that is the senior point. Once the application believes a header, anything that can reach the application without passing through the proxy can forge that header and impersonate any client. The discipline is therefore: strip the header on every inbound path, set it only at the terminating proxy, and be able to prove there is no route to the workload that bypasses the proxy. If you cannot prove that last part, do not deploy certificate-bound tokens behind a terminating proxy at all — you have swapped a cryptographic check for a string comparison on attacker-supplied input.
+
+One interop detail that costs an afternoon the first time: RFC 8705 defines `mtls_endpoint_aliases` in authorization server metadata — a JSON object of alternative endpoint URLs (token, revocation, introspection and so on) for mutual-TLS clients. It exists so a host that demands a client certificate does not trigger certificate prompts for clients that are not mTLS-aware. A client doing mutual TLS must take its endpoints from inside that object rather than the top-level metadata. A client that reads the top-level `token_endpoint` connects without presenting a certificate and is told, unhelpfully, that its credentials are invalid.
+
+> 🌍 **In the real world**: a partner payments integration works perfectly in the development environment, where the service is reached directly, and fails on its first deployment behind the shared ingress. The token has the right `cnf` claim, the client presents the right certificate, the handshake succeeds — and the resource server reports a thumbprint mismatch on every single call, because the certificate stopped at the ingress. The debugging session runs long precisely because both halves are correct in isolation; the missing piece is a forwarding setting nobody configured and a header nobody trusted.
+
+### Token introspection (RFC 7662)
+
+Two ways for a resource server to validate a token:
+
+1. **JWT validation** — verify signature locally; check `exp`, `aud`, `iss`. Fast, stateless, scales perfectly. Trade-off: can't revoke individual tokens.
+2. **Introspection** — POST the token to `/oauth/introspect` on the auth server. Server returns `{active: true, scope: "...", username: "...", exp: ...}` or `{active: false}`. Trade-off: every request hits the auth server (latency + load).
+
+```
+POST /oauth/introspect HTTP/1.1
+Authorization: Basic <client_id:client_secret>     # client_secret_basic — low-stakes variant
+Content-Type: application/x-www-form-urlencoded
+
+token=<the access token>
+
+→ 200 OK
+{
+  "active": true,
+  "scope": "orders.read",
+  "client_id": "orders-client",
+  "username": "ahmed",
+  "exp": 1715180000,
+  "sub": "user-42"
+}
+```
+
+The introspection call itself is an authenticated client call. The `client_secret_basic` above is the low-stakes form shown for brevity; for a high-value resource server, authenticate it with `private_key_jwt` or mTLS (see pitfall 10).
+
+**Use introspection when**:
+- Tokens are opaque (random strings, not JWTs).
+- You need authoritative real-time revocation status.
+- Auth server has additional metadata not in the token.
+
+**Use JWT validation when**:
+- Throughput matters (sub-ms latency).
+- Auth server should not be a SPOF for every request.
+- Short-lived tokens (5-15 min) make revocation gap acceptable.
+
+**Hybrid**: validate JWT for the common path; introspect on high-value endpoints, on session changes, or via a small cache with short TTL.
+
+### Token revocation (RFC 7009)
+
+Stateless JWT can't be revoked by definition. Workarounds:
+
+- **Short token lifetimes** (5-15 min) + refresh-token rotation — a stolen access token expires fast.
+- **Revocation list / blocklist** — server keeps a list of revoked `jti`s; resource server checks (often via a cache like Redis). Defeats statelessness but minor cost.
+- **Token introspection** — auth server is the source of truth.
+- **Versioned signing keys** — to revoke ALL tokens issued before T, rotate the signing key.
+
+In OAuth 2.0, RFC 7009 specifies the revocation endpoint:
+```
+POST /oauth/revoke
+{ token: <access_or_refresh_token>, token_type_hint: "refresh_token" }
+```
+
+Revoking a refresh token is the single most important practice — it cuts off the long-tail of session lifetime.
+
+### Token status lists — revocation you can check offline
+
+The four options above are short lifetimes, a `jti` blocklist you maintain yourself, introspection, and rotating the signing key. There is a fifth that has been standardised since, and it deserves a mention because it directly rebuts the opening sentence of that section.
+
+The IETF draft *Token Status List* (draft-ietf-oauth-status-list) inverts the introspection call. The issuer keeps a list in which every issued token owns one position. A status is one, two, four or eight bits wide; the positions are packed into a byte array, the array is compressed using DEFLATE with the ZLIB data format, and the result is published as a signed Status List Token — a JWT with `typ` set to `statuslist+jwt`, or the CBOR equivalent. Every token the issuer hands out then carries a `status` claim containing a `status_list` object with two members: `idx`, a non-negative integer giving its index, and `uri`, identifying where the list lives.
+
+The relying party fetches that URI with an ordinary HTTP GET, caches the result according to the list token's `ttl` and `exp` claims, and thereafter checks a single bit per request. No call to the authorization server on the hot path, no shared revocation database between services, and revocation freshness becomes a cache interval you choose rather than a token lifetime you are stuck with.
+
+The property introspection cannot match is privacy. Because one fetch covers every token on the list, the issuer does not learn which token the relying party was asking about — the draft calls this herd privacy. Introspection is the exact opposite: the authorization server learns precisely who checked which token, and when. Inside one company that is a feature. Across an ecosystem of independent verifiers it is a surveillance channel you have to justify to a regulator.
+
+Two honesty notes for an interview. As of mid-2026 this is still an Internet-Draft — it has cleared IESG review and sits in the RFC Editor queue, so there is no RFC number to quote and you should call it a draft. And the mechanism tells you a token's *status*, not whether it is otherwise valid: signature, audience and expiry are all still your job.
+
+> 🌍 **In the real world**: a national digital-identity scheme where hundreds of independent verifiers — pharmacies, letting agents, bar staff — check credentials issued by one authority. Introspection would mean every one of those verifiers telling the issuer, in real time, which citizen they had just checked, which is exactly the central database the scheme was designed to avoid. A status list means each verifier downloads the same compressed bitstring a few times a day, learns nothing about the other verifiers, and the issuer learns nothing about who was checked.
+
+### JWT validation vs introspection — when each
+
+| Concern | JWT validation | Introspection |
+|---|---|---|
+| **Latency** | Sub-millisecond | One network round-trip |
+| **Auth server load** | Zero per request | One per request |
+| **Revocation** | Can't (without blocklist) | Authoritative |
+| **Token format** | Must be JWT | Any (opaque) |
+| **Privacy** | Token contents readable | Auth server controls disclosure |
+| **Scaling** | Linearly with resource servers | Bounded by auth server |
+
+Most teams default to JWT validation with short expiry. Banking/healthcare often default to introspection with a small cache.
+
+### Access-token typing — RFC 9068 and the at+jwt header
+
+Drill 8 has you allow-list the `alg` header. There is a second header field with a normative check attached, and every validation list in this file has been missing it.
+
+RFC 9068, the *JSON Web Token (JWT) Profile for OAuth 2.0 Access Tokens*, defines what a JWT access token is supposed to look like. It registers the media type `application/at+jwt`, and because RFC 7515 recommends omitting the `application/` prefix, the `typ` value used SHOULD be `at+jwt`. The obligation on the receiving side is stronger, and note carefully who it binds — the resource server, not the issuer: the resource server MUST verify that the `typ` header value is `at+jwt` or `application/at+jwt`, and reject tokens carrying any other value.
+
+The reason is token-type confusion, and the concrete case is the ID token. An ID token and an access token from the same provider are both JWTs, both signed with the same key, both carry a valid issuer and a live expiry. An API that checks signature, issuer and expiry and stops there will accept one where it expected the other — and the ID token is the one the client is entitled to hold, log, decode and hand to a front end. Audience validation is your other line of defence here, since an ID token's audience is the client rather than the API. But the two checks fail independently: an API that matches audiences loosely, or whose identifier is also a registered client identifier, has nothing left. RFC 9068 says this explicitly — the explicit typing required by the profile helps the resource server distinguish JWT access tokens from OpenID Connect ID tokens.
+
+The profile's required claims are worth knowing too, because two of them tend to be skipped: `iss`, `exp`, `aud`, `sub`, `iat`, `jti` and `client_id`. `client_id` is what lets a resource server answer "which application is calling me", separately from "which user am I acting for" — the scope-versus-role distinction in Drill 14 depends on being able to tell those apart. And `jti` being required is what makes the `jti` blocklist from the revocation section workable at all; you cannot blocklist an identifier the token does not carry.
+
+> 🌍 **In the real world**: an internal API is written by a team who copied JWT validation from a blog post — signature, issuer, expiry, done. Months later the front-end team, debugging a session problem, starts sending the ID token instead of the access token, because it happens to be the value sitting in a variable they can reach. It works. That it works is the finding: an ID token has no `scope` claim, so whatever scope enforcement the API was believed to be doing had never been running.
+
+### Continuous Access Evaluation and claims challenges
+
+The table above frames revocation freshness as a choice between calling the authorization server on every request and living with a gap. There is a third shape, and on the Microsoft stack it is the native answer: let the identity provider push revocation to the resource, and let the resource challenge the client when it needs a replacement token.
+
+That is Continuous Access Evaluation. Microsoft describes it as an industry standard based on the OpenID Foundation's Continuous Access Evaluation Profile. Rather than waiting for a token to expire, participating services subscribe to critical events from the identity provider. Microsoft's documentation lists the events currently evaluated as: the user account is deleted or disabled; the user's password is changed or reset; multifactor authentication is enabled for the user; an administrator explicitly revokes all refresh tokens for the user; and high user risk detected by Microsoft Entra ID Protection. Separately, participating services can synchronise key Conditional Access policies and evaluate them in the service itself, which is how an IP-based location policy gets enforced at the resource instead of at the next token refresh.
+
+The counterintuitive consequence is the thing to lead with. Because revocation is pushed, CAE-aware sessions get *longer* tokens, not shorter: Microsoft's documentation states that token lifetime increases to long-lived, up to 28 hours, in CAE sessions, and that the configurable token lifetime policy is not honoured for clients negotiating CAE-aware sessions. Clients that are not CAE-capable keep the default one-hour lifetime. So the trade inverts the one in the table above — you stop buying freshness with short expiry and start buying it with a subscription channel. Microsoft is also candid about the latency: the goal is near real time, but propagation delay of up to fifteen minutes may be observed, while IP location policy enforcement is instant.
+
+The client-visible half is the claims challenge, and it is structurally the same as the step-up challenge later in this file. When a resource provider rejects a token that has not expired, it returns 401 with a `WWW-Authenticate: Bearer` header carrying `error="insufficient_claims"` and a `claims` parameter — a quoted string holding a base64-encoded OpenID Connect claims request. The client decodes that string, URL-encodes it, and sends it as the `claims` parameter on a fresh authorization request. Three parts, and you can describe them without reading the header aloud: a 401, an error code meaning "the claims in that token are not enough", and an encoded description of what would be enough.
+
+Both ends are opt-in, and that is the detail that catches teams out. Entra ID does not send claims challenges to a client that has not declared it can handle them; the client advertises the `cp1` capability. In MSAL.NET that is `WithClientCapabilities(new[] { "cp1" })` on the application builder; with Microsoft.Identity.Web it is a `ClientCapabilities` array in the `AzureAd` configuration section. On the API side, if you want to know whether a caller can cope with a challenge, request `xms_cc` as an optional claim in the resource application's manifest and look for the value `cp1` on the incoming token — the only currently known value. Microsoft's initial implementation focuses on Exchange, SharePoint Online and Teams, and CAE does not support guest user accounts. Both are worth knowing before you promise a security team instant revocation everywhere.
+
+> 🌍 **In the real world**: the fired-admin scenario from Drill 4, on a Microsoft stack. HR disables the account, a revocation event goes out to the resource providers, and the next call the ex-admin's laptop makes to a CAE-enabled resource comes back as a 401 with a claims challenge rather than data — even though the token in its cache has not expired. If the client application was built without declaring `cp1`, none of that happens: it never receives the challenge, so it was never issued a long-lived token either, and you are back to waiting out the default hour.
+
+### Refresh token rotation and reuse detection
+
+A refresh token is exchanged for a new access token (and a new refresh token). **Rotation**: every refresh issues a new refresh token AND invalidates the old one.
+
+**Reuse detection**: if the auth server sees the *old* refresh token used after the new one was issued, that's a sign of theft — invalidate the entire token family.
+
+```
+1. Client → AS: refresh_token=R1 → AS issues access=A1, refresh=R2 (R1 invalidated)
+2. Attacker (stolen R1) → AS: refresh_token=R1 → AS detects reuse → kills R2 family
+3. Legitimate client → AS: refresh_token=R2 → fails (family killed) → forced re-login
+```
+
+Attacker is locked out; legitimate user is forced to re-authenticate (annoying but secure).
+
+This is the modern best practice for browser-based apps (where refresh tokens have to live somewhere accessible). **Duende BFF**, **Auth.js** (the renamed NextAuth.js — same project), and most modern OAuth libraries implement reuse detection by default.
+
+### Back-channel logout — ending the session, not just the token
+
+The base file's answer to "what happens on the server when a user signs out?" is "nothing — the JWT is still cryptographically valid until `exp`". That is correct about the token and incomplete about the session, and the gap between the two is what OpenID Connect Back-Channel Logout 1.0 exists to close.
+
+The mechanism: when a session ends at the provider, the provider POSTs a `logout_token` — a JWT — directly to each relying party's registered `backchannel_logout_uri`. No browser is involved, which is the entire point. It works when the user has closed the tab, when the relying party is a server-side application with no live front end, and when third-party cookies are blocked.
+
+The token's claims are worth knowing, not least because one of them is a prohibition. Required: `iss`, `aud`, `iat`, `exp`, `jti`, and an `events` member containing `http://schemas.openid.net/event/backchannel-logout`. Then either `sub`, or `sid`, or both. And a `nonce` claim MUST NOT be present — deliberately, so that a logout token is syntactically invalid as an ID token and cannot be replayed in place of one in a forged authentication response. The relying party answers 200 (or 204) when the logout succeeds and 400 when the request is invalid, with `Cache-Control: no-store`.
+
+The `sub` versus `sid` choice is the design decision. Logging out on `sub` ends every session that user has, on every device — right for "my laptop was stolen", wrong for "I've finished on this shared machine". Logging out on `sid` ends one specific session. Client metadata carries `backchannel_logout_session_required` to declare whether the relying party needs `sid` to be present.
+
+What it does not do: it does not invalidate access tokens. The relying party is what acts — it destroys its own session record and its own cookie. Any access token already issued remains valid until it expires; back-channel logout removes the session that would otherwise have refreshed it. If you need both halves, pair it with refresh token revocation under RFC 7009. Two sibling specifications complete the picture: front-channel logout, which drives hidden iframes in the user's browser and therefore depends on third-party cookie behaviour that browsers keep tightening; and RP-initiated logout, which is the ordinary sign-out button sending the user to the provider to end the session there.
+
+> 🌍 **In the real world**: a hospital where clinicians share workstations and a dozen internal applications each hold their own session cookie. A clinician signs out of the records system and walks away. Without back-channel logout, the rota app, the imaging viewer and the messaging tool are all still signed in as that clinician for however long their cookies last. With it, one sign-out fans out into a dozen POSTs and every one of those sessions is gone before the next person sits down.
+
+### FAPI — Financial-grade API profile
+
+**FAPI** (Financial-grade API) is a profile defined by the OpenID Foundation for high-value APIs (banks, payments, regulated industries). Two versions:
+
+- **FAPI 1.0** — used by UK Open Banking (PSD2), Brazil Open Banking, Australia CDR.
+- **FAPI 2.0** — modernized; aligned with OAuth 2.1; simpler.
+
+**FAPI 2.0 Security Profile requirements**:
+- OAuth 2.1 baseline (PKCE, no implicit, sender-constrained refresh).
+- **Sender-constrained tokens** — DPoP or mTLS required.
+- **PAR** — Pushed Authorization Requests (next section) required.
+- **Restricted signing algorithms** — no HS256, no RS256; PS256 and ES256 are the usual choices. Note the Security Profile is a profile of OAuth 2.0 and does not itself mandate OpenID Connect, so don't recite OIDC as one of its requirements.
+- **Strict redirect URI matching** — no wildcards.
+- **Mandatory client authentication** — `private_key_jwt` or mTLS (no client_secret_basic).
+
+What is *not* mandatory: **signed request objects (JAR)**. FAPI 1.0 Advanced required them; in 2.0 they moved out of the Security Profile into the separate, optional **FAPI 2.0 Message Signing** profile, which exists for non-repudiation rather than baseline security. Claiming JAR is a FAPI 2.0 requirement is a common way to trip over an interviewer who has run the OpenID conformance suite.
+
+When FAPI applies: building a payment service, integrating with a bank's API, or any context where regulators specify "FAPI compliance." Otherwise, you're free to pick your own subset.
+
+### PAR — Pushed Authorization Requests
+
+In classic OAuth, the client builds an authorization URL with all parameters (scope, state, redirect_uri, code_challenge, …) and sends the user to it. Problem: parameters are visible in the URL, in browser history, in referrer headers — they can be tampered with.
+
+**PAR** (RFC 9126) reverses this:
+
+```
+1. Client → AS:  POST /par
+                 redirect_uri=..., scope=..., state=..., code_challenge=...
+                 (server-to-server; client is authenticated)
+   AS → Client: { request_uri: "urn:ietf:params:oauth:request_uri:abc123",
+                  expires_in: 60 }
+
+2. Client → User Agent → AS:
+   GET /authorize?client_id=...&request_uri=urn:ietf:params:oauth:request_uri:abc123
+
+3. Standard OAuth flow continues from there.
+```
+
+The auth request is opaque from the user's browser perspective — only a reference. Tampering and leakage attacks are prevented. PAR is mandatory in FAPI 2.0 and recommended for high-value clients in OAuth 2.1.
+
+### JAR / RAR — JWT Authorization Requests / Rich Authorization Requests
+
+**JAR** (RFC 9101) — the auth request itself is a signed JWT. Combined with PAR, the auth server has cryptographic proof of who initiated the request and what they asked for.
+
+**RAR** (RFC 9396) — replaces the simple `scope` string with a structured `authorization_details` array, allowing fine-grained, structured permissions. Critical for financial use cases:
+
+```json
+{
+  "authorization_details": [
+    {
+      "type": "payment_initiation",
+      "actions": ["initiate"],
+      "instructedAmount": { "currency": "EUR", "amount": "123.45" },
+      "creditorName": "Acme Corp",
+      "creditorAccount": { "iban": "DE..." },
+      "remittanceInformationUnstructured": "Invoice 1234"
+    }
+  ]
+}
+```
+
+The user consents to "transfer €123.45 to Acme" specifically — not just "give this app payment.read scope."
+
+### Resource indicators (RFC 8707) — one token, one API
+
+Drill 13 reaches the right conclusion — for anything crossing a trust boundary, issue a separate token per API — and then stops without saying how a client asks for one. RFC 8707, *Resource Indicators for OAuth 2.0*, is the how.
+
+It adds a `resource` parameter, which the client can send on the authorization request, on the token request, or both. Its value MUST be an absolute URI and MUST NOT include a fragment component, and the parameter MAY be repeated to indicate that the token is intended for use at multiple resources. The authorization server SHOULD audience-restrict the issued access token to the resource or resources indicated, and returns the error `invalid_target` when the requested resource is invalid, unknown or malformed.
+
+The reason it exists is that `scope` names permissions but not places. `orders.read` does not say *which* orders API. If your authorization server issues one token covering everything a client is entitled to reach, then that client — and anyone who lifts a token out of it — holds a key to every API it has ever been granted. A resource indicator is how the client says "I only want this to work at the payments API", and how the server knows what to put in `aud`.
+
+Do not confuse it with the `audience` parameter in this file's token-exchange example. That one belongs to RFC 8693 and applies to the token-exchange grant. RFC 8707's `resource` is a different specification, sent on ordinary authorization and token requests. The intent is similar; the documents are not, and an interviewer who knows the difference will notice which one you name.
+
+> 🌍 **In the real world**: an internal platform with several dozen services, all handed tokens carrying a single audience because that is how the original setup was wired and nobody revisited it. A low-traffic reporting service leaks a token in a stack trace pasted into a public issue tracker. Because that token's audience covers the whole estate, the incident review has to treat every service as potentially exposed and every team gets pulled in. With resource indicators in place, the same leak is a reporting-service incident and stays one.
+
+### Token exchange (RFC 8693)
+
+Token exchange lets a service swap one token for another. Common patterns:
+
+- **Service-to-service delegation** — A holds a user's token, calls B; B needs a token *for itself* but acting on behalf of the user. A exchanges the user token + its own credentials → token for B.
+- **Impersonation vs delegation** — impersonation uses identity X as if you are X (rare); delegation acts on X's behalf with audit (common).
+- **Reduced-scope tokens** — service holds broad-scope token, calls a less-trusted downstream with reduced-scope subset.
+- **External federation bridge** — exchange external IdP token for local IdP token.
+
+```
+POST /oauth/token
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+subject_token=<user's token>
+subject_token_type=urn:ietf:params:oauth:token-type:access_token
+audience=https://api-b
+scope=orders.read
+```
+
+### Workload identity federation — client credentials without a client secret
+
+Pitfall 10 says to use `private_key_jwt` or mTLS rather than a client secret for high-value clients. Workload identity federation takes the same idea one step further: hold no credential at all.
+
+The protocol primitive is RFC 7523, the *JSON Web Token (JWT) Profile for OAuth 2.0 Client Authentication and Authorization Grants*. Instead of `client_secret`, the token request carries `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` together with a `client_assertion` holding a signed JWT. That assertion must carry `iss`, `sub`, `aud` and `exp`, and the authorization server MUST reject any JWT that does not contain its own identity as the intended audience. With `private_key_jwt`, your client mints that assertion using a private key it holds. With federation, somebody else's identity provider mints it and you hold nothing.
+
+On Microsoft Entra ID that means configuring a federated identity credential on an app registration or a user-assigned managed identity, pinning three values — `issuer`, `subject` and `audience` — which Microsoft's documentation notes must match case-sensitively the corresponding values in the token the external provider sends. The workload then makes an otherwise ordinary `grant_type=client_credentials` request, passing the external provider's token as the `client_assertion`. Microsoft's own framing is exact: everything is the same as the certificate-based flow except the source of the assertion.
+
+```
+POST /{tenant}/oauth2/v2.0/token
+grant_type=client_credentials
+&client_id=...
+&scope=https%3A%2F%2Fgraph.microsoft.com%2F.default
+&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer
+&client_assertion=<the token the CI system or the cluster handed you>
+```
+
+Why this beats a secret, stated as mechanism rather than adjectives: there is no long-lived value sitting in a pipeline setting, a vault entry or a container environment, so there is nothing to copy out, nothing to rotate and nothing to expire on a Sunday night. The assertion is minted per run by the platform the workload is already running on, and the `subject` you pinned is that platform's own statement about which repository, branch or service account is executing.
+
+Microsoft's supported scenarios include Kubernetes clusters anywhere (AKS, EKS, GKE or on-premises), GitHub Actions, Google Cloud, AWS, SPIFFE and SPIRE identities, and Azure Pipelines service connections. Two limits worth carrying into an interview: Entra stores only the first 100 signing keys downloaded from an external provider's OIDC endpoint, and tokens issued by Entra ID itself may not be used in federated identity flows. On the AWS side the equivalent move is trading the same OIDC token for role credentials through STS's `AssumeRoleWithWebIdentity`.
+
+The platform mechanics — the projected token file inside a Kubernetes pod, federated-credential troubleshooting, the AKS wiring — are covered in [Secret management](../10-devops-and-cicd/05-secret-management.md). What belongs in an auth interview is the protocol shape above: an assertion grant, a pinned issuer and subject, and no stored secret.
+
+> 🌍 **In the real world**: a deployment pipeline that has carried the same Azure client secret in its settings since 2021. Three people who have since left the company saw it, it appears in an old runbook, and it expires on a date nobody has in a calendar. Replacing it with a federated credential means the pipeline asks its own platform for a fresh token at the start of every run and exchanges that for an Entra token. The secrets page on the app registration ends up empty, which is the whole point — there is no longer a value that anybody could paste anywhere.
+
+### Delegated authorization for AI agents
+
+An agent that reads a user's mail, files their expenses and calls three APIs on their behalf is a delegation problem, and every primitive it needs is already in this file. What is new is that there is now a concrete profile to point at.
+
+The Model Context Protocol authorization specification is the most specific thing to name, and because MCP revisions are dated strings you have to say which one you mean. The current revision is **2026-07-28**; `2025-06-18` and `2025-11-25` are earlier revisions still described by most write-ups, and the requirements below have already moved once between them. Its shape: an MCP server acts as an OAuth 2.1 resource server, an MCP client acts as an OAuth 2.1 client, and the authorization server is out of scope of the specification, whether it is co-hosted with the resource server or entirely separate. Authorization is OPTIONAL for MCP implementations; HTTP-transport implementations SHOULD conform to the specification, while stdio implementations SHOULD NOT and should take credentials from the environment instead.
+
+Discovery is where it does something this file has not covered elsewhere. The MCP server MUST implement RFC 9728, *OAuth 2.0 Protected Resource Metadata*, and MUST use the `WWW-Authenticate` header on a 401 to indicate the location of its resource metadata. The client parses that header, fetches the metadata, reads the `authorization_servers` field, and then obtains the authorization server's metadata — the server must offer at least one of RFC 8414 or OpenID Connect Discovery, and the client must support both. Client registration is the part that has already changed, so quote the current revision rather than the one you read about first: dynamic client registration (RFC 7591) is now only a MAY, and is explicitly marked deprecated and retained for authorization servers that cannot do better; the SHOULD has moved to OAuth Client ID Metadata Documents, where the client's `client_id` is an HTTPS URL from which the authorization server fetches the client's metadata. Whichever mechanism, the reason one is needed at all is specific to agents: a client may encounter a server nobody registered it with, and there is no human waiting to fill in a registration form.
+
+Two requirements carry most of the security, and both are things this file now covers separately. MCP clients MUST implement RFC 8707 resource indicators and include `resource` on both the authorization request and the token request, naming the canonical URI of the MCP server — and MUST send it whether or not the authorization server supports it. MCP servers MUST validate that tokens presented to them were issued specifically for them. And if an MCP server calls an upstream API, it MUST NOT pass through the token it received from the client; it acts as an OAuth client to that upstream and obtains a separate token, issued by the upstream authorization server. Keep that prohibition distinct from the *confused deputy problem*, which the specification lists as its own item with its own mitigation: there the setup is an MCP proxy server using a static client ID, where stolen authorization codes can be turned into access tokens without the user consenting afresh, and the requirement is to obtain user consent for each dynamically registered client before forwarding to a third-party authorization server. Two named failures, two different rules — an interviewer who works on this will notice if they are merged into one.
+
+Assemble the rest from what you already know. Rich authorization requests are how you express "this agent may refund up to this amount, on this order" rather than a scope that means "refunds". Token exchange with delegation semantics is how a downstream call still records on whose behalf the agent acted, six months later when somebody asks. Short lifetimes and sender-constraining are what bound the damage when a token ends up in a prompt, a tool response or a saved transcript — a genuinely new leak surface, because moving text around is what agents do all day.
+
+Be honest about the state of it. Cite the specification by revision date, describe the primitives, and say plainly that this area is still moving. An interviewer who works on it will respect that considerably more than a confident claim about a settled standard.
+
+> 🌍 **In the real world**: a support agent wired up to a refunds API. Give it the same token the human support tool uses and the blast radius of one successful prompt injection is the entire refunds scope. Give it a token issued for one resource, carrying an authorization-details entry naming one order and one maximum amount, valid for a few minutes, and the same injection buys the attacker a single refund on an order that was already in front of the agent.
+
+### Step-up authentication
+
+Some operations need stronger assurance than the original session — e.g., "I logged in with a password earlier; now I want to wire $50K." Step-up forces re-authentication with stronger factors.
+
+The OIDC spec defines:
+- **acr (Authentication Context Class Reference)** — claim indicating assurance level. ACR values are deployment-defined strings, not a standard list; don't reach for the old `urn:nist:loa:*` URNs, because NIST retired the single Level-of-Assurance model in SP 800-63-3 (2017) in favour of separate IAL / AAL / FAL dimensions (SP 800-63-4 finalised in 2025).
+- **amr (Authentication Methods Reference)** — claim listing methods used (`pwd`, `otp`, `mfa`, `webauthn`).
+- **acr_values** request parameter — "I require the assurance level my deployment labels `mfa`." The examples in this file use `pwd` for password-only and `mfa` for a second factor; those are illustrative deployment labels, not registered values — check what your own AS publishes.
+
+**RFC 9470** (OAuth 2.0 Step Up Authentication Challenge Protocol) standardises the response. When the resource server sees an insufficient `acr`, it returns a 401 with a WWW-Authenticate challenge demanding re-auth:
+
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer error="insufficient_user_authentication",
+                  acr_values="mfa"
+```
+
+The client redirects the user to re-authenticate with the requested ACR; the new token has updated `acr` and the operation proceeds.
+
+RFC 9470 also defines `max_age` in the same challenge, which is the *freshness* case — "your last authentication is too old" rather than "your authentication is too weak". The client answers it by re-authenticating, and the resource server checks the token's `auth_time` claim. Two distinct requirements, same challenge mechanism.
+
+**Step-up vs MFA-on-login**: forcing MFA on every login is friction. Step-up applies friction only where it's warranted — most users see fewer prompts; sensitive operations get stronger assurance.
+
+### Passkeys, WebAuthn and FIDO2
+
+`webauthn` appears in this file as an example `amr` value and `fido` in a drill answer, both with "phishing-resistant" attached and no explanation. The explanation matters, because phishing resistance is the one authentication property you cannot buy by adding more factors.
+
+The stack first. FIDO2 is the W3C Web Authentication API in the browser, plus CTAP between the browser and the authenticator. A passkey is a WebAuthn credential. Two operations run the whole thing, and both are worth naming because ASP.NET Core uses the same words. *Attestation* is registration: the authenticator generates a new key pair, keeps the private half, and returns the public half for the server to store. *Assertion* is authentication: the server issues a challenge, the authenticator signs it with the private key, and the server verifies the signature with the public key it stored.
+
+Phishing resistance falls out of the scoping rules rather than the cryptography. The credential is bound to a relying party identifier — a domain — and the browser will only produce an assertion for a matching origin, with the origin the browser actually saw included in the signed data. A user who lands on a look-alike domain is not asked to be vigilant; they are simply offered nothing, because no credential exists for that domain. Contrast a one-time code, where the user is entirely capable of reading it out to a caller claiming to be the bank. That is the whole of the claim, and it is why a passkey is a genuine step-up factor rather than a nicer password.
+
+The distinction that decides enterprise policy is synced versus device-bound. Most consumer passkeys sync through a platform or password-manager account, which is what makes them usable across a person's devices — and which also means the credential's security is now the security of that account. WebAuthn exposes whether a credential is eligible for backup and whether it is currently backed up. If your threat model requires credentials that never leave one piece of hardware, you need device-bound authenticators and a way to tell them apart, which is what attestation is for and why "we require attestation" is an enterprise sentence and rarely a consumer one. The identifier you check is the AAGUID, the Authenticator Attestation GUID — a 128-bit value indicating the authenticator model. Microsoft's guidance describes the workflow plainly: extract AAGUIDs from stored attestation objects, compare them against known-compromised models, and revoke affected credentials — while noting that AAGUID reliability depends on whether your app validates attestation statements at all.
+
+In .NET, ASP.NET Core Identity has built-in passkey registration and sign-in from .NET 10. `SignInManager<TUser>` provides `MakePasskeyCreationOptionsAsync` and `PerformPasskeyAttestationAsync` for registration, `MakePasskeyRequestOptionsAsync` and `PerformPasskeyAssertionAsync` for authentication, and `PasskeySignInAsync`, which performs the assertion and the sign-in in one call. `UserManager<TUser>.AddOrUpdatePasskeyAsync` stores the credential, and the stored `UserPasskeyInfo` carries the credential ID, the public key, a signature counter used for replay protection, and the backup flags — `IsBackedUp` being the one Microsoft's guidance suggests monitoring, so you can prompt a user whose only credential is unsynced to register a second. Behaviour is configured through `IdentityPasskeyOptions`: `ServerDomain` (the relying party identifier), `UserVerificationRequirement` (whether the authenticator must verify a biometric or PIN), `ResidentKeyRequirement` (whether the credential is discoverable, which is what allows sign-in without typing a username first), `ChallengeSize`, `AuthenticatorTimeout`, and the `VerifyAttestationStatement` and `ValidateOrigin` hooks.
+
+Know the documented limitations, because they are the follow-up questions. Attestation statements are not validated by default, so AAGUID-based policy needs the custom hook. Passkeys are treated as a primary authentication factor, not as a second factor. Only the Blazor Web App template ships with passkey support. And the implementation is deliberately scoped to Identity's authentication scenarios rather than being a general-purpose WebAuthn library — for full protocol coverage Microsoft's own documentation points at the community `fido2-net-lib` project, with the usual warning about third-party security libraries. One more that bites in production: if `ServerDomain` is not set, the relying party identifier is inferred from the Host header, so the hosting environment must validate host headers — and a credential registered on `app.contoso.com` also works across that domain's subdomains.
+
+Recovery is where passkey projects actually fail. If the passkey is the only way in, losing the device is losing the account. Microsoft's guidance lists the options without ceremony: recovery codes generated at account creation, email-based recovery flows, requiring more than one registered passkey, and watching the backup flag. It is worth knowing that the default Blazor Web App template sidesteps the problem entirely by requiring a backup method — a password or an external provider — when the account is created, so the template is not a demonstration of passwordless-only.
+
+> 🌍 **In the real world**: a workforce rollout where staff enrol passkeys on their personal phones. It goes well — nobody rings the helpdesk about passwords any more — until the security team asks where those credentials actually live. They are synced into personal cloud accounts, many of them protected by a password and a text message. The right answer is not to unwind the rollout; it is attestation plus an AAGUID allow-list for the roles that need it, and a second, device-bound authenticator issued to those people.
+
+### When there is no browser — the device grant and CIBA
+
+Two flows address the same shape of problem: the device you want to use is not the device you can comfortably authenticate on.
+
+**The device authorization grant** (RFC 8628) is for the television, the CLI, the till. The device asks the authorization server and receives a `device_code`, a short `user_code`, a `verification_uri` that is meant to be short and easy to type, optionally a `verification_uri_complete` that embeds the code for non-textual transmission such as a QR code, plus `expires_in` and an `interval`. The user goes to that URL on a phone or laptop and enters the code. Meanwhile the device polls the token endpoint with `grant_type=urn:ietf:params:oauth:grant-type:device_code`, receiving `authorization_pending` until the user finishes — and `slow_down` if it polls too eagerly, in which case the interval MUST be increased by five seconds for that and all subsequent requests.
+
+Given this file's table of what OAuth 2.1 removed, be precise about where the device grant stands. The 2.1 draft defines three grant types — authorization code, client credentials and refresh token — plus an extension mechanism for defining additional ones. The device grant is not on that list because it was never in the core document: it has always been its own RFC, and it continues as an extension grant. "Not included" and "removed" are different claims, and the question "what did 2.1 drop?" is about implicit and ROPC.
+
+The attack to know is device-code phishing, and RFC 8628's own security considerations raise it: it is possible for the flow to be initiated on a device in an attacker's possession. The attacker starts a flow on their own machine and sends the user code — or, worse, the complete verification URI, which requires no typing at all — to a victim who is told this is a normal sign-in step. The victim authenticates genuinely, approves, and the tokens land on the attacker's device. The RFC's mitigations are to make clear to the user what they are authorising and to confirm they have the device in their possession, together with rate-limiting user-code attempts and keeping enough entropy in the code that brute-forcing is infeasible against a rate limit and a finite lifetime. This is consent phishing with a modern coat of paint, and it is why some security teams distrust the device grant despite it being entirely sound for the case it was designed for.
+
+**CIBA** — OpenID Connect Client-Initiated Backchannel Authentication Flow, Core 1.0, Final — inverts who starts things. Its vocabulary is the Consumption Device, where the service is being consumed, and the Authentication Device, usually the user's phone, where they authenticate and authorise. The client POSTs to the backchannel authentication endpoint, authenticating with the client authentication method registered for its client ID, and identifies the user with exactly one of `login_hint`, `login_hint_token` or `id_token_hint`. It receives an `auth_req_id`. Then, depending on the mode: in *poll* mode the client polls the token endpoint; in *ping* mode the provider notifies the client's callback and the client then goes to the token endpoint; in *push* mode the provider delivers the tokens to the client's callback directly. The grant type at the token endpoint is `urn:openid:params:grant-type:ciba`.
+
+The parameter that makes CIBA the answer to device-code phishing is `binding_message` — a human-readable identifier or message displayed on both the consumption device and the authentication device, interlocking them. The customer sees the same short phrase on the agent's screen and on their own phone. If it only appears on the phone, something is wrong.
+
+Where each belongs: the device grant when the user is standing at the constrained device and simply needs a code to travel; CIBA when the *service* initiates and the user must approve out of band — a call-centre operator verifying a caller, a merchant terminal, a payment that has to be authorised on the customer's own phone. The OpenID Foundation publishes a Financial-grade API CIBA profile with its own conformance certification, and that profile does not permit push mode, because delivering tokens to a client-owned endpoint is one step too far at that risk tier. Useful in two ways: it fills out the FAPI answer, and it is concrete evidence for Drill 3's point that FAPI compliance is something you are tested on rather than something you declare.
+
+> 🌍 **In the real world**: a bank's call centre. The customer rings in and the agent needs proof of who they are. The old answer was security questions read out over the phone, which trains customers to answer exactly those questions for anyone claiming to be the bank. With CIBA, the agent triggers an approval and the customer's banking app asks them to confirm a request displaying a short phrase that the agent also reads out. A fraudster running the same flow from somewhere else cannot make the phrase on the customer's phone match the one they told the customer to expect.
+
+## Code & diagrams
+
+<details>
+<summary>🧩 Click to expand — code samples and diagrams</summary>
+
+### DPoP-protected request flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AS as Auth Server
+    participant RS as Resource Server
+    Note over C: Generate keypair,<br/>store privately
+    C->>AS: POST /token<br/>(with DPoP proof JWT in header)
+    AS-->>C: Token w/ cnf.jkt = SHA256(public key)
+    Note over C: Build new DPoP proof per request:<br/>{ htm, htu, jti, iat }<br/>signed w/ private key
+    C->>RS: GET /api/orders<br/>Authorization: DPoP <access_token><br/>DPoP: <new dpop proof jwt>
+    Note over RS: Verify access token (JWT)<br/>Verify DPoP proof signature<br/>Match cnf.jkt with proof key thumbprint<br/>Verify htm, htu, jti, iat
+    RS-->>C: 200 OK
+```
+
+### Refresh token rotation with reuse detection
+
+```
+Token family: {family_id, parent: null, children: [...]}
+
+Step 1: User logs in
+  AS issues:  access=A1, refresh=R1 (family F1 created)
+
+Step 2: Client refreshes
+  POST /token grant_type=refresh_token refresh_token=R1
+  AS:  invalidate R1, issue access=A2, refresh=R2 (family F1, parent=R1)
+
+Step 3a (legitimate path):
+  Client refreshes again with R2
+  AS:  invalidate R2, issue R3 (family F1, parent=R2)
+
+Step 3b (attack path):
+  Attacker (stolen R1) tries: refresh_token=R1
+  AS:  detects R1 already used → kill family F1 entirely
+  Legitimate client's R2/R3/etc are now invalid → forced re-login
+```
+
+### .NET client with DPoP (using Duende OidcClient)
+
+```csharp
+using System.Security.Cryptography;
+using System.Text.Json;
+using Duende.IdentityModel.OidcClient;
+using Duende.IdentityModel.OidcClient.DPoP;
+using Microsoft.IdentityModel.Tokens;
+
+// Generate or load the proof keypair. ES256 is the norm for DPoP — signing an RSA
+// proof on every request is slower and the proof is larger.
+// Note: JsonWebKeyConverter has no EC overload, so build the JWK from the curve
+// parameters directly.
+using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+var ecParams = ecdsa.ExportParameters(includePrivateParameters: true);
+var jwk = new JsonWebKey
+{
+    Kty = "EC",
+    Crv = "P-256",
+    X = Base64UrlEncoder.Encode(ecParams.Q.X),
+    Y = Base64UrlEncoder.Encode(ecParams.Q.Y),
+    D = Base64UrlEncoder.Encode(ecParams.D),   // private half — never leaves the client
+    Alg = "ES256"
+};
+
+var options = new OidcClientOptions
+{
+    Authority = "https://auth.example.com",
+    ClientId = "orders-spa",
+    // offline_access is what gets you a refresh token, which the handler below needs.
+    Scope = "openid offline_access orders.read orders.write"
+};
+
+// ConfigureDPoP is the switch — an extension method from the DPoP namespace above.
+// There is no DPoP property on OidcClientOptions itself.
+options.ConfigureDPoP(JsonSerializer.Serialize(jwk));
+
+var client = new OidcClient(options);
+var loginResult = await client.LoginAsync();   // PKCE auto-applied
+
+// ConfigureDPoP installs a proof-token handler inside the client, so the handler
+// hanging off the login result signs a fresh proof per request.
+var httpClient = new HttpClient(loginResult.RefreshTokenHandler);
+var response = await httpClient.GetAsync("https://api.example.com/orders");
+```
+
+</details>
+
+## Common pitfalls
+
+1. **Storing access tokens in localStorage.** XSS reads them. Use httpOnly cookies (BFF pattern) or memory-only with refresh-token reuse detection.
+2. **Long-lived access tokens.** A 1-hour token leak = 1 hour of attacker access. Aim for 5-15 minutes; refresh tokens fill the gap.
+3. **No refresh token rotation.** Rotate every use; detect reuse to kill the family.
+4. **Trusting `aud` checks alone.** Both `aud` AND `iss` AND signature must validate. An attacker with a token from a different IdP for a different audience can sometimes confuse loose validators.
+5. **Implicit / ROPC flows in 2026.** Both removed in OAuth 2.1. If your library still defaults to them, upgrade or migrate.
+6. **Forgetting to validate `nonce` in OIDC.** Without nonce validation, replay attacks against the ID token are possible.
+7. **DPoP without `jti` cache.** Replay protection requires deduping `jti` values within a short window; without that, an intercepted DPoP proof can be reused.
+8. **Skipping PKCE for confidential clients.** OAuth 2.1 requires it for all clients. Defense-in-depth — assume client secrets can leak.
+9. **Logging tokens.** Bearer tokens in logs / traces / monitoring are a leak vector. Redact at the source.
+10. **Using `client_secret_basic` for high-value clients.** Use `private_key_jwt` (signed JWT assertion) or mTLS — much harder to exfiltrate than a static secret.
+11. **No revocation strategy.** "We just have short tokens" works until something breaks (user fired, device lost). Implement /oauth/revoke + a blocklist for incidents.
+12. **Mixing `acr_values` and step-up confusingly.** Document which operations require which ACR; the client must understand the protocol or users get stuck in re-auth loops.
+
+## Interview-ready summary
+
+- **OAuth 2.1** consolidates 2.0 + a decade of BCPs: PKCE mandatory for all clients, no implicit/ROPC, sender-constrained refresh tokens.
+- **DPoP** sender-constrains tokens via per-request signed JWTs; works in browsers, no PKI overhead. mTLS is the heavyweight alternative for B2B / FAPI.
+- **Token introspection** = real-time validation against the auth server; trade latency for revocation freshness. **JWT validation** = stateless, fast, can't revoke individuals.
+- **Refresh token rotation + reuse detection** is the modern best practice for browser-based apps; defeats stolen refresh tokens.
+- **FAPI 2.0** = bank-grade profile; mandates DPoP/mTLS, PAR, strict client authentication — signed request objects (JAR) sit in the separate, optional Message Signing profile, not in the Security Profile. Required for Open Banking and similar.
+- **PAR / JAR / RAR** add integrity (JAR signed JWT requests), opacity (PAR pushes the request server-to-server), and structure (RAR replaces scope with `authorization_details`).
+- **Token exchange** lets services swap tokens for different audiences with delegation semantics.
+- **Step-up authentication** raises ACR for sensitive operations without forcing MFA on every login.
+
+**Expected interview questions:**
+
+1. *"How do you prevent access token theft from causing damage?"* — Sender-constrain tokens (DPoP or mTLS) so a stolen token alone is useless. Add httpOnly storage, short expiry, refresh-token rotation with reuse detection.
+2. *"Difference between JWT validation and introspection?"* — JWT is local crypto check; introspection asks auth server. JWT scales horizontally; introspection has authoritative revocation.
+3. *"Explain DPoP."* — Client signs a JWT proof per request with a key it holds; auth server records the key thumbprint in the token; resource server validates the proof matches. Token + proof together are required.
+4. *"What's wrong with the implicit flow?"* — Tokens in URL fragment, browser history, referrer leakage, no PKCE possible. Removed in OAuth 2.1.
+5. *"How does refresh token rotation work?"* — Every refresh issues a new refresh token AND invalidates the old. Old token reuse triggers family-wide invalidation (theft detection).
+6. *"What is FAPI?"* — Financial-grade API profile by OpenID Foundation; FAPI 2.0's Security Profile mandates DPoP/mTLS, PAR, strict client auth (JAR is the separate Message Signing profile). Required for Open Banking.
+7. *"How do you do step-up authentication?"* — Resource server returns 401 with `acr_values` requirement. Client redirects user to re-authenticate at higher assurance. New token has updated `acr` claim.
+8. *"How does token exchange differ from regular OAuth flows?"* — Service-to-service swap of one token for another (different audience, scope, or actor). Used for delegation, scope reduction, federation bridging.
+
+## Interview Cross-Questioning Drill
+
+<details>
+<summary>📖 Click to expand — cross-question chains (~15-20 min, cover answers and write cold)</summary>
+
+> ⚠️ **Honest caveat**: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
+
+### Drill 1 — DPoP vs bearer
+
+> **Q**: What specific attack does DPoP prevent that plain bearer tokens don't?
+>
+> **A**: Token replay by an attacker who exfiltrated the access token. A bearer token is "whoever has it can use it" — steal it from localStorage, network capture, leaked log line — the attacker can call APIs as the victim. DPoP binds the token to a key the client holds; every request must include a JWT proof signed by that key. Stolen token alone is useless without the key.
+>
+> **Cross-Q**: Where does the DPoP private key live, and can the attacker steal it too?
+>
+> **A**: In a browser: in `IndexedDB` via the WebCrypto API as a non-extractable key (the JS code can sign with it but can't read the raw key bytes). On mobile: in the secure enclave (iOS Keychain, Android Keystore) backed by hardware. If the attacker has the key, DPoP is defeated — but exfiltrating a non-extractable WebCrypto key requires either compromising the browser process itself (much harder than reading localStorage) or compromising the OS (where they already have everything). The attack surface shrinks dramatically.
+>
+> **Cross-Q²**: An attacker has full XSS on your page — they can call your DPoP-protected endpoints by signing proofs in the victim's browser. Does DPoP help in *that* case?
+>
+> **A**: Only partially. With full XSS the attacker can call endpoints as long as the victim's browser is open — the JS runs and signs DPoP proofs. But DPoP still prevents *offline* / *replay-from-elsewhere* abuse: the attacker can't take the captured tokens and use them from their own machine in another country, can't replay them tomorrow, can't sell them on dark markets. The "active attack while page is open" scenario is bounded; the "exfiltrate once, abuse for hours" scenario is killed. Combined with short token lifetimes (5 min), the live window shrinks further. DPoP is a depth layer, not a silver bullet — also fix the XSS.
+
+### Drill 2 — OAuth 2.1 vs 2.0
+
+> **Q**: What's been removed in OAuth 2.1 vs 2.0?
+>
+> **A**: (1) **Implicit flow** — tokens in URL fragment leak via history, referrer, and screen recording; no PKCE possible. (2) **Resource Owner Password Credentials (ROPC)** — client collects password, defeating the entire point of federated auth. Both removed.
+>
+> **Cross-Q**: What's been added/required?
+>
+> **A**: (1) **PKCE mandatory for all clients** including confidential — defense-in-depth against leaked secrets. (2) **Bearer tokens in URL query parameters forbidden** — body or header only. (3) **Refresh tokens for public clients must be sender-constrained OR rotated** — leak resistance. (4) **Security BCP guidance folded in** — the Security BCP (published as RFC 9700 / BCP 240 in January 2025) is folded into the 2.1 draft rather than left as separate advice. Be precise here: 2.1 is still a draft, so RFC 9700 is the published document to cite, and it is the Security BCP specifically — other OAuth BCPs remain separate documents.
+>
+> **Cross-Q²**: Your legacy app uses ROPC to integrate with a partner that requires it. What's the realistic migration?
+>
+> **A**: Two paths. (1) **Replace with auth-code flow + custom UX** — if the partner controls the user, route them through their standard login. (2) **Replace with client credentials flow** — if the partner is a service (not a user), use M2M tokens; no user password ever travels. The reality: many enterprises still have ROPC in flight in 2026 because partners haven't modernized. Mitigations: rate-limit and monitor ROPC endpoints aggressively, require MFA via a side-channel, and put a hard sunset date in writing. ROPC is the OAuth equivalent of plaintext FTP — works, but treat as legacy on borrowed time.
+
+### Drill 3 — FAPI
+
+> **Q**: What is FAPI and when is it required?
+>
+> **A**: FAPI (Financial-grade API) is an OpenID Foundation profile of OAuth/OIDC for high-value/regulated APIs. Required when: integrating with banks (UK Open Banking PSD2, Brazil Open Banking, Australia CDR), or building systems where regulators specify FAPI compliance. FAPI 2.0 is the current version, aligned with OAuth 2.1.
+>
+> **Cross-Q**: What does FAPI 2.0 mandate over plain OAuth 2.1?
+>
+> **A**: (1) **Sender-constrained tokens** — DPoP or mTLS required, not optional. (2) **PAR** (Pushed Authorization Requests) — auth requests pushed server-to-server, not built in browser URL. (3) **`private_key_jwt` or mTLS client auth** — `client_secret_basic` forbidden. (4) **Restricted signing algorithms** — no HS256, no RS256; PS256 and ES256 are the usual choices. (5) **Strict redirect URI matching** — no wildcards. Worth saying out loud what 2.0 *dropped*: signed request objects (**JAR**) were mandatory in FAPI 1.0 Advanced, but the FAPI 2.0 Security Profile doesn't require them — they moved to the optional Message Signing profile, which exists for non-repudiation.
+>
+> **Cross-Q²**: You're building a non-banking app but partners ask "are you FAPI compliant?" Should you adopt FAPI?
+>
+> **A**: Selectively. FAPI is expensive — DPoP keypair management per client, PAR server, mTLS infrastructure. If you don't need the full profile, don't adopt it whole — pick the relevant pieces: DPoP for stolen-token defense, PAR for auth-request integrity. Tell partners: "We implement DPoP-bound tokens, PAR-protected auth, and `private_key_jwt` client auth — a FAPI 2.0 subset." That's honest and gives them the security guarantees they care about without paying for the full bank-compliance overhead. Don't claim FAPI compliance without doing the full profile — auditors check.
+
+### Drill 4 — Introspection vs JWT validation
+
+> **Q**: When do you choose token introspection (RFC 7662) over local JWT validation?
+>
+> **A**: When **real-time revocation matters more than per-request latency**. Introspection POSTs the token to the AS on every call (or with caching) — the AS is the source of truth for "is this token still active?" JWT validation is sub-ms local crypto but can't see revocation until the token expires.
+>
+> **Cross-Q**: Concrete scenarios where introspection's network cost pays off?
+>
+> **A**: (1) **Employee termination at a bank** — when HR fires someone, their tokens must die *immediately*, not in 5-15 minutes. (2) **HIPAA-regulated healthcare** — compliance often requires "immediate access termination on incident." (3) **B2B partner that gets banned** — a partner whose contract is voided shouldn't have a usable token for the next hour. (4) **Opaque tokens** — random-string tokens have no payload to JWT-validate; introspection is the only path.
+>
+> **Cross-Q²**: Introspection adds a network round-trip per call. How do you reduce the load on the AS without losing revocation freshness?
+>
+> **A**: Short-TTL cache on the resource server. Cache the introspection response keyed by the token hash for 1-5 seconds. Common path: the cache hits and you skip the network call. After the TTL, you re-introspect — so revocations propagate within the TTL. The trade is "5-second window where a revoked token might still work" — far better than 15-minute JWT expiry, but with massively less AS load. Many large deployments use 5-second cache TTLs. For ultra-sensitive ops, skip the cache and introspect every call.
+
+### Drill 5 — Refresh-token rotation with reuse detection
+
+> **Q**: A refresh token gets stolen. The legitimate client and the attacker both try to refresh. What does reuse detection catch?
+>
+> **A**: When the AS sees R1 used *after* R2 was issued (R1 should have been invalidated when R2 was minted), it knows one of two parties is an attacker. Both legitimate clients and attackers only see their latest token; whoever uses the old one is replaying. The AS response: invalidate the entire token *family* — R2, R3, all descendants. Both parties lose access; the legitimate user must re-authenticate.
+>
+> **Cross-Q**: Couldn't an attacker race the legitimate client and refresh *first* — taking over the family?
+>
+> **A**: They could *win* the refresh, but then they hold R2 and the legitimate client holds R1. The next time the legitimate client refreshes (which they will, since their access token expired), they present R1 — the AS detects reuse and kills the family. So the attacker's win is short-lived; they can't sustainably use the family without re-stealing each new token. Combined with short access-token lifetimes (5-15 min), the attack window shrinks to one refresh cycle.
+>
+> **Cross-Q²**: Reuse detection works when the AS sees both attempts. What if the attacker uses *only* the old token and never lets the legitimate client refresh?
+>
+> **A**: The attacker controls the refresh cadence — they refresh every 5 minutes, keep getting new access tokens, the legitimate client never gets a chance to present R1. Mitigations: (1) the legitimate user notices ("I'm logged out" — they re-login and the security team gets alerted to potential compromise); (2) anomaly detection — same refresh token used from new IP/UA/geography triggers a step-up challenge or kills the family proactively; (3) device-bound refresh tokens — tie the token to a device fingerprint, alert on mismatch. Reuse detection alone isn't sufficient; it's one of multiple layers.
+
+### Drill 6 — mTLS for service-to-service
+
+> **Q**: When do you use mTLS over JWT for service-to-service?
+>
+> **A**: When (a) you need transport-level identity (the cert proves the caller is service X without any application logic), (b) regulatory requirements demand mTLS, (c) the consumer is a long-lived service (cert rotation cycles work fine), and (d) you want defense-in-depth with JWT *plus* connection-level cert.
+>
+> **Cross-Q**: mTLS has cert provisioning and rotation overhead. JWT has signing-key rotation overhead. Aren't they equivalent?
+>
+> **A**: Different threat models. mTLS authenticates the *TLS connection itself* — the cert is presented during handshake before any HTTP traffic. JWT authenticates *application-level requests* — anyone who can connect can send any JWT. mTLS gives you "this connection is from service X"; JWT gives you "this request claims identity Y." mTLS is harder to forge (requires the private key during connection establishment) and harder to log accidentally (cert thumbprints, not bearer secrets). For high-trust service mesh, mTLS at the connection + JWT at the request layer is the senior pattern.
+>
+> **Cross-Q²**: Service mesh (Istio, Linkerd) does mTLS automatically between services. Why would you also do JWT?
+>
+> **A**: Different identity layers. mTLS proves "this connection is from service A" — service identity. JWT carries the *user* identity that originally initiated the request chain. Service A calling Service B with a JWT containing `sub: alice` says "service A, acting on behalf of user alice, is calling B." Without the JWT, B knows "A called me" but not "for whom." For auditing, authorization (B may grant different permissions per user), and impersonation tracking, you need both. Standard pattern: mesh handles connection-level mTLS; app code propagates the user JWT.
+
+### Drill 7 — Step-up authentication
+
+> **Q**: A user logged in with password 2 hours ago and now wants to wire $50K. What happens?
+>
+> **A**: The wire endpoint checks the access token's `acr` claim and finds the value its AS uses for password-only authentication (`pwd` here). It requires the stronger value (`mfa` here). The endpoint returns `401 Unauthorized` with `WWW-Authenticate: Bearer error="insufficient_user_authentication", acr_values="mfa"`. The client redirects the user to `/authorize?...&acr_values=mfa`. The AS forces MFA / biometric / hardware key. New tokens come back with updated `acr`. Client retries the wire. Say out loud that these strings are deployment-defined — there is no standard ACR ladder to quote, so name whichever values your AS actually publishes.
+>
+> **Cross-Q**: How does the AS know which methods satisfy `mfa`?
+>
+> **A**: The AS has policy mapping each ACR value it publishes to a set of authentication methods — here, `pwd` = password only, `mfa` = password plus a phishing-resistant second factor (WebAuthn/FIDO2). The mapping is internal to the AS; the resource server only specifies the value it requires and trusts the AS to honor it. The `amr` claim then lists the *actual* methods used: `["pwd", "fido"]` — useful for auditing.
+>
+> **Cross-Q²**: A user keeps getting prompted for step-up on every $50K wire — annoying. How do you balance security and UX?
+>
+> **A**: Time-bound the elevation. After step-up, issue a token with `acr: mfa` valid for the next 10 minutes (or for the next N operations). Subsequent wires within that window don't re-prompt. After expiry, the next high-value op triggers step-up again. Configure the window based on operation value and customer risk profile — small wires (under $10K) might get a longer window than wire-to-new-recipient. This is standard banking UX: enter MFA once at the start of a "session" of high-value ops, not on every click.
+
+### Drill 8 — JWT signature stripping (`alg: none`)
+
+> **Q**: An attacker forges a JWT with header `{"alg":"none"}` and no signature. How does a vulnerable validator accept it?
+>
+> **A**: Some libraries (especially older ones) accept `alg: none` as a valid algorithm — the spec defines it for unsecured JWTs. If the validator's "verify" function trusts the header's `alg` without explicit allow-listing, it accepts any token with `alg: none` as authenticated. The attacker forges a token with any claims, signs it as "none," and the validator accepts.
+>
+> **Cross-Q**: What's the defense?
+>
+> **A**: **Allow-list the algorithm explicitly**. Never trust the header's `alg`. In .NET: `ValidAlgorithms = new[] { "RS256", "PS256", "ES256" }` on `TokenValidationParameters`. The library validates the token's `alg` is in the allow-list before verifying signature. `alg: none` is never in any production allow-list. Same for accepting HS256 when the issuer should use RS256 — that's the "algorithm confusion" attack (use the public key as HMAC secret).
+>
+> **Cross-Q²**: A second class of attack: an attacker submits a token with `alg: HS256` and `kid` pointing to a signing key. The validator uses the RSA public key as the HMAC secret. What's the attack?
+>
+> **A**: Algorithm confusion. The public RSA key is public — attacker has it. They forge a token with `alg: HS256`, sign it using the public key as the HMAC secret. A naïve validator does "look up key by kid → use that key with the alg specified in the token" — so it uses the public key as an HMAC key and *verifies the signature*. Forged token accepted. Defense: allow-list `alg: RS256` (or whatever the issuer signs with), and validate that the key in the JWKS is keyed to the right algorithm. Modern libraries handle this; older ones (especially pre-2017 PHP/Node libraries) didn't.
+
+### Drill 9 — PKCE
+
+> **Q**: What attack does PKCE prevent?
+>
+> **A**: Authorization code interception. In the auth-code flow, the AS sends a code via redirect to the client. On mobile (custom URL schemes) or in any compromised network path, an attacker could intercept the code and redeem it for tokens. PKCE binds the code to a secret (code_verifier) the legitimate client knows; the attacker has the code but not the verifier.
+>
+> **Cross-Q**: Why is PKCE mandatory for confidential clients too in OAuth 2.1, given they have a client_secret?
+>
+> **A**: Defense-in-depth. Client secrets leak — env-var dumps, git accidents, CI/CD pipeline exfiltration, log captures, container metadata SSRF. Without PKCE, an intercepted authorization code + the leaked client secret = full token issuance. PKCE adds a per-request secret known only to the legitimate client process at exchange time. Cost: one SHA-256 hash. Benefit: a leaked long-lived secret no longer maps to live token issuance.
+>
+> **Cross-Q²**: What's `code_challenge_method=plain` and why is it bad?
+>
+> **A**: `plain` means `code_challenge = code_verifier` (no hashing). If the auth URL leaks (browser history, referrer), the verifier is in the URL — defeats the entire purpose. The AS can implement PKCE in plain mode for backward compat, but every modern client should use `S256` (SHA-256 hash). OAuth 2.1 explicitly recommends S256; many ASes now reject `plain` entirely.
+
+### Drill 10 — JWT in cookie vs Authorization header
+
+> **Q**: For a browser SPA, do you put the JWT in a cookie or send via `Authorization: Bearer`?
+>
+> **A**: Modern best practice: **neither** in the SPA itself — use the BFF pattern. SPA gets a session cookie (httpOnly, Secure, SameSite=Lax); the BFF backend holds the actual tokens and forwards calls to APIs with the right token. If you must store tokens in the browser: httpOnly + Secure cookies if your CSRF protection is solid; never localStorage (XSS reads it).
+>
+> **Cross-Q**: HttpOnly cookies protect against XSS reading the token, but introduce CSRF. How do you defend?
+>
+> **A**: (1) `SameSite=Lax` (or Strict) — modern browsers won't send the cookie on cross-site POST. (2) Anti-CSRF tokens — server includes a per-request token in HTML, JS includes it in `X-CSRF` header; server validates. (3) Custom request headers — many CSRF attacks can't set custom headers (`X-Requested-With: XMLHttpRequest`) without CORS preflight. Layered. The BFF pattern subsumes all of this — tokens never leave the server, so the only attack surface is session hijack of the cookie, defended by httpOnly + SameSite.
+>
+> **Cross-Q²**: A team puts JWT in localStorage "for simplicity." What's the realistic threat model?
+>
+> **A**: Any XSS — even a third-party script loaded by a teammate, a compromised npm dependency, an XSS in a single forgotten input — reads the token. The attacker uses the token from their server for as long as it's valid. Token expiry of 5-15 min is the only mitigation; reuse detection on refresh helps. But the attacker can also exfiltrate the refresh token if it's also in localStorage. The whole class of vulnerability (one XSS = full account compromise) is structural to localStorage tokens. HttpOnly cookies move you to "session compromise requires either stealing the cookie session, which requires more than XSS, or compromising the browser process itself." Massively better posture.
+
+### Drill 11 — OpenID Connect Discovery
+
+> **Q**: What's `/.well-known/openid-configuration` and why does it matter?
+>
+> **A**: The OIDC discovery endpoint. The AS publishes a JSON document at `https://issuer/.well-known/openid-configuration` describing its capabilities: `authorization_endpoint`, `token_endpoint`, `jwks_uri`, `issuer`, `scopes_supported`, `response_types_supported`, `grant_types_supported`, etc. Clients use this to bootstrap: fetch once at startup, then know where to send auth, where to redeem tokens, where to fetch keys.
+>
+> **Cross-Q**: What's the security implication of trusting the discovery doc?
+>
+> **A**: Critical. The discovery doc tells your client what `jwks_uri` to fetch signing keys from — if an attacker MITMs the discovery fetch, they can redirect to attacker-controlled JWKS, then mint tokens with their own keys that validate. Defense: pin the issuer URL (HTTPS, verify cert chain) and verify the `issuer` field in the doc matches what you expected. ASP.NET Core's `Microsoft.Identity.Web` does this automatically; if you're rolling your own, ensure pinning.
+>
+> **Cross-Q²**: How often does the client refetch the discovery doc?
+>
+> **A**: Default: cache it for the application lifetime, or refresh on a slow interval (24 hours). The discovery doc rarely changes. JWKS (signing keys) refreshes more aggressively — typically every 1 hour, or on demand when a token presents a `kid` not in the current cache. The pattern: long cache for discovery, shorter cache for keys, refresh-on-demand for unknown keys. Microsoft.Identity.Web and Duende handle this.
+
+### Drill 12 — JWKS endpoint and key rotation
+
+> **Q**: How does an IdP rotate JWT signing keys without breaking issued tokens?
+>
+> **A**: Both old and new keys are published in JWKS during a transition window. New tokens are signed with the new key (header `kid` references it); old tokens (issued before rotation) still validate against the old key in JWKS. After the longest token lifetime expires, the old key is removed from JWKS. Resource servers fetching JWKS during the window see both keys; everything just works.
+>
+> **Cross-Q**: How long should the transition window be?
+>
+> **A**: At minimum, the maximum token lifetime — typically 1 hour for access tokens or 24+ hours for ID tokens. Common pattern: rotate keys monthly, leave the old key in JWKS for 7 days after rotation. This way any token issued before rotation has a comfortable validation window even if some clients have long-lived tokens. Don't quote a fixed cadence for Microsoft Entra ID — the old "every 6 weeks" figure is stale guidance. Current Microsoft guidance is that signing keys can roll at any time without announcement, so clients must be able to refresh JWKS on demand (cache the keys, but refresh when a `kid` you don't recognise turns up). Many private IdPs rotate quarterly.
+>
+> **Cross-Q²**: An attacker compromises a signing key. How do you respond?
+>
+> **A**: Three actions. (1) **Generate new key, publish in JWKS, switch issuer to it** — new tokens go out with the new key. (2) **Remove compromised key from JWKS immediately** — every existing token signed with it is now invalid (forces re-login for active users). (3) **Roll the long-lived tokens** — invalidate any refresh tokens that may have been issued during the compromise window (token reuse detection helps here). The user impact is severe (everyone re-logs in) but the security imperative is clear. Many IdPs don't make key revocation easy — that's why HSM-backed keys (where the private key never leaves hardware) are preferred for production.
+
+### Drill 13 — Audience validation
+
+> **Q**: What does the `aud` claim represent and what should validation check?
+>
+> **A**: `aud` (audience) identifies the intended recipient(s) of the token — typically the API or resource server. Validation: this token was issued *for me* (matching my expected audience identifier). Format: a string or array of strings. Standard practice: every resource server has a stable audience identifier (e.g., `api://orders-api`), and validates `aud == "api://orders-api"` (or includes it for multi-audience tokens).
+>
+> **Cross-Q**: Without audience validation, what's the attack?
+>
+> **A**: Cross-audience token replay. An attacker obtains a legitimate token for a low-trust API (e.g., `api://comments`) — perhaps by signing up themselves and getting a token. They present that token to a high-trust API (`api://payments`). If `payments` doesn't validate audience, it sees a valid signature from a trusted IdP and accepts. The attacker has elevated from "can post comments" to "can move money" using nothing but a low-trust token. Always validate audience.
+>
+> **Cross-Q²**: What if the token has `aud: ["api://payments", "api://orders"]` — is that OK?
+>
+> **A**: It means "this token is intended for both." The payments API and the orders API are both valid recipients. The danger: an attacker who gets such a multi-audience token from the orders API context can present it to payments. Validation must check "my audience is *one of* the audiences in the array" — and accept it. Multi-audience tokens are a design choice: if you have services that genuinely share trust (a tightly-bound family of microservices), multi-aud is convenient. For cross-trust-boundary, separate-audience tokens are safer (one per API) — limits blast radius.
+
+### Drill 14 — Scope vs role in OAuth
+
+> **Q**: When do you use scope vs role in an OAuth token?
+>
+> **A**: **Scope** = what the *client* (application) is allowed to do — represents the delegated permissions. The user consented to "this app can read orders" → token has `scope: orders.read`. **Role** = what the *user* is allowed to do — represents the user's authorization within the system. The user is an admin → token has `roles: ["admin"]`. Resource servers check both: "does this token's scope allow this operation AND does this user's role allow it?"
+>
+> **Cross-Q**: An admin user opens a third-party app that requested only `orders.read` scope. They want to delete an order. Should the app be allowed?
+>
+> **A**: No. The user is an admin (role permits delete), but the *app* was only granted `orders.read` scope. The user delegated read-only access to this app; they didn't say "act with my admin powers." The resource server enforces scope-first: "does this token's scope permit delete?" If no, reject — regardless of the user's role. Scope is the upper bound of what the app can do; role narrows further within that bound. This separation is why scope-and-role both matter.
+>
+> **Cross-Q²**: A common mistake: putting roles in the scope claim (`scope: orders.admin`). What goes wrong?
+>
+> **A**: You conflate two orthogonal things. Now you can't have "an admin user using a read-only app" — the role bleeds into the scope. You also lose the ability to consent meaningfully ("Grant this app `orders.admin`" sounds like a permission upgrade, not delegation). Worse: roles change (someone gets promoted); now their old tokens have stale role-in-scope, and you can't easily re-grant. Keep scope = app perms, role = user perms, in separate claims. Validate both at the resource server.
+
+### Drill 15 — Federation with multiple IdPs
+
+> **Q**: Your app needs to support sign-in via Entra ID, Google, and your corporate IdP. How do you architect?
+>
+> **A**: Federated IdP via a single internal AS (e.g., Duende IdentityServer). The internal AS is your sole token issuer; it federates to external IdPs as identity providers. Users pick "Sign in with Google" → redirect to Google → Google returns identity → internal AS issues *its own* token to your app. Your app only ever trusts the internal AS — single audience, single issuer, single signing key. The external IdP is a detail of how the user authenticated, surfaced via `idp` claim.
+>
+> **Cross-Q**: Why not let your app trust multiple IdPs directly (Entra ID, Google) and skip the internal AS?
+>
+> **A**: Cost spirals. Now your app validates tokens from N IdPs — N JWKS to fetch, N audiences to match, N issuers to allow-list, N sets of claims to normalize. When a new partner shows up with another IdP, you change code. Worse: each IdP has its own quirks (Google's `email_verified` claim semantics vs Microsoft's, etc.). The internal AS centralizes: it knows the quirks of each external IdP, normalizes claims (always emit `email`, `sub`, `name`), and your app only validates one issuer. The pattern scales linearly with apps, not with IdPs × apps.
+>
+> **Cross-Q²**: A corporate customer demands their employees authenticate via *their* corporate IdP only — not via Google or Entra ID. How do you support tenant-specific IdPs?
+>
+> **A**: Tenant configuration in the internal AS. Each tenant has a "home IdP" configured; when a user from `acme.com` signs in, the AS detects the tenant (from email domain or subdomain) and redirects them straight to Acme's IdP — Google and Entra ID aren't shown for Acme users. Generic users (no specific tenant binding) see all IdP options. This is multi-tenant federation with tenant-scoped IdP discovery — Auth0, Okta, Entra ID External Identities, and Duende all support this pattern.
+
+</details>
+
+## Cheat Sheet
+
+- **OAuth 2.1 = mandatory PKCE for all clients** + Implicit/ROPC removed + sender-constrained refresh tokens.
+- **DPoP (RFC 9449)**: per-request signed JWT proves possession of a private key bound to the access token.
+- **mTLS** is the heavyweight sender-constraint alternative — used in B2B and FAPI.
+- **JWT validation** = stateless, fast, can't revoke individuals; **introspection** = real-time, authoritative, slower.
+- **Refresh token rotation + reuse detection** kills entire token family if old token is replayed.
+- **PAR (RFC 9126)** pushes authorization request server-to-server; browser only sees a `request_uri` reference.
+- **JAR (RFC 9101)** signs the auth request as a JWT; **RAR (RFC 9396)** structures permissions beyond `scope`.
+- **FAPI 2.0** Security Profile = bank-grade profile mandating DPoP/mTLS + PAR + `private_key_jwt` client auth (JAR lives in the optional Message Signing profile).
+- **Token exchange (RFC 8693)** for service-to-service delegation, scope reduction, federation bridging.
+- **Step-up auth via `acr_values`** — return 401 with `WWW-Authenticate: insufficient_user_authentication`.
+
+## Walkthrough — Stolen mobile token replayed from desktop
+
+<details>
+<summary>📖 Click to expand — worked walkthrough scenario</summary>
+
+**Problem**: A bank's mobile app uses standard OAuth 2.0 + JWT bearer. A user reports unauthorized transactions: their valid token was somehow used from a Windows desktop in another country to initiate transfers. Forensics shows a malicious app on the user's phone exfiltrated the access token via Android accessibility services.
+
+**Diagnosis**: The bank's logs show two simultaneous sessions sharing identical `jti` and `sub` claims, originating from different IPs and User-Agents. JWT validation passes for both — bearer tokens have no notion of "where they came from." Standard OAuth 2.0 + bearer is structurally vulnerable: whoever has the bytes can use them. The mobile app stores the token in encrypted storage, but the malware ran with the user's OS-level permissions and read it anyway. No defense in the protocol can prevent this class of attack with bearer tokens.
+
+**Fix**: Migrate to DPoP-bound tokens. The mobile app generates an asymmetric keypair in the secure enclave (iOS Keychain / Android Keystore — non-extractable hardware-backed keys), and binds the access token to that key:
+
+```csharp
+// Mobile client (Duende OidcClient)
+// NOTE: this generates an in-process software key, which is what the portable API
+// gives you. For the enclave-backed key the prose describes, create the key through
+// the platform keystore (iOS Keychain / Android Keystore via the MAUI or Xamarin
+// bindings) so the private half is non-extractable, and export only the public
+// coordinates into the JWK below.
+using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+var ecParams = ecdsa.ExportParameters(includePrivateParameters: true);
+var jwk = new JsonWebKey
+{
+    Kty = "EC", Crv = "P-256", Alg = "ES256",
+    X = Base64UrlEncoder.Encode(ecParams.Q.X),
+    Y = Base64UrlEncoder.Encode(ecParams.Q.Y),
+    D = Base64UrlEncoder.Encode(ecParams.D)
+};
+
+var options = new OidcClientOptions
+{
+    Authority = "https://identity.bank.example.com",
+    ClientId = "mobile-banking-app",
+    Scope = "openid offline_access transfers.write accounts.read"
+};
+options.ConfigureDPoP(JsonSerializer.Serialize(jwk));   // from Duende.IdentityModel.OidcClient.DPoP
+
+var client = new OidcClient(options);
+var loginResult = await client.LoginAsync();
+var http = new HttpClient(loginResult.RefreshTokenHandler);   // proof-token handler installed by ConfigureDPoP
+var resp = await http.PostAsJsonAsync("https://api.bank.example.com/transfers", request);
+```
+
+Each request now includes a fresh DPoP proof JWT (`htm` + `htu` + `jti` + `iat`) signed by the in-enclave private key. The auth server bound `cnf.jkt = SHA256(public-key)` into the access token; the resource server validates that the DPoP proof's signing key matches that thumbprint.
+
+**Why it works**: A token alone is now useless — the malware exfiltrated only the bearer token, but the private key never leaves the secure enclave (extractable, at best, only on a physically rooted or jailbroken device — and only if the key really is keystore-backed, not the software key the sample above generates). On the desktop, the attacker can't generate a valid DPoP proof without the private key, so requests fail at the resource server with `invalid_dpop_proof`. Token theft is no longer "you have my account" — it's "you have a useless bag of bytes." For high-value endpoints, also pair with step-up auth (`acr_values=mfa`, using whatever value this AS publishes) so transfers above a threshold force re-authentication with biometrics.
+
+</details>
+
+## Self-test
+
+<details>
+<summary>1. Why does OAuth 2.1 mandate PKCE for confidential clients (which already have a client secret)?</summary>
+
+Defense-in-depth. Client secrets leak — env-var dumps, git accidents, log captures, container metadata SSRF, CI/CD pipeline exfiltration. Without PKCE, an intercepted authorization code + the leaked client secret = full token issuance. With PKCE, the attacker also needs the per-request `code_verifier` known only to the legitimate client process at exchange time. The cost is one SHA-256 hash; the benefit is that a leaked long-lived secret no longer maps to live tokens. OAuth 2.1 made it universal because the cost-benefit is overwhelmingly in favor.
+</details>
+
+<details>
+<summary>2. JWT validation is sub-millisecond local crypto. When does introspection's network round-trip pay off?</summary>
+
+When real-time revocation matters more than throughput. Banking: a fired employee's tokens must die *immediately*; introspection sees the revoke instantly while JWT-with-short-expiry leaves a 5-15 minute attack window. Healthcare: HIPAA compliance often requires "immediate access termination on incident." High-value B2B integrations: token compromise must be containable in seconds, not minutes. The hybrid pattern is common: JWT-validate the common path; introspect on sensitive endpoints, on session changes, or with a short-TTL Redis cache of the introspection response (1-5 seconds) to amortize the auth-server load.
+</details>
+
+<details>
+<summary>3. Refresh token rotation alone defeats some thefts. Why is reuse detection the critical addition?</summary>
+
+Without reuse detection, an attacker who steals refresh token R1 can race the legitimate client. Whoever calls `/token` first wins R2; the loser is locked out and the attacker happily continues refreshing. Reuse detection flips this: when the auth server sees R1 used *after* R2 was issued, it knows one of the two parties is an attacker (legitimate clients only see their newest token). The conservative response is to invalidate the entire token *family* — kill R2, R3, all descendants. The legitimate user is forced to re-authenticate (annoying), but the attacker is also locked out. Reuse detection turns the win condition from "race the user" to "you can't win without locking yourself out."
+</details>
+
+<details>
+<summary>4. PAR pushes the authorization request server-to-server, then redirects the user. Why bother — what specifically is fixed?</summary>
+
+Classic OAuth puts every auth-request parameter in the user's browser URL: `scope`, `redirect_uri`, `code_challenge`, `state`, `response_type`. That URL ends up in browser history, referrer headers (some browsers send `Referer` even on cross-origin redirect), proxy logs, screen recordings. Worse, a malicious browser extension or in-page script can read and tamper with parameters before submission. PAR sends the parameters server-to-server (with client authentication), gets back an opaque `request_uri`, then the browser only ever sees `GET /authorize?request_uri=urn:...:abc123`. The actual parameters never touch the browser, so they can't be read, tampered with, or logged at intermediaries. Mandatory in FAPI 2.0; recommended for any high-value authorization in OAuth 2.1.
+</details>
+
+<details>
+<summary>5. Step-up authentication is requested via `acr_values`. Walk through what happens when a user tries to make a high-value wire transfer with a session authenticated only by password.</summary>
+
+Client calls `POST /transfers` with the access token. Resource server inspects the token's `acr` claim — finds `pwd` (password only). The transfer endpoint requires `mfa` (multi-factor). Those two strings are this deployment's own ACR labels; there is no standard ladder. Resource server returns `401 Unauthorized` with `WWW-Authenticate: Bearer error="insufficient_user_authentication", acr_values="mfa"`. The client's OAuth library catches the 401, redirects the user to `/authorize?...&acr_values=mfa`. The auth server forces a fresh authentication step — biometric, hardware key, push-notification approval. New tokens come back with updated `acr=mfa`. Client retries the original `POST /transfers`; resource server now sees sufficient `acr` and processes. The user only sees friction on the high-value action, not on every login — that's the design goal.
+</details>
+
+## Cross-references
+
+- **Sibling: [Authentication & Authorization](./02-authentication-and-authorization.md)** — JWT, OIDC, OAuth 2.0 fundamentals.
+- **Sibling: [API Security](./04-api-security.md)** — broader API security beyond auth.
+- **Sibling: [API Management](./16-api-management.md)** — gateway is where most of these advanced policies are enforced.
+- **Sibling: [BFF & Aggregation](./14-bff-and-aggregation.md)** — cookie-on-server pattern eliminates browser token storage.
+- **[Security Deep Dive](../01-foundations/01-net-core-deep-dive/09-security.md)** — general .NET security context.
+- **[.NET Architect's Mastery](../04-architecture-and-patterns/09-dotnet-architects-mastery.md)** — security architecture decisions.
+
+## Sources
+
+<details>
+<summary>📚 Click to expand — sources and further reading</summary>
+
+- IETF — [RFC 9700 (BCP 240, OAuth 2.0 Security Best Current Practice)](https://www.rfc-editor.org/rfc/rfc9700.html), [draft-ietf-oauth-v2-1](https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/), RFC 9449 (DPoP), RFC 9126 (PAR), RFC 9101 (JAR), RFC 9396 (RAR), RFC 8693 (Token Exchange), RFC 9470 (Step Up Authentication Challenge), RFC 7662 (Introspection), RFC 7009 (Revocation), RFC 7636 (PKCE).
+- OpenID Foundation — [FAPI 2.0 specs](https://openid.net/wg/fapi/).
+- Aaron Parecki — [oauth.net](https://oauth.net/) and his book *OAuth 2.0 Simplified*.
+- Justin Richer — author of *OAuth 2 in Action* (Manning); modern auth talks.
+- Duende IdentityServer documentation — [duendesoftware.com/products/identityserver](https://duendesoftware.com/products/identityserver).
+- Microsoft Learn — [Microsoft identity platform documentation](https://learn.microsoft.com/en-us/entra/identity-platform/).
+
+<!-- nav-footer-start -->
+
+---
+
+[← Previous: API Management & Gateway](16-api-management.md) · [↑ Back to top](#advanced-auth--oauth-21-dpop-fapi-token-introspection) · [Next: 03 — Data & Persistence →](../03-data-and-persistence/README.md)
+
+<!-- nav-footer-end -->
+
+</details>
