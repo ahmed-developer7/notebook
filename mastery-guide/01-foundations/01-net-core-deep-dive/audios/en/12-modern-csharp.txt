@@ -1,0 +1,541 @@
+-- pause --
+Section 1. Why Modern C sharp Matters.
+
+The C sharp you write today should not look like the C sharp you wrote in 2018. Records replaced ~80% of hand-written DTOs. Pattern matching replaced sprawling if or else ladders and most of the visitor-pattern boilerplate.
+Nullable reference types replaced runtime NullReferenceException discovery with compile-time errors. Primary constructors deleted the field-and-constructor ceremony that every D I'd service used to start with.
+
+Each individual feature looks small. Together they make idiomatic dot NET 10 code dramatically shorter, safer, and clearer than the dot NET Framework era, and crucially, they shift entire classes of bug from runtime to compile time.
+A team that has internalized these features ships fewer null bugs, fewer mutability bugs, and fewer "did I match every case" bugs.
+
+this session is structured as a reference: each feature has a properties box, a "without or with" comparison, when-to-use versus when-not-to-use guidance, and worked examples. Skim for what you need, or read top-to-bottom to upgrade an old codebase mentally in one sitting.
+
+-- pause --
+Section 2. 23. Modern C sharp Features.
+
+-- pause --
+Table of Contents.
+
+Introduction.
+Record Types (C sharp 9+).
+Init-Only Setters (C sharp 9).
+Required Members (C sharp 11).
+Primary Constructors (C sharp 12).
+Pattern Matching (C sharp 8-12).
+Collection Expressions (C sharp 12).
+Raw String Literals (C sharp 11).
+File-Scoped Namespaces and Top-Level Statements.
+Implicit and Target-Typed new (C sharp 9).
+Nullable Reference Types (C sharp 8).
+Span and Memory, basics.
+Source Generators, what to know.
+Comparison Matrix, Old versus Modern Idioms.
+Common Pitfalls.
+Best Practices.
+Real-World Scenarios.
+Interview Cross-Questioning Drill.
+Cross-References.
+Sources.
+
+-- pause --
+Without modern C sharp versus With modern C sharp.
+
+Same behavior. Less code, fewer bugs, more obvious intent.
+
+-- pause --
+Real-world analogy: the standard kitchen.
+
+A 1990 seconds kitchen had one knife, one pan, and a stove. You learned to do everything with that. A modern kitchen has a knife, a pan, a stove, and a microwave, food processor, immersion blender, sous-vide. None of the new tools replace the old.
+But "I'll just use the knife for everything" is now a sign you're ignoring purpose-built tools that exist for the cases that come up daily.
+
+Modern C sharp features are those tools. record doesn't replace class; it replaces the cases where you wrote a class because that was the only option. Each feature in this session is the right tool for a specific recurring case.
+
+-- pause --
+Worked example, pretend Money.
+
+Deep dive: Type System, Records and value equality.
+
+-- pause --
+Init-Only Setters (C sharp 9).
+
+init lets you build immutability without giving up the readable object-initializer syntax. Combine with required to remove the constructor entirely.
+
+-- pause --
+required + record.
+
+This combination, record + required + init, is the modern DTO. Equality, immutability, mandatory fields, and zero ceremony.
+
+Deep dive: Type System, readonly and immutability primitives.
+
+-- pause --
+Subtle but important difference versus records.
+
+This is the single most common confusion. In a class, primary-constructor parameters are not properties, they're available within the class body and can be captured by methods, but to expose them you must declare an explicit property:
+
+-- pause --
+When to Use Primary Constructors.
+
+Deep dive: OOP and Polymorphism, Primary constructors.
+
+-- pause --
+Pattern Matching (C sharp 8-12).
+
+Pattern matching is the most consequential language change of the last decade. Used well, it eliminates whole categories of if or else chains and makes total or exhaustive logic obvious.
+
+-- pause --
+Type + var patterns (the visitor killer).
+
+Combined with sealed or closed hierarchies, this replaces double-dispatch and the visitor pattern entirely.
+
+-- pause --
+Logical patterns, and, or, not (C sharp 9).
+
+Deep dive: Nullability and Pattern Matching.
+
+-- pause --
+Collection Expressions (C sharp 12).
+
+Deep dive: link and List patterns.
+
+-- pause --
+Raw String Literals (C sharp 11).
+
+Deep dive: Fundamentals, Strings.
+
+-- pause --
+Top-level statements (C sharp 9).
+
+The compiler synthesizes the Program class. Use this for Program.cs and small C L I tools, not for libraries.
+
+-- pause --
+Implicit and Target-Typed new (C sharp 9).
+
+Useful when the type is on the left-hand side or is an obvious method parameter type. Avoid in var declarations, there the type is suddenly invisible from both sides.
+
+-- pause --
+Span and Memory, basics.
+
+For most application code you don't need to write Span by hand, just prefer A P Is that take it ( int.Parse(ReadOnlySpan), Encoding.UTF8.GetBytes(ReadOnlySpan,.) ).
+
+Deep dive: Performance and Memory.
+
+-- pause --
+Source Generators, what to know.
+
+Source generators run at compile time and emit additional C sharp code into the build. The runtime sees ordinary code, with no reflection cost.
+
+this session just acknowledges them; the deep treatment lives in Reflection, Attributes, and Source Generators.
+
+-- pause --
+Comparison Matrix, Old versus Modern Idioms.
+
+Hand-written DTO with equality, record, Less code, correctness for free.
+class { get; set; } mutable defaults, record + init + required, Immutability + safety.
+ctor { _x = x;. }, Primary constructor, Boilerplate elimination.
+if or else if or else ladder on type, switch expression, Exhaustive, returns value.
+null != x and and x.Length > 0, x is { Length: > 0 }, Single null-safe check.
+string.Format(.) for Jason or sequel, Raw string literal """. """, No escape forest.
+new List() {. }, Collection expression [. ], Target-typed, optimal alloc.
+namespace X { class Y { } }, File-scoped namespace X;, One fewer indent.
+static void Main(string[] args), Top-level statements, Less ceremony.
+Reflection-based regex / logging, [GeneratedRegex] / [LoggerMessage], A O T, perf.
+Untyped Object -on- Object equality, == on records, Value equality by default.
+
+-- pause --
+Common Pitfalls.
+
+Record equality on collection members.
+record Order(int Id, List Items) compares Items by reference, not contents. Two records with equal item lists are not equal. Use IReadOnlyList<> and either a custom Equals or wrap in a sequence-equality helper.
+
+Primary constructor params are not properties (in classes).
+public class S(IDep dep), dep is captured but not exposed. Don't expect s.Dep to compile.
+
+Mutating a record's mutable property.
+record User { public List Tags { get; set; } = []; }, yes, you can. Records aren't automatically deeply immutable; only positional parameters are init-only by default.
+
+with on a record struct copies the entire value.
+That's the point, but don't use record structs for large data, every with is a full bitwise copy.
+
+Pattern-matching exhaustiveness on open hierarchies.
+The compiler can't prove _ goes to is unreachable for non-sealed types. Either seal the hierarchy or accept the discard arm.
+
+required + serializers without JsonConstructor.
+Some serializers fail on required members. System.Text.Json supports it on init /required combinations in dot NET 8+, but custom serializers may not.
+
+Null-forgiving (! ) as a habit.
+x!.Foo silences the analyzer but doesn't fix the bug. If you reach for !, justify it with a comment or an explicit ArgumentNullException.ThrowIfNull.
+
+Top-level statements + global using from libraries.
+In tiny utility projects, accidental global usings can cause the unit test project to see types it shouldn't. Be explicit in shared library code.
+
+Raw string indentation.
+The closing """ 's indentation defines the left margin. Indent it differently from the content lines and you get either an exception (less indent than content) or unintended leading whitespace.
+
+new() everywhere.
+var x = new(); doesn't compile. Foo x = new(); does. Don't write new() where you can't see the type.
+
+-- pause --
+Best Practices.
+
+Use record for DTOs, commands, events, value objects. It's almost always the right answer for "data first" types.
+
+Combine record + required + init for the modern DTO. Mandatory fields, immutability, equality, all without writing a constructor.
+
+Adopt nullable reference types day-one in new projects. Treat warnings as errors. Migrate legacy projects file-by-file.
+
+Prefer switch expressions over if / else chains. They make exhaustiveness obvious and force you to handle every case.
+
+Prefer primary constructors for D I'd classes. Drop the field+ctor boilerplate. Switch back to a regular ctor if you need validation or readonly semantics.
+
+Use raw string literals for any structured text in code. Jason test fixtures, sequel strings, regex patterns, prompts.
+
+Default to file-scoped namespaces. No reason to keep the extra indent.
+
+Use collection expressions ( [. ] ) instead of new List {. }. Same readability, smarter allocation.
+
+Reach for source-generated regex / logging on hot paths. They're free perf if you can use them.
+
+Don't over-modernize. If the legacy code works and isn't being touched, leave it. Modernize when you're already in the file for another reason.
+
+-- pause --
+Scenario 1, Refactoring a DTO to a record.
+
+If callers depended on hand-rolled equality semantics that included collection contents, wrap the list in a value-type collection (for example EquatableArray ) or override Equals explicitly, record's default reference-compares lists.
+
+-- pause --
+Scenario 2, Eliminating null-check noise with NRT.
+
+Half the code, exhaustive, no defensive null check at the top, the type system already proved user is non-null at the call site.
+
+-- pause --
+Scenario 3, Primary constructor for a D I'd handler.
+
+No fields, no constructor, no assignment ceremony. The class focuses on what it does, not on plumbing.
+
+-- pause --
+Scenario 4, Pattern matching collapses an old visitor.
+
+Adding a new payment method now provokes a compiler warning at every switch if you've enabled CS8509, pointing you to every site that needs to handle it.
+
+-- pause --
+Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, record class versus record struct versus class.
+
+-- think --Q: When do you reach for record class, record struct, and plain class?
+
+A: record class for reference-type DTOs / commands / value objects that want auto-generated value equality and with expressions. record struct for small, hot, short-lived value types where you also want value equality (points, money, vectors).
+Plain class for mutable entities (EF tracked entities, services with state) where reference equality is correct.
+
+-- think --Cross-Q: Why isn't every DTO a record struct, it avoids heap allocation, right?
+
+A: Because with on a record struct copies the entire value. For anything beyond ~16-24 bytes, that's slower than allocating once and passing by reference. Record structs are also copied on every method call by default, pass in / ref readonly to avoid it.
+The break-even is roughly "fits in two C P U registers"; bigger than that and record class wins.
+
+-- think --Cross-Q²: I have record class Order(int Id, List Items). Two orders with the same Id and equal-content lists. Are they equal?
+
+A: No. Record equality is field-by-field, and List.Equals is reference equality. The two Items lists are different objects, so the records are not equal.
+Fix: wrap in EquatableArray / ImmutableArray with content equality, or override Equals / GetHashCode manually, or use IReadOnlyList and accept the limitation. This is the #1 record gotcha in production code.
+
+-- pause --
+Drill 2, Primary constructor on a class.
+
+-- think --Q: What's the difference between a class primary constructor parameter and an explicit private readonly field?
+
+A: A primary-ctor parameter is captured in the class's compiler-generated state, scoped to the entire class body, and not readonly, it can be reassigned. An explicit private readonly field is immutable after the ctor returns and clearly visible as state in the type's shape.
+
+-- think --Cross-Q: So if I want true readonly semantics, what do I write?
+
+A: Either go back to explicit fields ( private readonly IDep _dep; ) or project the parameter through a readonly field: public class S(IDep dep) { private readonly IDep _dep = dep; }.
+The latter looks redundant but actually enforces immutability and gives you the modern syntax for the rest of the file.
+
+-- think --Cross-Q²: Does a class primary constructor create properties like a record does?
+
+A: No. This is the single most common confusion. public record Person(string Name) exposes Name as a public init-only property. public class Person(string name) makes name a captured parameter, invisible from outside the class.
+To expose it you must write an explicit property: public string Name goes to name;. People keep expecting class Person(string Name).Name to compile and are surprised when it doesn't.
+
+-- pause --
+Drill 3, required keyword.
+
+-- think --Q: What does required (C sharp 11) actually enforce?
+
+A: At compile time, every caller constructing the type must set the required member, either in an object initializer or via a constructor decorated [SetsRequiredMembers]. If they don't, CS9035. It's the missing "non-null, mandatory" guarantee that init alone couldn't enforce.
+
+-- think --Cross-Q: Does required survive deserialization?
+
+A: It depends on the serializer. System.Text.Json (dot NET 8+) honors required and throws if the Jason omits the field. Older serializers and reflection-based deserializers may silently skip it because they bypass the constructor, they set fields directly.
+If you ship a public DTO with required, test deserialization explicitly.
+
+-- think --Cross-Q²: Can I use required on a struct?
+
+A: Yes, and it solves the historical problem of "structs always have a parameterless ctor that zero-inits, so I can't force the caller to set anything." public struct Money { public required decimal Amount; public required string Currency;
+}, new Money() is still legal at the call site but now refuses to compile without the initializer setting both fields.
+This was specifically designed to let structs feel like classes for mandatory-field DTOs.
+
+-- pause --
+Drill 4, Init-only setters.
+
+-- think --Q: When would you choose init over public set or making the property fully immutable (readonly field)?
+
+A: init when you want object-initializer syntax at construction time but immutability afterward. public set when the property genuinely changes during the object's lifetime. Plain readonly field when you don't need the property at all (private state).
+
+-- think --Cross-Q: Can init -set properties be modified through reflection?
+
+A: Yes, init is enforced by the C sharp compiler, not by the C L R. Reflection ( PropertyInfo.SetValue ) treats it as a regular setter. So init is a strong source-code guarantee, not a runtime invariant.
+Serializers like System.Text.Json use this to populate init -set properties during deserialization.
+
+-- think --Cross-Q²: What's the difference between init and record 's positional parameter?
+
+A: record Foo(string Bar) is sugar for a record with a public init -set property Bar plus a primary constructor that sets it. So they're the same thing under the hood when you positionalize them.
+The difference is syntactic: positional records give you with -expression-friendly defaults and deconstruction for free; explicit init properties give you more control over property names, modifiers, and ordering.
+
+-- pause --
+Drill 5, Raw string literals.
+
+-- think --Q: When is the syntactic overhead of """.""" worth it?
+
+A: Whenever the content contains " or \ characters that would otherwise need escaping, Jason, sequel, regex, embedded X M L or HTML, Jason Schema. Three quotes, no escaping, preserved line breaks. The break-even is "two or more escape characters", at that point raw strings are clearer.
+
+-- think --Cross-Q: How does raw string indentation work?
+
+A: The closing """ 's indentation defines the left margin. Every content line must be indented at least that much; the compiler strips that many leading spaces from each line. If you misalign, indent the closing fewer than content lines, the compiler errors.
+If you indent content less than the closing, the leading whitespace is preserved.
+
+-- think --Cross-Q²: Interpolation needs { inside the string. How does $$""".""" resolve that?
+
+A: The number of $ signs (1 to { }, 2 to {{ }}, 3 to {{{ }}}, et cetera) determines how many braces together mark an interpolation hole. So $$"""{ "a": {{x}} }""" produces Jason where single { and } are literal and {{x}} is the interpolation.
+This is why raw-string Jason templating beats string.Format, { doesn't need to be doubled in your literal text.
+
+-- pause --
+Drill 6, List patterns.
+
+-- think --Q: When would you choose a list pattern over an if or else chain on .Count + indexing?
+
+A: When the shape of the collection drives the logic, empty, single-element, head-and-tail, suffix-match. List patterns make the shape obvious at the call site and exhaustively cover it, where an if-chain is easy to miss a case.
+
+-- think --Cross-Q: How does [var first,., var last] work on a Span?
+
+A: Identically to an array. The compiler emits .Length >= 2, then first = s[0]; last = s[1]. The. (slice pattern) is a length check, not an allocation. Span supports [] and indexing, so the pattern lowers to direct index access, zero-allocation pattern matching on stack data.
+
+-- think --Cross-Q²: Can I use list patterns on IEnumerable?
+
+A: No. List patterns require length and indexer, that is, something countable and indexable. IEnumerable is sequential-only, so the compiler refuses. Works on: arrays, List, Span, ReadOnlySpan, anything implementing IList or providing Length / Count + indexer.
+To use it on an IEnumerable you must materialize first: arr = seq.ToArray(); arr switch {.}.
+
+-- pause --
+Drill 7, Property + recursive patterns.
+
+-- think --Q: What does this match? c is { Address: { City: "NYC" } }.
+
+A: It tests c != null and and c.Address != null and and c.Address.City == "NYC". The pattern is recursive, each { } opens a property pattern that itself can contain nested patterns. Null checks are implicit at every level.
+
+-- think --Cross-Q: How would you rewrite it for non-null nested access without recursive patterns?
+
+A: c is { Address.City: "NYC" }, C sharp 10+ added the dotted property-pattern shortcut. Same null-safe semantics, fewer braces. For deep paths this is much more readable than nesting.
+
+-- think --Cross-Q²: When would you prefer the nested-brace form over the dotted shortcut?
+
+A: When you also want to bind intermediate values: c is { Address: { City: var city, Zip: var zip } }, you get both city and zip as variables in scope. The dotted form can only check, not bind. So: use dotted for pure checks, nested-braces for "check + capture."
+
+-- pause --
+Drill 8, Top-level statements.
+
+-- think --Q: When are top-level statements appropriate and when not?
+
+A: Appropriate: Program.cs of a single-entry-point app, small C L I utility, sample / repro project. Inappropriate: libraries (no entry point), multi-entry-point projects, anything that needs an explicit Main(string[] args) signature for reasons like [STAThread] or testing the entry point directly.
+
+-- think --Cross-Q: Can I have multiple files with top-level statements in one project?
+
+A: No. Exactly one file in a project may contain top-level statements; the compiler synthesizes the Program class from it. Two files with top-level statements is a compile error. If you need more entry-point-style code, factor it into static classes the top-level file calls.
+
+-- think --Cross-Q²: How do I access args and how does testing the entry point work?
+
+A: args is implicitly in scope as a string[] in the top-level file, no Main(string[] args) needed. For testing, the synthesized Program class is internal; add to expose it, then call Program.Main(my Args) from your test.
+dot NET 6+ also generates a partial Program class so you can extend it in tests ( public partial class Program { } ), that's what WebApplicationFactory keys off.
+
+-- pause --
+Drill 9, File-scoped namespaces.
+
+-- think --Q: Is there any measurable difference between namespace X; and namespace X { }?
+
+A: Functionally identical, same I L, same metadata, same runtime behavior. The only differences are syntactic: one fewer level of indentation and a slightly clearer visual that the entire file lives in the namespace. It's a readability change, not a performance change.
+
+-- think --Cross-Q: Can I mix file-scoped and braced namespaces in the same file?
+
+A: No. A file with namespace X; cannot also have namespace Y { }, the file-scoped form claims the whole file. If you need multiple namespaces per file (rare, usually a code smell), you must use the braced form throughout.
+
+-- think --Cross-Q²: I have a file scoped namespace and a separate using System; line. Does the order matter?
+
+A: using directives must come before the file-scoped namespace X; declaration if they're file-level, or after the namespace if they're namespace-scoped, same as the braced form. The conventional placement is using lines at top, then namespace X;, then types.
+
+-- pause --
+Drill 10, Nullable reference types on legacy.
+
+-- think --Q: How would you turn on NRT for a 200-file legacy project without exploding the warning count?
+
+A: Enable at the project level ( enable in csproj), then top each legacy file with #nullable disable. Walk file-by-file: remove #nullable disable, fix the warnings, commit.
+CI treats warnings as errors only for migrated files (via per-file #nullable enable rather than project-wide TreatWarningsAsErrors ). This converts "200 files of warnings" into "1 file at a time of real bugs."
+
+-- think --Cross-Q: What's the difference between #nullable enable and #nullable enable warnings?
+
+A: #nullable enable turns on both annotations (you can declare string? ) and warnings (compiler flags potential nulls). #nullable enable warnings keeps the legacy annotations-disabled mode ( string is "unaware," not non-null) but emits warnings where the flow would suggest a null.
+Useful for the first phase of migration, see the bugs before committing to annotations.
+
+-- think --Cross-Q²: How does NRT interact with default(T) on a generic?
+
+A: For class T, default(T) is null, but the compiler doesn't know unless you constrain. Three approaches: (1) where T: class plus return T?, (2) where T: notnull plus throw rather than return default, (3) [MaybeNull] attribute on the return type if you must return default but want to flag callers.
+The unconstrained case ( T? for an unconstrained generic) means "the nullable version of whatever T is", for int, int?; for string, string?. Subtle but documented.
+
+-- pause --
+Drill 11, Collection expressions.
+
+-- think --Q: I write int[] xs = [1, 2, 3];, what does the compiler emit?
+
+A: An optimized form roughly equivalent to new int[] { 1, 2, 3 }, sometimes even better. For small literals the compiler may stack-allocate via RuntimeHelpers.CreateSpan and copy from a read-only data segment.
+The compiler picks the optimal representation for the target type, which is the whole point of collection expressions.
+
+-- think --Cross-Q: What's the target-type inference for var xs = [1, 2, 3];?
+
+A: It doesn't compile. Collection expressions require a target type, there's no canonical "the type of a collection literal." var has nothing to infer from.
+You must write int[] xs = [1, 2, 3] or List xs = [1, 2, 3] or use it where the type is determined by context (a method parameter, return type, et cetera).
+
+-- think --Cross-Q²: How does. (spread) work with mixed types?
+
+A: [.head, .tail] requires that head and tail are enumerable of an element type compatible with the target. For int[] all = [.head, 0, .tail] the compiler iterates both spans (or arrays) and copies in. For Span and arrays of the same T it's a MemoryCopy, extremely fast.
+For IEnumerable it's an iteration. The performance difference can be 10 times; prefer span or array sources when concatenating in hot loops.
+
+-- pause --
+Drill 12, params collections.
+
+-- think --Q: How does C sharp 13's params ReadOnlySpan differ from params int[]?
+
+A: params int[] allocates a new heap array on every call. params ReadOnlySpan lets the compiler stack-allocate the argument array (via stackalloc ) when the count is small and known, eliminating the allocation entirely.
+For hot logging / formatting paths called millions of times, this is a measurable win.
+
+-- think --Cross-Q: What types can be params in C sharp 13?
+
+A: Any "collection expression target", T[], Span, ReadOnlySpan, List, IEnumerable, IReadOnlyCollection, custom types with CollectionBuilder attribute, et cetera The compiler picks the cheapest at the call site.
+The historical "params arrays" pattern is now "params collections," with arrays as one of many backends.
+
+-- think --Cross-Q²: If both void Log(params string[] xs) and void Log(params ReadOnlySpan xs) exist on the same type, what happens?
+
+A: Overload resolution prefers the Span -typed overload because it avoids the allocation (the C sharp 13 spec elevates spans or readonly-spans for params resolution). If you want callers to keep using the array overload (compat), keep only it.
+If you're providing both, callers will silently move to the span overload, which is usually what you want. This is how string.Format and logging A P Is are being modernized without breaking the call site.
+
+-- pause --
+Drill 13, Static abstract members on interfaces.
+
+-- think --Q: What problem does static abstract (C sharp 11) on an interface solve?
+
+A: Generic math. Before C sharp 11, you couldn't write a generic Sum(T a, T b) goes to a + b because + isn't an interface member. With static abstract, INumber declares static abstract T operator +(T, T) and a constraint where T: INumber lets the jit call the operator on the concrete T.
+Hash, parse, zero, one, comparison, all expressible generically.
+
+-- think --Cross-Q: How is this implemented under the hood, virtual dispatch through a static?
+
+A: The jit specializes the generic method per concrete T. Each specialization gets a direct call to the static operator on that type, no vtable lookup, no boxing. So Sum calls int.operator + directly, Sum calls double.operator +.
+It's not a virtual call at runtime; it's a per-type specialization made possible by the constraint.
+
+-- think --Cross-Q²: Why is INumber parameterized on T self?
+
+A: That's the curiously recurring template pattern (CRTP), the interface refers to the type that's implementing it. It's needed because static members are not virtual through "interface reference", there's no instance to dispatch on.
+The generic constraint where T: INumber lets the compiler resolve T.Add(a, b) by knowing that T is the interface implementer. Without T self, you couldn't talk about "the type that's implementing this interface" in a method signature.
+
+-- pause --
+Drill 14, nameof with method groups.
+
+-- think --Q: What does nameof(MyClass.MyMethod) return when MyMethod is overloaded?
+
+A: The string "MyMethod", nameof returns the identifier, not a fully-qualified or overload-resolved name. It's purely a compile-time string. For overloaded methods, it gives the same value regardless of overload.
+
+-- think --Cross-Q: How does nameof interact with generics? nameof(List.Add)?
+
+A: Returns "Add". nameof only ever looks at the rightmost identifier. For nameof(List) you get "List" (not "List" ), it strips generic arity. This is intentional: nameof is for IDE-refactor-safe string references, not for runtime introspection.
+Use typeof(.).Name / .FullName if you want the generic-aware string.
+
+-- think --Cross-Q²: Can nameof reference this?
+
+A: No. nameof(this) is a compile error, this isn't an identifier. nameof requires a namespace, type, member, or parameter name. For self-referential code use MethodBase.GetCurrentMethod()?.Name or [CallerMemberName] parameter attribute on the receiving method.
+
+-- pause --
+Drill 15, Switch expression versus switch statement.
+
+-- think --Q: When should I use switch expression (returns a value) versus switch statement (executes side effects)?
+
+A: Expression when you're computing a value: var fee = method switch {. };, exhaustiveness-checked, returns once, single assignment.
+Statement when you're executing side effects that don't naturally compose to a value: switch (event) { case A: DoA(); break; case B: DoB(); break; }, multiple statements per arm, no return-value requirement.
+
+-- think --Cross-Q: What does the compiler warn about for a non-exhaustive switch expression?
+
+A: CS8509: "The switch expression does not handle all possible values." For sealed hierarchies / enum types with all known values, the compiler can prove exhaustiveness and won't warn. For open hierarchies it always warns until you add goes to default or goes to throw new..
+This is the killer reason to seal record hierarchies, you get exhaustiveness checking at every switch for free.
+
+-- think --Cross-Q²: A switch statement falls through by default? Or breaks?
+
+A: C sharp forbids implicit fallthrough. Every case must end in break, return, throw, goto case X, or goto default. Forgetting break is a compile error (CS0163: "Control cannot fall through from one case label.").
+This is one of C sharp's deliberate departures from C or C plus plus/Java, fallthrough bugs were one of the most expensive C-era footguns, and C sharp refused to inherit them. Switch expressions don't have this concept at all, each arm yields a value, no flow control.
+
+-- pause --
+Self-Test.
+
+Record equality is compiler-synthesized over the type's data members, and each member is compared with its own equality. Id compares by value; Items is a List, which never overrode Equals, so it compares by reference.
+Two lists holding equal elements are still two different objects, so the two records are not equal. Declaring the member as IReadOnlyList changes nothing, the runtime type is still a list or an array, and neither compares by content.
+The mirror image is just as surprising and is in Microsoft's own docs: build two records over the same array instance, then mutate that array's contents, and the records remain equal. Record equality never looks inside a reference-typed member.
+
+Nothing throws, which is why this survives code review. What breaks is everything built on equality: a cache-hit check that never hits, Distinct() that dedupes nothing, a HashSet or dictionary key that grows one entry per request, an idempotency check that lets the duplicate through.
+with compounds it, the result is a shallow copy, so the original and the copy share the same list instance and a mutation through one is visible through the other.
+
+Fixes, in order of preference: model the collection with a type that implements content equality (a Roslyn-style EquatableArray wrapper), or write Equals / GetHashCode by hand, or keep the default and state explicitly that the record has identity semantics for that member.
+ImmutableArray is not a fix, its equality also compares the underlying array reference.
+
+C sharp 9 gave positional records. C sharp 12 extended the same parenthesised syntax to non-record class and struct declarations, that is the new part, and it is exactly why the two forms look identical and behave differently.
+
+In a record the compiler synthesizes a public property per positional parameter (init-only on record class and readonly record struct, read-write on record struct ) plus a Deconstruct. In a class or struct it synthesizes none of that.
+Microsoft states the rules flatly: primary constructor parameters "aren't members of the class", a parameter named param "can't be accessed as this.param ", they "don't become properties, except in record types", and they "can be assigned to."
+
+Three consequences worth being able to say out loud. (a) svc.Dep does not compile; if callers need the value, project it, public IDep Dep goes to dep;.
+(b) You get no readonly guarantee: any member in the body can reassign dep, which is why private readonly IDep _dep = dep; is still worth writing on a service whose invariants matter.
+(c) Storage is conditional, the compiler creates a hidden field only when the parameter is accessed from a member body, so a parameter used solely in a field initializer or a base(.) call is never captured at all.
+
+Because nullable reference types are a compile-time feature only. Microsoft's wording is that they are "entirely a compile-time feature" and that "the runtime behavior of your program is unchanged." string and string? are the same System.String at runtime; the?
+is metadata plus compiler diagnostics, and nothing is injected to check anything. The annotation therefore holds only over code the compiler actually analysed under an enabled context.
+
+Most practical NREs after adopting NRT come from a boundary the analysis doesn't cover: a caller in a project or NuGet package compiled without nullable enabled, a deserializer or O R M that materialises the object without running your constructor, reflection, or your own !. config["UserName"]!
+is a promise, not a check, if the key is absent you own the failure, and it surfaces far from the !.
+
+Don't claim every NRE arrives from outside, though, Microsoft documents pitfalls that sit inside code the compiler did analyse.
+string[] values = new string[3]; hands you three null elements typed as non-nullable string, and neither the allocation nor a later values[0].Length produces a single warning; default(T) on a struct with non-nullable reference fields is the sibling case.
+Pass one of those into Greet(string name) and the parameter is null with nothing suppressed anywhere.
+
+The senior answer is that NRT changes where you validate, not whether you validate. Inside the assembly, trust the flow analysis and delete the defensive checks.
+At public entry points that untyped or untrusted callers reach, keep a real runtime check, ArgumentNullException.ThrowIfNull(input), and then let the attributes carry the contract outward ( [NotNull] after the throw, [NotNullWhen(true)] on a TryGet, [return:
+NotNullIfNotNull] on a passthrough) so callers get the compiler's help instead of a comment.
+
+init controls when a member may be set; required controls whether it must be. Every expression that creates the type has to set every required member in an object initializer, and the compiler errors when one is missing (CS9035).
+That is the "mandatory field" guarantee init could never give, with init alone, new User() compiles happily and leaves a non-nullable Email holding null.
+
+What still gets past it, in increasing order of how likely you are to meet it.
+[SetsRequiredMembers] on a constructor switches the check off for that construction path, and Microsoft's own warning is that the attribute "disables the compiler's checks that all required members are initialized", it is an assertion, never verified.
+Generic code is where people expect a hole and don't get one: a type with required members can't be used as a type argument when the type parameter carries a new() constraint at all (CS9040), precisely because new T() has no object initializer for the compiler to check.
+The hole opens only when you combine the two, give that type a [SetsRequiredMembers] parameterless constructor and it satisfies new() again, so new T() compiles and returns an instance whose required member was never set.
+
+The one that reaches production is deserialization. System.Text.Json does honour required, Deserialize throws JsonException when the property is absent from the payload. But a payload that sends "email": null deserializes without complaint: required means "present", not "non-null".
+Chain that with the previous question and a required string Email can still be null at runtime, so validate the inbound DTO rather than assuming the type system did it for you.
+
+The build stays green and the first order paid with the new method throws NotSupportedException out of the fee calculation, at checkout.
+The discard arm made the switch exhaustive by construction, so CS8509, "the switch expression does not handle all possible values of its input type (it is not exhaustive)", can never fire on it.
+You traded a compile-time diagnostic for a production exception, and the same trade is sitting in every other switch over PaymentMethod that ends the same way.
+
+Drop the catch-all and the compiler goes back to telling you the switch isn't exhaustive; if a value still reaches it at runtime, the generated code throws SwitchExpressionException, documented as indicating "that a switch expression that was non-exhaustive failed to match its input at runtime".
+It derives from InvalidOperationException and carries the offending value in UnmatchedValue, a strictly better failure than a hand-written NotSupportedException, because it names what didn't match.
+
+The judgement call is that CS8509 is a warning, so on its own it ships. Be precise about what dropping the discard buys you, though.
+Through C sharp 14 there is no way to tell the compiler a class hierarchy is closed, so the moment the catch-all goes, CS8509 fires on the switch you have today, "the pattern _ is not covered", not on the day the fourth subtype lands.
+Putting CS8509 on top of that doesn't arm a tripwire; it breaks the build immediately.
+On dot NET 10 the two honest options are to keep the discard and throw from it with the unmatched value in the message, or to drop it and treat the standing CS8509 warnings as a permanent inventory of the sites a new subtype would touch.
+(C sharp 15 adds a closed modifier that finally closes the gap: mark the base closed, handle every direct descendant, and the switch is exhaustive with no discard and no warning.)
+
+One number to keep straight: over an enum the diagnostic is CS8524, not CS8509, a separate code for the unnamed-value case, because any underlying integer can be cast to the enum. A WarningsAsErrors list naming only CS8509 misses every enum switch in the codebase.
