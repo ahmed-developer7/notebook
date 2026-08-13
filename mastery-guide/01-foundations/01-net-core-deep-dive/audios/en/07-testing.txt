@@ -1,0 +1,575 @@
+-- pause --
+Section 1. Why It Matters.
+
+Tests are not "extra work", they are how you ship software at speed without fear. A team without tests measures progress in lines of code; a team with good tests measures it in features safely delivered per sprint.
+The dot NET ecosystem has industrial-strength tooling (x Unit, NUnit, MSTest, Moq, NSubstitute, FluentAssertions, WebApplicationFactory, TestContainers, Verify) that turns testing from a chore into a productivity multiplier, but only if you understand what to test, at what level,
+and how to keep tests cheap to maintain.
+
+The cost of a bug grows by an order of magnitude at every stage: $1 to fix in a unit test, $10 in CI, $100 in staging, $1,000+ in production. Yet over-testing is just as bad, a 30-minute test suite no one runs is worth less than a 30-second one everyone runs.
+This guide is about hitting the right balance: where to put unit tests, where integration tests, where end-to-end, and the patterns that keep all three fast and trustworthy.
+
+This chapter focuses on unit and integration testing in dot NET 10, x Unit fundamentals, AAA, lifecycles, mocking, WebApplicationFactory, TestContainers, test data builders.
+End-to-end (Playwright), contract testing (Pact), performance testing, and mutation testing live in the broader Testing chapter.
+
+-- pause --
+Section 2. Table of Contents.
+
+Why It Matters.
+Real-World Analogy: Inspecting a Car.
+The Test Pyramid.
+Unit Testing.
+x Unit Fundamentals.
+The AAA Pattern.
+Test Fixtures and Lifecycles.
+Mocking, Moq versus NSubstitute versus FakeItEasy.
+When to Mock versus Use the Real Thing.
+Test Data Builders.
+Integration Testing with WebApplicationFactory.
+TestContainers, Real Databases in Tests.
+Common Pitfalls.
+Best Practices.
+Real-World Scenarios.
+Interview Cross-Questioning Drill.
+Self-Test.
+Cross-References.
+Sources.
+
+-- pause --
+Section 3. Real-World Analogy: Inspecting a Car.
+
+Think of testing as inspecting a car at three depths.
+
+You wouldn't ship a car after only freeway-driving it (slow, expensive, can't isolate failures), and you wouldn't ship a car after only bench-testing parts (the spark plug works, but does it work together with the fuel injector?). You need all three layers, but in different ratios.
+
+-- pause --
+Section 4. The Test Pyramid.
+
+-- pause --
+Without a Pyramid Strategy (anti-shape).
+
+The healthy pyramid has a wide unit base, fast, cheap feedback, narrowing through integration to a thin E2E tip. dot NET 10's tooling makes this shape achievable.
+
+-- pause --
+Section 5. 14. Unit Testing.
+
+-- pause --
+What "Unit" Means.
+
+A unit test exercises one logical class or function with all external dependencies replaced by test doubles. No DB. No file I O. No network. No clock. Pure C P U.
+
+-- pause --
+Section 6. x Unit Fundamentals.
+
+x Unit is the de-facto choice for new dot NET projects. NUnit and MSTest are valid alternatives, but x Unit has the cleanest design (no [SetUp] / [TearDown] magic, it's just constructors and IDisposable ).
+
+-- pause --
+Assertions.
+
+FluentAssertions makes failure messages dramatically clearer ("Expected order.Total to be 100.00m, but found 99.99m") and is worth the dependency.
+
+-- pause --
+Section 7. The AAA Pattern.
+
+Every test, no matter the framework, follows three phases:
+
+-- pause --
+Naming: One Test = One Sentence.
+
+A failing test name should answer "what was this checking?" without opening the file.
+
+-- pause --
+One Assertion (Conceptually) Per Test.
+
+You can have multiple Assert lines, but they should test one logical behaviour:
+
+-- pause --
+Section 8. Test Fixtures and Lifecycles.
+
+-- pause --
+Collection Fixture, Shared Across Multiple Test Classes.
+
+Use collection fixtures for expensive shared resources (TestContainers, real Kafka). For cheap resources (in-memory DB), per-test setup is fine.
+
+-- pause --
+Section 9. Mocking, Moq versus NSubstitute versus FakeItEasy.
+
+Three mocking libraries dominate in dot NET. They achieve the same goal with different syntactic philosophies.
+
+(FakeItEasy is similar to NSubstitute in style, A.CallTo(() goes to fake.Method(.)).Returns(.).)
+
+-- pause --
+Properties Box.
+
+Pick one library per repo and stick with it. Mixing Moq and NSubstitute makes onboarding harder. New projects in 2026 often pick NSubstitute (gentler, no licensing drama).
+
+-- pause --
+Section 10. When to Mock versus Use the Real Thing.
+
+-- pause --
+Rule of thumb.
+
+Mock at the edges (I O, time, randomness, third-party A P Is). Use the real implementation for everything inside your domain.
+
+-- pause --
+TimeProvider (dot NET 8+), the End of DateTime.UtcNow Pain.
+
+Microsoft.Extensions.TimeProvider.Testing (FakeTimeProvider) ships with dot NET 8+.
+
+-- pause --
+Section 11. Test Data Builders.
+
+A builder is a fluent helper that produces realistic test entities without bloating each test with object initialisation.
+
+-- pause --
+Properties.
+
+For complex graphs, AutoFixture generates random-but-valid data automatically, var order = new Fixture().Create();.
+
+-- pause --
+Section 12. Integration Testing with WebApplicationFactory.
+
+WebApplicationFactory (in Microsoft.AspNetCore.Mvc.Testing ) spins up your real A S P dot NET Core app in-process and gives you an HttpClient. No port binding, no real network, but the full pipeline (auth, routing, model binding, EF) is exercised.
+
+-- pause --
+Section 13. TestContainers, Real Databases in Tests.
+
+In-memory E F Core ( UseInMemoryDatabase ) is not a real database. It doesn't enforce constraints, doesn't have transactions, doesn't support real sequel. It's fine for early-stage tests; for confidence, you want the actual database engine.
+
+TestContainers for dot NET ( Testcontainers.MsSql, Testcontainers.PostgreSql, Testcontainers.Redis, et cetera) spins up Docker containers programmatically.
+
+Use TestContainers for the repository layer and any test where sequel behaviour matters. For business-logic tests with no sequel specifics, in-memory is fine, speed beats fidelity when fidelity isn't tested.
+
+-- pause --
+Section 14. Common Pitfalls.
+
+-- pause --
+2. Async Tests That Don't Await.
+
+If the framework sees a returned Task, it awaits, but only if the method returns it. .Wait() and .Result deadlock under sync contexts; never use them in tests.
+
+-- pause --
+3. Mocking What You Don't Own.
+
+Mocking HttpClient, DbContext, or Stream directly is brittle (their interfaces change, methods are non-virtual). Wrap them behind your own interface and mock that.
+
+-- pause --
+5. Shared Mutable State Between Tests.
+
+x Unit creates a new test class instance per test, so instance fields are safe. Static fields are not, never put mutable state on a static.
+
+-- pause --
+6. Tests That Assert Multiple Unrelated Things.
+
+Already covered: each test = one logical behaviour.
+
+-- pause --
+8. Asserting on Logs.
+
+Logging is observability, not a contract. If you assert "logger received 'order created'", any change to the log message breaks the test. Use structured logging + integration tests over a log sink instead.
+
+-- pause --
+9. Sleeping in Tests.
+
+Use FakeTimeProvider (real abstraction over time), await on a TaskCompletionSource, or polling with timeout, never raw delays.
+
+-- pause --
+10. Unit-Testing the Framework.
+
+You don't need to test that E F Core saves data, that int.Parse parses, that the framework's serializer round-trips. Test your logic.
+
+-- pause --
+11. WebApplicationFactory Database Pollution.
+
+If two integration tests share the same fixture and one leaves data behind, the second sees it. Either reset between tests (transaction-rollback or re-create DB), or write tests that expect the seeded state.
+
+-- pause --
+12. Snapshot Tests on Volatile Output.
+
+Snapshot or Verify tests are powerful but fragile if output includes timestamps, GUIDs, or floating-point. Scrub volatile fields before comparison.
+
+-- pause --
+Section 15. Best Practices.
+
+Pyramid shape: ~70% unit, ~25% integration, ~5% E2E. Adjust by team and product, but never invert.
+Test behaviour, not implementation. A test should survive any refactor that doesn't change the public contract.
+One logical assertion per test. Multiple Assert lines for one behaviour is fine; multiple unrelated behaviours is not.
+Name tests as full sentences. Method_Scenario_ExpectedResult.
+Mock at I O boundaries; use real domain code. Internal classes don't need mocks.
+Inject TimeProvider, never call DateTime.UtcNow directly. (dot NET 8+ standard.)
+Use FluentAssertions for readable failures.
+Use builders or AutoFixture to keep tests focused on what's relevant.
+For H T T P, use WebApplicationFactory, never spin up a real Kestrel host in tests.
+For sequel, use TestContainers when DB behaviour matters; in-memory otherwise.
+Run tests in parallel by default; use [Collection] only when state must be serialised.
+Treat test code as production code, review it, refactor it, keep it clean.
+CI: fail fast on flaky tests. Quarantine and fix; never [Skip] indefinitely.
+**Coverage is a lagging indicator.** Don't chase 100%; chase confident refactors.
+**A red test is a gift.** Never silence a failing test, fix the bug or fix the test.
+
+-- pause --
+Section 16. Real-World Scenarios.
+
+-- pause --
+Scenario 1: Testing a Controller (Integration Style).
+
+Question: Where do I draw the line, unit-test the controller, or integration-test the A P I?
+
+Recommendation: Integration test the route. A controller is mostly thin glue (model binding, D I resolution, returning IActionResult ). Unit-testing it means mocking everything around it and asserting "this controller calls this service", low value.
+An integration test against WebApplicationFactory exercises the same things a unit test would, plus the framework wiring, for ~10 times the value at ~3 times the time.
+
+If a controller has complex logic (rare and a smell), unit-test that logic in a separate class.
+
+-- pause --
+Scenario 2: Testing a BackgroundService.
+
+Question: A worker drains a queue and processes messages. How do I test it?
+
+Approach:
+
+Key idea: You're not testing BackgroundService 's lifecycle, Microsoft tested that. You're testing your code inside ExecuteAsync. Provide a way to make the loop terminate (cancellation, throw on second Dequeue ).
+
+-- pause --
+Scenario 3: Testing Data Access (Repository + E F Core).
+
+Question: In-memory DB or real DB?
+
+Recommendation:
+For repositories with non-trivial sequel (joins, raw sequel, stored procs, Jason columns, computed columns, triggers): real DB via TestContainers. In-memory will lie to you.
+For business services that just persist and reload entities: in-memory is fine, the sequel semantics aren't what you're testing.
+
+-- pause --
+Scenario 4: A Flaky Test in CI.
+
+Symptom: Test passes 9 or 10 runs in CI, fails 1 or 10 in a way that can't be reproduced locally.
+
+Diagnosis checklist:
+
+Action: Quarantine the test (move to a "flaky" trait), file a ticket, fix or delete within the sprint. Never let flaky tests poison the green-build culture.
+
+-- pause --
+Scenario 5: Testing a Resilience Pipeline.
+
+Question: I've added Polly retry or circuit-breaker. How do I test it without waiting real seconds?
+
+Approach: Inject TimeProvider (Polly v8 supports this), fake the underlying handler, and verify the number of attempts.
+
+-- pause --
+Section 17. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Test pyramid.
+
+-- think --Q: What's the rough proportion of tests in a healthy pyramid?
+
+A: ~70% unit, ~25% integration, ~5% end-to-end. Unit tests are the wide fast base; integration tests verify components together (DB, H T T P); E2E exercises full user journeys but is slow and brittle, so it's the thin tip.
+
+-- think --Cross-Q: Why not just write more integration tests, they catch more bugs per test?
+
+A: Because they're slow and they obscure failures. A failing integration test tells you "something in this 10-component path is broken"; a failing unit test tells you "this method's input X returns Y when it should return Z." Diagnosis time skyrockets when you over-rely on integration.
+Plus they're harder to run during refactor (5min suite versus 30 seconds), so devs run them less, and the feedback loop collapses.
+
+-- think --Cross-Q²: An "ice-cream cone" team has 80% manual E2E. Why is that the worst shape?
+
+A: Because manual tests scale linearly with people, not features. Every new feature requires more QA time on every release. They're flaky (humans are inconsistent), they're slow (a release week is the test cycle), and they have no version control (institutional knowledge walks out when QAs leave).
+The fix is brutal: invest in unit + integration aggressively, accept that for 6-12 months velocity drops, then enjoy a sustainable shape.
+
+-- pause --
+Drill 2, Unit test isolation.
+
+-- think --Q: How strict is "isolation" in a unit test?
+
+A: No I O, no DB, no file system, no network, no real time, no real randomness. The SUT runs against test doubles for every external dependency. Other classes in your own domain can be real (don't over-mock).
+
+-- think --Cross-Q: My unit test instantiates a real Order and Customer from my domain. Is that still a unit test?
+
+A: Yes. The "unit" is a logical behaviour, not a single class. If OrderService collaborates with Order and Customer (pure domain objects with no I O), exercising all three in one test is still unit-level. The boundary is I O, not class count.
+Over-mocking the domain ("mock the Customer to return a Customer") makes tests fragile to refactor and gives false confidence.
+
+-- think --Cross-Q²: What about DateTime.UtcNow inside the SUT, does my unit test break isolation?
+
+A: Yes, calling DateTime.UtcNow ties the test to real time, making it non-deterministic (a test about "is the token expired?" depends on when the test runs). Fix: inject TimeProvider (built into dot NET 8+) and use FakeTimeProvider in tests to set or advance time.
+Same for Random (inject IRandomProvider ), Guid.NewGuid() (inject IGuidProvider ), and ambient context like HttpContext (inject IHttpContextAccessor and fake it).
+
+-- pause --
+Drill 3, Integration versus unit boundary.
+
+-- think --Q: Where's the line between an integration test and a unit test?
+
+A: A unit test has no real I O; an integration test has at least one real I O boundary. Real DB, real H T T P client to a test server, real file system, real message broker (test container), anything that takes more than C P U.
+Speed is the side effect: unit is 1-10 milliseconds, integration is 100 milliseconds-5 seconds.
+
+-- think --Cross-Q: Is a test using E F Core's in-memory provider a unit or integration test?
+
+A: Gray area. The provider is in-process, so "no real I O" is technically true. But you're crossing the E F Core boundary (link to query compiler to in-memory store), there's framework code being exercised.
+Most teams call it integration-style (because it tests EF integration, even if fake) but classify under unit speed. Either label works as long as you don't think it tests real sequel semantics (it doesn't, see Drill 6).
+
+-- think --Cross-Q²: I use WebApplicationFactory with mocked dependencies, unit or integration?
+
+A: Integration. You're exercising the real A S P dot NET Core pipeline (routing, model binding, filters, middleware), even if your domain services are fakes. The framework wiring is the integration being tested. Calling it "unit" would mislead reviewers about what the test proves.
+
+-- pause --
+Drill 4, WebApplicationFactory.
+
+-- think --Q: What does WebApplicationFactory actually create?
+
+A: A full in-process A S P dot NET Core host using TestServer instead of Kestrel, no port binding, no real socket, and an HttpClient that talks to it via an in-memory HttpMessageHandler. The full pipeline runs (auth, routing, middleware, EF), giving you an integration test without network overhead.
+
+-- think --Cross-Q: When does the factory build the host, per test, per class, or per test run?
+
+A: Once per IClassFixture> instance. The factory is the fixture, and x Unit creates it once for the class, reusing across [Fact] s in that class. To get a fresh host per test, instantiate new WebApplicationFactory() in each test (slower but isolated).
+Per test run requires ICollectionFixture<> to share across multiple test classes.
+
+-- think --Cross-Q²: I'm replacing IPaymentGateway with a fake via ConfigureServices. Why does my replacement only work sometimes?
+
+A: Because services.RemoveAll() only removes if it was already registered. If the production registration happens after your ConfigureServices override (for example, a startup extension method runs later in the host builder), your removal predates the registration and the real one wins.
+Fix: register your fake using services.Replace(ServiceDescriptor.Singleton()) or ensure your WithWebHostBuilder runs after the host's default registration (it does by default, but verify with a breakpoint).
+
+-- pause --
+Drill 5, TestContainers.
+
+-- think --Q: When do you use TestContainers over E F Core's in-memory provider?
+
+A: When the test needs real sequel semantics: constraints, transactions, Jason columns, computed columns, triggers, stored procedures, raw sequel, dialect-specific behavior (for example, Postgres array types).
+In-memory is a link-to-Objects facade, it doesn't enforce uniqueness constraints, doesn't honor transactions, doesn't validate FK references.
+
+-- think --Cross-Q: What's the cost of TestContainers?
+
+A: ~3-10 seconds per container startup (depends on image, machine, Docker layer cache). Image pulls on first run can be minutes. Plus ~50-200MB memory per running container.
+Mitigated by sharing one container across many tests with ICollectionFixture<>, and by using lightweight images (alpine variants, Testcontainers' own minimized images). Docker must be on every dev machine and CI agent, a real ops requirement.
+
+-- think --Cross-Q²: My tests work locally with TestContainers but fail in CI with "Cannot connect to Docker daemon." Why?
+
+A: CI agent doesn't have Docker, or doesn't grant the test process access to it (rootless Docker, permissions). The fix depends on CI: GitHub Actions and Azure DevOps have official Docker support on ubuntu-latest images.
+Self-hosted agents need Docker installed and the agent user in the docker group. Or: use a Docker-in-Docker sidecar; or run tests in containers themselves with a shared Docker socket. Always: validate Docker availability in CI before relying on TestContainers.
+
+-- pause --
+Drill 6, E F Core in-memory danger.
+
+-- think --Q: Why is the E F Core In-Memory provider dangerous?
+
+A: It doesn't enforce database semantics. Unique constraints don't apply (you can insert two rows with the same "unique" key). Foreign keys aren't enforced. Transactions are no-ops. SaveChanges always succeeds. Raw sequel fails. Jason column queries fail.
+It's a link-to-Objects store wearing a DbContext costume. Tests pass; production breaks on the first INSERT with a real constraint.
+
+-- think --Cross-Q: What about SQLite as a test database, same trap?
+
+A: SQLite is a real database, so transactions and constraints work. But its dialect differs from sequel Server or Postgres, different DATE arithmetic, no schemas, looser type system (integer column accepts strings). For testing logic that doesn't touch dialect-specific sequel, SQLite is fine.
+For testing your actual prod-dialect sequel, only TestContainers matches.
+
+-- think --Cross-Q²: Microsoft says "for testing your own logic, in-memory is fine." When is that actually true?
+
+A: When the test exercises business logic only, with the DB as a simple "save object, load object" passthrough. If your business rule is "Order.IsValid() returns false when Lines is empty," that's pure C sharp, the DB doesn't matter. In-memory works.
+But if your repository has "Where(o goes to o.CreatedAt > @yesterday)," and your prod DB stores dates differently, in-memory's date semantics may pass while prod fails. Rule: in-memory for application service tests; real DB (TestContainers) for repository or persistence tests.
+
+-- pause --
+Drill 7, Mocking concretes.
+
+-- think --Q: Why mock interfaces and not concrete classes?
+
+A: Because Moq, NSubstitute, et cetera use runtime proxy generation (Castle.DynamicProxy), they intercept virtual methods on classes you give them. Interfaces are 100% virtual, so every method is mockable.
+Concrete classes have non-virtual methods by default; the proxy can only override virtual and abstract ones, sealed methods, static methods, and non-virtual methods are not interceptable.
+
+-- think --Cross-Q: What if my class has a virtual method, can I mock just that?
+
+A: Yes, but it's brittle. The mock can override the virtual method; non-virtual methods on the same class still call real logic. The mock's behavior is a hybrid: some methods mocked, others real, with no clear boundary.
+This is the "partial mock" antipattern, usually a sign the class should have been an interface or composed differently.
+
+-- think --Cross-Q²: What about sealed classes from third-party libraries (HttpClient, DateTime)?
+
+A: You can't mock them. The solution: wrap them in your own interface ( IClock { DateTime UtcNow {get;} }, IHttpExecutor { Task SendAsync(.) } ) and mock the wrapper.
+dot NET 8 fixed this for time specifically ( TimeProvider, mockable via FakeTimeProvider ) and for H T T P via IHttpClientFactory + HttpMessageHandler mocking. For other sealed types: wrap, don't fight.
+
+-- pause --
+Drill 8, AAA pattern.
+
+-- think --Q: What does the AAA pattern require and forbid?
+
+A: Arrange, set up state and dependencies. Act, invoke the single behavior under test (ideally one line). Assert, verify the outcome. Forbidden: mixing, no setting up new mocks between asserts, no asserting partway through the act, no acting twice.
+
+-- think --Cross-Q: My test has 30 lines of arrange, bad smell?
+
+A: Often yes. Either the SUT has too many dependencies (refactor to fewer collaborators or smaller scope), or the arrange should move to a TestDataBuilder ( OrderBuilder().Cancelled().WithTotal(50).Build() ).
+30 lines means a future reader spends most of their time understanding setup, not the actual behavior being tested. Builders make tests state "give me a cancelled order with total 50", the irrelevant defaults stay invisible.
+
+-- think --Cross-Q²: Where do edge-case assertions like "no side effects" fit in AAA?
+
+A: In Assert. "Verify SendEmail was never called" is part of the outcome, the test asserts "given an invalid order, the email service was NOT invoked." Pattern: _emailMock.Verify(e goes to e.Send(It.IsAny()), Times.Never) after the Act line.
+The structure stays clean: three phases, all verifications in the third.
+
+-- pause --
+Drill 9, Async test deadlock.
+
+-- think --Q: How do you avoid deadlocks in async tests?
+
+A: Always await. Never .Result, never .Wait(), never .GetAwaiter().GetResult(). In a unit test runner, there's no SynchronizationContext to deadlock (x Unit's default test execution is on the thread pool), but mixing sync-over-async in code-under-test still risks deadlocks in production.
+So even though the test might pass with .Result, you're testing broken patterns.
+
+-- think --Cross-Q: My test method is async void. Why is that wrong?
+
+A: async void is fire-and-forget, exceptions are raised on the synchronization context, not awaited. The test runner sees the method "complete" immediately when it hits the first await, and reports success even if the test would have failed. Use async Task for test methods; x Unit awaits them.
+
+-- think --Cross-Q²: I have [Fact] public Task Foo() goes to _svc.DoAsync().ContinueWith(t goes to Assert.True(false));, bug?
+
+A: Yes, subtle. The returned Task is the continuation, Assert.True(false) runs after DoAsync completes. But the inner Assert exception is wrapped in AggregateException by ContinueWith, and x Unit unwraps differently.
+Worse: if DoAsync throws, you never reach Assert and the test reports the original exception, not your intended assertion. Use await and explicit assertion: await _svc.DoAsync(); Assert.True(false);.
+
+-- pause --
+Drill 10, Test data builders.
+
+-- think --Q: When is a test data builder worth the ceremony?
+
+A: When the same entity is built in 10+ tests with slight variations. The builder centralizes the "valid baseline" and lets each test state only what differs. ~5 usages, inline construction is cheaper than maintaining a builder.
+Past 10, the builder pays for itself in readability and refactor safety.
+
+-- think --Cross-Q: How do builders compare to AutoFixture?
+
+A: Builders are explicit and named: new OrderBuilder().Cancelled().Build() reads like a spec. AutoFixture is implicit and random: fixture.Create() returns a "valid" Order with random fields.
+AutoFixture wins for tests where field values don't matter (just need some Order); builders win for tests where field values are part of the scenario. Often both in the same codebase: AutoFixture for "throwaway" objects, builders for domain-significant ones.
+
+-- think --Cross-Q²: I see public static implicit operator Order(OrderBuilder b) goes to b.Build();, why?
+
+A: Syntactic sugar, lets callers write Order order = new OrderBuilder().Paid(); without the explicit .Build(). Some teams love it (less noise); others hate it (hidden conversion, surprises readers). Both work.
+The conversion is one-directional (Builder to Order), so there's no risk of misuse going the other way.
+
+-- pause --
+Drill 11, [Theory] versus [Fact].
+
+-- think --Q: When should I prefer [Theory] over multiple [Fact] s?
+
+A: When the test body is identical and only inputs vary, parameter validation, boundary conditions, arithmetic edge cases. [InlineData(0)] [InlineData(-1)] [InlineData(int.MaxValue)] plus one [Theory] body is far cleaner than three near-duplicate [Fact] s.
+Keeps dry without hiding test names, each row becomes its own test case in output.
+
+-- think --Cross-Q: When does [Theory] become wrong?
+
+A: When the cases share inputs but have different assertion logic. Forcing them into one theory body with if (input == "x") Assert.Foo() else Assert.Bar() is worse than two [Fact] s, the test body becomes a switch statement.
+Theory shines for "same assertion, different inputs"; not "different inputs, different outcomes."
+
+-- think --Cross-Q²: [InlineData] versus [MemberData] versus [ClassData], pick when?
+
+A: [InlineData] for small, hardcoded primitives, 2-10 simple cases. [MemberData] for cases referencing complex objects, computed values, or shared across multiple theories ( public static IEnumerable Invalid goes to. ).
+[ClassData] for very large datasets where a separate class organizes test data (think: a hundred locale-specific test cases). Default to [InlineData]; reach for [MemberData] when you need to share or compute.
+
+-- pause --
+Drill 12, x Unit versus NUnit versus MSTest.
+
+-- think --Q: How do x Unit, NUnit, and MSTest compare on collection or shared fixtures?
+
+A: x Unit: per-test class instance by default (no shared state by accident), IClassFixture for class-level sharing, ICollectionFixture + [Collection("name")] for cross-class sharing.
+NUnit: instance reused across tests in the class by default (must reset state in [SetUp] ), [OneTimeSetUp] / [OneTimeTearDown] for class-level. MSTest: similar to NUnit, [TestInitialize] / [ClassInitialize] / [AssemblyInitialize] for tiered setup.
+
+-- think --Cross-Q: Which is the best fit for a new dot NET 8+ project?
+
+A: x Unit, by team consensus. Its design forces good habits (new instance per test = no shared state surprises, constructors instead of magic attributes). NUnit is more flexible ( [TestCase], theories, action attributes) but the default behavior favors shared state.
+MSTest has Microsoft backing and good IDE integration but is least feature-rich. Most new projects pick x Unit; legacy MSTest or NUnit teams stay with what they have.
+
+-- think --Cross-Q²: Can I run x Unit tests in parallel by default?
+
+A: Yes, x Unit parallelizes across test classes by default. Within a class, tests run sequentially. To force serial across classes, use [Collection("name")] to group them (collection members run serially, classes outside any collection run in parallel).
+To go further: [CollectionDefinition("name", DisableParallelization = true)]. The trade-off: parallel exposes shared-state bugs (good!) but can saturate CI agents (set dotnet test --max-parallel-threads if needed).
+
+-- pause --
+Drill 13, Test naming.
+
+-- think --Q: When does MethodName_State_Expected beat plain English test names?
+
+A: When tests are auto-listed alphabetically in CI output and you scan failures by name. Withdraw_AmountExceedsBalance_ThrowsInsufficientFundsException tells you at a glance: which method, which scenario, what should happen.
+Plain English ("should not allow over-drawing") makes failures harder to triage at scale.
+
+-- think --Cross-Q: When does plain English win?
+
+A: When tests are read in narrative order, not alphabetical (for example, behavior-spec style, BDD-flavored teams). "Given a cancelled order, when I try to ship it, then I get an error" reads like spec. Tools like SpecFlow or Reqnroll make this natural via Gherkin.
+The naming style is a culture fit, not a hard rule.
+
+-- think --Cross-Q²: What about Should_ThrowException_WhenBalanceTooLow?
+
+A: The "Should" prefix is divisive. Pro: emphasizes intent ("the system should."). Con: every test name starts with "Should," wasting scanning bandwidth and making alphabetical sort useless. Most modern dot NET teams drop the prefix and use MethodName_State_Expected.
+Whichever you pick, be consistent across the codebase, mixing styles is the actual problem.
+
+-- pause --
+Drill 14, Flaky tests.
+
+-- think --Q: What are the common sources of test flakiness?
+
+A: Time-dependent code (test passes when run "fast enough"). Shared state (test A leaves data, test B reads it). Async races (test asserts before background work completes). External dependencies (D N S, network, real DB). Order dependency (test passes only if A runs before B).
+Resource exhaustion (port collisions, file locks, container limits).
+
+-- think --Cross-Q: What's the triage process?
+
+A: (1) Reproduce: run the test in a loop locally. If it passes 100 or 100, it's environmental; if it fails sometimes, it's a code issue. (2) Quarantine: tag with a Flaky trait so CI doesn't fail on it. (3) Diagnose: time? state? async?, pick one hypothesis, instrument, retest.
+(4) Fix or delete within the sprint. Never indefinitely-skip a flaky test, it's a bug surface that gets ignored.
+
+-- think --Cross-Q²: Is there a category of test that's inherently flaky, no matter what?
+
+A: End-to-end browser tests against real systems can be inherently flaky, network blips, browser quirks, animation timing.
+Mitigations: Playwright's auto-retry with smart waits (waits for elements, not arbitrary timeouts), record-and-replay for video debugging, run in headless on consistent hardware. Accept ~5-10% flake rate as baseline and budget retries. that rate: brittleness; above: re-evaluate the test value.
+
+-- pause --
+Drill 15, Contract testing.
+
+-- think --Q: What does contract testing (Pact) solve that integration testing doesn't?
+
+A: Cross-service compatibility without deploying both services together. Integration test of service A against service B requires running B in test mode and hitting it, expensive, brittle, slow.
+Contract test: A records its expectations of B's A P I (the "consumer contract"); B verifies the contract against its real implementation in B's own test suite. Both can deploy independently with confidence.
+
+-- think --Cross-Q: How does Pact share contracts between teams?
+
+A: Via a Pact Broker (a server that stores contract versions and verification results). Consumer's CI publishes contracts after running consumer tests. Provider's CI fetches the contract, verifies against its A P I, publishes the result.
+The broker shows compatibility matrices: "consumer v3 is compatible with provider v7." Can I deploy? A P I answers "given consumer v3 and provider v7, are they compatible?" before a release.
+
+-- think --Cross-Q²: When does contract testing NOT help?
+
+A: When the contract is fully captured by an OpenAPI or G R P C schema and you validate at build time (schema-driven testing). Contract testing adds value when contracts have behavioral expectations beyond schema, "if I POST this, I expect a 201 with a Location header", that schema-only tools miss.
+Also: contract testing requires both sides to participate (publish + verify); if you don't own the provider's CI, it doesn't work. Public A P Is use OpenAPI + integration; internal microservices use Pact.
+
+-- pause --
+Section 18. Self-Test.
+
+Because the in-memory provider is not a relational database, it is a link-over-objects store wearing a DbContext costume, and the guarantees a repository leans on are exactly the ones it drops.
+Microsoft's own E F Core testing guidance calls using it as a database fake "highly discouraged" and supported only for legacy applications.
+Concretely: raw sequel is completely unsupported; transactions are not supported (starting one raises InMemoryEventId.TransactionIgnoredWarning, which throws by default, and the usual "fix" is to silence that warning, after which a rollback rolls nothing back);
+provider-specific translations such as EF.Functions.* do not exist; alternate-key or unique and foreign-key constraints are not enforced;
+and query results can differ from production because the operators execute in dot NET, not in your engine, sequel Server compares strings case-insensitively under the default collation, in-memory does not.
+
+The failure shape is a green suite followed by a production incident: the first insert is rejected by a real constraint, the raw-sequel path throws, or a compensating rollback silently compensates nothing.
+Use TestContainers, a real engine, same as production, wherever sequel behaviour is the thing under test: constraints, transactions, joins, Jason and computed columns, raw sequel.
+Microsoft's preferred cheap fake is SQLite in-memory, which at least gives real transactions and constraints, though its dialect still differs from sequel Server or Postgres. In-memory is defensible only when the database is a pass-through and the assertion is about business logic.
+
+IClassFixture> builds the factory once, before the first test in the class, and disposes it after the last.
+x Unit hands every test a brand-new instance of the test class, so instance fields are safe, but the fixture is shared, and with it the host, its D I container, every singleton in it, and whatever database that host is wired to.
+Test A's writes are still there when test B runs, and x Unit does not execute tests in source order, so "one at a time" and "all together" are genuinely different worlds. Anything cached inside a fake collaborator behaves the same way: it is a singleton in a host that outlives the test.
+
+The tell is an assertion about global state, db.Orders.Should().HaveCount(1) passes alone and fails second.
+Two fixes: reset between tests (open a transaction per test and roll it back in Dispose, or recreate and reseed the database), or write assertions that only reference the entity the test itself created, so a seeded baseline is irrelevant.
+If you need real isolation, new WebApplicationFactory() inside the test gives a fresh host per test at the cost of rebuilding it every time.
+Push the other way for genuinely expensive resources: ICollectionFixture shares one TestContainers database across several classes, which makes disciplined resetting more important, not less.
+
+In a well-factored app a controller is glue: model binding, D I resolution, mapping a service result onto an IActionResult. Unit-testing it means mocking every collaborator and then asserting that the controller called them, verifying implementation rather than behaviour.
+The test restates the method body, so a refactor that changes the call sequence turns it red while the H T T P contract never moved.
+Worse, it is blind to what actually breaks controllers in production: a route template that no longer matches, a missing D I registration, a model-binding or serializer rule, a filter, an auth policy. All of that is the framework wiring the unit test replaced with mocks.
+
+WebApplicationFactory runs the real pipeline in-process, so the assertion becomes a statement about the contract, "POST this body, get 201 with a Location header", which survives any internal refactor.
+What you pay: a host to start and a full pipeline per request instead of a constructor call, shared-fixture state to manage, and a coarser failure signal, red tells you the route is broken, not which line broke it.
+That is the whole argument for the pyramid: integration tests for the route, unit tests for the logic underneath, so diagnosis stays cheap.
+The exception is a controller carrying real branching logic, a smell in itself; extract it into a class you can unit-test directly, then integration-test the route around it.
+
+Two defects, one in the test and one in the design. The test sleeps: it burns two real seconds on every run, and it is a race, it only passes while the expiry window stays shorter than the delay, on every machine, including a loaded CI agent.
+That is the canonical passes-nine-runs-out-of-ten flake, and it gets slower as you add cases. The deeper problem is that it had to be written this way, because the service reads the ambient clock through DateTime.UtcNow: time is an undeclared dependency, so the only lever the test has is real time.
+
+Refactor: inject TimeProvider (an abstract class in the BCL since dot NET 8) and read time.GetUtcNow() instead.
+In the test, use FakeTimeProvider, namespace Microsoft.Extensions.Time.Testing, from the Microsoft.Extensions.TimeProvider.Testing package, which derives from TimeProvider: SetUtcNow(.) pins the starting instant and Advance(TimeSpan.FromHours(2)) jumps virtual time forward at no wall-clock cost.
+The test is now deterministic, runs in milliseconds, and states the actual rule ("expired two hours after issue") instead of "expired after the test slept." The same move covers the other ambient inputs, Random, Guid.NewGuid(), HttpContext, and when production code itself needs to wait,
+the fakeable replacements are Task.Delay(delay, time Provider, ct) and new CancellationTokenSource(delay, time Provider), both TimeProvider -aware overloads added in dot NET 8, plus TimeProvider.CreateTimer(.).
+Watch the shape there: CreateTimer is a member of TimeProvider, but there is no TimeProvider.Delay and no TimeProvider.CreateCancellationTokenSource, those exist only as extension methods in the Microsoft.Bcl.TimeProvider package,
+whose own docs say it is for building against pre-dot NET 8 surface area and should not be used from dot NET 8 or higher.
+
+Moq, NSubstitute and FakeItEasy all build the double at runtime with Castle DynamicProxy, and DynamicProxy's rule is that only virtual members can be intercepted. On an interface that costs nothing: the proxy implements the interface, so every member routes through the interceptor.
+On a class the proxy is a subclass, so it can only override members declared virtual or abstract; everything else keeps its real implementation, the base constructor still runs, and a sealed class cannot be subclassed at all.
+Static members are never dispatched virtually, so they are out too, as are value types like DateTime.
+
+The risk is not the outright failure, it is the partial success. Mock a class with one virtual method and you get a hybrid: that method faked, the rest executing production code, and nothing in the test marking the boundary.
+Someone later drops virtual during a refactor and the "mock" silently starts running real logic, possibly real I O, while the test stays green for the wrong reason. Escape hatch: own the seam.
+Define your own interface over the type you cannot control ( IClock, IFileStore, IPaymentGateway ) and mock that instead of fighting the proxy.
+dot NET already ships two of these: TimeProvider for the clock, and for H T T P the fakeable seam is HttpMessageHandler, its SendAsync is protected and overridable, plumbed in via IHttpClientFactory, which is why you fake the handler and never HttpClient itself.
