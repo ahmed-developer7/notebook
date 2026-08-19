@@ -1,0 +1,486 @@
+-- pause --
+Section 1. Why It Matters.
+
+A single missing [Authorize] attribute, an unparameterized sequel string, or a forgotten HSTS header is the difference between a healthy production system and a Monday-morning incident.
+Security in dot NET 10 is not a single library, it is a stack of small, layered defenses (T L S, authentication, authorization, anti-forgery, input validation, output encoding, secret management, rate limiting, security headers) and each layer assumes the others are doing their job.
+This document is the reference for what each layer does, why it exists, when to use it, and where the common foot-guns are buried.
+
+-- pause --
+Section 2. 19. Security and Authentication.
+
+Difficulty: Intermediate to Advanced | Reading Time: ~35 min.
+
+-- pause --
+With Security (the same A P I, hardened).
+
+Each layer is small. Skip one and an attacker has a foothold.
+
+-- pause --
+The Security Layer Cake.
+
+A request typically traverses every row in order. Defense in depth means one failed layer is contained by the next.
+
+-- pause --
+What Is a J W T?.
+
+A Jason Web Token is a compact, signed (and optionally encrypted) string carrying claims about a user. The server validates the signature on every request, no DB lookup needed.
+
+-- pause --
+Cookie Authentication.
+
+For server-rendered apps (Razor Pages, M V C, Blazor Server) cookies are still the right answer. The cookie is H T T P-only, Secure, SameSite set to Lax or Strict, and tied to a server-side ticket.
+
+When not to use cookies: pure SPA or mobile clients on cross-origin domains, where CSRF management plus cores preflight makes JWTs simpler.
+
+-- pause --
+OpenID Connect (OIDC).
+
+OIDC is O auth 2.0 + an identity layer. Use it for "Sign in with Google / Microsoft / Okta / Azure AD". The server never sees the password.
+
+Use the Authorization Code flow with PKCE. Implicit flow is dead.
+
+-- pause --
+Authorization: Roles, Claims, Policies.
+
+Authentication = "Who are you?". Authorization = "What may you do?". Two distinct middlewares; both must run.
+
+-- pause --
+H T T P S, T L S 1.3, HSTS.
+
+HSTS rules of thumb:
+Max-age at least 31536000 (1 year) for production.
+Use includeSubDomains only after every subdomain is H T T P S-ready.
+preload registers your domain with browsers; you cannot easily un-preload.
+
+-- pause --
+Anti-Forgery (CSRF).
+
+CSRF tricks a logged-in user's browser into submitting a request to your site. The browser dutifully attaches the cookie. Your A P I thinks the user wanted to do it.
+
+J W T-only A P Is (no cookies) are not vulnerable to classic CSRF, the browser does not auto-attach an Authorization header. But cookie-bearing endpoints must validate anti-forgery on every state-changing request.
+
+-- pause --
+Content Security Policy and Security Headers.
+
+CSP is the single most effective XSS defense the browser gives you. Start in Content-Security-Policy-Report-Only mode, watch the violation reports, then promote to enforcing.
+
+-- pause --
+Two-step rule.
+
+Validate input on the way in (allow-list, not deny-list).
+Encode output on the way out (HTML, JS, URL contexts each need different encoding).
+
+Razor automatically HTML-encodes interpolated values:
+
+For SPAs returning Jason, the browser does not interpret the response body as HTML, but it will interpret the response if you echo user input into a server-rendered page or into innerHTML. Always encode at the rendering boundary.
+
+-- pause --
+With parameterization (correct).
+
+Rule: if you find yourself building sequel by string concatenation with user input, you are writing a vulnerability. Period.
+
+-- pause --
+User Secrets (dev only).
+
+Stored at %APPDATA%\Microsoft\UserSecrets\\secrets.json, never committed.
+
+-- pause --
+Azure Key Vault + Managed Identity.
+
+Managed Identity = no secret to manage the secret store. The V M or Function or Container has an identity Azure issues; Key Vault grants get to that identity.
+
+-- pause --
+Rate Limiting (dot NET 7+).
+
+Pair the in-process limiter with an upstream WAF / Front Door rate limit for defense in depth.
+
+-- pause --
+Common Pitfalls.
+
+Storing J W T signing key in source control. Anyone with the repo can mint tokens.
+Using HS256 with a short, guessable key. HMAC keys must be at least 32 random bytes; or use RSA or ECDSA.
+Defaulting ClockSkew to 5 minutes silently. Tokens live up to 5 minutes past their exp. For short-lived flows, drop to 1, 2 minutes.
+Disabling ValidateLifetime "for tests". That config ships to prod sooner or later.
+Putting PII or secrets in J W T payload. A J W T is signed, not encrypted. Anyone who intercepts it reads it.
+Forgetting app.UseAuthentication() before UseAuthorization() (or omitting it). Authorization sees an anonymous principal and silently 401 seconds every request, or worse, allows anonymous if the policy is poorly written.
+[Authorize] on the controller, anonymous endpoint added later. Default to [Authorize] globally and require explicit [AllowAnonymous] opt-in.
+cores AllowAnyOrigin + AllowCredentials. The framework will throw, but devs work around it by reflecting the request origin, which is equivalent to allowing every origin and breaks the security model.
+Validating input at the controller but trusting it deeper. Validate at the boundary; treat anything past the boundary as already-checked.
+Logging full request bodies including passwords / tokens. Use a redacting logger; assert in CI that your log pipeline does not contain headers like Authorization.
+
+-- pause --
+Best Practices.
+
+Default deny. Add [Authorize] globally; opt-in to anonymous with [AllowAnonymous]. Mistakes default to "locked" rather than "open".
+Short access tokens, longer refresh tokens. 15 min access / 7 day refresh, refresh tokens single-use and server-tracked.
+Use Authorization Code flow with PKCE for all browser-based OIDC. Implicit flow is deprecated.
+Centralize validation logic. A TokenValidationParameters instance per environment, loaded from configuration, never hand-rolled per controller.
+Treat secrets as deployment artefacts, not source. User Secrets locally; Key Vault / Secrets Manager in prod; Managed Identity to access them.
+Rotate keys with a grace window. Maintain a list of acceptable signing keys with kid (key id) headers; introduce new keys before old ones expire.
+Threat-model before coding. STRIDE the new endpoint; ask "spoofing, tampering, repudiation, info disclosure, DoS, elevation of privilege".
+Pin T L S to 1.2+ and prefer 1.3. Disable protocols < T L S 1.2 in operating system / Kestrel config; modern dot NET defaults are good but verify.
+Layer rate limits. WAF / Front Door at edge, A S P dot NET RateLimiter per service, application-level throttles per business rule (for example, 5 password resets / hour).
+Audit security-relevant events. Log login success or fail with user id, IP, UA; ship to SIEM; alarm on anomalies (for example, 100 failed logins from one IP).
+Hash passwords with a slow KDF. Argon2id (preferred) or PBKDF2 with at least 600k iterations (2026 OWASP guidance). Never SHA-256, never MD5.
+Constant-time compare for tokens / hashes. Use CryptographicOperations.FixedTimeEquals, not ==, when comparing secrets.
+
+-- pause --
+Scenario 1: Securing a Public A P I for Partner Integrations.
+
+Need: Third-party partners call your A P I on behalf of their customers; you must isolate one partner's traffic from another's.
+
+Implementation outline:
+
+-- pause --
+Scenario 2: Multi-Tenant Data Isolation.
+
+Add an integration test that calls /api or orders as tenant A and asserts that no row from tenant B appears in any response, make this a CI gate.
+
+-- pause --
+Scenario 3: Defending Against Credential Stuffing.
+
+Threat: Attacker has 10M leaked email or password pairs from another breach. They try them all against your /login.
+
+Layered defense:
+
+-- pause --
+Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, J W T validation.
+
+Q: Walk me through every step the server performs to validate an incoming J W T.-- think --
+
+A: (1) Parse header or payload or signature from base64url; (2) verify the signature with the configured key (or fetch from JWKS endpoint, cached) using the algorithm declared in the header, but enforce that algorithm matches the expected set, never trust the header alone;
+(3) check exp (not expired), nbf (not before now), with bounded ClockSkew; (4) check iss matches ValidIssuer; (5) check aud matches ValidAudience; (6) build ClaimsPrincipal from the payload claims.
+
+Cross-Q: What's the "alg = none" attack and how does dot NET prevent it?-- think --
+
+A: An attacker submits a token whose header declares "alg": "none" and ships an unsigned payload. A naive validator that reads the algorithm from the header would accept anything.
+dot NET's JwtBearer validates against the algorithms supported by the signing key, IssuerSigningKey is a SymmetricSecurityKey or RsaSecurityKey, not an algorithm string, so the alg field is constrained. Also: TokenValidationParameters.ValidAlgorithms lets you pin the allowed set explicitly.
+Never trust the header.
+
+Cross-Q²: I set ClockSkew = TimeSpan.Zero to be strict. What goes wrong?-- think --
+
+A: NTP drift between auth server and A P I server (or between client device and server) routinely causes 100 milliseconds-2 seconds of clock skew.
+With zero tolerance, tokens issued at T set to 0 with exp set to 15min will fail validation around T set to 14:58 to T set to 15:02 depending on which side is fast, random 401 seconds for legitimate users near token expiry.
+The default 5 minutes is too lax for short-lived tokens; 1-2 minutes is the right balance.
+Pair with refresh-token rotation so brief skew failures self-heal on next request.
+
+-- pause --
+Drill 2, O auth 2.0 Authorization Code + PKCE.
+
+Q: Walk me through Authorization Code flow with PKCE for a single-page app signing in with Google.-- think --
+
+A: (1) SPA generates a random code_verifier (43-128 chars) and its SHA-256 hash code_challenge. (2) Redirects the browser to Google's /authorize with response_type set to code, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method set to S256.
+(3) User authenticates with Google; Google redirects back to redirect_uri?code set to xyz and state=.. (4) SPA POSTs /token with the code plus the original code_verifier. (5) Google hashes the verifier, compares to the stored challenge, match means same client.
+(6) Google returns access_token + id_token + optional refresh_token.
+
+Cross-Q: Why PKCE? What attack does it prevent that plain Authorization Code doesn't?-- think --
+
+A: Authorization code interception. A malicious app on the same device (or a man-in-the-middle on a non-H T T P S redirect URI like captures the code in the redirect. Without PKCE, the attacker can exchange that code for tokens, auth server has no way to know it's not the legitimate client.
+PKCE binds the code to the original code_verifier that only the legitimate client knows. Without it, the token exchange fails. PKCE replaces the client_secret for public clients (SPAs, mobile apps) that can't keep secrets.
+
+Cross-Q²: Why has Implicit Flow been deprecated?-- think --
+
+A: Implicit returned tokens directly in the URL fragment after authentication, no code exchange step. The token was exposed in browser history, referer headers, JS-accessible URL, and there was no way to securely deliver a refresh token.
+Authorization Code + PKCE replaces it for SPAs in 2026: the code is exchanged server-to-server (or via fetch with cores), tokens never appear in the URL, and refresh-token-with-rotation is supported.
+O auth 2.1 / O auth 2.0 Security BCP both prescribe PKCE for all O auth clients now, not just public ones.
+
+-- pause --
+Drill 3, O auth 2.0 versus OIDC.
+
+Q: What does OpenID Connect add that O auth 2.0 doesn't have?-- think --
+
+A: Identity. O auth 2.0 is an authorization framework, it gives you an access token to call A P Is on a user's behalf, but it does not tell you who the user is in a standard way.
+OIDC adds an id_token (a signed J W T) with standardized claims ( sub, name, email, iss, aud, exp, auth_time, nonce ) and a /userinfo endpoint. The id_token is for the client to consume (proves who logged in); the access_token is for resources to consume (proves what the bearer can do).
+
+Cross-Q: If I get both an id_token and an access_token, which do I send to my A P I?-- think --
+
+A: The access_token, every time. The id_token is a single-use authentication assertion for the client, with claims about the user, the A P I should never validate it as a bearer token.
+Sending the id_token to an A P I is a common misconfiguration that "works" because both are JWTs signed by the same issuer, but the aud and sub semantics differ and you lose scope-based authorization. Audience-bind your access tokens, validate aud strictly.
+
+Cross-Q²: What's the nonce parameter in OIDC for?-- think --
+
+A: Replay protection for the id_token. The client generates a random nonce, sends it in the /authorize request, the IdP includes it in the returned id_token. The client validates nonce matches what it sent, if an attacker replays a stolen id_token, it won't have the new nonce for the current login.
+Distinct from state (CSRF protection between the redirects) and from PKCE (code interception protection during code exchange). All three are needed for a hardened flow.
+
+-- pause --
+Drill 4, J W T versus session cookies.
+
+Q: It's 2026, when should I use J W T and when should I use a session cookie?-- think --
+
+A: Session cookie: server-rendered apps (Razor Pages, M V C, Blazor Server) with a single domain, when you need easy revocation and trust the browser to handle attachment.
+J W T: cross-origin clients (SPAs on a different domain, mobile, partners), microservices passing identity hop-to-hop, federated auth. Both: SPA-with-B F F pattern, the B F F holds the OIDC session cookie, the SPA never sees a token directly, the B F F forwards calls to A P Is with JWTs.
+
+Cross-Q: JWTs can't be revoked, isn't that a deal-breaker?-- think --
+
+A: Mitigated, not solved. Standard answer: keep access tokens short (5-15 min) so the revocation window is small, plus maintain a server-side denylist keyed by jti for high-value revocations (admin logout, security incident).
+Refresh tokens are long-lived but server-stored, so they can be revoked instantly, and rotation + reuse detection invalidates a whole token family if a stolen refresh token is replayed. The combination gets you fast-enough revocation without giving up the statelessness benefit on the read path.
+
+Cross-Q²: B F F pattern, why is it considered the safe SPA architecture in 2026?-- think --
+
+A: B F F (Backend-for-Frontend) keeps the OIDC session as an H T T P-only cookie between the browser and the B F F. The browser never sees access or refresh tokens, XSS can't steal them, no local Storage exposure.
+The B F F stores tokens server-side, forwards A P I calls with Authorization: Bearer., handles refresh transparently. Trade-off: you operate a stateful component (the B F F) and lose pure-static-SPA deployability. OWASP and Duende both recommend B F F for any SPA touching sensitive data.
+
+-- pause --
+Drill 5, CSRF.
+
+Q: Explain CSRF and when you need anti-forgery tokens.-- think --
+
+A: Cross-Site Request Forgery: a malicious site causes a logged-in user's browser to submit a state-changing request to your site. The browser auto-attaches the user's session cookie; your server thinks the user intended the action.
+Anti-forgery tokens (per-session unique values embedded in your forms or headers) defeat this, the attacker's page can't read your token due to same-origin policy, so the request arrives without it and gets rejected.
+
+Cross-Q: My A P I is J W T-only with no cookies. Do I still need CSRF protection?-- think --
+
+A: Generally no for classic CSRF, the browser does not auto-attach Authorization: Bearer headers, so a cross-site form post lands at your A P I without the token.
+But: (1) if you also accept cookie auth on the same endpoints, you're vulnerable; (2) WebSocket / SignalR upgrade requests carry cookies even with token auth, so the upgrade endpoint may need protection;
+(3) sensitive POST forms with <form action=" from a hostile site won't carry the token, but if your cores is misconfigured ( Access-Control-Allow-Origin: * with credentials), things get bad.
+Belt and braces: SameSite set to Strict cookies + J W T in headers + strict cores.
+
+Cross-Q²: What's the relationship between SameSite cookies and CSRF?-- think --
+
+A: SameSite set to Lax (modern browser default) means cookies aren't sent on cross-site POST requests, only on top-level GET navigations. This kills most classic CSRF without any token at all.
+SameSite set to Strict is even stricter, no cookies on any cross-site request, including following an external link.
+The catch: legacy clients (old browsers, embedded webviews) don't honor SameSite, and some legitimate cross-site flows (federated auth callbacks) require Lax not Strict. Anti-forgery tokens remain the belt; SameSite is the braces.
+
+-- pause --
+Drill 6, XSS prevention.
+
+Q: How does A S P dot NET Core's Razor engine prevent XSS by default, and where can it still go wrong?-- think --
+
+A: Razor's @expression syntax automatically HTML-encodes the output using HtmlEncoder.Default, alert(1) becomes and lt;script and gt;. and lt;/script and gt;. The escape hatch is @Html.Raw(.) which trusts the string as-is.
+XSS still happens when (1) you pass user content to Html.Raw, (2) you build HTML strings server-side and write them through Html.Raw, (3) you inject user data into JavaScript context ( var x = '@Model.Name'; ), HTML encoding doesn't escape JS context.
+
+Cross-Q: How do you safely inject server data into JavaScript?-- think --
+
+A: Use JavaScriptEncoder.Default.Encode for JS string context, or, far better, serialize via Jason and parse in JS: var x = @Html.Raw(JsonSerializer.Serialize(model));. System.Text.Json escapes characters that could break out of a JS string by default.
+Even safer: emit data into a {.} block, parse in JS with Jason.parse(document.getElementById('data').text Content), full HTML encoding still applies and no JS execution happens until you explicitly parse.
+
+Cross-Q²: How does Content-Security-Policy fit in as XSS defense?-- think --
+
+A: CSP is the last line, even if some encoding gap lets an attacker inject, CSP can refuse to execute it. script-src 'self' blocks inline scripts and external script tags except from your origin. Use a nonce ( script-src 'self' 'nonce-r4nd0m' ) for inline scripts you control.
+CSP doesn't fix XSS, it contains it. Treat CSP as defense in depth: encode and set CSP. Start in Content-Security-Policy-Report-Only mode, fix violations, then enforce.
+
+-- pause --
+Drill 7, H T T P S / HSTS.
+
+Q: What does Strict-Transport-Security do, and why isn't UseHttpsRedirection enough?-- think --
+
+A: UseHttpsRedirection returns a 301 or 307 from H T T P to H T T P S, but the first request to your site is still over H T T P. An attacker on the same network can intercept that initial H T T P request and never let the redirect happen (S S L strip).
+Strict-Transport-Security: max-age set to 31536000; includeSubDomains tells the browser "for the next year, always use H T T P S to this domain, even if the user types After the first H T T P S visit, the browser refuses to make H T T P requests to your domain.
+
+Cross-Q: What about the very first visit? HSTS only kicks in after the first H T T P S response.-- think --
+
+A: The "trust on first use" gap. Mitigation: HSTS preload, submit your domain to hstspreload.org, browsers ship with your domain on a preloaded list, no H T T P attempt is ever made even on the first visit. Catch: removing yourself from the preload list takes months and propagates slowly.
+Only preload when every subdomain (including future ones) is H T T P S-ready. Don't preload a domain you might want to roll back.
+
+Cross-Q²: I set max-age set to 31536000; includeSubDomains; preload. What's the failure mode if internal example com doesn't support H T T P S?-- think --
+
+A: After the first visit to example.com, the browser refuses to load at all, and there's no cert to fall back to, so H T T P S fails too. Users see "site can't be reached" with no workaround. Worse, once preloaded, this hits users who've never visited any subdomain.
+The fix is to roll out HSTS without includeSubDomains first, verify every subdomain works on H T T P S, then add includeSubDomains, then (much later) consider preload.
+
+-- pause --
+Drill 8, Secrets management.
+
+Q: Local User Secrets versus Azure Key Vault versus environment variables, when each?-- think --
+
+A: User Secrets ( dotnet user-secrets set ): local development only. Stored outside the repo at %APPDATA%\Microsoft\UserSecrets\\secrets.json. Never deployed. Environment variables: containers, C I C D pipelines, simple deployments.
+Easy but visible to anyone with shell access to the host; not auditable per-secret. Key Vault / A W S Secrets Manager: production.
+Auditable access, rotation, fine-grained R B A C, separation of "who can deploy" versus "who can read secrets." The app authenticates via Managed Identity / IAM role, no bootstrap secret on disk.
+
+Cross-Q: What's the bootstrap problem and how does Managed Identity solve it?-- think --
+
+A: "How does my app authenticate to Key Vault to read secrets without a secret to authenticate with?" In the bad old days you stored a Key Vault client ID + secret in appsettings.json, defeating the purpose.
+Managed Identity: Azure assigns the V M or Function or Container an identity at the platform level. The token is fetched from (the IMDS endpoint, only reachable from inside the V M). Key Vault grants the Managed Identity read access. No secret on disk, ever. A W S equivalent: IAM roles + STS.
+
+Cross-Q²: Someone commits a connection string to git. What's the response?-- think --
+
+A: (1) Rotate the credential immediately, assume it's compromised the moment it hit GitHub, regardless of whether the repo is public.
+(2) Force-push or use git filter-branch / BFG to remove from history (but the leak still exists in any clone made between commit and rewrite, rotation is the real fix). (3) Add a git-secrets or gitleaks pre-commit hook so it can't happen again.
+(4) Audit access logs on the credential's resource for the time it was exposed. (5) Move the secret to Key Vault. Don't skip rotation: secrets in public git get scraped by bots within minutes.
+
+-- pause --
+Drill 9, OWASP Top 10 in A S P dot NET Core.
+
+Q: Name the OWASP Top 10 vulnerability most commonly mishandled in A S P dot NET Core, and how to prevent it.-- think --
+
+A: A01, Broken Access Control.
+The classic miss: an authenticated user can fetch anyone's order by guessing IDs ( GET /api or orders or 42 ) because the controller only checks [Authorize], not "does this user own order 42?" Fix:
+resource-based authorization via IAuthorizationService.AuthorizeAsync(User, order, "OrderOwner") or query-time filters ( db.Orders.Where(o goes to o.OwnerId == user Id) ).
+Default deny; explicit allow per resource.
+
+Cross-Q: How does A03, Injection map to dot NET? Isn't E F Core safe by default?-- think --
+
+A: E F Core link is parameterized, safe. The escape hatches are dangerous: FromSqlRaw($"SELECT * FROM Users WHERE Email = '{email}'") (string interpolation into raw sequel) and ExecuteSqlRaw($"."). Use FromSql (formattable interpolated string, parameterized) or FromSqlInterpolated instead.
+Also: Process.Start with user input is command injection, XmlDocument with XmlResolver set is XXE, BinaryFormatter is deserialization injection (removed in dot NET 9). Injection isn't just sequel.
+
+Cross-Q²: What's the modern stand-in for A07, Authentication Failures ?-- think --
+
+A: Most app teams don't write auth from scratch anymore, they use A S P dot NET Identity, Auth0, Azure AD B2C, Cognito.
+The failure mode shifts to configuration: weak password policy, missing rate limit on /login, no account lockout, no MFA enforcement, password reset tokens that don't expire or are predictable.
+The 2026 OWASP guidance (NIST SP 800-63B): allow long passwords (no max < 64 chars), no forced rotation, check against breach databases (Have I Been Pwned k-Anonymity A P I), MFA required for admins, Argon2id for hashing (PBKDF2 with at least 600k iter as fallback).
+
+-- pause --
+Drill 10, Rate limiting.
+
+Q: Fixed window, sliding window, token bucket, concurrency, pick one for each: login endpoint, public A P I, internal R P C.-- think --
+
+A: Login: token bucket per-IP, bursts allowed (legitimate user retries on typo), refilled slowly (5 attempts per 5 min). Public A P I: sliding window per-A P I-key, smooth rate enforcement without boundary bursts, predictable for partners.
+Internal R P C: concurrency limiter, limit concurrent in-flight requests rather than rate, protects downstream DB or external services from sudden parallelism spikes.
+
+Cross-Q: What's the "boundary burst" problem with fixed-window?-- think --
+
+A: Fixed window resets at, say, every minute boundary. A client can hammer 100 requests in the last second of minute 0 and another 100 in the first second of minute 1, 200 requests in 2 seconds, but each window saw "only" 100.
+From the client's view, the rate limit is 200 or min on average but they can spike 100 times your intended throughput at boundaries. Sliding window slides the count across time and prevents this; token bucket smooths via the refill rate.
+
+Cross-Q²: An in-process rate limiter, what does it miss in a multi-instance deployment?-- think --
+
+A: Each instance enforces independently. 10 pods times 100 req or min = 1000 req or min reaching the backend through one client.
+Fixes: (1) shared distributed state (Redis-backed limiter, RedLockNet or custom INCR-with-T T L), (2) upstream limiter (A P I gateway, Front Door, Cloudflare) that sees all traffic, (3) accept the per-instance limit as a coarse circuit breaker and let upstream do precise rate control.
+dot NET's built-in RateLimiter is process-local by default; distributed variants exist as community packages.
+
+-- pause --
+Drill 11, Authentication versus Authorization.
+
+Q: Draw the bright line between authentication and authorization.-- think --
+
+A: Authentication = "who are you?", verifying identity via credentials (password, token, certificate). Output: a ClaimsPrincipal. Authorization = "what may you do?", checking the authenticated principal against a policy. Output: yes or no.
+A S P dot NET Core enforces this separation via two middlewares: UseAuthentication() populates HttpContext.User, UseAuthorization() evaluates [Authorize] attributes against it. Both must run; order matters (authentication first).
+
+Cross-Q: What happens if you UseAuthorization() without UseAuthentication() ?-- think --
+
+A: HttpContext.User is anonymous (an empty ClaimsPrincipal ). Every [Authorize] policy fails, every endpoint returns 401. Worse, if you have a default policy that allows anonymous access conditionally, it might unintentionally grant access.
+The framework emits a warning in development; production silently 401 seconds. Always: UseRouting to UseAuthentication to UseAuthorization to UseEndpoints.
+
+Cross-Q²: A request has a valid token but the user doesn't have the required role. What's the H T T P response, 401 or 403?-- think --
+
+A: 403 Forbidden. 401 means "I don't know who you are, authenticate"; 403 means "I know who you are and you can't do this." [Authorize] returns 401 when no or invalid credentials are present, 403 when credentials are valid but the policy fails.
+Clients use the distinction: 401 triggers a refresh-token attempt or re-login; 403 triggers "you don't have permission" U I without re-authenticating.
+
+-- pause --
+Drill 12, Policy versus role versus claim.
+
+Q: When do you use [Authorize(Roles=.)], [Authorize(Policy=.)], claim requirements? Compare.-- think --
+
+A: Roles: simple, coarse buckets ( Admin, User, Manager ), fewer than ~10, rarely change. Stringly-typed, no parameterization. Policy: composable named rule built from claims, requirements, custom handlers.
+The right answer for almost anything beyond "is this user an admin." Claims requirement ( RequireClaim(.) ): one-off check inside a policy. Modern guidance: define policies, even simple ones, AddPolicy("AdminOnly", p goes to p.RequireRole("Admin")). Gives you a single place to change the rule.
+
+Cross-Q: A policy needs to check "user owns the resource", that's not a claim. How do you implement it?-- think --
+
+A: Resource-based authorization. Define an IAuthorizationRequirement (for example, SameOwnerRequirement ), a handler AuthorizationHandler that inspects both the user and the resource, register the handler.
+In the endpoint, call await _auth.AuthorizeAsync(User, order, "OwnerOrAdmin"), this is imperative authorization because the resource isn't known until you've loaded it. Declarative [Authorize] can't express "owner of this specific record."
+
+Cross-Q²: How do you keep roles or permissions consistent across services in a microservices setup?-- think --
+
+A: Two patterns. (1) Claims in the J W T: at login, the identity provider embeds roles or permissions as claims. Every service reads them from the token, no extra calls. Trade-off: token bloat, stale claims (a permission revoked won't propagate until token expires).
+(2) Permission A P I call: each service calls a central "authorization service" with the user ID + resource, always fresh, but every request pays the round-trip. Hybrid: claims for coarse roles, A P I call for fine-grained per-resource permissions. Cache aggressively with short TTLs.
+
+-- pause --
+Drill 13, Refresh tokens.
+
+Q: Why rotation, and what is "reuse detection"?-- think --
+
+A: A long-lived refresh token (7-30 days) is high-value, if stolen, attacker can mint access tokens indefinitely. Rotation: every time the client uses a refresh token, the server invalidates it and issues a fresh one. The stolen token is now single-use.
+Reuse detection: if the same refresh token is presented twice (meaning either a replay or the attacker beat the legitimate client to it), the server invalidates the entire token family, the user is logged out everywhere, forcing re-authentication.
+This bounds the blast radius from a stolen refresh token.
+
+Cross-Q: How do you store refresh tokens server-side?-- think --
+
+A: Hashed (not plaintext) in a database table keyed by the hash, with UserId, IssuedAt, ExpiresAt, RevokedAt, ReplacedByTokenHash (for chaining rotations), and FamilyId (for invalidating a whole family on reuse detection).
+On refresh: hash the incoming token, look it up, check unrevoked + unexpired, mark this row revoked, insert the new token's hash, return the new token. Hash so a database leak doesn't hand attackers usable tokens; chain so audit trails work; family so reuse detection cascades.
+
+Cross-Q²: I'm running on multiple instances behind a load balancer. Where does the refresh-token store live?-- think --
+
+A: A shared, durable store, typically the relational database or Redis with persistence. Not in-memory on a single instance (every other instance would 401 on refresh) and not in a non-durable cache (a Redis restart would log everyone out).
+The refresh-token table is small, write-heavy on login or refresh, and tolerates a low-latency DB. Some teams use Redis with AOF everysec for low-latency reads with bounded loss tolerance.
+
+-- pause --
+Drill 14, Bearer token storage in the browser.
+
+Q: A junior asks where to store the access token in their SPA: local Storage or H T T P-only cookie. What's your answer?-- think --
+
+A: Neither, ideally, use the B F F pattern so the SPA never sees a token. If you must store it client-side, H T T P-only Secure SameSite set to Strict cookie with a CSRF token for state-changing requests.
+local Storage is JS-accessible, any XSS (a single unencoded user comment) exfiltrates every user's token.
+H T T P-only cookies are JS-invisible, so an XSS can still use the cookie via fetch, but can't steal it for offline use.
+
+Cross-Q: Why is the "XSS can still use the cookie" point important?-- think --
+
+A: Because H T T P-only cookies aren't a magic XSS fix. An XSS payload can fetch('/api or secret-data') from the user's browser with the cookie auto-attached, same effective access as a stolen token, but bounded to the duration of the XSS.
+Stolen local Storage tokens work from the attacker's machine, indefinitely (until expiry). H T T P-only cookies raise the cost of XSS substantially; they don't reduce it to zero. Pair with CSP, output encoding, and short token lifetimes.
+
+Cross-Q²: Is local Storage ever acceptable for tokens?-- think --
+
+A: When the trade-offs are understood and the risk is bounded, internal tools with strict CSP and no user-generated content, short-lived tokens (5 min), no PII access, and an environment where XSS would be catastrophic anyway.
+The 2026 industry consensus is "no, default to B F F or H T T P-only cookies." OWASP, NIST, and O auth 2.0 Security BCP all converge on this. If local Storage is on the table, default to "find a way to remove it."
+
+-- pause --
+Drill 15, mutual T L S.
+
+Q: When does mutual T L S beat J W T bearer for authenticating clients?-- think --
+
+A: Service-to-service in a controlled network (gateway-to-microservice, partner integrations with a known list of clients), where you need proof of client identity at the transport layer rather than at the application layer.
+The client presents a certificate; the server validates the cert chain against a known CA. No tokens to steal, no token expiry to coordinate, no bearer token in logs, and certificates can be pinned, rotated, revoked via CRL or OCSP.
+
+Cross-Q: What about user authentication, can mutual T L S replace J W T for users?-- think --
+
+A: Rarely in 2026. Client certificate enrollment on consumer devices is operationally painful (lost certs, device migration, no recovery flow). mutual T L S for users works in tightly-controlled environments (corporate-managed devices, smartcards in government or finance).
+For everyone else, J W T (with the user's auth flow being password + MFA + OIDC) is the right answer. mutual T L S shines for machines; J W T for humans.
+
+Cross-Q²: How do you implement mutual T L S in A S P dot NET Core?-- think --
+
+A: Configure Kestrel to require client certificates: services.Configure(o goes to o.ConfigureHttpsDefaults(h goes to { h.ClientCertificateMode = ClientCertificateMode.RequireCertificate; })).
+Validate the cert in AddCertificate() authentication handler, typically by checking the issuer thumbprint against an allow-list or by matching the cert's Subject against a known partner identity.
+The cert validation result populates HttpContext.User with claims from the cert, then your normal [Authorize] policies work on top. Pair with cert rotation: rotate before expiry, distribute new certs via your secret store, accept overlap.
+
+-- pause --
+Self-Test.
+
+Because JwtBearerOptions.MapInboundClaims defaults to true. Before the ClaimsPrincipal is built, the token handler rewrites known short J W T claim names to the legacy WS-\* claim types, sub becomes ClaimTypes.NameIdentifier ( email becomes ClaimTypes.Email.
+The claim is renamed, not duplicated, so a lookup by "sub" finds nothing.
+
+Production shape: nothing fails validation, nothing logs an error. The handler compares order.OwnerId.ToString() against null, never calls ctx.Succeed, and every legitimate owner gets a 403, while admins still sail through, because IsInRole("Admin") reads a different claim.
+It looks like a permissions bug, not an auth-config bug, which is why it survives triage for days.
+
+The fix is the line in the setup snippet: options.MapInboundClaims = false per scheme (or clear JsonWebTokenHandler.DefaultInboundClaimTypeMap globally).
+It isn't free, User.Identity.Name and IsInRole read TokenValidationParameters.NameClaimType / RoleClaimType, which still default to the long ClaimTypes.Name / ClaimTypes.Role.
+Turn mapping off without repointing those at the short names your issuer emits and role checks start failing the same silent way.
+
+Different parameter types. FromSqlRaw takes a plain string, so C sharp has already pasted the user's value into the text before E F Core sees it, what arrives is one opaque sequel statement with the payload baked in.
+FromSql and FromSqlInterpolated take a FormattableString: EF keeps the holes separate from the format, substitutes a generated placeholder ( @p0 ) and sends each value as a DbParameter.
+Microsoft's wording is that FromSql and FromSqlInterpolated "are safe against sequel injection, and always integrate parameter data as a separate sequel parameter", while FromSqlRaw "can be vulnerable to sequel injection attacks, if improperly used." Same split for ExecuteSql versus ExecuteSqlRaw.
+( FromSql arrived in E F Core 7; before that, FromSqlInterpolated is the equivalent.)
+
+Two things to add out loud. The compiler will not help you, FromSqlRaw($". ") compiles clean, so this is caught by review, an analyzer, or not at all.
+And parameters bind values, never identifiers: a user-chosen sort column or table name cannot be a DbParameter, so dynamic-shape sequel puts you back on FromSqlRaw with an allow-list of legal column names, an allow-list, not escaping.
+
+To keep the two failure paths indistinguishable. Skipping the hash for an unknown email is a "quick exit": that path returns immediately while the real path pays the KDF's full work factor.
+The gap is a user-enumeration oracle, an attacker replays 10M leaked addresses and, without guessing a single password, learns which ones have accounts here. Those confirmed addresses are then worth more everywhere else (phishing, reset abuse, targeted stuffing).
+OWASP's authentication guidance names both halves: a generic failure message regardless of whether the account exists, and no quick-exit logic, so the processing time doesn't differ either.
+
+Hence the shape in the code: identical Unauthorized() for "no such user" and "wrong password", and a constant dummy hash so both branches do the same work.
+Note where the 423 sits, lockout is only reported after the password verified, because "this account is locked" is itself an existence disclosure.
+Timing parity is one layer, not the defense: it is paired with per-IP and per-email rate limits, lockout with exponential backoff, CAPTCHA after N failures, and MFA, since an enumeration-proof endpoint that accepts unlimited attempts is still stuffable.
+
+Default deny in the pipeline instead of opt-in per endpoint: set a fallback policy, AddAuthorizationBuilder().SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build()), that is
+AuthorizationOptions.FallbackPolicy, so anything carrying no authorization metadata still requires an authenticated user. The forgotten attribute now 401 seconds instead of serving data.
+Semantics worth stating precisely: the fallback applies only when an endpoint has no authorization attributes at all; [Authorize] (even with no policy name) uses DefaultPolicy instead, and [AllowAnonymous] opts out, so login and health endpoints stay reachable but have to say so explicitly.
+FallbackPolicy is null by default; nothing changes until you set it.
+
+What it does not cover is A01. Broken access control is what happens after authentication succeeds: GET /api or orders or 42 with a perfectly valid token belonging to somebody else. No fallback policy, role or claim check catches that, because the rule depends on the row you just loaded.
+That needs resource-based authorization ( AuthorizeAsync(User, order, "OrderOwner") ) or a query-time filter that makes the row unreachable at all, Where(o goes to o.PartnerId == partner Id), or a global query filter on TenantId so forgetting the WHERE cannot leak across tenants.
+Default deny closes the anonymous hole; ownership rules close the horizontal one.
+
+Two independent reasons. First, it is not a secure store, Microsoft's wording is that Secret Manager "doesn't encrypt the stored secrets and shouldn't be treated as a trusted store.
+It's for development purposes only." The values sit in plain Jason at %APPDATA%\Microsoft\UserSecrets\\secrets.json ( ~/.microsoft or usersecrets//secrets.json on Linux or macOS); the only guarantee is that they live outside the project tree, so they can't be committed.
+Second, the provider isn't registered outside development at all: WebApplication.CreateBuilder adds user secrets only when the environment is Development.
+Deploy something that depends on it and Configuration["Jwt:Key"] is null in prod, which, in this page's setup code, surfaces as an ArgumentNullException out of Encoding.UTF8.GetBytes rather than a readable "missing configuration",
+and because options-configure delegates run lazily it typically fires on the first request through the authentication middleware, not at Build().
+
+Key Vault + Managed Identity adds what a file cannot: per-secret access auditing, rotation without a redeploy, R B A C that separates "can deploy" from "can read secrets", and it removes the bootstrap secret.
+The platform issues the V M or container or function an identity, the app fetches a token for it, and Key Vault grants that identity get; there is no credential on disk whose job is to protect the other credentials.
+Environment variables sit in between: fine for CI and containers, but plain text to anyone with shell access on the host and not auditable per secret.
