@@ -1,0 +1,76 @@
+-- pause --
+Section 1. 29. Hands-On Mini Project: TaskFlow A P I.
+
+-- pause --
+Project Overview.
+
+A complete Task Management rest A P I covering every concept from this guide.
+
+-- pause --
+Section 2. Self-Test.
+
+AddHostedService() registers the worker as a singleton, internally TryAddEnumerable(ServiceDescriptor.Singleton()). ITaskRepository is AddScoped, and it holds AppDbContext, which AddDbContext also registers scoped.
+A singleton constructor-injecting a scoped service is a captive dependency: one AppDbContext for the whole process lifetime.
+
+What that looks like in production: the context is never disposed until the process exits. Be precise about the failure mode here, because the folk version of this answer is wrong, a long-lived DbContext does not pin a pooled connection.
+EF "opens and closes database connections as needed - every time a query is executed - to avoid keeping connection for unnecessarily long times." What it does hold onto is the change tracker:
+every entity a tracking query loads stays referenced and stale for the life of the process, so the working set climbs and later reads hand back the cached instance instead of fresh database state.
+On this page that bites the moment the loop touches GetByIdAsync or CreateAsync, the current CleanupStaleTasksAsync uses ExecuteUpdateAsync, which tracks nothing (see Q4), so don't claim tracker growth from the cleanup query itself.
+Two consequences do land immediately: DbContext is documented as not thread-safe, so anything else resolving that same root-captured repository shares one instance and hits A second operation started on this context before a previous operation completed;
+and EF documents an InvalidOperationException as putting the context "into an unrecoverable state", with a per-iteration scope you throw that context away, with a captive one you keep it for the life of the app.
+
+When you find out depends entirely on environment. The generic host sets ValidateScopes and ValidateOnBuild to is Development, so locally it fails fast at startup with a message of the form Cannot consume scoped service 'ITaskRepository' from singleton 'Microsoft.Extensions.Hosting.IHostedService'.
+In Production both default to off, so the app starts clean and rots over hours, which is the argument for setting both flags explicitly in every environment.
+
+Note also that the scope is created inside the while loop, not outside it. Hoisting it out reproduces the same bug with extra ceremony. The unit of scope is the unit of work: using disposes it at the end of each iteration, which disposes the DbContext and drops its change tracker with it.
+
+Release() must run only on the path where a permit was actually taken. Move await _semaphore.WaitAsync(.) inside the try and the finally fires on the timeout path too, releasing a permit that was never acquired.
+new SemaphoreSlim(50) is the single-argument constructor,
+which Microsoft documents as defining no maximum: an instance built this way "doesn't throw a SemaphoreFullException exception if a call to the Release method increases the value of the CurrentCount property beyond initial Count." So the over-release is silent,
+every timed-out request ratchets the permit count upward and the limiter quietly stops limiting,
+with no exception and no log line, under exactly the load it exists for.
+( new SemaphoreSlim(50, 50) would at least make it fail loudly.)
+
+The return after writing 429 is the short-circuit: _next is never invoked, so nothing downstream runs for that request.
+
+What it limits is concurrent in-flight requests, a bulkhead, not a rate limiter; it says nothing about requests per second. Three consequences worth saying out loud.
+The permit count lives in the process, the field is static, and UseMiddleware builds a single middleware instance for the app anyway, so dropping static would not change that, which means four replicas behind a load balancer have a real cap of 200.
+It is global rather than per-client or per-route, so one caller in a loop can hold all 50 permits and starve everyone else. And the 5-second WaitAsync timeout means a rejected caller waits five seconds for its 429 while holding a connection, you queue instead of shedding.
+WaitAsync at least doesn't block a thread-pool thread the way Wait() would. For real policy, A S P dot NET Core's built-in rate limiting middleware ( AddRateLimiter / UseRateLimiter, dot NET 7+) gives you partitioned per-key limits.
+
+The pipeline is nested, so a middleware can only catch exceptions thrown by components registered after it. Registered first, it wraps everything.
+Move it UseCors and failures in RequestLoggingMiddleware, UseHttpsRedirection and the cores middleware escape past it entirely: no LogError, no Jason body, and the caller gets whatever the host produces. The switch mapping KeyNotFoundException to 404 and friends simply never runs for those.
+
+The second half is the one candidates miss. The handler sets context.Response.StatusCode after await _next(context) has thrown.
+If anything downstream already flushed headers, a partially streamed result, a WriteAsync before the failure, that assignment throws InvalidOperationException: StatusCode cannot be set because the response has already started.
+, Kestrel's HttpProtocol.StatusCode setter checks HasResponseStarted and formats CoreStrings.ParameterReadOnlyAfterResponseStarted.
+Microsoft's error-handling guidance states the constraint plainly: once the headers for a response are sent, the app can't change the response's status code, exception pages or handlers can't run, and the response must be completed or the connection aborted.
+The original exception is lost and replaced by a second one, and the client sees a truncated response carrying whatever status was already on the wire. The production-grade version guards first:
+
+One more thing to flag on this handler: it writes ex.Message straight into the response body. That leaks connection strings, table names and schema detail to callers. Return a problem-details payload with a correlation ID and keep the message in the log.
+
+UpdateAsync never touches its task parameter; it just calls SaveChangesAsync. That works only when task is still tracked by this repository's AppDbContext, loaded earlier in the same scope via GetByIdAsync (a tracking query) and mutated in place, so the tracker can diff it against its snapshot.
+It silently does nothing for an entity that came from GetAllAsync, because that query is AsNoTracking(), and the docs are unambiguous: "The change tracker will not track any of the entities that are returned from a link query.
+If the entity instances are modified, this will not be detected by the change tracker and SaveChanges() will not persist those changes to the database." Same for an entity model-bound from a request body, or loaded in a different scope.
+SaveChangesAsync returns 0, throws nothing, the controller reports success, and the write vanishes.
+Fix the signature's lie: either attach the argument ( _db.Tasks.Update(task) or _db.Entry(task).State = EntityState.Modified, both mark every property modified, so the UPDATE writes all columns), or drop the parameter and document the tracked-entity contract.
+
+ExecuteUpdateAsync fails the other way. It is the right tool here, a single UPDATE. WHERE at the database, no rows materialised, no per-entity tracker work, which is what archiving a potentially large slice of the table needs.
+But EF's docs are explicit that these methods "take effect immediately, at the point in which they are invoked" and are "completely unaware of EF's change tracker,
+and have no interaction with it whatsoever." So any TaskItem already loaded in that same context keeps its stale in-memory Status and a later SaveChanges will happily overwrite the archive; nothing living in a SaveChanges override or interceptor runs (audit stamps, domain events,
+soft-delete conversion); and because it never touches the tracker it "cannot automatically apply concurrency control", no RowVersion check, it is a blind overwrite.
+It also starts no transaction of its own, and each call is its own round trip. The int it returns is the rows-affected count, which is exactly what the cleanup service logs.
+
+On this page the two paths don't collide, because the cleanup runs in its own scope with its own AppDbContext, that isolation is the second thing CreateScope() buys you.
+
+Why synchronise at all: it is registered AddSingleton, so one instance serves every concurrent request.
+Dictionary supports multiple concurrent readers only as long as nothing modifies it; Microsoft's remarks are that to access it "by multiple threads for reading and writing,
+you must implement your own synchronization." Remove the lock and you don't get a clean exception, you get corrupted internal state, so the symptoms are lost or wrong entries and hard faults inside a lookup, on one server, under load, never reproducible locally.
+
+lock versus ConcurrentDictionary: ConcurrentDictionary uses fine-grained locking for writes and performs reads lock-free, so a read-heavy cache scales far better than this design, where every GetTask serialises behind one monitor shared by every request in the process.
+The explicit lock earns its place only when you need several operations to be atomic together, read one key and conditionally write another, say, which ConcurrentDictionary cannot give you.
+(And note its GetOrAdd / AddOrUpdate delegates are invoked outside the lock, so a factory can run more than once for the same key.)
+
+The bug as written: nothing evicts. SetTask grows the dictionary with no size cap and no expiry, and only InvalidateTaskCache(), called on create, clears it.
+A singleton lives for the process lifetime, so this is an unbounded cache in a long-running server: working set climbing until the container hits its memory limit and gets OOM-killed. That is what IMemoryCache with SizeLimit and an expiration policy exists for.
+A second smell in the same wiring: TaskService.CreateTaskAsync only ever invalidates, and nothing on this page calls GetTask or SetTask, as assembled, the cache costs a lock and memory and returns nothing.

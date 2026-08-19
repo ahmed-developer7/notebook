@@ -1,0 +1,324 @@
+-- pause --
+Section 1. 17. A S P dot NET Core Concepts (1-25).
+
+-- pause --
+1. dot NET Core versus dot NET Framework.
+
+See dot NET Fundamentals for detailed comparison.
+
+-- pause --
+3-10. Middleware, D I, Configuration.
+
+See Dependency Injection and Middleware for detailed coverage.
+
+-- pause --
+12. Entity Framework Core.
+
+See Entity Framework Core.
+
+-- pause --
+14-15. Async Programming and Request Pipeline.
+
+See Async or Await and Middleware.
+
+-- pause --
+16. Microservices.
+
+See Microservices and A P Is.
+
+-- pause --
+19. D I Lifetimes.
+
+See Dependency Injection.
+
+-- pause --
+21-22. BackgroundService and Generic Host.
+
+See Section 17.13.
+
+-- pause --
+Section 2. 28. Concept Mind Map.
+
+dot NET 10 / A S P dot NET Core Mind Map.
+
+Learning Path.
+
+Beginner: C sharp Types -> var or dynamic -> Inheritance -> D I Basics.
+Intermediate: async or await -> E F Core -> Middleware -> link.
+Advanced: garbage collector Internals -> Thread Pool -> Sync Primitives -> Microservices -> G R P C -> Performance Tuning.
+
+-- pause --
+Section 3. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+The earlier sections of this session give one-liner facts and scenario primers. This section is different: it's meta-drills that cut across multiple deep-dive topics, the way senior interviewers actually compose questions. Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant deep-dive file (the topic anchors are linked from the Foundations README).
+
+-- pause --
+Drill 1, Async + D I + scoping interplay.
+
+Q: I have a Scoped service injected into a controller. I await a DB call. After the await, my service's state seems wrong. What happened?-- think --
+
+A: Most likely you're confusing scope with thread affinity. A Scoped service lives for one H T T P request, that includes across awaits. The same instance is used before and after await.
+So state didn't change because of the await; some other code mutated it (for example, a background task captured the scope, or you fired off a fire-and-forget call that shared the service).
+
+Cross-Q: I do _ = Task.Run(() goes to _scopedService.DoWork()) from a controller. Why does this misbehave?-- think --
+
+A: Task.Run schedules on the thread pool. The Scoped service is captured by the lambda, but when the H T T P request completes, its scope is disposed. Your background task now holds a reference to a disposed DbContext (typical inner Scoped dep), first DB call throws ObjectDisposedException.
+Fix: inject IServiceScopeFactory, create a new scope inside Task.Run, resolve the service from that scope.
+
+Cross-Q²: How does IHttpContextAccessor interact with async?-- think --
+
+A: It uses AsyncLocal under the hood, so the HttpContext flows across await automatically, same logical request, same context. But: in a Task.Run callback or a BackgroundService, there's no HttpContext (the request has either ended or never existed).
+Accessing HttpContextAccessor.HttpContext there returns null. The Scoped service + HttpContext flow is request-only.
+
+-- pause --
+Drill 2, Caching + concurrency canonical pattern.
+
+Q: What's the canonical async-safe "get-or-fetch" cache pattern?-- think --
+
+A: A ConcurrentDictionary>> (or AsyncLazy ). Two callers race for the same key: both see the same Lazy>, both await the same Task, the fetch happens once. Avoids the "stampede" of N parallel fetches for the same uncached key.
+
+Cross-Q: What happens if the fetch throws?-- think --
+
+A: The Task becomes faulted; all await ers see the exception. Crucially, the faulted Task stays in the cache, every subsequent caller gets the same exception. You usually want negative caching with short T T L (or: remove from cache on fault).
+Pattern: wrap in a custom helper that removes the entry on Task.IsFaulted.
+
+Cross-Q²: How does this interact with IMemoryCache.GetOrCreateAsync ?-- think --
+
+A: IMemoryCache.GetOrCreateAsync is not stampede-safe by default, two simultaneous misses both call the factory.
+To make it safe, wrap factory invocation with a SemaphoreSlim keyed by cache key, or use Microsoft.Extensions.Caching.Hybrid (HybridCache, dot NET 9+) which is stampede-safe out of the box.
+HybridCache is the modern answer; pre-9, the manual ConcurrentDictionary+Lazy pattern is the canonical one.
+
+-- pause --
+Drill 3, Exception handling across async + middleware.
+
+Q: An async background task throws inside a BackgroundService. What does A S P dot NET Core's exception middleware see?-- think --
+
+A: Nothing. Exception middleware is in the H T T P pipeline, it only sees exceptions from H T T P request handling.
+A BackgroundService runs outside that pipeline; if its ExecuteAsync throws, the host logs BackgroundServiceExceptionBehavior (default: ignore in dot NET 6, stop-host in dot NET 6+ with BackgroundServiceExceptionBehavior.StopHost ).
+
+Cross-Q: How do I get those exceptions surfaced and recorded?-- think --
+
+A: Wrap your ExecuteAsync body in try or catch and log explicitly via ILogger. Optionally: configure BackgroundServiceExceptionBehavior.StopHost to fail-fast on unhandled background exceptions (forces a pod restart via Kubernetes, clean recovery).
+For retryable transient failures, catch + log + delay + retry inside the loop.
+
+Cross-Q²: An IExceptionHandler in the H T T P pipeline catches a OperationCanceledException from a downstream HttpClient. What's the right response?-- think --
+
+A: Depends on who canceled. If HttpContext.RequestAborted.IsCancellationRequested is true, the client gave up, return 499 (or just don't respond; the connection is gone). If your own timeout fired, return 504 Gateway Timeout. Pattern: in the handler, check the token; map accordingly.
+Don't log either at error level, both are expected behavior.
+
+-- pause --
+Drill 4, Modern C sharp + E F Core.
+
+Q: I model EntityName as a record class to get value equality. E F Core complains. What's going on?-- think --
+
+A: E F Core's change tracker uses reference equality to identify entity instances. A record class overrides Equals for value equality, which confuses the tracker, two entities with the same property values look like "the same entity" to the change tracker, leading to inconsistent state updates.
+Rule: use class (not record ) for EF-tracked entities. Use record for DTOs or value objects that leave the EF boundary.
+
+Cross-Q: Can I use init -only setters on EF entities?-- think --
+
+A: Mostly yes for new entities (E F Core 7+ supports init setters via reflection). But: change-tracked properties need to be mutable for EF to apply updates loaded from the DB. So init works for keys (set once at creation) but not for any property EF needs to update.
+Practical convention: init for Id and immutable fields; set (private set if you want encapsulation) for everything else.
+
+Cross-Q²: How do positional records and EF migrations get along?-- think --
+
+A: Poorly for entities. The auto-generated constructor takes parameters in declaration order; EF's migrations don't know about it. You'd have to add [PersistedConstructor] or write a parameterless ctor for materialization.
+Just don't use positional records for entities, use them for the query result types ( record class CustomerSummary(int Id, string Name, int OrderCount) ) returned by Select projections instead.
+
+-- pause --
+Drill 5, Generics + D I + open generics.
+
+Q: I register services.AddScoped(typeof(IRepository<>), typeof(EfRepository<>)). What does this enable?-- think --
+
+A: Open generic registration, for any IRepository the D I container resolves to EfRepository with the same T. Saves you from registering one closed generic per entity type. IRepository to EfRepository, IRepository to EfRepository, all from one line.
+
+Cross-Q: Why isn't this the default for all generic services?-- think --
+
+A: Because not every generic class can be safely instantiated for every T. Some implementations have constraints ( where T: IEntity ) that D I can't easily enforce, or some need a per-T configuration. Open generic registration is opt-in; you decide which generics are universal.
+
+Cross-Q²: What's the catch with open generics and A O T?-- think --
+
+A: Open generic resolution uses reflection at runtime, D I walks the type to construct the closed generic. A O T can trim that reflection metadata, breaking resolution.
+Workaround: explicit closed-generic registrations ( AddScoped, EfRepository>() ) for each known type, or use source-generated D I containers (Microsoft.Extensions.DependencyInjection.SourceGeneration in preview) that emit the registrations at compile time.
+
+-- pause --
+Drill 6, Records + serialization gotchas.
+
+Q: I have record User(string Name, [property: JsonIgnore] string SecretKey). Does the attribute apply?-- think --
+
+A: Yes, [property: JsonIgnore] targets the auto-generated property. Without property: the attribute would attach to the constructor parameter, which isn't a serialization target.
+This is the canonical "attribute on a record-positional-param" gotcha; without the prefix the attribute silently does nothing.
+
+Cross-Q: Can System.Text.Json deserialize positional records?-- think --
+
+A: Yes (since dot NET 5 with the appropriate ctor matching). The deserializer looks for a constructor whose parameter names match Jason property names case-insensitively. Required members (C sharp 11 required ) are honored in dot NET 8+.
+Trap: if you have multiple constructors, mark the one for deserialization with [JsonConstructor].
+
+Cross-Q²: What's different about record struct for Jason?-- think --
+
+A: Boxing, a record struct boxes when deserialized through the non-generic object A P I path. The generic A P I ( JsonSerializer.Deserialize(.) ) avoids the box. Use generics consistently.
+Also: record struct doesn't have inheritance; if you have a polymorphic Jason shape, record struct won't work, fall back to record class.
+
+-- pause --
+Drill 7, Async streams + cancellation.
+
+Q: I have IAsyncEnumerable. The consumer cancels mid-iteration. What happens server-side?-- think --
+
+A: The compiler-generated state machine observes the cancellation token (passed via [EnumeratorCancellation] ) and stops producing. The await foreach exits with OperationCanceledException.
+Critical: the producer must honor the token, yield return is a suspension point, but doesn't itself check cancellation. Pass the token to any awaitable I O inside the iterator.
+
+Cross-Q: How does [EnumeratorCancellation] work?-- think --
+
+A: It's a parameter attribute on the CancellationToken parameter of an async IAsyncEnumerable method. The C sharp compiler wires the WithCancellation(.) call from the consumer into that parameter. Without the attribute, the token passed to WithCancellation is silently ignored.
+Compile-time gotcha: forgetting the attribute fails silently, no compile error, just no cancellation.
+
+Cross-Q²: A S P dot NET Core minimal A P I endpoint returning IAsyncEnumerable. Does H T T P request cancellation flow into it?-- think --
+
+A: Yes, the framework wires HttpContext.RequestAborted into the iterator's EnumeratorCancellation parameter automatically. So a client disconnecting ( fetch.abort(), tab closed, network drop) cancels the producer mid-stream.
+This is what makes server-sent streams over H T T P correct, no orphaned producers.
+
+-- pause --
+Drill 8, Middleware ordering with auth + cores + exception handling.
+
+Q: What's the correct order: ExceptionHandler, H T T P S Redirect, cores, Authentication, Authorization, MapEndpoints?-- think --
+
+A: ExceptionHandler first (so it catches everything below) to H T T P S Redirect to Routing ( UseRouting ) to cores (after routing so it knows the endpoint's policy) to Authentication to Authorization to MapControllers / MapEndpoints.
+Order is meaningful: each middleware sees only what flows through it.
+
+Cross-Q: Why does cores go after routing?-- think --
+
+A: Because cores policies can be per-endpoint ( [EnableCors("policy")] attribute). The routing middleware identifies the endpoint, then cores inspects the endpoint's metadata to pick the right policy. Pre-routing cores could only apply a global policy.
+In dot NET 7+ the framework actively warns if you put cores before routing.
+
+Cross-Q²: Where do UseRateLimiter and UseOutputCache go?-- think --
+
+A: UseRateLimiter typically after routing, before auth, rate-limit unauthenticated requests too. UseOutputCache after authorization if the cache key includes user identity, before authorization if cache is purely URL-based and you want to skip the auth cost for cached responses.
+Decision depends on whether cache should be per-user.
+
+-- pause --
+Drill 9, garbage collector + async memory pressure.
+
+Q: My app's Gen 2 collections are firing too often. The async workload allocates ~5MB per request. What's the likely cause?-- think --
+
+A: Async state machines for chained awaits each allocate (one per async method). String allocations from string.Format or interpolation. List resizing. Jason serialization buffers.
+Per-request 5MB of garbage is high, investigate with dotnet-trace and the GCMemory ETW provider to spot the largest sources.
+
+Cross-Q: How does ValueTask reduce allocation?-- think --
+
+A: When the async method completes synchronously (cached value, fast path), ValueTask is a struct on the stack, zero heap allocation. When the path is genuinely async, ValueTask wraps a Task (one allocation, same as before).
+Use ValueTask for paths where at least 80% of calls return synchronously (cache hit, in-memory lookup). For paths that always touch I O, plain Task is fine, same allocation cost either way.
+
+Cross-Q²: When is ArrayPool the right tool?-- think --
+
+A: For large, short-lived buffers used in hot paths: parsing, serialization, scratch space. Rent, use, return. The pool eliminates the garbage collector pressure of repeated new byte[8192] calls.
+Anti-pattern: not returning to the pool, the array becomes effectively private and pool is no better than new.
+Pattern: try or finally around the rented array to guarantee return.
+
+-- pause --
+Drill 10, Threading primitives in async code.
+
+Q: I need mutual exclusion in async code. lock or SemaphoreSlim ?-- think --
+
+A: SemaphoreSlim (with WaitAsync(1) ). lock doesn't work across await, the lock is thread-scoped, and await may resume on a different thread. SemaphoreSlim is async-aware and lets you await semaphore.WaitAsync() then release in finally.
+
+Cross-Q: Can I use Monitor.Enter / Monitor.Exit manually for finer control?-- think --
+
+A: Same issue, Monitor is thread-affine. After await, you may not be on the thread that entered the monitor, and Exit throws SynchronizationLockException. Don't try to make Monitor work across await; that path leads to deadlocks.
+Use SemaphoreSlim or, for read-heavy scenarios, AsyncReaderWriterLock (from third-party libraries, not in BCL).
+
+Cross-Q²: When is Interlocked (lock-free) appropriate in async code?-- think --
+
+A: For single-variable atomic updates: counters, flags, single-pointer CAS. Interlocked.Increment(ref counter) is fine in async code, it doesn't need lock affinity.
+For anything more complex (compound state mutations, ordering between multiple variables), you need either a lock-free data structure ( ConcurrentDictionary, ConcurrentQueue ) or a SemaphoreSlim.
+
+-- pause --
+Drill 11, Configuration + D I lifetime interaction.
+
+Q: I inject IOptionsMonitor into a singleton. Config changes at runtime. What's the right pattern to react?-- think --
+
+A: Subscribe in the constructor: _subscription = monitor.OnChange(updated goes to { _cache.Invalidate(); UpdateWorker(updated); });. Hold the IDisposable returned by OnChange in a field and dispose it in the service's Dispose.
+Use monitor.CurrentValue (not monitor.OnChange ) on every read for the latest value.
+
+Cross-Q: What if I instead injected IOptionsSnapshot into a singleton?-- think --
+
+A: Captive dependency, Scoped service inside Singleton. dot NET's default scope validation catches this at startup and throws InvalidOperationException. Production builds with ValidateScopes = false would silently work wrong: the singleton holds the first scope's snapshot forever.
+The error message is the friend; don't disable scope validation just to make it go away.
+
+Cross-Q²: My singleton reads IOptionsMonitor.CurrentValue on every request. Is the per-call cost meaningful?-- think --
+
+A: Negligible, CurrentValue is a property getter returning a cached, atomically-updated field. No reflection, no parsing, no allocation on the hot path. The only cost is a single field read. Reading on every call is the correct, performant pattern for "freshest value, no caching needed."
+
+-- pause --
+Drill 12, HttpClient + auth + retry composition.
+
+Q: I have a J W T that expires every hour. My HttpClient retries failed calls. After hour 2 of running, retries start failing. Why?-- think --
+
+A: The auth handler that adds the J W T runs before Polly retry in your registration. First call: token valid, succeeds. Token expires. Subsequent call: 401, Polly retries, but the retried call replays the same expired token because the auth handler already attached it.
+Fix: ensure the auth handler is inside the retry strategy (added after AddStandardResilienceHandler in registration), so it runs on each retry and refreshes if needed.
+
+Cross-Q: How does the auth handler know to refresh?-- think --
+
+A: It checks token expiration before adding Authorization. If expired, it calls the token endpoint, caches the new token, then attaches. Some implementations are reactive (catch 401, refresh, retry once internally). Reactive needs to be careful to not infinite-loop if the refresh itself fails.
+
+Cross-Q²: What about token caching across multiple typed clients?-- think --
+
+A: Make the auth handler resolve a singleton ITokenProvider from D I. The provider holds the cached token (with SemaphoreSlim to deduplicate concurrent refreshes). All typed clients share the same provider; one token, one refresh on expiry.
+Without sharing, each typed client refreshes independently, N typed clients = N token requests per hour, plus thundering herd at expiration.
+
+-- pause --
+Drill 13, Health checks + readiness + liveness.
+
+Q: What's the difference between liveness, readiness, and startup probes?-- think --
+
+A: Liveness: "is the process responding at all?", fail to restart pod. Readiness: "can the process serve traffic now?", fail to remove from load balancer, don't restart. Startup: "has the process finished initializing?", fail to don't fire liveness yet (gives slow apps time to start).
+All three are H T T P endpoints in A S P dot NET Core; you tag health checks with HealthCheckRegistration.Tags.
+
+Cross-Q: Should a health check ping the database?-- think --
+
+A: Readiness yes; liveness no. If the DB is briefly unreachable, liveness should still pass (the process is healthy; it's the dependency that's broken). Readiness should fail so the load balancer routes around this pod.
+Restarting because of a DB outage is a self-inflicted multiplied outage, every pod cycles, none ever ready. Liveness should only check process internals; readiness checks the dependencies you need to serve.
+
+Cross-Q²: How do I make a health check that times out gracefully?-- think --
+
+A: Pass a CancellationToken honoring HealthCheckOptions.Timeout. A S P dot NET Core enforces a per-check timeout (configurable, default 30 seconds). Your check's I O calls must honor the token; otherwise the timeout fires but the check keeps running, leaking.
+Pattern: await db.PingAsync(cancellation Token).
+If PingAsync doesn't accept tokens, wrap in Task.Run + linked CTS, but ideally, fix the underlying A P I to support cancellation.
+
+-- pause --
+Drill 14, Logging + tracing + observability.
+
+Q: I log a message inside a method called via G R P C. The log line should show the G R P C trace ID. How does it flow?-- think --
+
+A: A S P dot NET Core's G R P C middleware sets Activity.Current with the W3C traceparent from the incoming request. ILogger enrichment (via ActivityListener or Serilog's Enrich.FromLogContext() ) reads Activity.Current.Id and adds it to the log entry.
+No manual plumbing needed if the enrichment is configured.
+
+Cross-Q: I Task.Run(() goes to DoWork()) inside the G R P C handler. Does the trace ID propagate?-- think --
+
+A: Yes, Activity.Current uses AsyncLocal, which does flow across Task.Run. So the spawned task inherits the trace context.
+Caveat: if you explicitly using var scope = new Activity(.) and Dispose before the Task.Run completes, the trace will be ended early; the inner task's logs may show a closed activity.
+
+Cross-Q²: My logs show a different trace ID than my OpenTelemetry trace. Why?-- think --
+
+A: Mismatch between A S P dot NET Core's Activity.Current.Id (W3C trace context) and Serilog or NLog enrichers that may emit older formats ( SpanId, TraceId as separate fields, or non-W3C IDs).
+Make sure your logger enricher uses W3C format: in Serilog, Enrich.WithSpan() from Serilog.Enrichers.Span for OpenTelemetry-compatible IDs. Standardize on W3C across logs and traces, otherwise correlation breaks at every hop.
+
+-- pause --
+Drill 15, Performance + garbage collector + threading interaction.
+
+Q: My A P I's p99 latency spikes every few minutes for ~50 milliseconds. C P U is fine. What's the suspect?-- think --
+
+A: Gen 2 garbage collector pauses. Server garbage collector default mode pauses threads during Gen 2 collection. For a long-running app with growing Gen 2 (singleton caches, static collections, et cetera), pauses can run 20-100 milliseconds.
+Diagnosis: dotnet-counters monitor with System.Runtime, watch gen-2-gc-count and gen-2-size over time.
+If they grow, you have Gen 2 pressure.
+
+Cross-Q: How do I reduce Gen 2 pressure?-- think --
+
+A: (1) Reduce long-lived allocations (cache size limits, weak references). (2) Switch to Background Server garbage collector (dot NET 6+ default), which performs Gen 2 collection on background threads. (3) Pre-warm in singletons (allocate once, reuse). (4) Use ArrayPool for transient large buffers.
+(5) For truly low-pause workloads (sub-10 milliseconds p99), investigate GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency, but that's a Band-Aid; the right fix is reducing allocation.
+
+Cross-Q²: How does ThreadPool starvation manifest, and how is it different from garbage collector pauses?-- think --
+
+A: ThreadPool starvation = no thread available to dispatch work. Symptom: latency rises gradually, not in spikes. Diagnosis: dotnet-counters shows threadpool-queue-length growing and threadpool-thread-count saturating at the configured max.
+Cause: sync-over-async ( task.Result, task.Wait() ) blocks pool threads waiting for I O that needs another pool thread to complete, deadlock or starvation. Fix: never block on async; use await end-to-end. garbage collector pauses are short and sharp; ThreadPool starvation is slow and accumulating.

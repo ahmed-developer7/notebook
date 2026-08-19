@@ -1,0 +1,830 @@
+-- pause --
+Section 1. Why it matters.
+
+Almost every non-trivial decision a service makes, which database to talk to, which Key Vault to read, which feature flag is on, how aggressive the retry policy is, is steered by configuration.
+Get it wrong and you ship secrets to GitHub, hard-code production endpoints into dev builds, or silently swallow a typo'd environment variable that should have crashed the service at boot.
+
+dot NET's configuration system is deceptively simple at the surface ( builder.Configuration["Key"] ) and substantially more nuanced underneath:
+a layered, ordered chain of providers, three different IOptions consumer interfaces with different lifetimes, change-token plumbing for hot reload, validation hooks that can fail-fast at startup, and a separate secrets pipeline that grafts onto the same tree.
+
+Senior interviews routinely probe this: "what's the difference between IOptions, IOptionsSnapshot,
+and IOptionsMonitor," "what happens if a singleton consumes IOptionsSnapshot," "how does appsettings.Production.json override appsettings.json," "where do User Secrets live and why aren't they checked in." this session is the long-form reference for those questions.
+
+-- pause --
+Section 2. 26. Configuration Deep Dive.
+
+Difficulty: Intermediate to Advanced | Reading Time: ~55 min.
+
+-- pause --
+Real-world analogy.
+
+Think of configuration as a layered onion of defaults and overrides:
+
+Or, a touring musician's setlist:
+
+appsettings.json is the printed song list, works in every venue.
+appsettings.Production.json is the venue-specific tweak (different encore for the European tour).
+Environment variables are the show-day cue card the road manager hands out.
+User Secrets are the private notebook, never shown to the audience.
+Key Vault is the locked road case where the master tapes live; only certain crew can open it.
+Command-line args are the conductor improvising mid-show, overrides everything.
+
+-- pause --
+IConfiguration, the flat hierarchical tree.
+
+IConfiguration exposes a unified, string-keyed, hierarchical key-value tree. Despite the Jason in appsettings.json looking nested, the underlying model is flat: every leaf has a colon-delimited path.
+
+Reading values:
+
+Environment-variable key flattening: the colon (: ) used in keys is illegal in some shells, so providers translate double underscore ( __ ) into colon:
+
+-- pause --
+Configuration providers and order of precedence.
+
+WebApplication.CreateBuilder(args) registers a fixed default chain. Providers added later override earlier providers for any colliding key, last writer wins.
+
+ASCII walkthrough, same key resolved through the chain:
+
+Three details that separate a memorised list from an understood one:
+
+Entry 1 is real, and people forget it. Host configuration, ASPNETCORE_ / DOTNET_ -prefixed environment variables plus the command line, used to bootstrap the environment name and content root, is chained into app configuration as a fallback, so any app-level source overrides it.
+Microsoft's list of default app configuration sources (highest to lowest) ends with "Fallback host configuration".
+The command-line provider is used twice. Once early, so --environment Staging can decide which appsettings.{Environment}.json gets loaded, and once at the end, which is why the command line ends up highest priority.
+builder.Configuration is a ConfigurationManager, not a plain ConfigurationBuilder. It implements both IConfigurationBuilder and IConfigurationRoot, and per its A P I docs, "as sources are added, it updates its current view of configuration".
+That is why builder.Configuration["Foo"] returns a value while you are still adding sources, and why branching registration on a config value in Program.cs works:
+
+Debugging precedence: IConfigurationRoot.GetDebugView() prints every key with the provider that supplied the winning value, the fastest way to answer "why is this value not what I set?".
+
+️ GetDebugView() prints values, including secrets. Never wire it to an unauthenticated endpoint or a production log sink.
+
+When to add custom providers:
+
+-- pause --
+Strongly-typed binding with Configure.
+
+Reading raw strings everywhere is brittle. The options pattern binds a configuration section to a typed POCO, validates it, and injects it.
+
+BindConfiguration("SectionName") is the same thing expressed on the fluent builder. Instead of you handing it a section, it resolves IConfiguration from the D I container and binds the named section path, so you do not need builder.Configuration in scope:
+
+Do not confuse BindConfiguration with source generation. BindConfiguration is reflection-based like everything else, its signature carries [RequiresDynamicCode] and [RequiresUnreferencedCode].
+Source-generated binding is a separate, opt-in compiler feature; see Source-generated binding and Native A O T.
+
+-- pause --
+Named options.
+
+You can register several instances of the same options type under different string names, two SMTP servers (transactional versus marketing), one H T T P client policy per downstream, one settings object per tenant.
+
+The rule that gets tested: IOptionsSnapshot and IOptionsMonitor both expose .Get(name); IOptions does not. IOptions.Value always returns the unnamed default instance. If your design needs named instances, IOptions is off the table.
+
+An unnamed registration is really just the instance whose name is Options.DefaultName (the empty string), which is why the same validator and post-configure machinery covers both.
+
+-- pause --
+PostConfigure and PostConfigureAll.
+
+PostConfigure registers an action that runs after every Configure action for that type, regardless of registration order. It is the last thing to touch the object before a consumer sees it.
+
+Two uses that come up constantly:
+
+Overriding a third-party library that calls services.Configure(.) inside its own AddX() extension. You cannot reach inside their registration, but PostConfigure is guaranteed to run last.
+Computed defaults, deriving one setting from another after binding.
+
+PostConfigure without a name targets only the default (unnamed) instance. PostConfigureAll applies to every instance, named and unnamed. Reaching for PostConfigure in an app that uses named options is a classic "why didn't my override apply" bug.
+
+-- pause --
+OptionsBuilder, the fluent surface.
+
+AddOptions() returns an OptionsBuilder. Everything else chains off it:
+
+services.Configure(section) is the shorthand: it binds and nothing else, no validation, no ValidateOnStart. Both end up registering the same IOptions / IOptionsSnapshot / IOptionsMonitor services.
+
+They compose; they do not replace. Calling Configure twice (or Configure plus AddOptions().Bind() ) does not make the second call win wholesale, every registered configure action runs, in registration order, against the same instance.
+Later actions overwrite the individual properties they touch and leave the rest alone.
+
+-- pause --
+Binding collections, dictionaries, and arrays.
+
+The binder walks nested types recursively. Jason arrays bind to List / T[]; Jason objects bind to Dictionary. No extra registration is needed.
+
+Array elements are just keys with numeric segments, so the environment-variable form uses the index directly:
+
+The merge rule that surprises people: overriding Egress__AllowedOrigins__0 from the environment replaces index 0 only. If the Jason file defined three entries, you still get three, indices 1 and 2 survive.
+Configuration merges per leaf key, not per array and not per section (see additive leaf overlay). There is no "clear this array" key; if you need a different length, override every index you want, and be aware that a shorter environment list cannot shrink a longer file list.
+
+-- pause --
+Type conversion, how strings become values.
+
+Every configuration value arrives as a string.
+The reflection binder converts it with TypeDescriptor.GetConverter(type).ConvertFromInvariantString(value), and when that conversion throws, the binder wraps it in an InvalidOperationException, Failed to convert configuration value '{value}' at '{path}' to type '{type}'.
+It does not silently fall back to the default. There is no special-casing for bool or enums: whatever TypeDescriptor says, goes.
+
+"FeatureEnabled": true, bool, true (Jason boolean).
+"FeatureEnabled": "true", bool, true ( bool.Parse, case-insensitive).
+"FeatureEnabled": "1", bool, InvalidOperationException.
+"FeatureEnabled": "yes", bool, InvalidOperationException.
+"Level": "Warning", enum, parsed case-insensitively.
+"Level": "Wraning", enum, InvalidOperationException.
+"Level": "5", enum, value 5, even if no member is defined for it.
+"Timeout": "00:01:30", TimeSpan, TimeSpan.Parse, [d.]hh:mm:ss[.fffffff].
+"Timeout": "90 seconds", TimeSpan, TimeSpan.Parse has no such format.
+
+Consequences worth remembering:
+
+Prefer the literal Jason true over the string "true", same value, no parse ambiguity, and it stops anyone from "helpfully" changing it to 1.
+A numeric enum value binds even when it names no member, so Enum.IsDefined in an IValidateOptions is the only thing that catches "Level": "99".
+Environment variables have no types at all, everything is a string there, so Smtp__UseTls set to true is the string "true" and parses fine, but Smtp__UseTls set to 1 throws.
+For human-friendly durations ( "90 seconds", "5m" ) bind a string and parse it yourself, or attach a custom TypeConverter to a dedicated type. Do not expect the built-in binder to do it.
+
+-- pause --
+IOptions versus IOptionsSnapshot versus IOptionsMonitor.
+
+The single most-asked configuration question in interviews. Three interfaces for consuming the same bound T, with three different lifetimes and reload behaviors.
+
+When to use which:
+
+-- pause --
+Validation, DataAnnotations, IValidateOptions, ValidateOnStart.
+
+Failing at startup is vastly better than failing on the first user request at 3 AM.
+
+DataAnnotations:
+
+Custom IValidateOptions for cross-field rules:
+
+Fluent inline:
+
+Three mechanics that decide whether validation actually protects you:
+
+Multiple IValidateOptions for the same T all run, and their failures are aggregated into a single OptionsValidationException rather than the first one short-circuiting. Splitting rules across small, individually testable validators costs nothing.
+Validate(string? name, T options) is called for every instance, and for the default instance name is Options.DefaultName, the empty string, not null. OptionsManager.Get normalises name ??= Options.DefaultName before the factory runs, so a null never reaches your validator.
+Scope a validator with if (name != "Marketing") return ValidateOptionsResult.Skip;.
+ValidateOnStart() is per named instance. It is registered on one OptionsBuilder and keys its startup check on (typeof(TOptions), builder.Name), forcing Get(that Name) and nothing else. Named instances registered elsewhere are still validated lazily.
+One ValidateOnStart() does not fail-fast a whole type.
+
+-- pause --
+Reloading and change tokens.
+
+appsettings.json providers default to reloadOnChange: true, the file is watched via FileSystemWatcher, and changes propagate via IChangeToken. IOptionsSnapshot and IOptionsMonitor honor this; IOptions does not.
+
+Name the plumbing precisely, interviewers push on this: PhysicalFileProvider to FileSystemWatcher to CancellationChangeToken to the provider reloads to ConfigurationRoot signals its reload token to IOptionsMonitor drops the cached instance, rebinds, and invokes OnChange subscribers;
+IOptionsSnapshot picks up the new value at the next scope.
+
+Caveats:
+Environment variables and command-line args do not reload, they are read once at startup. Changing an env var on a running process has no effect on IConfiguration.
+The Key Vault provider does not reload by default. AzureKeyVaultConfigurationOptions.ReloadInterval is a TimeSpan? whose default is null, and the docs are explicit: "By default, the configuration provider caches secrets for the application lifetime.
+The app ignores secrets that are later disabled or updated in the key vault." You must set ReloadInterval or call IConfigurationRoot.Reload() yourself.
+File reload is deliberately delayed, not debounced. FileConfigurationSource.ReloadDelay defaults to 250 milliseconds, documented as "the number of milliseconds that reload will wait before calling Load", to "avoid triggering reload before a file is completely written".
+It is a fixed wait after the watcher fires, not a coalescing window.
+One edit can raise several notifications. Per Microsoft's change-token guidance, "a configuration file's FileSystemWatcher can trigger multiple token callbacks for a single configuration file change", editors that save by writing a temp file and renaming are the usual cause.
+Write OnChange handlers so that running twice is harmless.
+
+-- pause --
+Secrets, User Secrets, Key Vault, connection strings.
+
+The cardinal rule: secrets never live in source control. Period.
+
+User Secrets (development only):
+
+The User Secrets provider is added automatically in the Development environment. The file lives outside the repo and per-developer.
+
+Azure Key Vault (production):
+
+Key Vault secret names may contain only alphanumerics and dashes, the colon is illegal, so hierarchy uses two dashes: Smtp--Pwd is loaded as Smtp:Pwd.
+
+Connection strings, convention helper:
+
+From the environment, the ordinary form is ConnectionStrings__Default=.. In addition, the environment-variables provider itself, not any hosting platform, applies special processing to a fixed set of prefixes.
+When no prefix argument is passed to AddEnvironmentVariables() (the default), a variable named {PREFIX}{KEY} is loaded as ConnectionStrings:{KEY}, and for the database prefixes a companion ConnectionStrings:{KEY}_ProviderName entry is created:
+
+CUSTOMCONNSTR_Orders, ConnectionStrings:Orders, none.
+SQLCONNSTR_Orders, ConnectionStrings:Orders, System.Data.SqlClient.
+SQLAZURECONNSTR_Orders, ConnectionStrings:Orders, System.Data.SqlClient.
+MYSQLCONNSTR_Orders, ConnectionStrings:Orders, MySql.Data.MySqlClient.
+
+These are the names Azure App Service writes when you add a connection string in the portal, which is why the mapping exists, but the translation happens in dot NET, so it behaves identically anywhere you set those variables.
+Newer target frameworks (A S P dot NET Core 10+) document a wider list:
+POSTGRESQLCONNSTR_ (which does get a provider entry, Npgsql ), plus APIHUBCONNSTR_, DOCDBCONNSTR_, EVENTHUBCONNSTR_, NOTIFICATIONHUBCONNSTR_, REDISCACHECONNSTR_ and SERVICEBUSCONNSTR_, all of which map the key but create no provider entry.
+Check the table for the framework you target rather than assuming.
+
+-- pause --
+Hot-reload pitfalls (captive options).
+
+The single most-bitten gotcha. When a singleton consumes IOptions (or worse, IOptionsSnapshot ), it captures a snapshot of the bound value forever, config changes never reach it.
+
+Without hot-reload awareness:
+
+**Worse, singleton consuming IOptionsSnapshot is a captive dependency:**.
+
+With hot-reload awareness:
+
+-- pause --
+Scope validation, the switch that makes captive dependencies throw.
+
+"Injecting IOptionsSnapshot into a singleton throws" is only half an answer, and the other half is where interviews go. It throws because scope validation is on, and scope validation is not on everywhere.
+
+Two switches on ServiceProviderOptions:
+
+ValidateScopes, Resolving a scoped service from the root provider / into a singleton, at resolve time.
+ValidateOnBuild, The same lifetime mismatches, found by walking every registration, at builder.Build().
+
+The default is environment-dependent, not version-dependent. Microsoft's D I documentation states the check applies "when an app runs in the development environment": the default host turns both on for IHostEnvironment.IsDevelopment() and leaves them off otherwise.
+There is no dot NET version at which Production started validating scopes by default.
+
+So the honest answer is: in Development you get a loud InvalidOperationException;
+in Production, with defaults, the container happily resolves the scoped IOptionsSnapshot from the root scope, the singleton pins it forever, and it silently works wrong, the exact failure mode validation exists to prevent.
+
+Turn it on everywhere and find out at deploy time instead of at 3 AM:
+
+ValidateOnBuild costs a one-time startup walk of the registration graph. That is a good trade for almost every service.
+
+-- pause --
+Anti-pattern, injecting IConfiguration into services.
+
+Why it is bad: the service is hard to unit-test (you have to construct a real IConfiguration ), infrastructure concerns leak into domain logic, key lookups are stringly-typed and scattered, and, the one that actually bites, it bypasses the validation pipeline entirely.
+ValidateOnStart cannot protect a key nobody bound.
+
+The legitimate exception, which is worth volunteering in an interview because it shows you know the rule rather than reciting it: reading configuration in Program.cs to make registration decisions is fine. That code is composition-root infrastructure, it runs once, and you are not unit-testing it.
+
+-- pause --
+Source-generated binding and Native A O T.
+
+Reflection-based binding needs runtime type metadata and dynamic code. Trimming removes the metadata; Native A O T removes dynamic code generation. Either way, reflection binding breaks, typically as a runtime "property not found" or a silently unbound property, which is worse.
+
+dot NET 8 introduced a configuration binding source generator that solves this by generating the binding code at compile time using C sharp 12 interceptors. Enable it in the project file:
+
+Things people get wrong about it:
+
+It is a project-level switch, not an A P I choice. Once enabled, the generator intercepts binding calls on ConfigurationBinder ( Bind, Get, GetValue ), OptionsBuilderConfigurationExtensions ( Bind, BindConfiguration ) and OptionsConfigurationServiceCollectionExtensions ( Configure(section) ).
+Switching from Configure to BindConfiguration does not get you source generation, and staying on Configure does not lose it.
+Your Program.cs does not change. The call sites stay identical; the compiler substitutes generated code behind them.
+If PublishAot is on and the generator is off, the build tells you: IL2026 from the trim analyser (the A P I is [RequiresUnreferencedCode] ) and IL3050 from the A O T analyser ( [RequiresDynamicCode] ).
+
+Set true to read the generated binder, it is plain, readable code, and reading it once makes the whole feature obvious.
+
+The same "source generator replaces reflection" pattern shows up in JsonSerializerContext for System.Text.Json, [GeneratedRegex] for regular expressions, and [LoggerMessage] for logging. Recognising the family is worth a point in an A O T question.
+
+-- pause --
+Code and diagrams.
+
+Provider precedence chain.
+
+The IOptions trinity and who may consume what.
+
+Reload path, end to end.
+
+Production-grade registration, all mechanisms at once.
+
+-- pause --
+Common pitfalls.
+
+Pitfall 1 illustrated, "the value is correct on disk but my service ignores it":
+
+Pitfall 7 illustrated, boolean parsing:
+
+The binder throws, it does not quietly fall back to false. Full conversion table in Type conversion.
+
+Pitfall 13 illustrated, __ is an environment-variable convention, not a Jason one:
+
+The __ to: translation lives in the environment-variables provider. Jason already has real nesting, so it never runs there. Symptom: the env var works, the file "doesn't", and both look right.
+
+Pitfall 15 illustrated, the OnChange data race:
+
+Never mutate the options object in place after publishing it. Swap the whole reference; treat the instance as immutable.
+
+-- pause --
+Best practices.
+
+Hierarchical convention, group related keys under one section per concern ( Smtp, Logging, RateLimits ). Bind one POCO per section.
+Validate at startup, always pair Bind() with ValidateDataAnnotations() and ValidateOnStart(). Fail-fast beats fail-slow.
+Secrets out of source, User Secrets in dev, Key Vault in prod, never appsettings.*.json.
+Document keys in README, list every key your service reads, with default + required flag. Future-you will thank you.
+Prefer IOptionsMonitor in singletons / IOptionsSnapshot in controllers, IOptions only for libraries or truly static config.
+Per-environment files, appsettings.Development.json, appsettings.Staging.json, appsettings.Production.json. Override only what differs.
+Turn on the configuration binding source generator ( true ) if you trim or publish Native A O T, dot NET 8+. It is a project-level switch and does not change your call sites.
+Validate URLs and connection strings, use a custom IValidateOptions to assert format at startup, not at run time. Validate shape here; validate reachability in an IHostedService.
+Don't read IConfiguration directly in business code, bind to a typed POCO and inject IOptions. The one legitimate exception is Program.cs registration decisions.
+Test with AddInMemoryCollection, unit tests can substitute config without touching the file system.
+Turn on ValidateScopes and ValidateOnBuild in every environment, the defaults only protect Development.
+Treat bound options as immutable, never mutate .Value; the instance is shared.
+
+-- pause --
+Real-world scenarios.
+
+Scenario 1, Multi-environment deployment.
+
+Same image, different ASPNETCORE_ENVIRONMENT value. Connection strings are the same key in all environments, only the resolved value differs.
+
+Scenario 2, Per-tenant configuration overlay.
+
+A SaaS service with hundreds of tenants. Use a custom configuration provider that reads tenant-specific overrides from a database or blob, layered on top of the defaults. Wrapping IOptionsMonitor.Get(name) with the tenant ID gives O(1) per-tenant resolution.
+
+Scenario 3, Runtime feature flags via config reload.
+
+Edit appsettings.json (or push to Key Vault) to IOptionsMonitor fires OnChange to service flips a flag without redeploying. Pair with a feature-flag S D K (for example, Azure App Configuration, LaunchDarkly) for the production-grade version.
+
+Scenario 4, Connection-string rotation without downtime.
+
+Say your policy rotates the sequel password in Key Vault on a schedule. Three things have to line up:
+
+The provider has to re-poll. ReloadInterval is null by default, so out of the box the app never sees the new secret. Set ReloadInterval (or expose an admin-triggered IConfigurationRoot.Reload() ).
+Your code has to re-read. Nothing in E F Core or ADOdot NET subscribes to configuration. If you captured the connection string at startup, including AddDbContext(o goes to o.UseSqlServer(config.GetConnectionString("Default"))), which runs once, rotation cannot reach you.
+Resolve it per DbContext construction from IOptionsMonitor.CurrentValue instead.
+The rotation itself has to overlap. Between the vault write and the next poll, the app is still presenting the old password. If both passwords are valid during that window, nothing fails.
+If the rotation is atomic, new connections fail until the poll catches up, so the overlap window must exceed ReloadInterval, or you accept a short error budget.
+
+The honest summary: the configuration system gives you delivery of the new secret. Zero downtime comes from the overlap window and from reading the value at use time, not from the options pattern by itself.
+
+-- pause --
+Interview-ready summary.
+
+IConfiguration is a flat, string-keyed tree;: is the path separator regardless of source. Values are strings until bound.
+Providers are additive and last-writer-wins per leaf key. Default order (lowest to highest): host config (chained fallback) to appsettings.json to appsettings.{Environment}.json to User Secrets (Development) to environment variables to command line.
+Environment variables use __ for hierarchy because: is not portable; the translation happens in the env-var provider only, never in Jason.
+Key Vault secret names use -- for hierarchy, translated to: on load.
+IOptions, singleton, fixed at first resolve, no .Get(name). IOptionsSnapshot, scoped, fresh per scope, has .Get(name), illegal in a singleton. IOptionsMonitor, singleton, .CurrentValue always fresh, .Get(name), .OnChange().
+Captive dependency = singleton capturing a scoped service. Scope validation ( ValidateScopes / ValidateOnBuild ) turns it into a startup exception, and it is on by default only in Development.
+Configure actions compose in registration order; PostConfigure runs after all of them for the unnamed instance; PostConfigureAll for every instance.
+ValidateDataAnnotations() for per-field rules, .Validate(func, msg) for a quick cross-field rule, IValidateOptions for multi-rule or D I-dependent validation. Multiple validators all run and aggregate into one OptionsValidationException.
+ValidateOnStart() moves validation from first .Value access to host startup, so bad config never serves a request, but it applies to one named instance, the one whose OptionsBuilder it was chained onto. Every name you want checked at boot needs its own chain.
+A validator's name argument is Options.DefaultName ( string.Empty ) for the default instance, never null.
+Reload is file-watcher to ReloadDelay (250 milliseconds) to provider reload to change token to monitor rebind. Environment variables and command-line args never reload; Key Vault does not reload unless you set ReloadInterval.
+The OnChange callback runs on whatever thread signalled the reload with no synchronisation guarantee, publish a whole new instance with Volatile.Write, dispose the returned IDisposable, and make the handler safe to run twice.
+Binding is reflection-based and throws InvalidOperationException on a failed conversion. Native A O T / trimming needs true (dot NET 8+), which is a project switch, not an A P I choice.
+Injecting IConfiguration into a service is an anti-pattern, except in Program.cs, where reading config to decide registrations is exactly right.
+
+-- pause --
+Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Provider order.
+
+Q: In a default A S P dot NET Core app, what's the provider load order and who overrides whom?-- think --
+
+A: Host configuration (chained in as the bottom fallback) to appsettings.json to appsettings.{Environment}.json to User Secrets (Development only) to Environment Variables to Command-line args.
+Later providers override earlier ones for any colliding key, so --Smtp:Port set to 8025 on the command line wins over everything else.
+Two details that mark out a senior answer: the chained host configuration layer is genuinely there at the bottom (Microsoft's own list ends with "Fallback host configuration"), and the command-line provider is registered twice, early,
+so --environment Staging can select which appsettings.{Environment}.json loads, and again at the end, which is what gives it top priority.
+
+Cross-Q: Where does Azure Key Vault fit?-- think --
+
+A: Wherever you register it, typically after appsettings but before env vars (so an env var can still override a vault secret during incident response). Provider order is determined by *registration order in builder.Configuration.Add, not by provider type. Last Add* call wins on collision.**.
+
+Cross-Q²: I want appsettings.Production.json to override Key Vault. Where do I register the Vault provider?-- think --
+
+A: Before appsettings.Production.json. Use builder.Configuration.Sources.Insert(.) or, more idiomatic, clear and rebuild the chain in the order you want. The default order assumes vault overrides files; flipping is unusual and usually a sign of a mis-modeled dependency.
+
+-- pause --
+Drill 2, IOptions versus IOptionsSnapshot versus IOptionsMonitor.
+
+Q: Walk me through the three interfaces.-- think --
+
+A: IOptions is Singleton, value captured at first resolve, never refreshes. IOptionsSnapshot is Scoped, fresh per request or scope, honors hot reload. IOptionsMonitor is Singleton, CurrentValue is always fresh, and OnChange fires when config reloads.
+Rule of thumb: controllers use IOptionsSnapshot, background services use IOptionsMonitor, libraries use IOptions.
+
+Cross-Q: Why is IOptionsSnapshot Scoped and not Singleton?-- think --
+
+A: Because it caches the value for the duration of a scope (request), multiple reads within a request see the same value, even if config changes mid-request. The scope is the natural unit of "stability." After the request ends, the next request gets a fresh value.
+It's per-request caching with reload awareness.
+
+Cross-Q²: Why does IOptionsMonitor need OnChange if CurrentValue is always fresh?-- think --
+
+A: Polling CurrentValue works for "listen on every use." But many use cases need eager reaction, invalidate a cache, refresh a connection, restart a downstream worker. OnChange lets you register a callback that fires only when config actually changes, so you don't do work on every read.
+Pattern: _monitor.OnChange(updated goes to { cache.Invalidate(); ReWireWorker(updated); }).
+
+-- pause --
+Drill 3, Captive options trap.
+
+Q: A singleton service injects IOptions. Config changes on disk. What does the singleton see?-- think --
+
+A: Nothing. IOptions is captured at first resolve and never updates. The on-disk change is honored by IOptionsSnapshot / IOptionsMonitor, not IOptions.
+Symptom: "I edited appsettings.json and the file reloaded, but my rate limiter still uses the old value." The fix is IOptionsMonitor and reading .CurrentValue on every use.
+
+Cross-Q: What if the singleton injects IOptionsSnapshot instead?-- think --
+
+A: Lifetime mismatch. IOptionsSnapshot is Scoped; a Singleton can't legally consume a Scoped service, it would capture the first scope's snapshot and pin it forever. Captive dependency, the canonical example.
+Whether you find out depends entirely on scope validation: the default host enables ValidateScopes and ValidateOnBuild only when the environment is Development, so in Development you get an InvalidOperationException;
+in Production, with defaults, the container resolves the scoped snapshot from the root scope and it silently works wrong.
+This is not version-gated, there is no dot NET release where Production started validating scopes by default. Fix it by setting both switches explicitly in UseDefaultServiceProvider so the failure shows up in every environment.
+
+Cross-Q²: How do I expose the latest config to a Singleton without IOptionsMonitor ?-- think --
+
+A: You can use IServiceScopeFactory: inside a singleton method, using var scope = factory.CreateScope(); var opt = scope.ServiceProvider.GetRequiredService>().Value;, fresh value per call. This is the workaround when, for some reason, IOptionsMonitor isn't appropriate.
+Generally IOptionsMonitor is cleaner; use the scope factory only when you also need other scoped services.
+
+-- pause --
+Drill 4, reloadOnChange: true.
+
+Q: What's the cost of reloadOnChange: true on appsettings.json ?-- think --
+
+A: A FileSystemWatcher per file, plus a delayed re-parse on every change event. On healthy systems it's negligible. On containers with network or union file systems the watcher can produce spurious events or miss them entirely, verify on your actual platform rather than assuming.
+Memory cost is one IChangeToken per file. Default in WebApplication.CreateBuilder is true, leave it on unless you have a measured reason.
+
+Cross-Q: Why might I disable it?-- think --
+
+A: (1) Read-only containers where appsettings can't change at runtime by design. (2) Very large appsettings (multiple megabytes) where re-parsing is non-trivial. (3) Test environments where reload races interact badly with test setup.
+Disable via reloadOnChange: false in the explicit AddJsonFile call.
+
+Cross-Q²: I see the file changed but IOptionsSnapshot.Value is stale. Why?-- think --
+
+A: Two named mechanisms, not folklore. First, FileConfigurationSource.ReloadDelay, documented default 250 milliseconds, is a deliberate wait between the watcher firing and Load() being called, so a half-written file isn't parsed; a read inside that window sees the old value.
+Second, FileSystemWatcher is not one-event-per-edit: Microsoft's change-token guidance says a config file's watcher "can trigger multiple token callbacks for a single configuration file change", and editors that save via temp-file-plus-rename can surface as delete or create rather than change.
+Symptoms: stale value, or a callback that fires twice. Workarounds: make handlers idempotent, force a reload with IConfigurationRoot.Reload(), and confirm by subscribing to IOptionsMonitor.OnChange and logging.
+
+-- pause --
+Drill 5, IValidateOptions.
+
+Q: When do you use DataAnnotations versus IValidateOptions versus the fluent .Validate(.) ?-- think --
+
+A: DataAnnotations for per-field rules ( [Required], [Range], [RegularExpression] ), declarative and visible in the POCO. .Validate(s goes to., "msg") for cross-field rules inline at registration ( UseTls and and Port == 25 to fail).
+IValidateOptions for complex multi-rule validation that needs D I (resolves other services for validation context). All three compose; you can layer them.
+
+Cross-Q: What does ValidateOnStart() actually do?-- think --
+
+A: It registers a startup validator ( IStartupValidator ) that the host runs during application startup, before the first request. If validation fails, the app fails to start with the validation messages, fail-fast.
+Without it, validation runs lazily the first time a TOptions instance is created, the first .Value / .Get(name) access, which could be at 3 AM during a user request.
+Two limits worth volunteering: reloads re-run validation, so a bad hot-reloaded value surfaces as an exception at the next read rather than at startup;
+and ValidateOnStart() is per named instance, it hangs off one OptionsBuilder and keys its check on (typeof(TOptions), builder.Name), forcing Get(that Name) and nothing else.
+A type with named instances needs AddOptions("Name"). ValidateOnStart() for each name you want checked at boot.
+
+Cross-Q²: If ValidateOnStart fails, what does the user see?-- think --
+
+A: The app process exits with a non-zero code, the error appears in startup logs ( OptionsValidationException with all the failed rules), Kubernetes / Service Fabric mark the pod as unhealthy and restart it. The container loops in CrashLoopBackOff until you fix the config.
+This is desired: bad config never serves traffic. Disaster scenario without ValidateOnStart: the app starts, takes traffic, and fails on the first request that hits the invalid option, users see 500 seconds, monitoring alerts fire, you scramble.
+
+-- pause --
+Drill 6, ValidateOnStart failure modes.
+
+Q: I rolled a config change to staging. ValidateOnStart failed. What do I do?-- think --
+
+A: Read the validation error, it tells you exactly which field failed which rule. Fix the config (in source, vault, or env var), redeploy. Do not disable validation as a workaround; that just hides the problem. The whole point is to crash loudly before you serve a request with bad config.
+
+Cross-Q: What if the bad config is in Key Vault and I can't easily redeploy?-- think --
+
+A: Update the secret in the vault, then either redeploy the pod (forces reload) or wait for ReloadInterval to expire. Or: if the validation is only firing because of a non-critical field, use a conditional in IValidateOptions, but document why and revisit later.
+Don't hot-fix by editing the validator.
+
+Cross-Q²: Can ValidateOnStart validate options that depend on async I O (for example, "can the SMTP server be reached")?-- think --
+
+A: Not directly, IValidateOptions.Validate is sync. For reachability checks at startup, use a separate IHostedService that runs in StartAsync and throws if the dependency is unreachable. Pattern: validate shape with IValidateOptions, validate reachability with a hosted service.
+Both run before traffic.
+
+-- pause --
+Drill 7, User Secrets.
+
+Q: When are User Secrets actually loaded?-- think --
+
+A: Only when the environment is Development ( ASPNETCORE_ENVIRONMENT, or DOTNET_ENVIRONMENT for non-web hosts) AND the project's .csproj has a UserSecretsId property AND you used a default host builder, WebApplication.CreateBuilder,
+Host.CreateApplicationBuilder or Host.CreateDefaultBuilder, which auto-registers the provider in Development.
+Outside of dev, they're not even read.
+
+Cross-Q: Where is the file on disk?-- think --
+
+A: Windows: %APPDATA%\Microsoft\UserSecrets\\secrets.json. macOS or Linux: ~/.microsoft or usersecrets//secrets.json. The UserSecretsId is a GUID generated by dotnet user-secrets init. The file is per-developer, per-machine, not synced.
+
+Cross-Q²: Should I commit UserSecretsId to the repo?-- think --
+
+A: Yes, it's a property of the project, not a secret. It's just an identifier that says "this project uses User Secrets; look in folder on each developer's machine." The actual secret values are in the per-developer file, never in source control.
+Common mistake: confusing the ID (commit) with the contents (never commit).
+
+-- pause --
+Drill 8, Azure Key Vault rotation.
+
+Q: My sequel password rotates in Key Vault every 90 days. How does my running app pick up the new value without a deploy?-- think --
+
+A: AzureKeyVaultConfigurationOptions.ReloadInterval = TimeSpan.FromMinutes(5) makes the provider poll the vault every 5 min.
+On a rotation, the next poll sees the new value, fires IChangeToken, and IOptionsMonitor.OnChange triggers, your handler invalidates E F Core's connection pool, next command opens with the new password. Zero-downtime rotation.
+
+Cross-Q: What's the latency window between rotation and pickup?-- think --
+
+A: Up to ReloadInterval (5 min in our config). During that window, the app uses the old password, which the database also still accepts during a brief overlap window (depends on rotation strategy). If the DB rotates atomically (no overlap), connections fail until the next poll.
+Pattern: rotate with overlap (both passwords valid for 10+ min), or shorten ReloadInterval to 1 min.
+
+Cross-Q²: How do I forcibly reload secrets in an emergency?-- think --
+
+A: ((IConfigurationRoot)builder.Configuration).Reload() triggers all providers to re-read. Expose this as an admin endpoint (gated by auth!) for incident response. Alternative: pod restart, slower but simpler.
+
+-- pause --
+Drill 9, Environment-specific layering.
+
+Q: I have appsettings.json with "Smtp:Host":"localhost" and appsettings.Production.json with "Smtp:Host":"smtp prod example com". In Production, what's the resolved value?-- think --
+
+A: smtp prod example com. appsettings.{Environment}.json loads after appsettings.json in the provider chain, the later registration overrides the earlier on any colliding key. It's not a deep merge in the usual sense, it's a flat-tree overlay where leaf collisions are won by the later provider.
+
+Cross-Q: How does the loader know which environment file to load?-- think --
+
+A: The host reads ASPNETCORE_ENVIRONMENT (or DOTNET_ENVIRONMENT for non-web hosts) and substitutes it into appsettings.{Environment}.json. The default is Production if unset.
+The env-var name is case-insensitive but the file name is case-sensitive on Linux, appsettings.Production.json works, appsettings.PRODUCTION.json doesn't.
+
+Cross-Q²: I have "Smtp": { "Host": "x" } in base and "Smtp": { "Port": 25 } in env-specific. Final shape?-- think --
+
+A: Both keys are present: Smtp:Host = "x", Smtp:Port = 25. Layering operates on leaves, not subtrees, the env-specific file adds Port without removing Host. This is "additive override," not "replace subtree." Subtle but documented; many developers expect "replace whole section" and are surprised.
+
+-- pause --
+Drill 10, Connection strings.
+
+Q: What's special about ConnectionStrings:Default versus other config keys?-- think --
+
+A: There's a convention helper: builder.Configuration.GetConnectionString("Default") is documented as shorthand for GetSection("ConnectionStrings")["Default"]. Otherwise it's just a regular key. The helper is for discoverability, every dot NET dev knows where to look.
+
+Cross-Q: How do connection strings flow from environment variables?-- think --
+
+A: Two patterns. Standard: ConnectionStrings__Default=. (env var with double-underscore to: translation).
+Prefixed: the environment-variables provider has documented special handling for a fixed set of connection-string prefixes, CUSTOMCONNSTR_, SQLCONNSTR_, SQLAZURECONNSTR_, MYSQLCONNSTR_ and, in newer target frameworks, several more.
+SQLAZURECONNSTR_Orders becomes ConnectionStrings:Orders, plus a companion ConnectionStrings:Orders_ProviderName. The trap in the question: that translation is done by dot NET, not by Azure.
+Those are the names Azure App Service happens to write, but the behaviour is identical wherever the variables are set, so don't answer "App Service magic", and don't assume another cloud's service does the same thing.
+
+Cross-Q²: Should connection strings live in Key Vault?-- think --
+
+A: In production, yes. Connection strings often contain passwords. Treat them as secrets: store in vault, surface via the vault provider as ConnectionStrings--Default (double-dash to colon). Dev environments can use User Secrets.
+Never commit a real connection string to source, even pointing at a "dev" database is a leak surface.
+
+-- pause --
+Drill 11, Configure versus BindConfiguration.
+
+Q: What's the difference between services.Configure(config.GetSection("X")) and AddOptions().BindConfiguration("X") ?-- think --
+
+A: Careful, this is a trap question, and the tempting answer is wrong. Both are reflection-based. Configure(section) is the shorthand that binds and nothing else.
+BindConfiguration("X") is the OptionsBuilder equivalent that resolves IConfiguration from the D I container itself, so you don't need builder.Configuration in scope, and it chains with .Validate. (). Its signature carries [RequiresDynamicCode] and [RequiresUnreferencedCode], which is the giveaway.
+Source generation is a separate, project-level opt-in: true, introduced in dot NET 8. Once on, it intercepts binding calls on ConfigurationBinder, OptionsBuilderConfigurationExtensions and OptionsConfigurationServiceCollectionExtensions, so it covers Configure too.
+Choosing BindConfiguration does not buy you source generation, and staying on Configure does not lose it.
+
+Cross-Q: Why does A O T matter for option binding?-- think --
+
+A: Trimming strips the reflection metadata the binder needs, and Native A O T removes runtime code generation entirely. Reflection binding then either fails or, worse, quietly leaves properties unset.
+The source generator emits concrete binding code at compile time using C sharp 12 interceptors, so nothing is discovered at runtime. If PublishAot is set and the generator is off, the build raises IL2026 (trim) and IL3050 (A O T) telling you exactly this.
+Same family: JsonSerializerContext for System.Text.Json, [GeneratedRegex] for regex, [LoggerMessage] for logging.
+
+Cross-Q²: Can I combine BindConfiguration with IValidateOptions and ValidateOnStart ?-- think --
+
+A: Yes, they chain fluently:
+csharp.
+services.AddOptions().
+.BindConfiguration("MySection").
+.ValidateDataAnnotations().
+.Validate(s goes to., "rule").
+.ValidateOnStart();
+services.AddSingleton, MyValidator>();
+
+All four mechanisms run at startup (with ValidateOnStart ). This is the canonical "production-grade options registration" pattern.
+
+-- pause --
+Drill 12, Custom providers.
+
+Q: When would you write a custom IConfigurationProvider ?-- think --
+
+A: When the source isn't covered by built-ins: HashiCorp Vault, Consul KV, a tenant-config service, a feature-flag SaaS (LaunchDarkly), an in-house secrets A P I. The contract is: Load() (populate the data dictionary), optionally OnReload() (signal change tokens).
+You also write an IConfigurationSource that wires registration.
+
+Cross-Q: How is this different from just calling the A P I at startup and adding via AddInMemoryCollection ?-- think --
+
+A: Custom providers integrate with the reload pipeline, they can re-fetch and signal change. AddInMemoryCollection is a snapshot at startup with no reload. For values that genuinely change at runtime (rotated secrets, flipped feature flags), custom providers are correct.
+
+Cross-Q²: How do I test a custom provider?-- think --
+
+A: Two layers. Unit-test the provider in isolation: instantiate, call Load(), assert the data dictionary. Integration-test via ConfigurationBuilder: new ConfigurationBuilder().Add(new MyConfigurationSource(.)).Build() and assert resolved values.
+For reload, fire the source's change-token manually and observe IOptionsMonitor.OnChange callbacks.
+
+-- pause --
+Drill 13, Hot-reloading subscribers.
+
+Q: I subscribe to IOptionsMonitor.OnChange in a singleton. Config changes. What runs?-- think --
+
+A: OptionsMonitor drops the cached instance, re-binds, then invokes its subscriber list synchronously, inline on whichever thread signalled the change, subscribers are a multicast delegate, so they run one after another in subscription order.
+That thread is not the file-watcher thread: for file providers the reload callback awaits ReloadDelay first, so the continuation lands on a thread-pool thread; a polling provider such as Key Vault uses its own.
+The framework offers no thread-affinity and no synchronisation guarantee, see the next cross-Q. Pattern: keep the callback short, because it blocks the rest of the notification chain, but "short" does not mean "unsynchronised", a Volatile.Write of a freshly bound instance is both.
+Push slow work onto a background task.
+
+Cross-Q: So what breaks if I just assign to a field in the callback?-- think --
+
+A: A data race.
+The callback thread writes _current = updated while request threads read _current;
+with no memory barrier a reader can observe a stale reference indefinitely, and if you mutate the existing object instead of swapping it, readers can see a half-updated object, host from the new config, port from the old.
+The fix is to publish a whole new instance atomically: Volatile.Write(ref _current, updated) in the callback, Volatile.Read(ref _current) once at the top of each operation, and never touch the object after publishing. Interlocked.Exchange works equally well and also hands you the previous value.
+A lock is fine too and is the simplest correct thing if several fields must move together.
+
+Cross-Q²: How do I unsubscribe?-- think --
+
+A: OnChange returns an IDisposable. Hold the reference, Dispose() to unsubscribe. Common leak: registering in a constructor and discarding the return value, the subscription keeps the delegate (and therefore your object) reachable from the monitor.
+Pattern: implement IDisposable on the consumer and dispose the subscription there.
+
+One more thing worth volunteering: the callback fires on a change notification, not on a value change. If the file is rewritten with identical content, subscribers still run, and a single edit can produce more than one notification.
+So handlers must be idempotent, and "fire only when the value actually changed" is something you implement yourself by comparing against the last published instance.
+
+-- pause --
+Drill 14, Hierarchical key paths.
+
+Q: I have "A": { "B": { "C": "val" } } in Jason. What's the IConfiguration key?-- think --
+
+A: A:B:C. The colon (: ) is the path separator regardless of source: Jason nests, INI uses dots, env vars use __, command-line uses: directly. All providers map to the same colon-separated flat tree.
+
+Cross-Q: How do environment variables encode A:B:C ?-- think --
+
+A: A__B__C (double underscore). The docs are explicit about why: "a colon separator doesn't work on all platforms", Bash, for one, while "a double underscore ( __ ) is supported by all platforms and is automatically converted into a colon". The provider does the translation.
+Single-underscore is not translated, A_B_C is a literal flat key. In Kubernetes this is exactly how you inject nested config: mount a ConfigMap or Secret as environment variables named Smtp__Host, Smtp__Port, and dot NET reassembles the tree. Same for Docker Compose environment: entries.
+One platform-specific exception worth knowing: Azure App Service accepts:
+directly in Application Settings keys ( Smtp:Host ) and handles the translation on its side, but that only works there, so __ remains the safe cross-platform answer and the one to give unless you are asked about App Service specifically.
+
+Cross-Q²: My env var Smtp__Credentials__Pwd doesn't seem to override appsettings.json 's Smtp.Credentials.Pwd. Why?-- think --
+
+A: Check case sensitivity (env var names are case-insensitive on Windows, case-sensitive on Linux), check the env-var provider is registered (it is by default in CreateBuilder ), check it's loaded after the Jason file (it is by default), and check for typos.
+Most common cause: the env var was set in a different shell than the one launching the app.
+Rather than guessing, print the resolved picture: ((IConfigurationRoot)builder.Configuration).GetDebugView() lists every key with the provider that supplied the winning value, which answers "who overrode me" in one line. Treat its output as secret, it prints values.
+
+-- pause --
+Drill 15, Boolean and enum parsing.
+
+Q: appsettings.json has "FeatureEnabled": "yes". What does GetValue("FeatureEnabled") return?-- think --
+
+A: It throws InvalidOperationException, "Failed to convert configuration value. to type 'System.Boolean'", wrapping the FormatException from bool.Parse. Only "true" / "false" (case-insensitive) parse; "1", "0" and "yes" do not.
+Always use the literal Jason boolean ( true, not "true" ) when you can, same final value, and nobody can "helpfully" change it to 1.
+
+Cross-Q: What about enums?-- think --
+
+A: Same path, TypeDescriptor.GetConverter(.).ConvertFromInvariantString(.), so string names parse case-insensitively and an unrecognised name throws InvalidOperationException too. It does not silently fall back to default(T).
+The real trap is the other direction: a numeric value binds even when no member is defined for it, so "Level": "99" succeeds and produces the invalid enum value 99. That is what Enum.IsDefined in an IValidateOptions is for.
+
+Cross-Q²: How do I bind a TimeSpan from "00:01:30" ?-- think --
+
+A: It just works, the converter calls TimeSpan.Parse, which handles [d.]hh:mm:ss[.fffffff]. What does not work is anything friendlier: "90 seconds" and "5m" are not TimeSpan formats and will throw, and TimeSpan.Parse does not accept ISO-8601 durations like PT1M30S either.
+If you want human-friendly durations, bind a string and parse it yourself, or introduce a dedicated type with its own TypeConverter. Don't expect the binder to invent a format for you.
+
+-- pause --
+Drill 16, Named options.
+
+Q: You need two SMTP configurations, transactional and marketing, bound to the same settings class. How?-- think --
+
+A: Named options. services.Configure("Transactional", section) and again for "Marketing", then read them with IOptionsMonitor.Get("Transactional"). An "unnamed" registration is just the instance whose name is Options.DefaultName, the empty string, which is why one validator covers both.
+
+Cross-Q: Which of the three interfaces can resolve a named instance?-- think --
+
+A: IOptionsSnapshot.Get(name) and IOptionsMonitor.Get(name). IOptions has no .Get at all, .Value is always the unnamed default. That is a design decision, not an oversight: IOptions exists for the "one settings object, fixed for the process" case.
+If your design needs names, IOptions is off the table, which also means a library that only takes IOptions cannot be configured per-name by its consumers.
+
+Cross-Q²: You call services.PostConfigure(o goes to o.UseTls = true) and the marketing instance still has T L S off. Why?-- think --
+
+A: Because PostConfigure with no name targets only the default (unnamed) instance. Named instances are untouched. Use PostConfigureAll for a genuinely universal override, or PostConfigure("Marketing",. ) to target one.
+This is a silent failure, nothing throws, the value is simply not what you asked for, which is why it is a favourite interview question.
+
+-- pause --
+Drill 17, PostConfigure ordering and third-party libraries.
+
+Q: A NuGet package's AddWidgets() calls services.Configure(.) internally, and you need to override one property. What is the cleanest fix?-- think --
+
+A: services.PostConfigure(o goes to o.Timeout = TimeSpan.FromSeconds(30)) after AddWidgets().
+PostConfigure is guaranteed to run after all Configure actions for that type, regardless of the order they were registered in, so your override is definitive without you having to reason about registration order at all.
+
+Cross-Q: Why not just call services.Configure(o goes to o.Timeout =.) after theirs?-- think --
+
+A: It would usually work, configure actions run in registration order, but it is fragile. It only holds as long as your call really is last, which breaks the moment someone reorders Program.cs, or the library registers lazily, or another package configures the same type.
+PostConfigure states the intent ("this wins") instead of relying on an ordering accident.
+
+Cross-Q²: Do Configure calls replace each other?-- think --
+
+A: No, they compose. Every registered action runs, in order, against the same instance. Two Configure calls that set different properties both take effect; two that set the same property leave the later one's value.
+So "the last binding wins" is true per property, not per registration, and it means a stray Configure somewhere else in the codebase can quietly reach into your options object.
+
+-- pause --
+Drill 18, Binding collections and dictionaries.
+
+Q: How do you bind a Jason array and a Jason object to a POCO?-- think --
+
+A: Nothing special is needed. Jason arrays bind to List or T[]; Jason objects bind to Dictionary; nested types recurse. Internally an array is just keys with numeric segments, Egress:AllowedOrigins:0,:1,:2, which is why the env-var form is Egress__AllowedOrigins__0.
+
+Cross-Q: appsettings.json defines a 3-element array and an env var sets index 0. Do you get 1 element or 3?-- think --
+
+A: Three. The environment variable overrides index 0 only; indices 1 and 2 come from the file untouched. Merging happens per leaf key, and an array is nothing but leaf keys with numeric names, the configuration system has no concept of "an array" to replace wholesale.
+
+Cross-Q²: So how do you shrink a list from the environment?-- think --
+
+A: You can't, cleanly, there is no "clear this collection" key. That is the practical argument against modelling anything you'll want to fully override as an array.
+The workarounds are to bind a single delimited string and split it yourself, to use a Dictionary keyed by name so entries can be individually replaced, or to have the higher-priority source define every index. Say the limitation out loud rather than inventing an A P I for it.
+
+-- pause --
+Drill 19, Validators, plural.
+
+Q: Can you register more than one IValidateOptions for the same T ?-- think --
+
+A: Yes. All registered validators run, and their failures are aggregated into a single OptionsValidationException rather than the first one short-circuiting.
+That is genuinely useful: split "network settings are sane" and "credentials are present" into two named, individually testable classes and a misconfigured deployment reports both problems at once instead of one per restart cycle.
+
+Cross-Q: How does IValidateOptions interact with named options?-- think --
+
+A: The signature is Validate(string? name, T options) and a validator is invoked for every instance, so it must decide what it applies to. The detail people get wrong: for the default instance name is Options.DefaultName, which is string.Empty, not null.
+OptionsManager.Get does name ??= Options.DefaultName before calling the factory, so a null never reaches your validator.
+That makes if (name != "Marketing") return ValidateOptionsResult.Skip; the correct way to scope a validator to one instance, and it makes the tempting name is null check for "the default one" dead code. Ignoring name entirely makes the validator universal.
+Silently validating the wrong instance is the bug this parameter exists to prevent.
+
+Cross-Q²: Can you inject services into a validator?-- think --
+
+A: Yes, it is resolved from the container like anything else, and that is the main reason to prefer it over ValidateDataAnnotations. The trap: validators are typically registered as singletons, so injecting a scoped service such as a DbContext is a captive dependency.
+Inject IServiceScopeFactory and create a scope inside Validate instead. And think twice before validating against a database at all, ValidateOnStart runs before the app is serving, so a slow or unavailable dependency turns a config check into a startup outage.
+Validate shape in IValidateOptions; validate reachability in an IHostedService.
+
+-- pause --
+Cheat Sheet.
+
+Provider precedence (highest wins).
+
+6 (highest), Command-line args, --Smtp:Port set to 8025.
+5, Environment variables, Smtp__Port set to 8025; also CONNSTR_ prefixes.
+4, User Secrets, Development only, needs UserSecretsId.
+3, appsettings.{Environment}.json, Filename is case-sensitive on Linux.
+2, appsettings.json, Committed defaults.
+1 (lowest), Host configuration (chained), ASPNETCORE_ / DOTNET_ vars, content root.
+
+Custom providers (Key Vault, Consul, database) sit wherever you register them, order is registration order, not provider type.
+
+The IOptions trinity.
+
+IOptions, Singleton, Never, Yes, .Value.
+IOptionsSnapshot, Scoped, Per scope, No, captive, .Value, .Get(name).
+IOptionsMonitor, Singleton, Live, Yes, .CurrentValue, .Get(name), .OnChange().
+
+Registration quick-reference.
+
+Key conventions.
+
+Config keys / Jason nesting,:, Smtp:Credentials:Pwd.
+Environment variables, __, Smtp__Credentials__Pwd.
+Env-var array indices, __n, Egress__AllowedOrigins__0.
+Azure Key Vault secret names, --, Smtp--Pwd.
+Command line,: directly, --Smtp:Port set to 8025.
+
+Numbers worth knowing.
+
+FileConfigurationSource.ReloadDelay, 250 milliseconds default, A P I docs.
+AzureKeyVaultConfigurationOptions.ReloadInterval, null default = never reloads, A P I docs.
+ValidateScopes / ValidateOnBuild defaults, on in Development only, D I docs.
+
+Diagnostics.
+
+"Wrong value, no idea why", maps to, ((IConfigurationRoot)cfg).GetDebugView(), shows the winning provider per key.
+"Env var ignored", maps to, Confirm the process actually sees it; check __ versus: and case.
+"Reload didn't happen", maps to, Check reloadOnChange, and that the provider reloads at all (env vars and Key Vault do not, by default).
+"Works in Dev, broken in Prod", maps to, Scope validation is off in Prod, turn it on and rerun.
+
+-- pause --
+Walkthrough.
+
+Scenario: an order-processing service needs SMTP settings. Validate at startup, hot-reload MaxRetries, and run a separate named "AlertSmtp" channel alongside the default.
+
+Step 1, Define the POCO.
+
+Step 2, Cross-property validation in a class.
+
+Step 3, Register.
+
+️ ValidateOnStart() is per named instance. It is registered on the OptionsBuilder.
+, whose name is Options.DefaultName, and internally keys its startup check on.
+(typeof(TOptions), builder.Name), so only the default instance is forced at startup.
+"AlertSmtp" is registered with plain Configure(name, section) and is therefore.
+validated lazily, the first time something calls .Get("AlertSmtp"). To fail fast on.
+both, give the named instance its own builder:
+
+csharp.
+builder.Services.AddOptions("AlertSmtp").
+.Bind(builder.Configuration.GetSection("Smtp:Alert")).
+.ValidateDataAnnotations().
+.ValidateOnStart();
+
+Step 4, Consume from a singleton that needs live MaxRetries.
+
+Step 5, Consume the named channel from a scoped service.
+
+Result: the app refuses to start if the default instance has a missing Host, an out-of-range Port, or T L S on port 25.
+The same validator also covers "AlertSmtp", but, as registered, that instance is checked on first use rather than at startup, unless you give it its own AddOptions("AlertSmtp"). ValidateOnStart() chain.
+MaxRetries can be edited in appsettings.json and EmailDispatcher picks it up live, roughly ReloadDelay (250 milliseconds) after the write, without a data race. AlertService uses its own SMTP server.
+
+What would break this: capturing monitor.CurrentValue into a field in step 4's constructor and never re-reading it (frozen config); injecting IOptionsSnapshot into EmailDispatcher instead (captive dependency, and silent in Production unless scope validation is forced on);
+dropping the IDisposable from OnChange (leaked subscription); or assuming one ValidateOnStart() covers every named instance (it covers exactly one name).
+
+-- pause --
+Self-test.
+
+A: IOptionsSnapshot is scoped, recreated per D I scope. A singleton capturing it is a captive dependency: the snapshot is created once from the root scope and never refreshed, which defeats the entire point of using a snapshot.
+Whether it throws depends on scope validation, which the default host enables only in the Development environment, so in Development you get an InvalidOperationException, and in Production with defaults it silently misbehaves.
+Fix: use IOptionsMonitor (singleton, live) if you need fresh values, or IOptions if the value is genuinely fixed. Separately, set ValidateScopes and ValidateOnBuild explicitly so the mistake fails loudly everywhere.
+
+A: 5. The environment-variables provider is registered after the Jason providers, so it wins on collision, and __ is translated to: making the key Retry:MaxAttempts, the same key the Jason file produced. Last writer wins, per leaf key.
+
+A: Lazily, the first time a TOptions instance is created, which is the first .Value / .Get(name) access, typically inside a request handler. The app starts "successfully" with broken config and fails on a real user request. ValidateOnStart() moves it to host startup.
+Note that validation also re-runs on reload, so a bad hot-reloaded value surfaces at the next read either way.
+
+A: PostConfigure() without a name applies only to the default (unnamed) instance. PostConfigureAll() applies to every instance including all named ones. Both run after every Configure action for that type, regardless of registration order.
+Reaching for PostConfigure in an app that uses named options is a silent no-op on those instances.
+
+A: The callback runs on whatever thread signalled the reload, a thread-pool thread for file providers, with no synchronisation guarantee.
+Publish a whole new instance atomically: Volatile.Write(ref _current, updated) in the callback and Volatile.Read(ref _current) once at the start of each operation, or Interlocked.Exchange. Never mutate the options object in place after publishing it, treat it as immutable.
+A lock is also correct and is simpler if several fields must change together.
+
+A: Binding throws InvalidOperationException ("Failed to convert configuration value. to type 'System.Boolean'") wrapping the FormatException from bool.Parse. It does not quietly become false.
+Only "true" / "false" parse, case-insensitively, and the Jason literal true is better than the string "true".
+
+A: Set true in the project file, dot NET 8+. That switches binding from reflection to compile-time generated code via interceptors, at every intercepted call site. What does not fix it: swapping Configure for BindConfiguration.
+Both are reflection-based A P Is and both are covered by the generator once it is enabled; the choice between them is about ergonomics, not A O T.
+
+A: AzureKeyVaultConfigurationOptions.ReloadInterval defaults to null, which means the provider never re-polls, the docs state the provider "caches secrets for the application lifetime" by default. Set ReloadInterval, or expose an authenticated admin action calling IConfigurationRoot.Reload().
+And re-polling alone is not enough: whatever consumes the value must read it at use time rather than having captured it at startup.

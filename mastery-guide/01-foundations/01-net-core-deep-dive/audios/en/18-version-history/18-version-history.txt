@@ -1,0 +1,320 @@
+-- pause --
+Section 1. Why it matters.
+
+Microsoft has shipped a major dot NET release every November since the dot NET 5 unification. Each release alternates L T S (3-year support) and STS (Standard-Term Support, 18 months).
+Senior dot NET engineers need version literacy: which features arrived when, which versions are still supported, what's gained by upgrading. Interviewers ask "what's new in dot NET 8?" or "why dot NET 10 over dot NET 9?", knowing the answer is table stakes for senior roles.
+
+this session is the canonical reference inside the guide for "what changed and when." The other 17 files explain how features work; this one anchors them in time and helps you talk about upgrade paths.
+
+How to read this session:
+Each version section lists language to runtime to A S P dot NET Core to E F Core to libraries to tooling.
+Bold = the headliner for that release (the feature you'd lead with in an interview).
+(dot NET X+) annotations elsewhere in the guide point back to this session for context.
+
+When NOT to over-index on this: don't pick projects by the latest version alone. L T S releases (dot NET 8, dot NET 10) are the production safe bets. STS (dot NET 7, dot NET 9) are interesting but expire fast.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+The release cadence, L T S versus STS.
+
+L T S (Long-Term Support): 36 months of patches. Even-numbered versions: dot NET 6, 8, 10, 12.
+STS (Standard-Term Support): 18 months of patches. Odd-numbered: dot NET 5, 7, 9, 11.
+
+Production rule of thumb: target L T S for systems you don't want to upgrade twice a year. Target STS for greenfield work where you want the newest features and accept the upgrade cadence.
+
+As of May 2026:
+dot NET 6 (L T S, Nov 2021): out of support since Nov 2024.
+dot NET 7 (STS, Nov 2022): out of support since May 2024.
+dot NET 8 (L T S, Nov 2023): supported through Nov 2026, many production systems on this.
+dot NET 9 (STS, Nov 2024): out of support May 2026, about to fall off.
+dot NET 10 (L T S, Nov 2025): the current production target. Supported through Nov 2028.
+
+-- pause --
+dot NET 7 (Nov 2022, STS, out of support).
+
+Released alongside C sharp 11. The "performance and A O T polish" release.
+
+Language, C sharp 11:
+required members, public required string Name { get; init; } forces the caller to set it; replaces ad-hoc constructor validation.
+Raw string literals, """.""" for multi-line strings, Jason, sequel embedded in C sharp without escape soup.
+List patterns, if (arr is [1, 2,., 9, 10]) {. }.
+Generic math (static abstract members in interfaces), INumber, IAddable, et cetera enables T Sum(IEnumerable) where T: INumber.
+File-scoped types, file class X visible only within the file; great for source generators.
+UTF-8 string literals, "abc"u8 returns ReadOnlySpan directly; avoids encoding overhead in hot paths.
+ref fields and scoped ref, enabled Span to live as a struct field.
+
+Runtime / garbage collector / jit:
+NativeAOT for console apps went GA, single-file, ahead-of-time compiled binaries with no jit and minimal startup time.
+On-Stack Replacement (OSR), hot methods recompile in place during execution.
+Profile-Guided Optimization (PGO), preview, jit learns hot paths from runtime profiles.
+~1,000+ performance pull requests documented by Stephen Toub.
+
+A S P dot NET Core:
+MapGroup for Minimal A P Is, app.MapGroup("/orders").RequireAuthorization() for shared route prefixes and metadata.
+Endpoint filters, middleware-like behaviour at the per-endpoint level.
+Output caching middleware, app.UseOutputCache() + [OutputCache] attribute.
+Rate limiting middleware, Microsoft.AspNetCore.RateLimiting GA with token-bucket / sliding-window / fixed-window / concurrency limiters.
+G R P C Jason transcoding, expose G R P C services as rest without dual-implementation.
+
+E F Core 7:
+ExecuteUpdate / ExecuteDelete, bulk operations without loading entities into memory.
+Jason columns for sequel Server, mapped as owned subdocuments.
+DateOnly / TimeOnly mapped to native DB types.
+
+Libraries / BCL: TimeSpan.FromXxx overloads taking int; [StringSyntax] attribute for IDE highlighting; rate-limiting primitives in System.Threading.RateLimiting.
+
+Tooling: dotnet publish /t:PublishContainer builds a Docker image without a Dockerfile.
+
+-- pause --
+dot NET 8 (Nov 2023, L T S, supported through Nov 2026).
+
+The big L T S release. Many production systems still run on this in 2026.
+
+Language, C sharp 12:
+Primary constructors for classes, public class OrderService(IRepo repo, ILogger log) {. }. Saves boilerplate; the parameters are in scope throughout the class. Records had this since C sharp 9; classes get it now.
+Collection expressions, int[] x = [1, 2, 3];, List y = [1, 2, 3];, spread with [.first, .second].
+Default lambda parameters, (int x = 10) goes to x * 2.
+Alias any type, using IntDict = System.Collections.Generic.Dictionary;.
+Inline arrays, [InlineArray(8)] struct Buffer { byte _e0; } for fixed-size struct arrays.
+Experimental attribute, [Experimental("DiagId")] flags A P Is as preview.
+
+Runtime / garbage collector / jit:
+Dynamic PGO on by default, typical 5, 20% throughput uplift on real workloads.
+NativeAOT for A S P dot NET Core (Minimal A P Is), Minimal A P I apps can publish A O T-only. Trade-off: no Microsoft.AspNetCore.Mvc controllers, no reflection-heavy serializers.
+Tiered compilation improvements including DynamicPGO + ReadyToRun composite mode.
+
+A S P dot NET Core:
+MapIdentityApi(), opinionated identity-as-A P I for SPAs and mobile, separate from the cookie or M V C Identity stack.
+Keyed services in D I, services.AddKeyedScoped("primary", PrimaryFoo); resolve with [FromKeyedServices("primary")].
+IExceptionHandler, first-class global exception handling registered via services.AddExceptionHandler().
+H T T P or 3 enabled by default in Kestrel.
+Blazor United, Server + WebAssembly + Static SSR + Streaming + per-component interactivity in one app model.
+
+E F Core 8:
+Complex types (value objects), [ComplexType] mapping for owned-type-like patterns without the weird ID semantics.
+Hierarchy mapping (TPC, TPT, TPH) stabilised.
+Json column improvements including for Postgres jsonb.
+Raw sequel queries returning unmapped types, db.Database.SqlQuery($"SELECT.").
+
+Libraries / BCL:
+TimeProvider, abstract clock; injectable into tests; replaces ad-hoc DateTime.Now mocks.
+FrozenDictionary / FrozenSet, read-optimised immutable collections, faster lookups than Dictionary.
+Random.GetItems / Random.Shuffle.
+System.Numerics.Tensors for SIMD-accelerated math.
+
+Tooling / containers:
+dotnet publish /p:PublishProfile set to DefaultContainer with chiseled Ubuntu base images for tiny, secure containers.
+dot NET Aspire preview, opinionated stack for cloud-ready distributed apps (orchestration, OpenTelemetry, dashboard).
+
+-- pause --
+dot NET 9 (Nov 2024, STS, out of support May 2026).
+
+The "polish and observability" release. Many shops skipped 9 to wait for 10's L T S.
+
+Language, C sharp 13:
+params collections, params works for any IEnumerable -compatible type, not just arrays. void Log(params ReadOnlySpan args) allocates zero.
+System.Threading.Lock, private Lock _l = new(); then lock (_l) {. }. Faster than locking on object and clearer intent.
+Partial properties, like partial methods, useful for source generators.
+\e escape sequence for ESC character (terminal control codes).
+field keyword (preview), refer to a property's backing field inside get / set. Promoted to GA in C sharp 14.
+Implicit index access in object initializers, new T { [1] = value }.
+
+Runtime / garbage collector / jit:
+More dynamic PGO improvements, better inlining heuristics, devirtualization.
+garbage collector reduces commit churn on long-running services.
+Loop optimizations for vectorization.
+
+A S P dot NET Core:
+Built-in OpenAPI, builder.Services.AddOpenApi() + app.MapOpenApi() produces an OpenAPI document from Minimal A P Is. Replaces Swashbuckle for new projects (Swashbuckle still supported).
+HybridCache (preview to GA), combines IMemoryCache (L1) and IDistributedCache (L2) with stampede protection. The pattern most production apps roll by hand, now first-party.
+Static asset delivery improvements, fingerprinted asset URLs, automatic compression.
+Improved Blazor static SSR, server-rendered with progressive enhancement.
+
+E F Core 9:
+Improved ExecuteUpdateAsync, accepts compiled-query-like patterns.
+Better Json query support with provider-specific operators.
+Read-only context performance improvements.
+
+Libraries / BCL:
+link CountBy / AggregateBy / Index, items.CountBy(x goes to x.Category) returns IEnumerable>. Index() adds index numbers like Python's enumerate.
+ReDoS attack detection in regex compilation.
+OrderedDictionary, generic ordered dictionary in BCL.
+
+Tooling:
+dot NET Aspire 9 GA, distributed-app dev experience matures (Postgres, Redis, RabbitMQ, Kafka resources; OpenTelemetry wired by default; dashboard).
+
+-- pause --
+dot NET 10 (Nov 2025, L T S, supported through Nov 2028).
+
+The current L T S. Default target for new production work in 2026.
+
+Language, C sharp 14:
+Extension members beyond methods, extension properties, operators, and static members. The biggest C sharp language change in years:
+
+field keyword, promoted from preview. Inside a property accessor, field refers to the auto-generated backing field, no need to declare it explicitly:
+
+Null-conditional assignment, obj?.Property = value; (no-op if obj is null).
+Partial constructors and partial events, for source generators.
+nameof over unbound generics, nameof(List<>).
+Unsafe lambdas / lambdas with modifiers, static, unsafe on lambdas.
+User-defined compound assignment, overload +=, -=, et cetera directly without overloading the base operator.
+Implicit span conversions, string to ReadOnlySpan works without explicit .AsSpan().
+
+Runtime / garbage collector / jit:
+NativeAOT improvements, closer to feature parity with full runtime; better library compatibility.
+More dynamic PGO, devirtualization across more call sites.
+garbage collector region-based heap improvements for sustained-load services.
+Stack-allocated arrays, small array allocations escape-analyzed onto the stack.
+
+A S P dot NET Core:
+Server-Sent Events (S S E) helpers in Minimal A P Is, Results.ServerSentEvents(IAsyncEnumerable) for streamed responses.
+Memory-efficient validation, new validation pipeline reduces allocations.
+Granular static-asset optimization, per-asset compression / fingerprinting policies.
+Blazor diagnostics improvements and simpler form-state management.
+Improved OpenAPI, better handling of polymorphic types, generic type parameters.
+
+E F Core 10:
+Continued perf improvements in change tracking and query translation.
+Better complex-type support.
+Improved migrations for online schema changes.
+
+Libraries / BCL:
+Continued link additions and reflection improvements for source generators.
+Performance: smaller allocations across H T T P and Jason code paths.
+
+Tooling:
+dotnet run improvements, runs single-file C sharp programs with #:package directives for inline package references (the "shebang for C sharp" experience).
+dot NET Aspire 10, production deployment story matures (Azure / A W S / G C P integrations).
+
+-- pause --
+Section 3. Code and diagrams.
+
+-- pause --
+Release timeline.
+
+L T S releases (dot NET 8, 10, 12.) overlap with the next L T S, you have time to upgrade.
+
+-- pause --
+Headline features at a glance.
+
+Language, C sharp 11, C sharp 12, C sharp 13, C sharp 14.
+Top language feature, required, raw strings, primary constructors, collection expressions [.], params collections, Lock, extension members (everything), field.
+A O T, Console GA, A S P dot NET Minimal A P Is, Continued, Near feature parity.
+OpenAPI, Swashbuckle, Swashbuckle, Built-in AddOpenApi, Built-in (improved).
+Identity, Cookie or M V C, + MapIdentityApi, continued, continued.
+Hybrid cache, manual, manual, HybridCache, continued.
+H T T P or 3, preview, default, default, default.
+Aspire, preview, 9 GA, 10 GA.
+Container build, dotnet publish, chiseled bases, continued, continued.
+Bulk EF ops, ExecuteUpdate / Delete, improved, improved, improved.
+Default ports, 5000 / 5001, 5000 / 5001, 5000 / 5001, 5000 / 5001.
+
+-- pause --
+Five key code samples, one per major release.
+
+C sharp 11, required members + raw string literals (dot NET 7):
+
+C sharp 12, primary constructor + collection expression (dot NET 8):
+
+C sharp 13, params collections + Lock (dot NET 9):
+
+C sharp 14, extension members + field keyword (dot NET 10):
+
+A S P dot NET Core dot NET 9, built-in OpenAPI:
+
+-- pause --
+Section 4. Common pitfalls.
+
+Shipping production on STS (dot NET 7, 9, 11). 18-month support window. You'll be forced to upgrade twice as often as on L T S. Pick L T S for systems you don't want to babysit.
+Targeting net8.0 while running dotnet --version 10.0.x S D K. Works, but make sure your matches what you actually deploy. Mixed S D K or runtime versions in CI versus local cause confusing build errors.
+NativeAOT compatibility surprises. Some libraries (especially older ones, anything heavy on reflection / Activator.CreateInstance ) don't A O T. Test dotnet publish -p:PublishAot set to true before committing.
+Assuming Swashbuckle still required on dot NET 9+. Built-in AddOpenApi covers most cases. Swashbuckle remains for advanced features (X M L comments, custom filters), but new projects should start with built-in.
+Treating params collections as drop-in. Calling code that passes null to params ReadOnlySpan fails differently from params T[]. Test edge cases.
+Mixing C sharp language versions across a solution. latest per project; consistent across the solution. Otherwise newer features fail to compile in older projects.
+Forgetting E F Core's bulk operations skip change tracking. ExecuteUpdateAsync doesn't fire SaveChangesAsync interceptors. Audit columns / soft-delete cascades / domain events all bypass.
+Identity A P I confusion. MapIdentityApi is the new lightweight one; cookie or M V C Identity still exists separately. Don't try to use both.
+HybridCache without configuring distributed backing. Without an IDistributedCache registered, HybridCache falls back to L1-only, silently. Verify both are wired.
+Aspire pinned across major versions. Aspire's A P I evolves faster than dot NET itself. Pin Aspire NuGet versions explicitly; expect breaking changes between major dot NET upgrades.
+Reading net9.0 and assuming "current." Source code captures intent at write time; dot NET 10 may be the better target now. When upgrading, multi-target if you have library consumers; bump TFM if you control deployment.
+STS-to-STS upgrade gap. If you're on dot NET 9 and the next L T S (dot NET 10) is what you want, you upgrade through dot NET 10, there's no skipping. Plan it as a single bump, not two.
+
+-- pause --
+Section 5. Interview-ready summary.
+
+Cadence: new release every November. Even = L T S (3 yrs), odd = STS (18 months).
+As of May 2026: dot NET 8 (L T S) and dot NET 10 (L T S) are supported; dot NET 9 expires this month.
+dot NET 7 brought C sharp 11 (required, raw strings, generic math), Minimal A P I filters, output cache + rate limiting, E F Core bulk ops.
+dot NET 8 is the big L T S, C sharp 12 (primary constructors, collection expressions), NativeAOT for A S P dot NET, identity A P I, keyed D I, H T T P or 3 default, TimeProvider, frozen collections.
+dot NET 9 added C sharp 13 (params collections, Lock), built-in OpenAPI, HybridCache, link CountBy / AggregateBy, Aspire 9 GA.
+dot NET 10 is the current L T S, C sharp 14 (extension members beyond methods, field keyword, null-conditional assignment), more A O T polish, S S E in Minimal A P Is.
+Production guidance: target L T S unless you need a feature only on STS. Multi-target libraries; pin S D K in global.json.
+
+Expected interview questions:
+
+"What's new in dot NET 8?", L T S release. C sharp 12 (primary constructors for classes, collection expressions, default lambda params). NativeAOT for A S P dot NET Core. Keyed D I. IExceptionHandler. H T T P or 3 default. TimeProvider. Frozen collections. PGO on by default.
+"What's new in dot NET 9?", STS. C sharp 13 (params collections, System.Threading.Lock, partial properties). Built-in OpenAPI. HybridCache. link CountBy / AggregateBy. Aspire 9 GA.
+"What's new in dot NET 10?", L T S, current. C sharp 14 with the headline being extension members beyond methods (extension properties, operators), field keyword GA, null-conditional assignment. Continued A O T and PGO improvements. Better S S E support in Minimal A P Is.
+"Why prefer L T S for production?", 36 months of patches versus 18; one upgrade every 2 years instead of every year. Reduces operational overhead and CVE-patch churn.
+"What's TimeProvider and why is it useful?", Abstract clock introduced in dot NET 8. Inject TimeProvider instead of using DateTime.UtcNow; tests can advance time deterministically. Replaces hand-rolled IClock abstractions.
+"What's the difference between Swashbuckle and AddOpenApi ?", Swashbuckle is the legacy NuGet (still supported). AddOpenApi is built into A S P dot NET Core 9+. For new projects, AddOpenApi is enough; Swashbuckle has more advanced customization.
+"What's NativeAOT and which versions support what?", Compiles to native ahead of time, no jit, fast startup, smaller binaries. dot NET 7 GA for console, dot NET 8 added A S P dot NET Core Minimal A P Is. dot NET 10 closes more compatibility gaps.
+"What does field (C sharp 14) replace?", The hand-written backing-field pattern: private string _name; public string Name { get goes to _name; set goes to _name = value?.Trim(). }.
+With field, no explicit declaration: the compiler generates the backing storage; you just reference field in the accessor.
+
+-- pause --
+Section 6. Cheat Sheet.
+
+Cadence: November release; even = L T S (3 yrs); odd = STS (18 mo).
+Currently supported (May 2026): dot NET 8 (L T S), dot NET 10 (L T S); dot NET 9 expires this month.
+dot NET 7: C sharp 11, required, raw strings, generic math; Minimal A P I filters.
+dot NET 8: C sharp 12, primary ctors, collection expressions; NativeAOT for A S P dot NET; keyed D I; TimeProvider; frozen collections.
+dot NET 9: C sharp 13, params collections, Lock, partial properties; built-in OpenAPI; HybridCache.
+dot NET 10: C sharp 14, extension members beyond methods, field keyword, null-conditional assignment.
+global.json: pin S D K version; avoids "works on my machine" version mismatch.
+Multi-target libs: net8.0;net10.0 for broad consumption.
+STS upgrade rule: don't skip, dot NET 9 to dot NET 10 is one bump; can't jump 9 to 11.
+A O T readiness: dotnet publish -p:PublishAot set to true early in CI to surface trim warnings.
+
+-- pause --
+Section 7. Walkthrough, Upgrading dot NET 8 to dot NET 10 in production.
+
+Problem: A team runs 12 services on dot NET 8 (L T S, supported through Nov 2026).
+The platform team wants to roll forward to dot NET 10 (L T S, supported through Nov 2028) to capture C sharp 14 features ( field keyword, extension properties), better A O T cold-start, and to align with the next two-year cycle.
+
+Diagnosis: Read dotnet --info and the per-project to confirm starting state. Inventory dependencies: dotnet list package --outdated --include-transitive shows which NuGets ship dot NET 10 builds.
+Critical packages (E F Core, A S P dot NET Core, Aspire) must align, Aspire in particular is pinned per major dot NET version. Run the upgrade-assistant: dotnet tool install -g upgrade-assistant; upgrade-assistant analyze. produces a per-project compatibility report with breaking changes flagged.
+
+Fix: Phase the rollout. (1) Pin S D K in global.json to enforce reproducible builds: {"sdk": {"version": "10.0.100", "roll Forward": "latest Feature"}}.
+(2) Bump one library project's to net10.0; fix any breaking changes (often E F Core's ExecuteUpdate parameter changes, or IHostingEnvironment deprecations). (3) Run the project's existing tests + dotnet publish -p:PublishAot set to true in CI to surface trim or A O T warnings early.
+(4) Bump the entry-point service after libraries land. (5) Deploy to canary 1%, watch p99 latency / garbage collector counters / error rate for 24 hours. (6) Roll forward across services one per week.
+
+Why it works: Phasing is critical because dot NET majors change runtime behavior subtly, garbage collector heuristics, jit decisions, BCL implementations. Per-service canary catches regressions before they hit all traffic. Pinning S D K ensures CI and local builds match.
+The two-L T S cadence (dot NET 8 to dot NET 10) is intentional: skipping the STS in between ( net9.0 ) avoids a forced upgrade in Nov 2026 when dot NET 9 expires.
+
+-- pause --
+Section 8. Self-test.
+
+L T S (Long-Term Support) = 3 years of patches; STS (Standard-Term Support) = 18 months. Microsoft alternates them so even-numbered versions (even = L T S: dot NET 6, 8, 10) get the long support window and odd-numbered (dot NET 7, 9, 11) ship as innovation drops with shorter support.
+Production teams skip STS and upgrade L T S-to-L T S every 2 years; teams that need a specific feature (for example, HybridCache shipped in dot NET 9) can take an STS.
+The "STS gap", running dot NET 9 in May 2026 means upgrading to dot NET 10 within weeks or losing patches, is a planning trap; pick L T S unless the STS feature is worth the upgrade tempo.
+
+dot NET 7 is STS, expired May 2024. The team must upgrade. Best path: jump straight to dot NET 10 (current L T S), dot NET 8 is also L T S but expires Nov 2026, only 18 months out.
+The upgrade hops are dot NET 7 to 8 (test) to 9 (test) to 10 if you want incremental confidence, or 7 to 10 if your dependencies allow.
+Multi-step upgrades catch breaking changes more cleanly; direct hops are faster. Either way, do not stay on dot NET 7, no security patches means CVE risk.
+Pre-upgrade checklist: NuGets supporting target TFM, A O T compatibility if relevant, E F Core migration semantics if jumping 7 to 9 ( ExecuteUpdate / ExecuteDelete are dot NET 7+ but their semantics evolved).
+
+NativeAOT wins for: (a) serverless / cold-start sensitive workloads, Azure Functions, A W S Lambda, where jit warm-up burns money; (b) constrained-memory containers where jit's working set is too large; (c) single-file deployments needing minimal binary size;
+(d) scenarios needing zero jit (security or regulatory).
+Loses for: (a) reflection-heavy code paths (older ORMs, I O C containers, legacy serializers); (b) plugin systems loading DLLs at runtime; (c) hot-paths where Tier 1 jit optimizations + Dynamic PGO eventually outperform A O T.
+Trade-off summary: A O T trades startup time + size for build complexity + reflection limits. Default to jit for monoliths; consider A O T for microservices, C L I tools, edge workloads.
+
+No, field requires both the C sharp 14 compiler (Roslyn shipped with the dot NET 10 S D K or versus 17.12+) and a set to 14 or latest.
+The C sharp version is independent of the target framework, so technically you can set latest in a net8.0 project, but field may emit I L that requires runtime support not present in net8.0. The pragmatic answer: feature-by-feature.
+Some C sharp 14 features (records improvements, syntactic sugar) work on older TFMs; others (anything touching the runtime, like Lock ) need the new BCL. Check the language-version reference docs. If it's purely syntactic, bumping works; if it's runtime-bound, you must bump TFM.
+
+The compiler builds the library twice, once for each TFM, producing bin or Debug or net8.0 or Lib.dll and bin or Debug or net10.0 or Lib.dll. Consumers on dot NET 8 reference the first; dot NET 10 consumers the second.
+Inside the source, #if NET10_0_OR_GREATER blocks let you use newer A P Is only when targeting newer TFMs, with fallbacks for older.
+Trade-offs: (+) wide compatibility, one NuGet package serves both L T S audiences; (+) new features available where supported; (−) build is slower (compiles n times), tests must run per TFM, debugging is more complex, NuGet package is larger.
+Use multi-targeting for libraries with broad consumer base (Newtonsoft, Polly, Serilog do this); skip it for application services where you control the runtime.

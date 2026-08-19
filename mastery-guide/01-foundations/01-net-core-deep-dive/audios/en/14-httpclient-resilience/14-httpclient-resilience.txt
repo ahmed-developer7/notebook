@@ -1,0 +1,930 @@
+-- pause --
+Section 1. Why It Matters.
+
+Almost every modern dot NET service is also an H T T P client. It calls a payment gateway, an identity provider, an internal microservice, an L L M, a third-party A P I.
+The default reflex, new HttpClient() per request, was a footgun that brought down production systems for the better part of a decade.
+The fixes are well-known now ( IHttpClientFactory, SocketsHttpHandler pool tuning), but the resilience layer on top is where 2026 dot NET shines:
+Polly v8's ResiliencePipeline + Microsoft.Extensions.Http.Resilience lets you express retry, circuit breaker, timeout, hedging, and fallback in a few declarative lines.
+
+This guide treats H T T P outbound calls as a system: the lifecycle pitfalls of HttpClient, the factory pattern, the modern Polly v8 A P I, the dot NET 8+ standard pipeline, the DelegatingHandler chain, and SocketsHttpHandler tuning.
+Each section comes with the trade-offs you actually hit in production.
+
+-- pause --
+Section 2. Table of Contents.
+
+Introduction.
+Real-World Analogy.
+HttpClient Lifecycle Pitfalls.
+IHttpClientFactory, including BaseAddress and Relative URIs.
+Typed, Named, and Basic Clients.
+Polly v8 ResiliencePipeline.
+Strategies in Detail, including Transient Fault Classification.
+Standard Resilience Pipeline (dot NET 8+).
+DelegatingHandler Chain.
+SocketsHttpHandler Tuning.
+Testing HttpClient.
+Common Pitfalls.
+Best Practices.
+Real-World Scenarios.
+Interview-Ready Summary.
+Interview Cross-Questioning Drill.
+Cheat Sheet.
+Walkthrough, Diagnosing Socket Exhaustion in Production.
+Self-Test.
+Cross-References.
+Sources.
+
+-- pause --
+Section 3. Introduction.
+
+-- pause --
+The HttpClient Story.
+
+HttpClient is the dot NET A P I for making H T T P requests. Underneath, it owns a HttpMessageHandler chain that ultimately reaches SocketsHttpHandler, the part that actually opens TCP or T L S connections. The handler is expensive; it caches D N S lookups, pools connections, and holds state.
+Creating one per request flushes that pool, leaks sockets into TIME_WAIT, and exhausts ephemeral ports under load.
+
+Microsoft frames the choice as exactly two supported lifetime strategies, and everything else is a bug:
+
+Long-lived client with PooledConnectionLifetime set. A static /singleton HttpClient built over a SocketsHttpHandler whose PooledConnectionLifetime you configure. No socket churn, and connections are recycled so D N S is re-resolved.
+Short-lived clients from IHttpClientFactory. The factory pools and rotates HttpMessageHandler instances; each CreateClient() is a cheap wrapper. You additionally get named or typed configuration, D I, logging, and Polly composition.
+
+The broken third option, new HttpClient() per request, or a static client with the handler left at its defaults, is what interviewers are probing for.
+
+-- pause --
+Without versus With.
+
+The two numbers behind this, with sources, quote these, not folklore:
+
+Windows default dynamic (ephemeral) port range, 49152, 65535, that is 16,384 ports, Microsoft, The default dynamic port range for TCP or IP has changed in Windows Vista and Windows Server 2008.
+Windows TIME_WAIT hold time, the TcpTimedWaitDelay registry parameter; Microsoft documents a default of 240 seconds, reducible to 30 seconds, Microsoft, Settings that can be modified to improve network performance.
+Why the socket is held at all, TCP TIME-WAIT is 2 times MSL, so late-arriving segments from the closed connection can't be mistaken for a new one, RFC 9293 §3.3.2 (cited by Microsoft's own HttpClient guidelines).
+
+Linux and container images use different ranges and delays, check sysctl net.ipv4.ip_local_port_range on the actual host rather than quoting a Windows number at a Linux problem.
+
+-- pause --
+Why It Matters in 2026.
+
+Microservices and SaaS integrations multiply the number of outbound H T T P dependencies in any nontrivial app.
+Polly v8's ResiliencePipeline replaced the v7 policy classes with a builder-based A P I that is allocation-free on the success path. Polly's release train is independent of dot NET's, v8 is the current major line and runs the same on dot NET 8, 9, and 10.
+Saying "Polly v8 became stable in dot NET 10" is a category error an interviewer who knows Polly will catch.
+Microsoft.Extensions.Http.Resilience (currently the 10.x line) ships a "standard pipeline" of five strategies with opinionated defaults, plus a standard hedging handler, in one line.
+H T T P or 2 and H T T P or 3 multiplexing change how connections behave, pool tuning matters more than ever.
+
+-- pause --
+Section 4. HttpClient Lifecycle Pitfalls.
+
+-- pause --
+The Two Wrong Answers.
+
+️ Say "static client with an untuned handler", not "static client". A static /singleton HttpClient is one of the two lifetime strategies Microsoft explicitly recommends, provided you set PooledConnectionLifetime on its SocketsHttpHandler.
+PooledConnectionLifetime defaults to Timeout.InfiniteTimeSpan, which is exactly why the untuned static client pins one D N S resolution for the life of the process. Calling the static client categorically wrong is a mis-statement an interviewer can correct you on.
+
+-- pause --
+Section 5. IHttpClientFactory.
+
+-- pause --
+BaseAddress and Relative URIs.
+
+One of the highest-frequency real bugs in this whole topic, and a favourite interview question, because the failure is silent: the request succeeds, it just goes to the wrong URL.
+
+Why, in one sentence you can say out loud: HttpClient resolves the relative reference against BaseAddress using the RFC 3986 §5.3 merge rule, which keeps everything in the base path up to and including the last / and discards the rest, so a base of /v2 contributes only /,
+and a relative reference that itself starts with / is an absolute-path reference that replaces the base path entirely.
+
+-- pause --
+Section 6. Typed, Named, and Basic Clients.
+
+-- pause --
+Consuming a Typed Client End to End.
+
+Registration is the half everyone shows. The half that gets asked about is consumption, the caller depends on the typed class, never on IHttpClientFactory or HttpClient.
+
+️ OrderService here must not be a singleton. Typed clients are registered as transient and are meant to be short-lived; capturing one in a singleton pins its handler and defeats rotation, the same stale-D N S failure as the untuned static client.
+If you need H T T P from a singleton, inject IHttpClientFactory and use a named client, or configure PooledConnectionLifetime on the primary handler.
+
+-- pause --
+Section 7. Polly v8 ResiliencePipeline.
+
+Polly v8 (the Polly.Core rewrite) replaced the v7 policy classes with a builder that produces a ResiliencePipeline. It is allocation-free on the success path, telemetry-aware, and composable.
+Polly versions independently of dot NET, v8 is not "a dot NET 10 feature", it is simply the current major line of the library, and it runs the same on dot NET 8, 9, and 10.
+
+-- pause --
+Standalone (not via H T T P factory).
+
+Builder order = nesting order. The first strategy you add is the outermost; the callback you pass to ExecuteAsync is the innermost.
+In the pipeline, retry wraps the breaker, which wraps the timeout, which wraps the H T T P call, so the timeout is per-attempt and the breaker is consulted on every attempt.
+
+-- pause --
+Section 8. Strategies in Detail.
+
+-- pause --
+Transient Fault Classification.
+
+Before you configure a single retry, you have to be able to say which failures deserve one.
+This is the classification the shipped AddStandardResilienceHandler() uses, and it is the answer to "which status codes do you retry?", because it is not a matter of taste, it is documented behaviour of the handler you are recommending.
+
+What the standard handler's retry and circuit breaker both handle (Microsoft Learn, Build resilient H T T P apps):
+
+H T T P 500 and (server errors).
+H T T P 408 Request Timeout.
+H T T P 429 Too Many Requests.
+the exceptions HttpRequestException and Polly's TimeoutRejectedException.
+
+️ The trap in the middle: 429. It is a 4xx, so the "never retry 4xx" heuristic wants you to give up, but 429 means "come back later", not "never", and it usually carries a Retry-After header.
+HttpRetryStrategyOptions.ShouldRetryAfterHeader makes the retry strategy derive its delay from that header instead of from the backoff curve, and it defaults to true, so the standard handler already honours Retry-After for you.
+The interview-grade version of this answer is therefore "it's on by default, and you'd only set it to false if you had a reason to distrust the server's number", not "remember to switch it on". Never hard-code a delay for 429 when the server told you one.
+
+-- pause --
+Retry.
+
+**The default that surprises people: the standard handler retries every H T T P method, POST included.** Microsoft's docs are explicit, "By default, the standard resilience handler is configured to make retries for all H T T P methods", and they ship two extension methods to narrow it:
+options.Retry.DisableFor(HttpMethod.Post, HttpMethod.Delete) for a specific list, and options.Retry.DisableForUnsafeHttpMethods() for the whole unsafe set (POST, PATCH, PUT, DELETE, CONNECT).
+If you tell an interviewer "the standard handler only retries idempotent methods", you are wrong; the correct answer is "it retries everything unless you call DisableForUnsafeHttpMethods(), which is exactly why duplicate-order bugs show up after someone adds one line of resilience."
+
+️ "Unsafe" is not the same property as "non-idempotent", and this is the follow-up question. DisableForUnsafeHttpMethods() switches off retries for POST, PATCH, PUT, DELETE and CONNECT, because Microsoft selects on safety (read-only semantics, RFC 9110 §9.2.1), not on idempotency.
+But PUT and DELETE are idempotent (§9.2.2) and are usually perfectly safe to retry.
+So the blanket call is the conservative default, not the precise one: if you want to keep retrying PUT and DELETE while protecting your writes, name the methods yourself with options.Retry.DisableFor(HttpMethod.Post, HttpMethod.Patch). Know which of the two properties you are actually selecting on.
+
+-- pause --
+Circuit Breaker.
+
+When the downstream is clearly broken, hammering it with retries makes the situation worse and burns your latency budget. The circuit breaker watches a rolling window; once the failure ratio exceeds a threshold, it opens, failing fast for a cool-off period, then transitions to half-open to probe.
+
+-- pause --
+The Three Timeout Surfaces.
+
+There are three separate things called "timeout" here, and confusing them is the single most common way people accidentally disable their own retries.
+
+HttpClient.Timeout, The entire SendAsync, including every Polly retry. Default 100 seconds., Set to Timeout.InfiniteTimeSpan once Polly owns timeouts.
+Polly per-attempt timeout ( AddTimeout, innermost), One individual attempt, Bounds a single hang so a retry can actually fire.
+Polly total timeout ( AddTimeout, outermost), The whole pipeline, all attempts and backoffs, The operation's hard deadline.
+
+Polly's timeout cancels co-operatively through the CancellationToken, which flows into HttpClient and on into the response stream, so it only works if the code it actually observes the token.
+
+-- pause --
+Retry Budget Arithmetic.
+
+Timeout ordering is not a vibe, it is an inequality you can compute before you ship:
+
+Count the attempts correctly, this is where the arithmetic usually goes wrong. Polly's MaxRetryAttempts is the number of retries in addition to the original call. So MaxRetryAttempts = 3 means four attempts and three backoff delays, not three and two.
+Getting this off by one understates your worst case by a whole attempt plus a backoff, which is exactly the margin you thought you had.
+
+Worked example, the shipped AddStandardResilienceHandler() defaults, which is the case worth having memorised:
+
+So the standard pipeline's own defaults do not fit inside its own total timeout: a maximally unlucky request is cut off by the 30 seconds total timeout partway through, and the last attempts never run.
+That is a deliberate design, the total timeout is the hard deadline and the retry count is a best-effort budget inside it, but you should be able to say it out loud,
+because "does the standard handler always make four attempts?" is a fair cross-question and the answer is "only when they fit in 30 seconds."
+
+To make a budget fit fully, shorten the per-attempt timeout, drop the retry count, or raise the deadline, but do the arithmetic rather than discovering it in an incident.
+
+-- pause --
+Bulkhead / Rate Limiter.
+
+The Polly v7 bulkhead is now expressed as a rate-limiter strategy backed by a concurrency limiter. It bounds how many concurrent calls can be in flight to a particular dependency, preventing one slow dependency from monopolizing your thread pool.
+
+️ Do not build the limiter inside the RateLimiter delegate. RateLimiterStrategyOptions.RateLimiter is invoked per execution; constructing a fresh ConcurrencyLimiter in it gives every call its own private limiter with all permits free, so nothing is ever limited.
+Use DefaultRateLimiterOptions (or AddConcurrencyLimiter ) so a single limiter instance is shared, and reach for the RateLimiter delegate only when you genuinely need to select among long-lived limiters, for example one per tenant, held in a dictionary.
+
+-- pause --
+Fallback.
+
+Fallback belongs outermost in a hand-built pipeline, it must be able to catch everything inside it (open circuit, exhausted retries, blown total timeout). Adding it first in the builder puts it outermost.
+Note that this is a convention for pipelines you compose; the shipped standard handler has no fallback stage at all.
+
+-- pause --
+Hedging.
+
+Hedging makes a parallel (or staggered) second attempt before the first one finishes, useful for tail-latency reduction in idempotent reads.
+
+Hedging is not retry, and the distinction is a favourite interview probe:
+
+Fires, after an attempt fails or times out, before the first attempt resolves.
+Solves, fault tolerance, tail-latency reduction.
+Steady-state cost, none (only pays on failure), extra in-flight requests during every hedge window.
+Safe on, anything you have classified as retryable, idempotent operations only.
+
+The cost is real: each hedged attempt is a full additional request to the dependency, so a hedging window that fires often multiplies both your egress and the downstream's load. Hedge cheap idempotent reads where p99 is the problem; do not hedge an expensive query to shave a median.
+
+Hedging a POST is only legitimate when the endpoint is idempotent by contract, an Idempotency-Key header with server-side deduplication. A raw POST /orders hedged twice is a double-create with extra steps.
+
+Microsoft also ships AddStandardHedgingHandler(), a five-stage pipeline (total timeout to hedging to per-endpoint rate limiter to per-endpoint circuit breaker to per-endpoint attempt timeout) that keeps a pool of circuit breakers keyed by URL authority so unhealthy endpoints aren't hedged against.
+
+-- pause --
+Section 9. Standard Resilience Pipeline (dot NET 8+).
+
+Microsoft.Extensions.Http.Resilience ships a curated default that chains five strategies, outermost first: Rate Limiter to Total Timeout to Retry to Circuit Breaker to Per-Attempt Timeout.
+
+Two things about that list are worth memorising precisely, because both are commonly mis-stated:
+
+There are five stages and fallback is not one of them. Fallback is something you add yourself in a custom pipeline. If you recite "Fallback to Rate Limiter to. " as the standard order, you have merged a hand-rolled convention into the shipped product.
+**The circuit breaker sits inside the retry.** That means the breaker is consulted on every single attempt, not once per retry block, which is what makes it able to cut a retry loop short with BrokenCircuitException the moment it opens.
+
+-- pause --
+Standard Pipeline Composition.
+
+Documented defaults (Microsoft Learn, Build resilient H T T P apps: Key development patterns). Learn these as a set, an interviewer who asks "what does the one-liner actually give you?" is checking whether you know the shipped numbers or are guessing:
+
+1, Rate limiter, Permit 1_000, queue 0.
+2, Total timeout, 30 seconds.
+3, Retry, Max retries 3, backoff Exponential, jitter true, base delay 2 seconds.
+4, Circuit breaker, Failure ratio 10%, min throughput 100, sampling duration 30 seconds, break duration 5 seconds.
+5, Attempt timeout, 10 seconds.
+
+The two bolded values are the ones people leave out, and both change the story:
+
+Min throughput 100. The breaker will not open until it has seen at least 100 calls in the 30-second window. On a low-traffic client that means the shipped breaker may never trip; on a high-requests per second one it is a sane floor.
+Any advice about MinimumThroughput being "too low" has to be measured against the real default, which is 100, not 5.
+Break duration 5 seconds. Short, the standard pipeline is tuned to probe for recovery quickly rather than to shed load for a long cool-off.
+
+-- pause --
+When to Use Standard versus Custom.
+
+Prefer overriding deltas to rebuilding the pipeline. There is a middle ground between "take the defaults" and "hand-roll everything", pass a configuration delegate and change only what your data justifies:
+
+Spec the deltas, not a rewrite. And note the guidance that goes with it: add one resilience handler, don't stack them.
+If you need to replace an inherited configuration wholesale, for example a client that should hedge while everything else uses the standard handler, call RemoveAllResilienceHandlers() first rather than layering a second handler on top:
+
+-- pause --
+Section 10. DelegatingHandler Chain.
+
+Every outbound call walks a chain of DelegatingHandler s, the same model as A S P dot NET Core middleware, but on the client side. This is where you cleanly slot in concerns like auth, logging, header propagation, and chaos.
+
+The one rule that generates everything else: registration order is pipeline order, first-registered outermost. Microsoft's wording is "Multiple handlers can be registered in the order that they should execute.
+Each handler wraps the next handler until the final HttpClientHandler executes the request." So the first AddHttpMessageHandler() runs first on the way out and last on the way back.
+
+The resilience handler is just another handler at the position where you call it. That single fact decides the whole layout:
+
+-- pause --
+Custom Handler Skeleton.
+
+Two details in that snippet are deliberate:
+
+TryAddWithoutValidation, not Add. HttpHeaders.Add validates the value and throws on anything it considers malformed, and TraceIdentifier is host-supplied, so a stray character turns a logging concern into a failed request. TryAddWithoutValidation returns false instead of throwing.
+**A per-attempt handler must set, not append.** Polly re-sends the same HttpRequestMessage instance on each attempt, so headers already on it are still there.
+An auth handler should assign request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token), an assignment replaces, rather than calling Add, which would accumulate a second value on the retry.
+
+Separately: IHttpClientFactory creates a separate D I scope per handler instance, and that scope is not the incoming-request scope and can outlive it. Do not cache request-scoped data (anything off HttpContext ) in a handler's fields; read it per call through an accessor, as.
+
+-- pause --
+Handler Order Matters.
+
+️ The wording trap. "Auth before retry" and "auth after retry" both get used to mean both things, so drop the words before or after and say what nests inside what: the retry wraps the auth handler.
+Concretely: .AddStandardResilienceHandler().AddHttpMessageHandler(), resilience registered first, auth registered second, therefore auth is inner, therefore auth re-runs on every retried attempt. That is the arrangement you want and the one to draw on a whiteboard.
+
+-- pause --
+Section 11. SocketsHttpHandler Tuning.
+
+SocketsHttpHandler is the bottom of the pipeline. Its defaults are reasonable for most apps, but a few knobs are worth knowing.
+
+-- pause --
+What Each Knob Does.
+
+PooledConnectionLifetime, Timeout.InfiniteTimeSpan, Max age of a pooled connection, measured from when it was established, regardless of idle or active time. Closing it forces the next request to re-resolve D N S. This is the D N S-refresh knob.
+PooledConnectionIdleTimeout, 1 minute (dot NET 6+); 2 minutes on dot NET Core/dot NET 5, Closes connections sitting unused. Housekeeping, not correctness.
+MaxConnectionsPerServer, unlimited, Caps parallel connections to one origin.
+EnableMultipleHttp2Connections, off, opt in, Lets the pool open more than one H T T P or 2 connection per origin. Microsoft notes this "explicitly goes against RFC 9113 §9.1", which is why it is not the default.
+AutomaticDecompression, none, Transparent gzip / brotli / deflate.
+ConnectTimeout, unbounded, Bounds the TCP + T L S handshake phase.
+
+The default that catches people out: PooledConnectionLifetime is infinite. Not two minutes. The two minutes belongs to a different mechanism, IHttpClientFactory 's HandlerLifetime, which throws away the whole handler (and with it, its entire pool) on a schedule.
+The factory never touches PooledConnectionLifetime. Two knobs, two owners:
+
+| | PooledConnectionLifetime | HandlerLifetime |.
+| Owned by | SocketsHttpHandler | IHttpClientFactory |.
+| Default | Timeout.InfiniteTimeSpan | 2 minutes |.
+| Recycles | one connection at a time | the entire handler and its pool |.
+| Set via | ConfigurePrimaryHttpMessageHandler / UseSocketsHttpHandler | SetHandlerLifetime(.) |.
+
+-- pause --
+Wire It In.
+
+Why SetHandlerLifetime(Timeout.InfiniteTimeSpan) belongs in that snippet. Once you configure PooledConnectionLifetime yourself, the handler recycles its own connections, so factory-level handler rotation is redundant work on a second, independent clock.
+Microsoft's guidance is explicit: "Since SocketsHttpHandler will handle connection pooling and recycling, handler recycling at the IHttpClientFactory level is no longer needed.
+You can disable it by setting HandlerLifetime to Timeout.InfiniteTimeSpan." Leaving both clocks running is not a correctness bug, but it does mean you tore down a healthy pool for no reason, and it is exactly the follow-up question an interviewer asks after you volunteer PooledConnectionLifetime.
+
+.ConfigurePrimaryHttpMessageHandler(() goes to new SocketsHttpHandler {. }) is the older equivalent and still fine; UseSocketsHttpHandler (dot NET 5+) is preferred because it configures the handler rather than replacing whatever the pipeline already built.
+
+The two minutes is not a magic constant, pick the interval from how often you expect D N S or endpoint topology to change.
+
+-- pause --
+Section 12. Testing HttpClient.
+
+"How do you unit-test a class that makes H T T P calls?" is asked constantly, and the answer is structural rather than clever: you never mock HttpClient (its methods aren't virtual in the way you'd want), you substitute the handler underneath it.
+
+-- pause --
+Asserting That a Retry Actually Fired.
+
+The interesting test is not "does it parse a 200", it is "does my resilience configuration do what I think". Make the mock stateful so it can fail once and then succeed, and assert on the call count:
+
+Keep the retry delay tiny in tests ( Delay = TimeSpan.FromMilliseconds(1) ) or the suite pays the real backoff.
+
+-- pause --
+Choosing a Test Double.
+
+Hand-rolled HttpMessageHandler, maps to, Unit tests; zero dependencies; full control including statefulness.
+RichardSzalay.MockHttp, maps to, Same, with fluent request matching and built-in assertions.
+WireMock.Net, maps to, A real local H T T P stub server, use when you need genuine H T T P semantics (status lines, headers, chunked bodies, delays).
+WebApplicationFactory + ConfigureTestServices, maps to, Integration tests: re-register the client's handler for the whole host.
+
+-- pause --
+Fault Injection.
+
+Polly v8 absorbed the Simmy chaos library into the core package, so fault and latency injection are ordinary strategies on the same builder: AddChaosFault, AddChaosLatency, AddChaosOutcome, and AddChaosBehavior.
+Polly's guidance is to place the chaos strategy last in the pipeline, innermost, right next to the outbound call, so it subverts the request at the last moment and everything it reacts as it would to a real fault. Gate it behind configuration so it is never enabled in production.
+
+-- pause --
+Section 13. Common Pitfalls.
+
+-- pause --
+1. new HttpClient() Per Request.
+
+The classic. Symptom: random SocketException: Only one usage of each socket address is normally permitted after the app has been up a few hours. Fix: IHttpClientFactory.
+
+-- pause --
+2. static HttpClient Forever.
+
+Avoids socket exhaustion but pins one handler, and therefore one set of connections, for the lifetime of the process.
+Because PooledConnectionLifetime defaults to Timeout.InfiniteTimeSpan, those connections are never recycled and D N S is never re-resolved: a new IP for the dependency is missed until the process restarts.
+Fix: set PooledConnectionLifetime on the handler (this makes the static client a supported pattern, not a workaround), or move to IHttpClientFactory and let handler rotation do it.
+
+-- pause --
+3. Retrying Non-Idempotent POSTs.
+
+A POST that creates an order, retried after a timeout, may produce a duplicate order. Either:
+Make the operation idempotent (idempotency key header), then retry safely.
+Restrict retries to GET / HEAD / PUT / DELETE / OPTIONS.
+
+-- pause --
+4. No Jitter in Retry Delays.
+
+100 clients all hit a downstream simultaneously, all fail, all retry exactly 1 second later, the thundering herd. Always set UseJitter = true.
+
+-- pause --
+5. Inner Timeout > Outer Timeout.
+
+Polly's per-attempt timeout is 30 seconds. The user-facing A P I's deadline is 5 seconds. The outer cancels first; Polly never gets to fire its timeout meaningfully. Order timeouts so the innermost is the shortest.
+
+-- pause --
+6. Adding a Polly Retry On Top of HttpClient.Timeout.
+
+HttpClient.Timeout cancels the whole outer SendAsync, including retries. Use Polly's timeout strategy (per-attempt) and leave HttpClient.Timeout = Timeout.InfiniteTimeSpan if you want full control.
+
+-- pause --
+7. Reading Response Body Outside the Handler Scope.
+
+First, the myth to unlearn: handler rotation does not pull the rug out from under an in-flight read.
+An expired handler is only stopped from being lent to new clients; it stays alive until its reference count reaches zero, so requests already using it, including their response streams, drain normally.
+
+The real failure with the same symptom is disposing the response too early. HttpResponseMessage owns the body; dispose it (or the HttpClient you own, if you own one) before the stream is consumed and the read fails or returns truncated data. Two concrete forms:
+
+Fix: either consume the body fully inside the scope that owns the response, or hand the response (not a bare stream) to whoever will consume it and let them dispose it.
+And when streaming with HttpCompletionOption.ResponseHeadersRead, remember HttpClient.Timeout spans the whole operation including the body read, which is another reason to set it to Timeout.InfiniteTimeSpan and let Polly and your own CancellationToken do the bounding.
+
+-- pause --
+8. Not Disposing HttpRequestMessage.
+
+HttpClient.GetAsync(url) is fine for simple cases, but if you build a HttpRequestMessage manually, using it (or Dispose() ) prevents leaking buffers in long-running services.
+
+-- pause --
+9. Missing EnableMultipleHttp2Connections.
+
+A high-requests per second client talking to an H T T P or 2 dependency over one connection eventually hits the peer's concurrent-stream limit and its flow-control window; further streams queue instead of dispatching.
+Enabling multiple H T T P or 2 connections lets the pool spread load across several TCP connections.
+It is opt-in, Microsoft notes that enabling it "explicitly goes against RFC 9113 §9.1", which is why it isn't on by default.
+
+-- pause --
+10. Treating 429 Like 503.
+
+429 Too Many Requests usually carries a Retry-After header. Honor it, HttpRetryStrategyOptions.ShouldRetryAfterHeader takes the delay from that header rather than the backoff curve, and defaults to true.
+The pitfall is the mirror image: hand-rolling a pipeline with a plain RetryStrategyOptions instead of the H T T P-specific HttpRetryStrategyOptions loses that behaviour silently, and your retry storm extends the throttling window.
+
+-- pause --
+11. Putting Auth After Retry.
+
+(Read the title as "auth nested outside the retry", the before or after wording is exactly what makes this pitfall confusing, so state it as nesting.)
+
+A 401 prompts a token refresh. If the auth handler sits outside the resilience handler, it runs once per logical request and the retried attempt replays the same expired token, a retry loop that cannot succeed.
+Register the auth handler after the resilience handler so it nests inside it and re-runs per attempt: .AddStandardResilienceHandler().AddHttpMessageHandler(). Correct nesting: retry wraps auth.
+
+-- pause --
+12. Logging Bodies in Production.
+
+Logging request or response bodies leaks PII, secrets, and bloats log volumes. Log status, latency, and headers; gate body logging behind a flag. Use RedactLoggedHeaders on the IHttpClientBuilder so Authorization and friends don't reach the log sink either.
+
+-- pause --
+13. BaseAddress Without a Trailing Slash.
+
+The versioned path segment is silently dropped and every call goes to the wrong URL while still returning 200 seconds from something. BaseAddress ends with /; relative paths never start with /. See BaseAddress and Relative URIs.
+
+-- pause --
+14. Logging Handler Registered Inside the Retry.
+
+The mirror image of pitfall 11. A logging handler nested inside the resilience handler emits one line per attempt with no notion of the operation, so you see three unrelated-looking failures instead of one operation that recovered. Register logging first, outermost.
+
+-- pause --
+15. Assuming the Standard Handler Won't Retry Your POST.
+
+It will. AddStandardResilienceHandler() retries all H T T P methods by default. Adding resilience to a service with non-idempotent POSTs and no idempotency keys converts transient faults into duplicate writes.
+Call options.Retry.DisableForUnsafeHttpMethods() unless you have deliberately made those calls safe to repeat.
+
+-- pause --
+Section 14. Best Practices.
+
+Always use IHttpClientFactory. Typed clients are the default; named clients are for dynamic selection.
+Use the standard resilience handler unless you have a reason not to. AddStandardResilienceHandler() is a sensible baseline.
+Always enable jitter. UseJitter = true is one line and prevents thundering herds.
+Order timeouts: inner shortest, outer longest. Otherwise the outer dominates and the inner is moot.
+Make calls idempotent before retrying mutating operations. Idempotency keys, If-None-Match, or unique request IDs.
+Set PooledConnectionLifetime when you own the handler, its default is infinite, so nothing recycles until you say so. Pick the interval from your expected rate of D N S change, and pair it with SetHandlerLifetime(Timeout.InfiniteTimeSpan) so you aren't running two rotation clocks.
+Enable multiple H T T P or 2 connections. Especially for high-requests per second inter-service calls; it is opt-in.
+Auth handler inside the resilience handler, registered after it, so refreshed tokens reach the retried attempt. Assign request.Headers.Authorization rather than Add, since the same request object is reused across attempts.
+Honor Retry-After. HttpRetryStrategyOptions.ShouldRetryAfterHeader reads it for you and defaults to true, so use the H T T P-specific options type and don't hard-code a delay for 429.
+Tune breaker thresholds against the shipped defaults, not folklore. The standard handler's MinimumThroughput is 100, high enough that a low-traffic client may never trip it, which is usually the problem you actually have.
+Use HttpCompletionOption.ResponseHeadersRead for streaming responses so the body isn't buffered into memory, and keep the response alive until the stream is consumed.
+Add a correlation ID handler, outermost, using TryAddWithoutValidation so a malformed identifier can't throw on the way out.
+Test resilience with Polly's chaos strategies, AddChaosFault, AddChaosLatency, AddChaosOutcome, AddChaosBehavior (Simmy, absorbed into Polly v8). Place them innermost and gate them behind configuration.
+Log at the boundary. A logging handler at the outermost position captures retries, breaker openings, and end-to-end latency in one place.
+BaseAddress ends with /, relative paths don't start with one. Cheapest bug in the list to prevent and one of the most expensive to find.
+Decide explicitly whether unsafe methods retry. DisableForUnsafeHttpMethods() or an idempotency-key contract, but make it a decision, not a default you didn't read. Note the blanket call also stops retrying PUT and DELETE, which are idempotent; use DisableFor(.) if you want to keep those.
+One resilience handler per client. Stacking them multiplies attempts in ways nobody can reason about; use RemoveAllResilienceHandlers() when you need to replace an inherited configuration.
+
+-- pause --
+Section 15. Interview-Ready Summary.
+
+Socket exhaustion. new HttpClient() per request gives every call its own connection pool; closed sockets sit in kernel TIME_WAIT (2 times MSL, RFC 9293) and the machine's ephemeral port range runs out. Dispose() is doing its job, the kernel is the constraint.
+Two supported lifetimes, not one. Long-lived client with PooledConnectionLifetime set, or short-lived clients from IHttpClientFactory. The bug is an untuned handler, not the word "static".
+IHttpClientFactory. Pools and rotates HttpMessageHandler instances every HandlerLifetime (default 2 min); CreateClient() is a cheap wrapper; expired handlers drain before disposal. It does not set PooledConnectionLifetime.
+Client styles. Typed by default (one class, one A P I surface); named for runtime selection; basic for one-offs. Typed clients are transient, never capture one in a singleton.
+BaseAddress. Trailing slash on the base, no leading slash on the relative path, per the RFC 3986 §5.3 merge rule. Absolute Uri arguments bypass BaseAddress entirely.
+DelegatingHandler s. Registration order is pipeline order, first outermost. Handlers registered after the resilience handler nest inside it and re-run per attempt, which is exactly why auth goes there and logging goes outermost.
+Polly v8. ResiliencePipelineBuilder replaces v7's policy classes; allocation-free on the success path; builder order is nesting order, first added is outermost. Versions independently of dot NET.
+Retry. Exponential backoff plus jitter, or you build a thundering herd. Retry 408 or 429 or 5xx and HttpRequestException; never 400 or 401 or 403 or 404 or 422.
+Circuit breaker. Closed to open to half-open probe to closed or open. In-process and per-replica; no cross-instance coordination without an external store.
+Timeouts. Three surfaces: HttpClient.Timeout (whole call, default 100 seconds, set to infinite under Polly), Polly per-attempt, Polly total. Inner must be shorter than outer, and (attempts times per Attempt) + backoffs < total.
+Hedging. Fires before the first attempt resolves; buys tail latency at the cost of extra in-flight requests. Idempotent operations only.
+The standard handler. Five stages, rate limiter (1000 or 0) to total timeout (30 seconds) to retry (3, exponential, jitter, 2 seconds base) to circuit breaker (10%, min throughput 100, 30 seconds sampling, 5 seconds break) to attempt timeout (10 seconds). No fallback stage.
+Retries every H T T P method until you call DisableForUnsafeHttpMethods().
+Testing. Substitute the HttpMessageHandler, not the HttpClient. Assert on call counts to prove a retry actually fired.
+
+-- pause --
+Section 16. 25. HttpClient and Resilience (Polly).
+
+This heading exists to keep the legacy anchor #25-httpclient--resilience-polly alive for documents that link to it (notably 01-net-core-deep-dive or README.md ).
+The content it used to hold was a duplicate of material earlier in this session; rather than maintain two copies that can drift apart, it now points at the canonical sections.
+
+Jump to the real thing:
+
+Registering basic, named, and typed clients to IHttpClientFactory § Registration.
+The recommended typed-client baseline to Typed Client (the recommended baseline).
+Getting the URL right to BaseAddress and Relative URIs.
+
+-- pause --
+Polly Resilience (dot NET 8+).
+
+The one-liner and what it actually configures to Standard Resilience Pipeline (dot NET 8+).
+Hand-composing a pipeline to Custom Order.
+Per-strategy detail, with the trade-offs to Strategies in Detail.
+Which failures deserve a retry at all to Transient Fault Classification.
+The circuit-breaker state machine to Circuit Breaker.
+
+-- pause --
+Section 17. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Socket exhaustion.
+
+Q: Why is using var http = new HttpClient(); await http.GetAsync(.) per request wrong?-- think --
+
+A: Each new HttpClient() creates a new HttpMessageHandler with its own connection pool, so nothing is reused and every call opens a fresh TCP connection.
+When it closes, the kernel holds the socket in TIME_WAIT, on Windows for the TcpTimedWaitDelay interval, which Microsoft documents as defaulting to 240 seconds. The machine's ephemeral port range is finite (Windows default 49152, 65535, that is
+16,384 ports), so under sustained load you exhaust it and get SocketException: Only one usage of each socket address is normally permitted. The symptom appears minutes-to-hours into a load run, never in dev.
+
+Cross-Q: Why doesn't using solve the leak, isn't that what dispose is for?-- think --
+
+A: Because the socket itself doesn't immediately close on Dispose. TCP keeps the 4-tuple in TIME-WAIT for 2 times MSL (RFC 9293 §3.3.2) so that a late-arriving segment from the old connection can't be mistaken for data on a new one reusing the same tuple.
+Disposing the C sharp object releases the managed handle; the kernel's state machine runs independently. Dispose is correct; the protocol is the bottleneck. The fix isn't disposing harder, it's opening fewer connections.
+
+Cross-Q²: So is static readonly HttpClient the fix, or is it also wrong?-- think --
+
+A: Careful, this is where the question is usually asked badly. A static client is one of the two lifetime strategies Microsoft explicitly recommends, provided you construct it over a SocketsHttpHandler with PooledConnectionLifetime configured.
+What's wrong is the static client with the handler left at defaults: PooledConnectionLifetime defaults to Timeout.InfiniteTimeSpan, so connections are never recycled, D N S is never re-resolved, and a rolling restart or cloud failover leaves you talking to a dead IP until the process restarts.
+IHttpClientFactory is the other supported strategy, pooled handlers plus rotation every HandlerLifetime, and it additionally buys you named or typed configuration, D I, logging, and Polly composition.
+
+-- pause --
+Drill 2, IHttpClientFactory.
+
+Q: What does IHttpClientFactory actually manage?-- think --
+
+A: A pool of HttpMessageHandler instances keyed by named client. Each CreateClient(name) returns a lightweight HttpClient wrapper around a borrowed handler. Handlers rotate every HandlerLifetime (default 2 min), old handlers are disposed once no client still holds them.
+The factory owns the lifecycle; you don't using the client.
+
+Cross-Q: What happens to in-flight requests when a handler rotates?-- think --
+
+A: The handler isn't immediately disposed, it stays alive until its reference count drops to zero (all clients borrowing it have completed their requests). New clients get the new handler; old clients drain naturally. Rotation is graceful.
+
+Cross-Q²: If I factory.CreateClient("payment") 1000 times in a tight loop, am I leaking?-- think --
+
+A: No, CreateClient returns a cheap wrapper, not a new handler. The wrapper is garbage collector'd normally; the underlying handler is shared.
+Some teams cache the client ( var c = factory.CreateClient(); / hold for many calls / ), which is fine within a scope but wrong as a singleton because you'd defeat handler rotation. Rule: get a client per logical operation; the factory makes that cheap.
+
+-- pause --
+Drill 3, Named versus typed clients.
+
+Q: When do you use a named client versus a typed client?-- think --
+
+A: Typed when one class owns calls to one A P I surface, PaymentClient, EmailClient. D I gives the class its HttpClient directly, and Polly handlers register on the type.
+Named when you need to pick at runtime, "primary" versus "secondary" for failover, "us-east" versus "eu-west" for geo routing, and a static class doesn't fit. Typed is default; named is escape hatch.
+
+Cross-Q: Can I have a typed client that internally selects between named clients?-- think --
+
+A: Yes, inject IHttpClientFactory into the typed-client class, and have it call factory.CreateClient("primary"|"secondary") based on a strategy. You get the best of both: a strongly-typed class boundary at the call site, dynamic selection at the implementation. This is a common failover pattern.
+
+Cross-Q²: Can two typed clients share one HttpClient configuration?-- think --
+
+A: Not directly, each typed-client registration creates its own configuration. You can share configuration logic via an extension method: static IHttpClientBuilder AddSharedConfig(this IHttpClientBuilder b) goes to b.ConfigureHttpClient(.).
+Then both AddHttpClient().AddSharedConfig() and AddHttpClient().AddSharedConfig() apply the same setup. dry without coupling.
+
+-- pause --
+Drill 4, Polly v8 composition order.
+
+Q: In a ResiliencePipelineBuilder, what order do you compose retry, circuit breaker, and timeout?-- think --
+
+A: From the caller inward: Rate Limiter to Total Timeout to Retry to Circuit Breaker to Per-Attempt Timeout to downstream. That is exactly what AddStandardResilienceHandler() composes.
+Reason: rate limiter is the outermost guard against overload; total timeout is the absolute budget; retries happen inside that budget; the breaker is consulted per attempt (open = fail fast); per-attempt timeout bounds each individual attempt so a retry can actually fire.
+
+Cross-Q: What actually changes if I swap retry and circuit breaker?-- think --
+
+A: How many failures the breaker gets to count.
+Breaker inside retry (the standard order) means the breaker is entered on every attempt, so a single logical call that retries three times feeds it three failures, it accumulates faster and can cut the retry loop short mid-flight with BrokenCircuitException.
+Breaker outside retry means it is entered once per logical call and sees only the final outcome of the whole retry block, so it accumulates more slowly but each sample represents "we genuinely could not get through".
+The standard pipeline nests the breaker inside, which is why it can abandon a doomed retry sequence immediately instead of burning the remaining attempts and backoffs.
+
+Cross-Q²: Where does fallback go in the order?-- think --
+
+A: Outermost, first in the builder, so it can catch everything inside it: an open circuit, exhausted retries, a blown total timeout. Putting fallback inside retry would make retry fire against the fallback path, which is meaningless.
+One caveat to state before you're corrected: fallback is not a stage of AddStandardResilienceHandler(). The shipped handler has exactly five stages and fallback isn't one of them; the outermost-fallback rule applies to pipelines you compose yourself.
+
+-- pause --
+Drill 5, Retry strategy.
+
+Q: What's the right combination of MaxRetryAttempts, Delay, and BackoffType for an unreliable third-party A P I?-- think --
+
+A: Typically: MaxRetryAttempts = 3, Delay = TimeSpan.FromSeconds(1), BackoffType = Exponential, UseJitter = true. That is four attempts in total, MaxRetryAttempts counts retries in addition to the original call, at roughly 0 seconds, 1 second, 2 seconds, and 4 seconds.
+Tune based on the dependency's recovery behavior: faster backoff if the A P I recovers in <1 second, slower if recovery is multi-second.
+
+Be careful quoting a jitter figure: Polly's plus or minus 25% jitter applies to Constant and Linear backoff.
+With Exponential + UseJitter it instead uses the decorrelated-jitter algorithm ( DecorrelatedJitterBackoffV2, from Polly.Contrib.WaitAndRetry), whose delays are not a tidy plus or minus 25% band around the exponential curve and can land it.
+Say "jitter randomises the delay so clients de-synchronise", not a specific percentage, unless you know which backoff type is in play.
+
+Cross-Q: Why is jitter critical?-- think --
+
+A: Without jitter, N clients failing simultaneously all retry exactly 1 second later, then 2 seconds, then 4 seconds, a thundering herd. The downstream recovers, gets slammed again, fails, and the cycle repeats. Jitter spreads the retries randomly across the delay window, smoothing the load.
+UseJitter = true is one line; the cost of forgetting it is a cascading outage.
+
+Cross-Q²: When should I retry a non-idempotent POST?-- think --
+
+A: Only when the operation has an idempotency key, a unique ID the server uses to deduplicate, and it's common for payment and order A P Is to offer or require one.
+Pattern: the client generates a GUID per logical operation and sends it as an Idempotency-Key header; the server stores (key, result) for a bounded window, so a retry with the same key returns the original result without re-executing.
+Without an idempotency mechanism, retrying a POST is a duplicate-order bug waiting to happen, and remember AddStandardResilienceHandler() retries POSTs by default, so this is on by accident unless you turn it off.
+
+-- pause --
+Drill 6, Circuit breaker.
+
+Q: Walk me through the three circuit breaker states.-- think --
+
+A: Closed: all calls pass through; the breaker counts failures in a rolling window. Open: calls short-circuit with BrokenCircuitException (no downstream call); after BreakDuration elapses, transition to half-open. Half-Open: a single probe call is allowed; success to closed, failure to open again.
+The state machine prevents you from hammering a dead dependency and lets it recover.
+
+Cross-Q: What's the right FailureRatio and SamplingDuration ?-- think --
+
+A: Start by knowing what you're overriding: the shipped standard handler uses 10% failure ratio, minimum throughput 100, 30 seconds sampling, 5 seconds break.
+MinimumThroughput is the statistical floor, the breaker won't open until it has seen that many calls inside the sampling window, which stops one failed call out of one from reading as a 100% failure ratio.
+Then adjust for traffic: a low-traffic client (single-digit requests per second) will never accumulate 100 calls in 30 seconds, so the shipped breaker effectively never trips and you must lower the threshold or lengthen the window;
+a high-traffic client has samples to spare and can afford a shorter sampling duration to react faster.
+The failure mode runs both ways, set it too low on a busy endpoint and a single blip trips the breaker; leave it at 100 on a quiet one and the breaker is decorative.
+
+Cross-Q²: Where does the breaker state live in a horizontally scaled service?-- think --
+
+A: Per-instance. Polly's breaker is in-process, 10 replicas means 10 breakers, each tracking its own failure ratio. This is by design (cheap, no external coordination). The downside: one instance opens while others still try.
+For coordinated breakers across instances, you need an out-of-process state store (Redis-backed implementations exist), much heavier, rarely worth it. Most teams accept per-instance and rely on aggregate effects.
+
+-- pause --
+Drill 7, Timeout cascades.
+
+Q: I have a total pipeline timeout of 10 seconds, retry with MaxRetryAttempts = 3 and 1 second exponential backoff, no per-attempt timeout. What's the worst-case latency?-- think --
+
+A: Up to 10 seconds, the total pipeline timeout caps everything. Without a per-attempt timeout, a single hung downstream can consume the whole 10 seconds on the first attempt; the remaining attempts never happen because the total timeout fires first.
+Lesson: total timeout is the hard ceiling; per-attempt is what bounds individual hangs so retries can actually run.
+
+Cross-Q: Set per-attempt to 3 seconds. Worst case now?-- think --
+
+A: First get the count right, MaxRetryAttempts = 3 means 4 attempts (the original plus three retries) and 3 backoffs, which is the off-by-one most people make here.
+So 4 times 3 seconds = 12 seconds of attempts plus 1+2+4 = 7 seconds of backoff approximately 19 seconds nominal, and the 10 seconds total timeout still cuts it off well before that.
+You'd get roughly two or three attempts and then a total-timeout fault. To fit fully inside 10 seconds: MaxRetryAttempts = 2 (3 attempts), per-attempt 2 seconds, Delay 200 milliseconds, 3 times 2 seconds + (0.2 + 0.4) approximately 6.6 seconds, with margin for jitter.
+
+Cross-Q²: Where should HttpClient.Timeout be set in this picture?-- think --
+
+A: To Timeout.InfiniteTimeSpan (that is, disabled). HttpClient.Timeout is a hard cap on the whole SendAsync call including retries, it overrides Polly's timeout and breaks the cascade.
+Polly's per-attempt timeout is the strategy-aware version; leave HttpClient.Timeout infinite and let Polly enforce timeouts. This is the #1 hidden-timeout gotcha when adding resilience to existing code.
+
+-- pause --
+Drill 8, Bulkhead / rate limiter.
+
+Q: What isolation does a bulkhead (rate limiter) provide?-- think --
+
+A: It caps concurrent in-flight calls to a dependency. If PermitLimit = 50, at most 50 requests are mid-flight; further requests are queued (if QueueLimit > 0 ) or rejected.
+This stops one slow dependency from monopolizing the thread pool, even if dependency X is timing out, you have at most 50 threads parked on it, not your entire pool.
+
+Cross-Q: How is this different from a circuit breaker?-- think --
+
+A: Breaker stops calls when failure rate spikes. Rate limiter caps concurrency all the time, regardless of failure rate. Used together: rate limiter prevents resource starvation under healthy-but-slow conditions; breaker fails fast under dependency-is-broken conditions.
+Different problems, different tools.
+
+Cross-Q²: What's QueueLimit = 0 versus QueueLimit = 100 ?-- think --
+
+A: 0 means reject immediately when concurrency is at the cap, caller gets a RateLimiterRejectedException. 100 means queue up to 100 extra; the 101st gets rejected. Queueing trades latency for completion (callers wait their turn); zero-queue trades completion for latency (callers fail fast).
+For user-facing endpoints, zero-queue + fast user feedback. For background workers, large queue + acceptance.
+
+-- pause --
+Drill 9, PooledConnectionLifetime.
+
+Q: Why does SocketsHttpHandler.PooledConnectionLifetime matter?-- think --
+
+A: It caps how long a TCP or T L S connection may stay in the pool, measured from when it was established, regardless of how much of that time it spent idle or active. When the connection is closed the next request opens a new one, which re-resolves D N S.
+Its default is Timeout.InfiniteTimeSpan, so out of the box nothing recycles, and a persistent connection can outlive a D N S change indefinitely.
+
+Cross-Q: You said the default is infinite, but I've read that IHttpClientFactory defaults it to 2 minutes. Which is it?-- think --
+
+A: Both statements are about different knobs and conflating them is the classic error. SocketsHttpHandler.PooledConnectionLifetime is infinite by default and the factory never sets it.
+What the factory has is HandlerLifetime, default 2 minutes, which expires the whole handler, the handler stops being lent to new clients, drains its in-flight requests, and is then disposed along with its entire connection pool.
+Connection-level recycling versus handler-level recycling; two mechanisms, two owners, one shared purpose.
+
+Cross-Q²: I'm using static HttpClient (legacy). Can I get D N S refresh without switching to the factory?-- think --
+
+A: Yes, and it isn't a hack, it's the other officially supported strategy. Construct it over a tuned SocketsHttpHandler:
+csharp.
+static readonly HttpClient Http = new(new SocketsHttpHandler {.
+PooledConnectionLifetime = TimeSpan.FromMinutes(2) // choose from your D N S change rate.
+});
+
+The handler recycles connections on that schedule, so D N S is re-resolved. You give up named or typed configuration, D I, and the factory's Polly integration, though you can still attach a pipeline manually by wrapping the socket handler in a ResilienceHandler.
+And the converse: if you set PooledConnectionLifetime on a factory-registered client, also call SetHandlerLifetime(Timeout.InfiniteTimeSpan), because otherwise two independent rotation clocks are recycling the same pool for no benefit.
+
+-- pause --
+Drill 10, EnableMultipleHttp2Connections.
+
+Q: When does EnableMultipleHttp2Connections = true matter?-- think --
+
+A: H T T P or 2 multiplexes streams over one TCP connection. Under high concurrency, the flow-control window on a single connection becomes a bottleneck, requests queue at the TCP layer waiting for window credits.
+Enabling multiple H T T P or 2 connections lets the pool spread streams across multiple TCP connections, eliminating head-of-line blocking at the transport layer. Critical for high-requests per second inter-service calls.
+
+Cross-Q: Why is the default false ?-- think --
+
+A: Because H T T P or 2's design intent is one connection per origin, and Microsoft's own documentation says enabling multiple connections "explicitly goes against RFC 9113 §9.1". The default is spec-conformant; the override is an informed throughput decision.
+For internal high-requests per second service-to-service traffic it is usually the right call, but say "usually", not "always", you are overriding a protocol recommendation and should be able to justify it.
+
+Cross-Q²: At what concurrency does a single H T T P or 2 connection become the bottleneck, and how would you detect it?-- think --
+
+A: There is no universal number, the ceiling is whatever the peer advertises in SETTINGS_MAX_CONCURRENT_STREAMS, plus the TCP congestion window and RTT.
+Two anchors you can quote: RFC 9113 §6.5.2 recommends that value be no smaller than 100, and Kestrel's Http2Limits.MaxStreamsPerConnection defaults to 100, so if your downstream is an A S P dot NET Core service on defaults,
+roughly 100 concurrent in-flight requests per connection is where extra streams start queueing rather than dispatching.
+The detection signal is the useful part: rising p99 latency under load with no corresponding rise in error rate. Errors would point at the dependency; latency without errors points at your own transport queueing.
+
+Cross-Q³: How is this different from H T T P or 1.1 connection pooling?
+
+A: H T T P or 1.1: one request per connection at a time, the pool opens N connections for N concurrent requests. H T T P or 2: many concurrent streams over one connection, the pool opens one.
+EnableMultipleHttp2Connections lets H T T P or 2 use multiple connections like H T T P or 1.1 does, sacrificing some of H T T P or 2's elegance for throughput. H T T P or 3 (QUIC) sidesteps transport-level head-of-line blocking entirely, since loss on one stream doesn't stall the others.
+
+-- pause --
+Drill 11, Polly v7 versus v8.
+
+Q: What are the major A P I differences between Polly v7 (policies) and v8 (ResiliencePipeline)?-- think --
+
+A: v7: Policy.Handle().WaitAndRetryAsync(.) to returns an IAsyncPolicy; runtime allocates per call. v8: new ResiliencePipelineBuilder().AddRetry(.).Build() to returns ResiliencePipeline; allocation-free on success path, telemetry-aware, composable.
+v8 also unifies sync and async ( pipeline.Execute(.) and pipeline.ExecuteAsync(.) on the same pipeline).
+
+Cross-Q: Why was v7 retired?-- think --
+
+A: Three reasons. (1) Allocation per execution hurt high-requests per second scenarios. (2) The sync or async split forced duplicate policies.
+(3) Strategy composition was limited, v8's builder + options pattern is genuinely more expressive, and it made room for strategies v7 never had (hedging, and the Simmy chaos strategies folded into the core package).
+v7 still exists on NuGet, but Microsoft.Extensions.Http.Resilience builds on v8, if you want AddStandardResilienceHandler(), you are on v8.
+
+Cross-Q²: How do I migrate v7 policies to v8 incrementally?-- think --
+
+A: v7 and v8 are separate packages ( Polly versus Polly.Core + Polly.Extensions ), they coexist. Migrate file-by-file: replace Policy.HandleResult with new ResiliencePipelineBuilder().AddRetry(new RetryStrategyOptions { ShouldHandle =. }).
+The conceptual mapping is direct; the syntax is more verbose but more discoverable via IntelliSense. Don't try to migrate in a single pull request for a large codebase, file-by-file behind a feature flag is safer.
+
+-- pause --
+Drill 12, Standard resilience pipeline.
+
+Q: What does AddStandardResilienceHandler() give me out of the box?-- think --
+
+A: Five stages, outermost first:
+rate limiter (permit 1000, queue 0) to total timeout (30 seconds) to retry (3 retries, that is up to 4 attempts, exponential, jitter on, 2 seconds base delay) to circuit breaker (10% failure ratio, minimum throughput 100, 30 seconds sampling, 5 seconds break) to per-attempt timeout (10 seconds).
+Retry and breaker both handle H T T P 500-and-, 408, 429, plus HttpRequestException and TimeoutRejectedException. No fallback stage, that's a hand-built addition, not part of the standard handler.
+
+Cross-Q: Anything in that default set that would surprise a team adopting it?-- think --
+
+A: Two things. It retries every H T T P method, POST included, Microsoft's docs say so explicitly, and the remedy is options.Retry.DisableFor(.) or options.Retry.DisableForUnsafeHttpMethods() (POST, PATCH, PUT, DELETE, CONNECT).
+A team that adds one line of resilience to a payment service and doesn't read that has just built a duplicate-charge generator. And the breaker's minimum throughput is 100, which on a low-traffic client means it will realistically never open, people assume they're protected when they aren't.
+
+Cross-Q²: Can I add my own strategy to the standard pipeline?-- think --
+
+A: Not to it, the guidance is one resilience handler per client, don't stack them.
+Your options are: pass a delegate and override deltas, AddStandardResilienceHandler(options goes to { options.Retry.MaxRetryAttempts = 5; }), which is the cleanest and preserves everything you didn't touch;
+compose from scratch with AddResilienceHandler("name", builder goes to.) when the shape itself is wrong for you; or call RemoveAllResilienceHandlers() first to drop an inherited configuration before adding a different one.
+"Spec the deltas, not rewrite the whole policy."
+
+-- pause --
+Drill 13, DelegatingHandler chain.
+
+Q: I have CorrelationId, Auth, and Logging handlers. What's the right registration order?-- think --
+
+A: From outermost (closest to caller) inward: Logging to CorrelationId to resilience handler to Auth to SocketsHttpHandler, which is the registration order .AddHttpMessageHandler().AddHttpMessageHandler().AddStandardResilienceHandler().AddHttpMessageHandler().
+Logging outermost so one log record covers the whole operation including every retry. CorrelationId next, so a single ID identifies the logical request rather than each attempt. Auth inside the resilience handler so a refreshed token is applied on each retried attempt.
+
+Cross-Q: Why must Auth be inside the resilience handler?-- think --
+
+A: Because only handlers inside it re-execute per attempt. If auth is outside, it stamps the token once; Polly then re-sends that same HttpRequestMessage with the same expired token, gets 401 again, and you have a retry loop that cannot possibly succeed.
+With auth inside, each attempt re-enters the auth handler and can attach a fresh token. Say it as nesting, not as before or after: the retry wraps the auth handler.
+
+Cross-Q²: How does AddHttpMessageHandler() decide order?-- think --
+
+A: Registration order = pipeline order, first registered is outermost. Microsoft's wording: "Multiple handlers can be registered in the order that they should execute.
+Each handler wraps the next handler until the final HttpClientHandler executes the request." AddStandardResilienceHandler and AddResilienceHandler are just more handlers in that chain, sitting wherever you call them.
+So .AddHttpMessageHandler().AddStandardResilienceHandler() puts Auth outside the resilience pipeline, it runs once, tokens never refresh on retry, wrong, while .AddStandardResilienceHandler().AddHttpMessageHandler() puts Auth inside it, right.
+
+Cross-Q³: The auth handler runs on every attempt now. Any hazard in that?
+
+A: Two. First, the same HttpRequestMessage instance is reused across attempts, so a handler that calls request.Headers.Add(.) accumulates duplicate header values on retries, assign request.Headers.Authorization instead, since assignment replaces.
+Second, IHttpClientFactory gives each handler instance its own D I scope, separate from the incoming-request scope and potentially longer-lived, so a handler that cached a token (or anything else off HttpContext ) in a field can leak it across unrelated requests. Resolve per call.
+
+-- pause --
+Drill 14, D N S resolution caching.
+
+Q: How does dot NET cache D N S resolutions?-- think --
+
+A: It mostly doesn't, SocketsHttpHandler resolves D N S lazily, per new connection. But the connection pool means resolutions are effectively cached for the lifetime of a connection. A long-lived H T T P or 2 connection bypasses D N S for hours unless you cap it via PooledConnectionLifetime.
+
+Cross-Q: Why does IHttpClientFactory solve "stale D N S" then?-- think --
+
+A: Because handler rotation (every HandlerLifetime, default 2 min) retires the whole handler and, once it has drained, its entire pool, so subsequent requests open new connections that re-resolve D N S. Without any rotation, a pool can hold the same IP for the life of the process.
+Be precise about the bound, though: the factory doesn't make stale D N S impossible, it makes staleness bounded, worst case you keep using an old address for about one HandlerLifetime after the change.
+
+Cross-Q²: My app calls a Kubernetes service via D N S. Service IP changes after a rolling restart. What's the failure mode without rotation?-- think --
+
+A: Existing connections keep pointing at the old pod IP. The operating system sends RST when the old pod's socket closes; dot NET sees IOException / HttpRequestException; a new connection is opened. Without PooledConnectionLifetime, the new connection re-resolves D N S, usually finds the new IP.
+But in some load-balancer scenarios (sticky sessions, slow D N S propagation), connections can keep failing for minutes. Combined fix: PooledConnectionLifetime to force rotation + Polly retry to absorb the transient errors during rollout.
+
+-- pause --
+Drill 15, Idempotency on retry.
+
+Q: Which H T T P methods are safe to retry blindly?-- think --
+
+A: RFC 9110 §9.2.2 defines the set exactly: PUT, DELETE, and the safe methods, GET, HEAD, OPTIONS, TRACE. Retrying those produces the same observable server state. POST, PATCH, and CONNECT are not idempotent (CONNECT is a common wrong answer, it is neither safe nor idempotent).
+Note "idempotent" is about server state, not about getting an identical response body: a retried GET is idempotent even if the resource changed underneath you.
+
+Cross-Q: Why is PUT idempotent but POST not?-- think --
+
+A: PUT means "make the resource at this URI be this representation", a full-state assignment, so applying it twice lands on the same final state.
+POST means "process this representation according to the resource's own semantics", which is open-ended and typically creates a new subordinate resource each time.
+PATCH sits with POST rather than PUT because it describes a delta, "increment the balance by 10" applied twice increments by 20, which is exactly why the standard resilience handler's DisableForUnsafeHttpMethods() covers PATCH as well as POST.
+
+Cross-Q²: My A P I has a POST /orders endpoint. How do I make it safe to retry?-- think --
+
+A: Add an idempotency-key contract. Client generates a UUID per logical create attempt, sends Idempotency-Key:. Server stores (key, response) for a bounded window. First POST: process and store. Retry with same key: return the stored response, don't re-process.
+The server-side store can be Redis with a T T L. This is the conventional way to make POST retry-safe, and note it requires the server to cooperate, which is the whole difficulty (see Drill 17).
+
+-- pause --
+Drill 16, BaseAddress and relative URIs.
+
+Q: BaseAddress = new Uri(" and http.GetAsync("users"). What URL is actually called?-- think --
+
+A:, the v2 segment is silently dropped. URI resolution follows the RFC 3986 §5.3 merge rule: the relative reference is merged against the base by keeping the base path up to and including its last / and discarding everything after it.
+has no trailing slash, so its usable base path is just /, and users is appended to that. Nothing throws; you simply call the wrong endpoint.
+
+Cross-Q: How do you fix it, and what's the second half of the rule?-- think --
+
+A: Give BaseAddress a trailing slash, new Uri(", and never start the relative path with a slash. A leading slash makes the reference an absolute-path reference, which replaces the base path entirely: "/users" resolves to no matter what BaseAddress says.
+Both halves have to hold; getting one right and the other wrong still drops the prefix.
+
+Cross-Q²: I need to call one absolute URL from inside a typed client that has a BaseAddress. How?-- think --
+
+A: Pass an absolute Uri: await http.GetAsync(new Uri(" ct). When the argument is an absolute URI, BaseAddress is not consulted at all. BaseAddress only participates when the argument is a relative URI or a relative string.
+That's the clean escape hatch, no need for a second client just to reach one foreign host, though a second named client is better if the foreign host needs its own timeouts, auth, or resilience.
+
+-- pause --
+Drill 17, Retrying a POST when the server won't help.
+
+Q: You need to retry a POST that creates a subscription. The vendor doesn't support idempotency keys and won't add them. What are your options?-- think --
+
+A: Ranked, best first. (1) Push for server-side idempotency support, it's the only real fix, and worth raising even if it lands next quarter.
+(2) Don't retry the POST: options.Retry.DisableForUnsafeHttpMethods(), and surface the failure to application logic (user-visible error, manual retry, an outbox with human review).
+(3) Retry zero times but keep the circuit breaker and timeouts, you still get fail-fast and bounded latency without duplication risk.
+(4) Application-level check-then-act: before creating, query whether a record with your unique business key (email, external order ID) already exists; retry the read freely and only create if absent.
+That's idempotency implemented on your side of the wire, extra round-trips, and a race window unless the business key is uniquely constrained server-side.
+
+Cross-Q: Option 4 has a race. When is it still the right answer?-- think --
+
+A: When the duplicate is recoverable but expensive rather than catastrophic, and when the business key has a real uniqueness constraint on the vendor's side so the second create fails loudly instead of succeeding twice.
+If the vendor enforces uniqueness, check-then-act plus "treat a duplicate-key error as success" is effectively idempotent. If it doesn't, you're only narrowing the window, and you should say so out loud rather than presenting it as a fix.
+
+Cross-Q²: Same vendor returns 500 both for genuine hiccups and for malformed requests. How do you configure retry?-- think --
+
+A: You can't distinguish them from the status code, so stop trying to.
+Three practical moves: (1) ask the vendor for a machine-readable error code in the body ( "error": "INVALID_CURRENCY" versus "error": "INTERNAL_ERROR" ); (2) parse the body inside ShouldHandle and filter on that code, since ShouldHandle sees the whole HttpResponseMessage;
+(3) keep the retry count low, one or two attempts, so an unretryable 500 costs little.
+Combined with an idempotency key where one exists, that's the pragmatic answer. Retrying a malformed request three times just triples the latency of a guaranteed failure.
+
+-- pause --
+Drill 18, Testing that resilience actually works.
+
+Q: How do you test a typed client's H T T P behaviour without hitting the network?-- think --
+
+A: Substitute the HttpMessageHandler, not the HttpClient. Subclass HttpMessageHandler, override SendAsync to return a canned HttpResponseMessage, pass it to new HttpClient(handler), and construct the typed client around that.
+For integration tests, WebApplicationFactory + ConfigureTestServices lets you re-register the client's handler for the whole host; WireMock.Net gives you a real local stub server when you need genuine H T T P semantics.
+
+Cross-Q: That proves parsing works. How do you prove the retry fired?-- think --
+
+A: Make the mock stateful and assert on the call count. A counter in the closure returns 503 on the first call and 200 on the second; the test then asserts both that the result is successful and that the handler was invoked exactly twice.
+Asserting only on the result is the classic false-positive, a pipeline with retry disabled and a mock that returns 200 immediately passes it. Keep the retry Delay down to a millisecond or two so the suite doesn't pay real backoff.
+
+Cross-Q²: How would you test that your circuit breaker opens?-- think --
+
+A: Drive the mock to fail enough times to satisfy both FailureRatio and MinimumThroughput inside SamplingDuration, then assert the next call throws BrokenCircuitException without the handler being invoked again, the call-count assertion is what proves it short-circuited rather than failed normally.
+This is where the shipped defaults bite: against MinimumThroughput = 100 your test would need 100 calls, so configure a small breaker explicitly in the test rather than exercising the standard handler's defaults.
+For fault injection in a more realistic setup, Polly's chaos strategies ( AddChaosFault, AddChaosLatency ) do this at the pipeline level.
+
+-- pause --
+Section 18. Cheat Sheet.
+
+Socket exhaustion: new HttpClient() per request to own pool per instance to sockets in kernel TIME_WAIT to ephemeral ports exhausted. Fix: reuse handlers.
+Two supported lifetimes: long-lived client + PooledConnectionLifetime, or short-lived clients from IHttpClientFactory. Nothing else.
+PooledConnectionLifetime default = Timeout.InfiniteTimeSpan. HandlerLifetime default = 2 minutes. Different knobs, different owners.
+Set both and you have two clocks: pair PooledConnectionLifetime with SetHandlerLifetime(Timeout.InfiniteTimeSpan).
+Typed client is the default; named for runtime selection; typed clients are transient, never captured in a singleton.
+BaseAddress ends with /; relative paths don't start with /. RFC 3986 §5.3. Absolute Uri bypasses BaseAddress.
+Handler order = registration order, first outermost. Logging to CorrelationId to resilience to Auth to SocketsHttpHandler.
+Inside the resilience handler = re-runs per attempt. That's why auth goes there and logging doesn't.
+HttpClient.Timeout default 100 seconds and covers all retries to set Timeout.InfiniteTimeSpan under Polly.
+Budget: (attempts times perAttemptTimeout) + sum(backoffs) < total Timeout.
+Builder order = nesting order: first strategy added is outermost.
+Standard handler, 5 stages: rate limiter 1000 or 0 to total timeout 30 seconds to retry 3 retries (= 4 attempts) / exponential / jitter / 2 seconds to breaker 10% / min 100 / 30 seconds / break 5 seconds to attempt timeout 10 seconds. No fallback stage.
+MaxRetryAttempts counts retries, not attempts. 3 implies 4 attempts, 3 backoffs. Budget accordingly.
+Standard handler retries every method to DisableForUnsafeHttpMethods() unless the calls are idempotent.
+Retry set: 500+, 408, 429, HttpRequestException, TimeoutRejectedException. Never 400 or 401 or 403 or 404 or 422.
+429 to ShouldRetryAfterHeader, not a hard-coded delay.
+Breaker is per-process, per-replica. N replicas, N breakers.
+Hedging not equal to retry: fires before the first attempt resolves; buys tail latency; idempotent only.
+EnableMultipleHttp2Connections is opt-in and knowingly against RFC 9113 §9.1; the signal you need it is p99 rising with no error-rate rise.
+Testing: swap the HttpMessageHandler; assert call counts, not just results.
+One resilience handler per client; RemoveAllResilienceHandlers() to replace an inherited one.
+
+-- pause --
+Section 19. Walkthrough, Diagnosing Socket Exhaustion in Production.
+
+Symptom. A payment service that is fine in dev and staging starts throwing SocketException: Only one usage of each socket address is normally permitted roughly 45 minutes into each production traffic peak. It clears after a restart and comes back.
+
+Step 1, confirm it's ports, not the dependency. The exception text already points at local socket allocation rather than a remote failure, but confirm on the host:
+
+Thousands of sockets in TIME_WAIT against a single destination, and a TIME_WAIT count in the same order of magnitude as the port range, is the signature. Correlate the count's growth with the log timestamps of the first exception.
+
+Step 2, find the source. Search for new HttpClient( in the call path. Here it's inside a method called once per incoming request. At low load the per-call connections retire faster than they accumulate; at production requests per second they don't.
+
+Step 3, understand why using didn't save it. Each HttpClient owns its own handler and therefore its own connection pool, so nothing is shared.
+Disposing releases the managed object, but the kernel keeps the 4-tuple in TIME_WAIT for 2 times MSL (RFC 9293) so late segments can't be misread as belonging to a new connection. The bottleneck is the protocol, not the garbage collector.
+
+Step 4, fix. Replace per-request construction with a factory-registered typed client:
+
+Then inject PaymentClient everywhere the old new HttpClient() was, and make sure no singleton captures it.
+
+Step 5, verify. After deploy, the TIME_WAIT count against that destination should fall to a handful and stay flat under the same load. Add a dashboard panel for it; this failure is far cheaper to catch as a trend than as an outage.
+
+Two follow-on lessons worth stating in the postmortem. PooledConnectionLifetime was added not for the socket problem but for the next one, rolling deployments change pod IPs, and without connection recycling the pool keeps dialling the old address.
+And DisableForUnsafeHttpMethods() was added because the standard handler retries POSTs by default: fixing socket exhaustion without that line would have traded an availability incident for a double-charge incident.
+
+-- pause --
+Section 20. Self-Test.
+
+Dispose() releases the managed object and, if the client owns its handler, the pool, but the operating system then holds each closed socket in TIME_WAIT.
+That's a TCP state, not a dot NET one: the connection's 4-tuple is reserved for 2 times MSL (RFC 9293 §3.3.2) so that a segment delayed in the network from the old connection cannot be delivered into a new connection that happens to reuse the same tuple.
+On Windows the effective duration is governed by the TcpTimedWaitDelay parameter, documented with a default of 240 seconds and reducible to 30. No managed code can bypass it. The fix is not "dispose harder" but "open fewer connections", reuse handlers.
+
+Zero. The standard handler's retry (and breaker) handle H T T P 500-and-, 408, 429, HttpRequestException, and TimeoutRejectedException. 401 is none of those, and correctly so, since replaying the identical request with the identical expired credential returns the identical 401.
+If you need 401 to trigger a token refresh, that is not a retry concern: add a DelegatingHandler registered after the resilience handler (so it sits inside and runs per attempt) that inspects the response, refreshes the credential, sets request.Headers.Authorization, and re-sends.
+Putting the refresh logic outside the resilience handler is the common mistake, it would run once and never see the retried attempts.
+
+It calls the v2 is silently dropped. RFC 3986 §5.3 merges a relative reference against the base by retaining the base path up to and including its last / and discarding the remainder. With no trailing slash the retained portion is just /.
+Fix: And the mirror-image trap, GetAsync("/users"), is an absolute-path reference that replaces the base path entirely, so it also lands on even when BaseAddress does have its trailing slash. Both rules must hold.
+
+It's the statistical floor: the breaker will not open until it has observed at least that many calls within SamplingDuration, so that one failure out of one call doesn't read as a 100% failure ratio and trip the circuit on the first hiccup.
+The standard resilience handler's default is 100, alongside a 10% failure ratio and a 30-second sampling window.
+That default is the thing to reason about: a client doing a couple of requests per second will never accumulate 100 calls in 30 seconds, so its breaker is effectively inert, protection you believe you have and don't. Tune it to observed traffic in both directions.
+
+You have enabled retries on those POSTs. The standard handler is documented as retrying all H T T P methods by default, with three attempts, exponential backoff and jitter, on 500-and- / 408 / 429 / HttpRequestException / TimeoutRejectedException.
+A 503 after a POST is ambiguous, the server may have processed the order and then failed, or failed before processing, so each retry risks a duplicate order.
+Remedies, in order: call options.Retry.DisableForUnsafeHttpMethods() (or DisableFor(HttpMethod.Post) ) so POSTs aren't retried; or make the endpoint idempotent with an Idempotency-Key contract and then retry deliberately.
+What you must not do is add the line, enjoy the availability improvement, and never find out that the retry set includes your writes.
