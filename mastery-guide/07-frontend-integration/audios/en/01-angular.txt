@@ -1,0 +1,1037 @@
+-- pause --
+Section 1. Why it matters.
+
+Angular is Google's opinionated TypeScript-first frontend framework, used heavily in enterprise dot NET shops because the typed-everywhere mindset matches the dot NET worldview. The framework you defended in a 2018 design review is not the framework you are being interviewed on.
+Between v16 (May 2023) and v22 (June 2026) Angular replaced its reactivity model (signals), its rendering trigger (zoneless), its default change-detection strategy ( OnPush ), its template control flow ( @if / @for ), its declaration model (standalone), and its forms story (Signal Forms).
+Everything you already know still works, almost none of it is still the default.
+
+For dot NET developers the object model is familiar: classes with decorators ( @Component, @Injectable ), hierarchical D I, singleton services, dependency inversion. The gap that shows up in senior interviews is not syntax.
+It is being able to state precisely what marks a view dirty, why effect() is not a data-fetcher, what still schedules rendering after you delete zone.js,
+and which of the A P Is you are describing are actually stable, mechanisms you use by instinct but have probably never had to articulate under questioning.
+
+Version timeline, what landed when, and at what stability. Interviewers use this as a fluency probe. Dating a feature two majors early, or presenting a developer-preview A P I as production-ready, is the fastest way to signal that you stopped upgrading a while ago.
+
+v14, Jun 2022, Standalone A P Is (developer preview); inject() usable in field initialisers and factories; typed reactive forms; functional router guards in v14.2.
+v15, Nov 2022, Standalone A P Is stable; directive composition A P I ( host Directives ); NgOptimizedImage stable; provideHttpClient() + functional interceptors.
+v16, May 2023, Signals, developer preview; DestroyRef + takeUntilDestroyed(); @Input({ required: true }); withComponentInputBinding(); non-destructive hydration (developer preview); with Fetch() (v16.1, opt-in or experimental); after Render / afterNextRender (v16.2).
+v17, Nov 2023, Signals stable, except effect(), to Signal(), to Observable(), which stayed developer preview; built-in control flow and @defer (developer preview); hydration stable; esbuild or Vite application builder default.
+Then input() in 17.1, model() + signal queries in 17.2, output() in 17.3, all developer preview.
+v18, May 2024, Control flow and @defer stable; unified change-detection scheduler; provideExperimentalZonelessChangeDetection() (experimental); @let (18.1, developer preview).
+v19, Nov 2024, Standalone is the default ( standalone: false becomes the opt-out); input(), output(), model(), view Child(), view Children(), content Child(), content Children(), takeUntilDestroyed() all stable; linked Signal, resource, rx Resource introduced experimental;
+incremental hydration (developer preview); allowSignalWrites removed; APP_INITIALIZER deprecated for provideAppInitializer(); http Resource in 19.2 (experimental).
+v20, May 2025, effect(), linked Signal(), to Signal(), to Observable() stable; provideExperimentalZonelessChangeDetection renamed provideZonelessChangeDetection() (developer preview, stable in 20.2); after Render() renamed afterEveryRender(), no backwards-compatible alias;
+*ng If / *ng For / *ng Switch deprecated; withIncrementalHydration() stable; PendingTasks public.
+v21, Nov 2025, Zoneless by default for new apps, Zone.js apps must now opt in with provideZoneChangeDetection(); Signal Forms ( @angular or forms or signals ) experimental; Vitest the default test runner.
+v22, Jun 2026, OnPush is the default change-detection strategy; ChangeDetectionStrategy.Default renamed Eager and deprecated; Signal Forms stable; resource() / rx Resource() / http Resource() stable; HttpClient uses fetch by default ( with Fetch() deprecated); incremental hydration on by default;
+@angular or aria stable; TypeScript 6 / Node 22+ required.
+
+Two consequences of that table are worth memorising because they change how you answer nearly every other question.
+First, the reactive default is now pull-based: a signal read inside a template registers that view as a consumer, so Angular knows which view to refresh instead of re-checking the tree.
+Second, the render trigger is now explicit: with zone.js gone, "something async happened" is no longer a reason to run change detection, a notification from a signal, an event listener, markForCheck(), or ComponentRef.set Input() is.
+
+Why interviewers ask:
+full-stack roles in dot NET shops usually require Angular, and Angular is where architectural regret accumulates fastest, an app started in v8 with Default change detection, NgModules, and a BehaviorSubject store per feature is still running in production somewhere near the job you are applying for.
+The interview is often really "can you plan and stage that migration without stopping feature work".
+
+When NOT to choose: greenfield consumer apps with small teams and tight bundle budgets (React or Svelte are lighter to start); public marketing sites (Astro or a static-site generator); products whose value is streaming or edge rendering flexibility (Next.js and SvelteKit still lead there).
+Angular's return on investment shows up in long-lived, many-team, form-heavy line-of-business apps, exactly the shape most dot NET back ends serve.
+
+In the real world: a team stays on v15 for three years because "upgrades don't ship features". Support for v15 ends, a security advisory lands on a transitive dependency, and the jump has to happen in one quarter.
+The individual ng update steps are mostly automatic, the schematics handle standalone, control flow, and the initializer renames.
+What is not automatic is that v19 makes standalone the default, v21 removes zone.js from new bootstraps, and v22 makes OnPush the default: three defaults their code silently depended on.
+The migration that finally worked was the boring one, upgrade one major at a time, run the official schematics per step, and treat each default flip as its own pull request with its own regression pass.
+The lesson they wrote down: Angular's breaking changes are rarely A P I removals; they are default changes, and defaults are invisible in a diff.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+Standalone components (modern Angular).
+
+NgModules did three jobs at once, and separating them is the whole story of the migration:
+
+Compilation scope, which components, directives and pipes a template is allowed to reference.
+Provider scope, a lazy-loaded NgModule created a child EnvironmentInjector, so its providers were effectively "scoped to this feature".
+A unit of lazy loading, load Children pointed at a module.
+
+Standalone components take job 1 and move it onto the component itself ( imports ). Job 2 moved to route-level providers and bootstrap Application providers. Job 3 moved to load Component / load Children pointing at a routes array.
+Nothing about the injector hierarchy changed, only the thing that declares it.
+
+Timeline, precisely: standalone A P Is were developer preview in v14, stable in v15, the default shape generated by ng new in v17, and in v19 standalone: true became the implicit default so the flag disappears from new code and non-standalone declarables must now say standalone: false.
+
+Two details that separate people who migrated from people who read about migrating:
+
+CommonModule is usually dead weight now. @if / @for / @switch are compiler built-ins, not directives, so they need no import at all.
+What you still need from @angular or common are the pipes ( AsyncPipe, DatePipe, CurrencyPipe, DecimalPipe, JsonPipe ) and they are individually importable standalone pipes. Importing CommonModule to get | date pulls the whole set into the component's dependency graph.
+Unused entries in imports get flagged by the extended diagnostic NG8113 ("unused standalone imports", added in v19, a warning by default, promotable to error in tsconfig.json under angularCompilerOptions.extended Diagnostics ).
+That is the opposite of the NgModule failure mode, where over-importing was invisible and permanent.
+
+Bridging both worlds. A standalone component can import a legacy NgModule wholesale ( imports: [MatLegacyThingModule] ), which is how you migrate leaf-first without a big-bang rewrite. Going the other way, an NgModule can list a standalone component in its imports.
+For providers that only exist as an NgModule ( SomeLibModule.for Root({.}) ), importProvidersFrom(SomeLibModule.for Root({.})) lifts them into bootstrap Application, treat it as a migration crutch, not a destination, because it defeats the tree-shaking that made standalone worth doing.
+
+The official schematic does the mechanical work in three passes, in this order:
+
+In the real world: a 400-component app runs the standalone schematic and everything compiles, but two features start behaving as if they have amnesia, a wizard loses its state between steps, and a report screen fetches the same reference data on every navigation.
+The cause: those features were lazy NgModules whose providers created one instance per feature-load; the schematic moved several of those services to component-level providers, which creates one instance per component instance.
+The fix was to put them back on the route ( { path: 'wizard', providers: [WizardStateService], load Children:. } ), which reproduces the old lifetime exactly.
+The rule worth carrying into the interview: standalone changed where providers are declared, not how injectors nest, if a lifetime changes after migration, you moved a provider to the wrong level.
+
+-- pause --
+Templates and bindings.
+
+Angular's templating is HTML with extra syntax. Four binding flavours:
+
+Control flow (developer preview v17, stable v18): the built-in @if, @for, @switch blocks replace the structural directives *ng If, *ng For, *ng Switch (deprecated in v20). No import, no directive instance per branch, and real type narrowing:
+
+Status, precisely: control flow blocks were developer preview in v17, stable in v18, and *ng If / *ng For / *ng Switch were deprecated in v20. They still work; the compiler will nag. The automated conversion is ng generate @angular or core:control-flow.
+
+Why blocks instead of structural directives. *ng If was a directive on an: every branch created an embedded view with its own TemplateRef, its own change-detection entry, and a directive instance whose inputs had to be checked each cycle.
+Blocks are compiled directly into the component's template function as instructions, so there is no directive instance to instantiate or check, and the compiler can narrow types across the branch, @if (user();
+as u) gives you a non-nullable u in the body, which *ng If="user() as u" could only approximate.
+
+**Why track is mandatory in @for when track By was optional in ng For.* NgForOf shipped with a default: track by object identity.
+That default is silently catastrophic with immutable state, an NgRx selector, a computed() returning [.items], or an H T T P response re-parsed from Jason produces all-new object references for unchanged rows, so Angular destroyed and rebuilt every DOM node and every child component in the list.
+You lost input focus, scroll position, in-flight animations, and any state held inside row components; and you paid for a full re-instantiation of the subtree. Making track a required part of the syntax forces that decision at authoring time instead of at incident time. Rules of thumb:
+
+track item.id, the correct answer for anything with server identity.
+track $index, correct only for a list of primitives, or a list that is never reordered or spliced.
+track item, reference identity, the old default; choose it deliberately or not at all.
+
+Inside @for you get the implicit variables $index, $count, $first, $last, $even, $odd, and they can be aliased ( let idx = $index ).
+
+@let, template-local variables (developer preview in 18.1, stable in 19). Read-only, scoped to the current template and its descendants, and re-evaluated as part of change detection:
+
+Use it to kill the "call the same getter four times in one template" habit without inventing a computed() for a purely presentational value. It does not memoise, an expensive expression in @let still runs on every check, so genuinely costly derivations belong in a computed().
+
+Two-way binding is still sugar. [(value)]="x" desugars to [value]="x" plus (value Change)="x = $event", the "banana in a box" only works when the child exposes an output named Change.
+With model() (below) Angular generates that output for you, which is why model() is the only clean way to write a two-way bindable signal input.
+
+In the real world: a trading dashboard migrates *ng For to @for and the schematic writes track item (reference identity) because it cannot prove anything better. Everything looks fine in dev.
+In production the price feed replaces the array every 500 milliseconds with freshly parsed objects, so every row is destroyed and recreated twice a second, the sparkline canvases in each row reset, the "copy ID" tooltip closes as you reach for it,
+and C P U sits high with no obvious culprit because the profile is spread across component construction rather than one hot function.
+Changing to track row.symbol made the whole class of symptoms vanish. The takeaway to say out loud in an interview: track is not a performance hint, it is the identity contract for the DOM, with the wrong key, correctness bugs (focus, scroll, child state) arrive before performance ones.
+
+-- pause --
+Signals, the new reactivity model.
+
+The most important change in Angular's history, and the area where a 10-year Angular CV is most likely to be tested. Signals are reactive values that track their own consumers: reading one inside a reactive context registers a dependency, writing one notifies everything that read it.
+
+-- pause --
+The graph: producers, consumers, laziness, and glitch-freedom.
+
+A producer is anything that can be read reactively: signal, computed, input, model, resource().value, to Signal().
+A consumer is anything that tracks what it read: a computed, an effect, or a template view during change detection.
+computed is both, which is how you get a dependency graph rather than a flat list of subscriptions.
+
+Dependencies are dynamic and per-run: computed(() goes to a()? b(): c()) depends on a and exactly one of b / c, re-recorded every evaluation. That is fundamentally different from RxJS combine Latest, where the dependency set is fixed when you write the pipeline.
+
+The docs are explicit that "computed signals are both lazily evaluated and memoized": the body does not run until something reads it, and the cached value is reused until a dependency actually changes. Two consequences worth stating in an interview:
+
+A computed nobody reads never runs. If you are relying on a derivation for a side effect, you have written a bug, nothing will call it.
+The graph is glitch-free. Writes push a "possibly dirty" mark down the graph; values are only recomputed when pulled on read, and each node checks whether its dependencies' versions really changed before recomputing.
+So in the classic diamond ( a to b, a to c, (b,c) to d ), d is never observed with a new b and a stale c, and it recomputes once, not twice. RxJS with combine Latest over two derived streams will happily emit that intermediate state.
+
+Equality, and where the default bites. The default comparison is Object.is (reference equality for objects). Two failure modes follow:
+
+equal is available on signal(), computed() and linked Signal(). Use it deliberately: a deep-equality function on a large object trades C P U on every write for skipped renders, which is only a win when renders are expensive.
+
+untracked() reads a signal without creating a dependency.
+Two legitimate uses: reading configuration or "current value at the time of the event" inside an effect that should only re-run for one specific input; and calling a method that happens to read signals from inside a reactive context where you do not want its internals to become dependencies.
+
+-- pause --
+effect(): what it is for, and what it is emphatically not for.
+
+effect(fn, options?) returns an EffectRef; the callback receives an on Cleanup register function. It must run in an injection context unless you pass { injector }, and it is destroyed with that context.
+
+Timing matters and is asked about: an effect created inside a component runs as a component lifecycle event during change detection; an effect created in a root-level service (a "root effect") runs as a microtask, unconnected to the component tree.
+
+Do not use effect() to derive state. That is computed() 's job (or linked Signal() if the derived value must also be writable). Do not use effect() to fetch data, that is resource() / http Resource() / rx Resource(), or an explicit RxJS pipeline.
+The effect-as-fetcher pattern (read a signal, call the A P I, set() the result into another signal) is the single most common signals anti-pattern, and it fails in four specific ways:
+no cancellation of the in-flight request when the input changes again, no ordering guarantee so a slow first response overwrites a fast second one, no loading or error state without hand-rolling two more signals, and a real risk of a feedback loop when the effect writes something it also reads.
+
+The nuance that catches people who learned signals in 2023: Angular v19 removed the allowSignalWrites flag, and writes inside effects no longer throw. The guardrail is gone because it blocked legitimate cases and was easy to work around; the guidance did not change.
+A senior answer is: "writes are legal, usually a smell, and specifically correct when synchronising with something outside the graph, a third-party widget, local Storage, an imperative canvas, or when implementing a deliberate reset that linked Signal cannot express."
+
+-- pause --
+Signal inputs, model(), output(), and signal queries.
+
+Introduced developer preview across 17.1 ( input ), 17.2 ( model, signal queries) and 17.3 ( output ); all stable in v19. The decorator forms ( @Input, @Output, @ViewChild, @ContentChild ) are not deprecated and remain fully supported, do not claim otherwise in an interview.
+
+What actually differs from the decorator versions, mechanically:
+
+Inputs are read-only signals. You cannot set() an input from inside the component, which is exactly the discipline @Input() foo never enforced. When a child must also write, that is model(), which creates the input and the Change output, and whose .set() / .update() emit that output.
+input() is not available in ngOnChanges -style diffs. There is no "previous value", if you genuinely need the delta, keep ngOnChanges, or hold the previous value yourself in a linked Signal computation (which receives previous ).
+output() is not an EventEmitter. It returns OutputEmitterRef with .emit(), it is not an Observable, and it has no .next(). Subscribing imperatively is outputToObservable(ref); producing an output from a stream is outputFromObservable(obs$) (both from @angular or core or rxjs-interop, stable in v19).
+EventEmitter still works and is still an RxJS Subject under the hood, the practical difference is that output() cannot leak, because its subscriptions are tied to the component's DestroyRef.
+Signal queries have different timing and a different shape. view Child() returns Signal, view Children() returns Signal, and .required() drops the undefined from the type.
+There is no static: true, no QueryList, and no .changes Observable, you react by reading the query signal inside a computed() / effect() or the template.
+Results are resolved as part of change detection, so reading one in the constructor gives you undefined; that is not a bug, it is the graph telling you the view has not been created yet.
+Transforms: transform runs on every write and must be a pure function; boolean Attribute and number Attribute (from @angular or core ) cover the common attribute-coercion cases.
+
+-- pause --
+linked Signal(): writable state that resets when its source changes.
+
+Experimental in v19, stable in v20. It is the missing primitive between signal (writable, never resets) and computed (resets, never writable): a writable signal whose value is recomputed whenever its source changes.
+
+computation receives the new source value and a previous object exposing previous.source and previous.value, which is what lets you keep the user's choice when it is still valid.
+Before v19 this was written as an effect that wrote a signal, the pattern everyone was told not to use, because there was no alternative.
+If an interviewer asks "when is it OK for an effect to write a signal", the strongest answer includes "less often since v19, because linked Signal covers the reset case".
+
+-- pause --
+resource(), rx Resource(), http Resource(): async as state.
+
+Introduced experimental in v19 ( resource, rx Resource ) and 19.2 ( http Resource ); all stable in v22. A resource turns an async read into signals, value, status, error, is Loading, with cancellation wired to the reactive graph.
+
+Reading it in a template:
+
+Surface worth knowing precisely: value, status, error, is Loading, has Value(), reload(), and local mutation via set() / update(); ResourceStatus is 'idle' | 'loading' | 'reloading' | 'resolved' | 'error' | 'local'.
+Options include params, loader, stream, default Value, injector, and an id used to key the SSR TransferState cache. http Resource also takes parse (renamed from map in v20) for validating or transforming the response, a natural place to run a Zod schema against a dot NET DTO.
+
+Boundaries interviewers push on: resources are for reads, not mutations, POST / PUT / DELETE stay on HttpClient, and afterwards you call reload() on whatever resource is now stale.
+Resources are also eager: once params resolves, the request goes out, unlike a cold Observable that waits for a subscriber.
+
+-- pause --
+RxJS interop, and when RxJS is still the right answer.
+
+to Signal() subscribes immediately, unsubscribes with the injection context, and re-throws the source's error when the signal is read, an errored stream does not silently become undefined.
+to Observable() is implemented with an effect, so it needs an injection context too, and it emits on change rather than replaying every intermediate write.
+
+Signals are not a replacement for RxJS; they replaced BehaviorSubject -as-state.
+Reach for RxJS when time is part of the problem: debounce or throttle, retry with backoff, switch Map / concat Map / exhaust Map concurrency control, merging event sources, WebSockets and S S E, and anything where you care about the sequence of changes rather than the current value.
+
+In the real world: a team migrates a 60-service app from BehaviorSubject stores to signals over a quarter and hits three problems in the same week.
+(1) A computed() returning rows().map(toViewModel) re-renders a large grid on every unrelated store write, because a fresh array is a fresh reference every time, fixed by making the row view-models stable, not by adding a deep equal.
+(2) A shared helper calls to Signal() in a plain function invoked from ngOnInit, throwing NG0203 in a code path only exercised by one lazy route, fixed by moving the call to a field initialiser.
+(3) Removing | async changed when values landed: the async pipe delivered the first emission before the first render, while the new signal was seeded with initial Value: null and a template that had never handled null started throwing.
+The lesson: the mechanical part of a signals migration is easy; the hard part is that async pipe and to Signal have different first-emission timing, and every ?. you never needed suddenly matters.
+
+In the real world: a detail page fetches with effect(() goes to { this.load(this.id()); }). It works for a year.
+Then a keyboard-navigable list is added, the user arrows through ten records in two seconds, and the page starts showing record 7's header with record 3's line items, ten overlapping requests, resolving out of order, each set() -ing into the same pair of signals.
+The team's first fix was a loading guard, which turned it into a different bug (dropped updates). The real fix was six lines of http Resource, whose params change aborts the previous request by construction. effect() had no cancellation to offer; the abort was never the developer's to implement.
+
+-- pause --
+Dependency injection.
+
+Constructor injection, same model as dot NET D I:
+
+inject() arrived in v14 and works in class field initialisers, constructor bodies, and factory functions.
+
+Two injector trees, not one. This is the mental model that makes every "why did I get a different instance" question tractable:
+
+The EnvironmentInjector chain: NullInjector to platform injector to root injector ( bootstrap Application providers + provided In: 'root' ) to one child per lazy route that declares providers.
+The ElementInjector chain: one node per component or directive that declares providers (or view Providers ), nested exactly like the component tree.
+
+Resolution walks the ElementInjector chain up the component tree first, then jumps to the EnvironmentInjector chain, then hits NullInjector and throws NG0201: No provider for X.
+inject() accepts InjectOptions to steer that walk: { optional: true } (return null instead of throwing), { self: true } (this injector only), { skip Self: true } (start at the parent, the classic way to detect "am I nested inside another instance of myself"), and { host: true }.
+
+Provider scopes and what they actually cost:
+
+provided In: 'root', app-wide singleton, and tree-shakable: if nothing injects it, it never reaches the bundle. Listing the same service in app config ts providers: [] is not tree-shakable, because the config is eagerly referenced.
+provided In: 'platform', shared across multiple Angular apps bootstrapped on one page (rare, for example micro-frontends in a single document).
+Route-level providers: [.], one instance per activation of that route subtree; the standalone replacement for "providers in a lazy NgModule".
+Component providers: [.], one instance per component instance; view Providers restricts visibility to the component's own template, excluding projected content.
+{ provide: TOKEN, use Class | use Value | use Existing | use Factory }, plus multi: true for collections ( HTTP_INTERCEPTORS is the classic).
+
+InjectionToken is the answer to "how do I inject an interface", TypeScript interfaces vanish at runtime, so there is nothing to use as a key. It is the Angular analogue of dot NET's keyed services ( AddKeyedSingleton ) combined with IOptions.
+
+Application initialisation moved to functions in v19: provideAppInitializer(() goes to inject(ConfigService).load()) replaces the { provide: APP_INITIALIZER, use Factory, multi: true } incantation (with provideEnvironmentInitializer and providePlatformInitializer for the other two).
+The callback runs in an injection context, and returning a Promise or Observable blocks bootstrap, the Angular equivalent of work in Program.cs before app.Run().
+
+-- pause --
+Injection contexts, DestroyRef, and the errors you get outside one.
+
+An injection context exists during class construction and field initialisation, inside factory functions, inside route guards or resolvers or interceptors while Angular is invoking them, and inside anything wrapped in runInInjectionContext(injector, fn). Outside one, inject() throws NG0203.
+This is the single most common runtime error in modern Angular code, because half the ergonomic A P Is ( inject, effect, to Signal, to Observable, takeUntilDestroyed ) are injection-context-bound:
+
+DestroyRef (v16) is injectable teardown: destroy Ref.on Destroy(cb) works anywhere you can inject, including inside a service scoped to a component, which is what lets library helpers clean up without demanding an ngOnDestroy from the caller.
+takeUntilDestroyed() (v16, stable v19) is its RxJS operator, its optional destroy Ref parameter is exactly the escape hatch for calling it outside an injection context.
+
+What inject() enables that constructor parameters cannot, the real interview answer, not "it's shorter":
+
+Functional A P Is have no class to hang parameters on. Guards, resolvers and interceptors are plain functions; inject() is the only way they can reach D I.
+Composable inject helpers. You can write injectRouteParam('id') or inject Breakpoint() as a reusable function that internally injects and returns a signal, Angular's answer to React hooks. Constructors cannot be composed this way.
+Inheritance without constructor plumbing. A base class that injects in field initialisers needs no super(a, b, c) chain, so adding a dependency to the base does not break every subclass.
+Ordering. Field initialisers run before the constructor body, so inject() results are available to other field initialisers, including effect() and to Signal() calls that depend on them.
+
+For testing, TestBed swaps providers, the same idea as A S P dot NET Core's WebApplicationFactory.WithWebHostBuilder, and TestBed.runInInjectionContext(fn) is how you unit-test an inject-helper or a functional guard without a component.
+
+In the real world: an app has an AuthService marked provided In: 'root' and, in one feature module converted years earlier, a stray providers: [AuthService] on a shell component. Everything works, until the "session expiring" banner starts appearing while the user is active.
+Two instances existed: the interceptor injected the root one and refreshed its token; the banner injected the shell-scoped one, whose expiry timestamp never advanced. Nothing errors when you provide a service twice, and nothing in the code review diff looks wrong.
+They found it by injecting Injector in both places and comparing identity in the console. The habit they adopted afterwards: a service that holds state gets exactly one declaration site, and providers on a component is treated as a code smell requiring justification in the pull request description.
+
+-- pause --
+Routing.
+
+The Angular Router maps URL paths to components.
+
+Lazy loading ( load Children / load Component ) splits routes into separate JS chunks. Critical for keeping initial bundle small.
+
+Functional guards arrived in v14.2 and are now the only form worth writing; the class-based CanActivate interfaces are deprecated:
+
+All guard types return MaybeAsync, boolean, UrlTree, or a Promise or Observable of either.
+
+can Match versus can Activate is a real architecture question, not trivia. can Activate runs after the route has matched, which for a lazy route means after the chunk has been downloaded and evaluated.
+can Match runs during matching, so a failed check means the chunk is never fetched and the router falls through to the next matching route, which is also how you serve two different components for one path (admin versus standard dashboard).
+Put role gates on can Match; keep can Activate for per-activation checks such as "this specific record is locked".
+
+Router configuration features you should be able to name:
+
+withComponentInputBinding() deserves a call-out because it removes most ActivatedRoute boilerplate: declare id = input.required() on the routed component and the router binds the:id path param straight into the signal, route data and query params bind by name too.
+Two caveats: the binding is by name, so a rename in app routes ts silently stops binding, and input.required on a param that is only sometimes present will throw.
+
+Resolvers block navigation, the URL changes, the old component stays on screen, and the user sees nothing happen until every resolver settles. On a slow A P I that reads as a frozen app.
+The modern alternative is to navigate immediately and let the destination own its loading state with http Resource() / resource(); keep resolvers for data you truly cannot render a shell without (permissions that decide layout, an entity that decides which child route to redirect to).
+
+Also worth knowing: paramsInheritanceStrategy defaults to 'always' as of v22 (child routes inherit parent params and data even without path Match tricks), a behaviour change with no automated migration, so a v21 app that relied on not inheriting can start seeing unexpected params.
+
+In the real world: a security review flags that the admin bundle is downloadable by any authenticated user, the route used can Activate: [admin Guard], so the router matched the path, fetched admin-chunk.js, ran the guard, and redirected to /403.
+The chunk was in the browser's cache and in the network log, complete with internal endpoint names, field labels and feature flags. Switching to can Match stopped the download. The part the team had to write up for the auditor was harder: the guard was never the control anyway.
+Anyone can call the A P I directly; the fix that mattered was confirming the dot NET side enforced the role on every admin endpoint. Route guards are U X; authorisation lives on the server.
+
+-- pause --
+Forms, template-driven versus reactive.
+
+Two flavors. Reactive forms are dominant for non-trivial cases.
+
+Template-driven (good for simple forms):
+
+Reactive (programmatic; better for complex):
+
+Typed reactive forms (v14) have sharp edges that come up constantly in senior interviews:
+
+form.value is a Partial, because disabled controls are excluded from it. form.getRawValue() returns everything. Sending form.value to a dot NET endpoint that binds to a non-nullable DTO is how "the field the user could see but not edit silently became null" bugs happen.
+Controls are nullable by default ( reset() sets them to null ). new FormControl('', { non Nullable: true }), or inject(NonNullableFormBuilder), makes reset() return to the initial value and drops | null from the type.
+value Changes / status Changes are Observables and need takeUntilDestroyed(). When a subscriber writes back into the form, pass { emit Event: false } to set Value / patch Value or you get an infinite loop.
+update On: 'blur' | 'submit' on a control or group is the cheapest fix for "validation fires on every keystroke and the async validator hammers the A P I".
+Cross-field rules belong on the group: fb.group({.}, { validators: passwords Match }). Async validators run only after the synchronous ones pass, and the control sits in pending status meanwhile.
+Custom form controls implement ControlValueAccessor ( write Value, registerOnChange, registerOnTouched, setDisabledState ) and register via NG_VALUE_ACCESSOR with multi: true.
+
+Signal Forms, experimental in v21, stable in v22, shipped in @angular or forms or signals. The model is a signal; form() binds validation rules to paths within it:
+
+Field state is exposed as signals, value(), errors(), touched(), valid(), invalid(), pending(), and there are logic rules ( disabled(), readonly(), hidden(), debounce() ) declared alongside the validators rather than imperatively toggled.
+schema() + apply() extract a rule set so the same shape (an address, a line item) validates identically everywhere, and apply Each() handles arrays.
+
+Do not tell an interviewer you would migrate a large app's forms to Signal Forms because it is new. Reactive forms are not deprecated, a large form layer is where the domain rules live, and there is a compatibility layer precisely so the two can coexist.
+The defensible plan is: new forms in Signal Forms, existing forms migrated only when they are being reworked anyway.
+
+In the real world: a team enables strict typed forms during a v13 to v14 upgrade and ships. Two weeks later, finance reports that discount codes vanish from a small percentage of orders.
+The discount field is disabled whenever the customer tier is set automatically, and the save call posted form.value, which excludes disabled controls. The dot NET model binder happily bound null and the update overwrote the stored code.
+Nothing threw, nothing logged, and it only affected the tiers where the field was disabled. One-word fix ( getRawValue() ), three days to find. form.value omitting disabled controls is the most expensive default in Angular forms.
+
+-- pause --
+HttpClient and interceptors.
+
+HttpClient returns cold Observables, nothing is sent until you subscribe, and unsubscribing cancels the in-flight request (with the fetch backend, via AbortController ).
+That cancellation is free switch Map semantics and the reason a raw .subscribe() in a component is worse than it looks: nobody cancels it when the user navigates away. For one-shot calls, firstValueFrom(obs$) gives you a Promise for async or await code.
+
+Interceptor mechanics worth stating precisely. with Interceptors([a, b, c]) composes them like A S P dot NET Core middleware: the request passes through a to b to c to backend, and the response Observable unwinds c to b to a.
+Each interceptor is a function (req, next) running in an injection context, so inject() works.
+withInterceptorsFromDi() bridges legacy class-based HTTP_INTERCEPTORS, the two can coexist, but D I-based interceptors always run after the functional ones, which is a subtle ordering trap during migration.
+
+HttpRequest is immutable: mutate by req.clone({ set Headers, set Params,. }).
+
+Use HttpContext, not URL string matching, to opt requests out. The req url includes('/auth or refresh') check everyone writes is fragile (it breaks the moment an absolute URL, a query string, or a similarly named endpoint appears):
+
+Retry belongs where the semantics are known. next(req).pipe(retry({ count: 3, delay: 1_000 })) in an interceptor retries everything, including non-idempotent POST s, which is how a customer ends up charged three times.
+Retry GET / HEAD / PUT / DELETE globally if you must, and let individual calls opt in via HttpContext for anything else. HttpErrorResponse.status === 0 means the request never completed, network failure, D N S, or a cores rejection; the browser deliberately hides which.
+
+A full single-flight token-refresh interceptor (the dot NET-seam classic) is in Code and diagrams.
+
+-- pause --
+Change detection, Zone versus zoneless.
+
+This is the section a senior interview will dwell on, because it is where "I've used Angular for ten years" and "I know how Angular works" separate.
+
+-- pause --
+What zone.js actually does.
+
+Zone.js monkey-patches the browser's asynchronous A P Is, set Timeout, set Interval, requestAnimationFrame, XHR or fetch, addEventListener, and Promise (via a ZoneAwarePromise that replaces the global), so that every callback runs inside a tracked execution context.
+Angular's NgZone counts the tasks entering and leaving that context and, when the microtask queue drains, emits onMicrotaskEmpty, which historically called ApplicationRef.tick().
+
+Note what this mechanism does not know: it knows that something asynchronous finished, never that any state changed. Every set Timeout in a third-party tooltip library, every mousemove listener, every resolved promise that touched nothing schedules a full application check.
+That is "zone pollution", and the classic mitigation is ng Zone.runOutsideAngular(() goes to.) for animation loops, polling and scroll handlers, re-entering with ng Zone.run(.) only when real state changes.
+
+-- pause --
+The check itself: dirty flags, and the three ways to force one.
+
+ApplicationRef.tick() walks the view tree from the root. For each view it decides whether to check it:
+
+A component with Eager (the strategy formerly called Default ) is checked every traversal that reaches it.
+A component with OnPush is checked only when its view is dirty.
+A view becomes dirty when:
+an input bound in the template receives a new value (reference comparison), an event fires from within the view or its children, an AsyncPipe in the template emits (it calls markForCheck() internally), a signal read by the template changes, or ComponentRef.set Input() is called.
+
+The three imperative A P Is are not interchangeable:
+
+ChangeDetectorRef.markForCheck(), Marks this view dirty and marks its ancestors so traversal reaches it. Does not check anything itself; the next scheduled tick does the work., Almost always, you changed state outside Angular's knowledge and want it rendered on the next pass.
+ChangeDetectorRef.detect Changes(), Synchronously checks this view and its children, right now, ignoring the scheduler., Rarely: measuring the DOM immediately after a state change, or driving a detached view. It is also how you create ExpressionChangedAfterItHasBeenCheckedError in a parent.
+ApplicationRef.tick(), Runs a full synchronous check from the root., Effectively never in application code; it is what the scheduler calls for you.
+
+ChangeDetectorRef.detach() / reattach() still exist for the "10,000 rows, I will render manually" cases, that is what detect Changes() on a detached view is genuinely for.
+
+-- pause --
+ExpressionChangedAfterItHasBeenCheckedError (NG0100).
+
+In development, Angular runs a second check pass immediately after each change-detection run and compares the bindings. If a binding changed between the two passes, the pass was not idempotent, and Angular throws NG0100. The docs are explicit: "Angular only throws this error in development mode."
+
+That last point is the interview answer. Production does not throw, it renders the first value and leaves the DOM inconsistent with your model until something else triggers a check.
+So NG0100 is not a dev-only annoyance to silence with set Timeout(() goes to.) or an extra detect Changes(); it is a genuine "my render pass has side effects" bug that production hides.
+Typical causes: a getter that returns a new object each call, a child writing to a parent's binding in ngAfterViewInit, or a service mutated during rendering.
+Signals make the class of bug rarer, a signal write during a check schedules another pass rather than corrupting the current one, but they do not make it impossible.
+
+-- pause --
+Zoneless: what replaces the signal that zone.js provided.
+
+The precise history, because getting it wrong is a tell:
+experimental in v18 ( provideExperimentalZonelessChangeDetection() ), renamed and promoted to developer preview in v20 ( provideZonelessChangeDetection() ), stable in v20.2, and the default for new apps in v21, where the opt-in is now provideZoneChangeDetection() if you still need Zone.js.
+
+The enabling change actually landed earlier: v18 introduced a unified change-detection scheduler. Instead of "zone says the microtask queue drained, therefore tick", Angular now has explicit notification sources that schedule a coalesced check.
+Zoneless simply removes zone.js as one of those sources. Per the zoneless guide, a check is scheduled when:
+
+ChangeDetectorRef.markForCheck() is called (which AsyncPipe does for you),
+ComponentRef.set Input() is called,
+a signal read in a template is updated,
+a bound host or template listener callback runs,
+a view marked dirty by any of the is attached.
+
+What breaks when you drop zone.js is therefore anything that assumed "async work implies a render":
+
+Stability observables never fire. NgZone.onMicrotaskEmpty, on Unstable and on Stable never emit, and NgZone.is Stable is always true.
+Code waiting on stability (SSR serialisation, some test helpers,
+"hide the splash screen when stable") must move to afterNextRender() / afterEveryRender() or to PendingTasks (public A P I since v20), inject(PendingTasks).run(() goes to promise) keeps the app "unstable" for as long as your work is outstanding,
+which is exactly what SSR needs before it serialises HTML.
+NgZone.run() and runOutsideAngular() still exist and are safe to leave in place, which makes incremental migration possible. But run() no longer causes a check by itself, if the callback does not touch a signal, fire a listener or call markForCheck(), nothing renders.
+Libraries that mutate state from raw callbacks stop updating. A charting library that calls back from a set Timeout, a j Query-era plugin, a WebSocket client that pushes into a plain array. The fix is a one-line adapter: write into a signal, or call markForCheck() in the callback.
+fake Async / tick() -heavy tests need review; zoneless tests generally use await fixture.when Stable() with the real scheduler.
+
+-- pause --
+How signals let Angular skip subtrees.
+
+Under zone.js with Default everywhere, one event meant checking every binding in the application. With signals, the flow inverts: when a signal that a template read is written, that specific view is marked for refresh and its ancestors are marked for traversal.
+The next scheduled check walks from the root directly down the marked path and refreshes only the views that actually depend on the changed value, siblings and unaffected branches are skipped even if their strategy is Eager.
+This is why "signals + OnPush" is not two optimisations but one: the signal tells Angular which view to check, so the strategy question mostly stops mattering.
+
+v22 flips the default: OnPush is now the default strategy for components, ChangeDetectionStrategy.Default has been renamed Eager and deprecated, and the update migration writes change Detection: ChangeDetectionStrategy.Eager onto existing components to preserve behaviour.
+Read that carefully before an interview: it means new components you write in v22 are OnPush whether you asked for it or not, a component that renders from a mutated array or a service field it does not read reactively will simply not update.
+
+Event coalescing (generated by default for zone-based apps since v18) collapses the multiple change-detection runs caused by one bubbling event into a single check, cheap, and worth turning on in any legacy app you cannot make zoneless yet.
+
+In the real world: a component tree that ran fine for years on Default is switched to OnPush during a performance push, and roughly a fifth of the screens quietly stop updating.
+The pattern is always the same: a service holds orders: Order[], components read service.orders directly in templates, and updates mutate the array in place. Under Default the next tick re-read the array and the DOM caught up; under OnPush nothing marks those views dirty, so nothing renders.
+The team's instinct was to sprinkle markForCheck(), which worked and made the code unexplainable. What actually fixed it was converting the service's state to a signal and replacing mutation with replacement, after which the OnPush question became irrelevant.
+OnPush does not break apps; mutable shared state does, and OnPush is just the first thing that notices. In v22 this arrives whether you opt in or not, because OnPush is the default.
+
+In the real world: an SSR app goes zoneless and the server starts returning pages with empty content areas. The cause: rendering used to wait for NgZone.on Stable, and a service kicked off its data load from a set Timeout(0), the zone knew about the pending task, so the server waited.
+Zoneless has no such knowledge, so serialisation happened before the data arrived. Wrapping the load in inject(PendingTasks).run(() goes to this.load()) restored the behaviour explicitly.
+The general lesson worth quoting: zone.js was an implicit "I am busy" signal for the whole application; zoneless makes you say it out loud, and SSR is where the silence shows first.
+
+-- pause --
+Deferrable views, @defer and incremental hydration.
+
+@defer (developer preview v17, stable v18) is route-level lazy loading applied at template granularity: the compiler splits the block's dependencies into their own chunk and fetches it when a trigger fires.
+
+Triggers: on idle (optional timeout), on viewport, on interaction (click or keydown), on hover, on immediate, on timer(2 seconds), and when. prefetch runs on its own trigger, separated by a semicolon, to download without rendering.
+@placeholder 's minimum and @loading 's after / minimum exist to stop the flash-of-spinner that makes deferral feel worse than not deferring.
+
+The restriction people trip over: deferred dependencies must be standalone and must not be referenced anywhere outside the @defer block, including from a view Child query or the @placeholder / @loading blocks. One stray reference and the component is pulled back into the eager bundle, silently.
+ng build --stats-json plus a bundle analyser is how you verify the split actually happened.
+
+Incremental hydration (developer preview v19, withIncrementalHydration() stable v20, default in v22 with withNoIncrementalHydration() as the opt-out) reuses the same block syntax with hydrate triggers:
+the server renders the real content instead of the placeholder, the client leaves it dehydrated, HTML on screen, no JavaScript downloaded, and hydrates on demand.
+
+hydrate on idle | viewport | interaction | hover | immediate | timer(.), hydrate when, and hydrate never for content that is genuinely static. Event replay is enabled along with it, so a click that arrives before hydration is queued and replayed rather than lost.
+
+In the real world: a team wraps six dashboard widgets in @defer (on viewport) and the initial bundle barely moves.
+The reason: a parent component held view Child(RevenueChartComponent) to call refresh() on it, so the compiler could not exclude the chart from the eager chunk, the reference outside the block silently disabled the deferral for the biggest widget.
+Replacing the imperative refresh() call with an input the chart reacts to restored the split. @defer fails open: when it cannot defer, you get working code and no error, only a bundle that did not shrink. Verify with the build stats, never by assuming.
+
+-- pause --
+Modern surface you may have missed.
+
+Things a 10-year Angular engineer is expected to recognise, that landed while you were shipping features:
+
+afterNextRender() / afterEveryRender() (v16.2 as after Render / afterNextRender; after Render was renamed afterEveryRender in v20 with no backwards-compatible alias).
+Both run only in the browser, never during SSR, which makes them the correct home for DOM measurement, third-party widget initialisation and anything touching window, replacing the isPlatformBrowser + ngAfterViewInit dance.
+DestroyRef + takeUntilDestroyed() (v16; stable v19), teardown without an ngOnDestroy, usable inside services and helper functions.
+NgOptimizedImage (stable v15), the ng Src directive that enforces width or height (preventing layout shift), generates srcset, sets fetchpriority for the LCP image via priority, and lazy-loads the rest. It is a standalone directive: imports: [NgOptimizedImage].
+Directive composition A P I (v15), host Directives: [CdkDrag, { directive: HasColor, inputs: ['color'] }] applies directives to a host from within the component, re-exporting selected inputs or outputs.
+Composition instead of inheritance, and the only clean way to bundle behaviour into a component without asking every consumer to remember three directives. Works with standalone directives only.
+provideAppInitializer() / provideEnvironmentInitializer() (v19), function-based replacements for APP_INITIALIZER / ENVIRONMENT_INITIALIZER, both now deprecated.
+PendingTasks (public since v20), explicit "the app is busy" signalling for SSR and tests in a zoneless world.
+@let (18.1 preview, stable v19), built-in control flow (v18), @defer (v18), covered.
+@angular or aria (developer preview v21, stable v22), headless, accessible interaction patterns (listbox, menu, tabs, et cetera) that you style yourself; relevant when someone asks how you would build a design system without adopting Material wholesale.
+Tooling: the esbuild or Vite application builder became the default in v17 ( @angular-devkit or build-angular:application, now also @angular or build:application ), and Vitest is the default test runner from v21 with Karma or Jasmine still selectable via --test-runner set to karma.
+
+-- pause --
+Angular and dot NET: the integration seam.
+
+The half of the interview that only full-stack candidates get asked.
+
+Token attachment. One functional interceptor, reading from a signal-backed auth service, adding Authorization: Bearer..
+Skip the token for third-party origins, an interceptor that blindly attaches to every request will leak your access token to any C D N or analytics endpoint you call through HttpClient.
+
+The refresh race. A page that fires seven parallel requests on load will get seven 401 seconds within milliseconds of the token expiring.
+Without single-flighting, that is seven refresh calls; with refresh-token rotation on the dot NET side (the default in most OIDC setups), six of them present an already-used token, the identity provider treats reuse as theft and revokes the session, the user is logged out because you refreshed.
+The fix is one shared in-flight refresh ( share Replay + a nulled-out field on finalize ), with the other requests waiting on it and retrying once. Full implementation in Code and diagrams.
+
+cores preflight cost. Any request with Authorization, a custom header, or a non-simple content type triggers an OPTIONS preflight, a full round trip before the real one, per URL, per method. On a chatty screen against a distant A P I this doubles the request count.
+Mitigations: set Access-Control-Max-Age so the browser caches the preflight (A S P dot NET Core: policy.SetPreflightMaxAge(TimeSpan.FromHours(1));
+browsers cap it), keep the SPA and the A P I same-origin behind one reverse proxy so cores never applies, and remember that AllowCredentials() cannot be combined with a wildcard origin.
+A cores failure surfaces in Angular as HttpErrorResponse with status: 0 and nothing useful in the message, always check the browser console, and check whether the preflight or the actual request failed.
+
+Cookie auth and SSR. On the server there is no browser: no cookie jar, no document.cookie, no automatic credential attachment, and relative URLs have no origin to resolve against.
+A cookie-authenticated app that renders fine in the browser will render logged-out HTML from the server unless you forward the incoming request's cookies onto the outgoing A P I calls.
+Angular provides the REQUEST, RESPONSE_INIT and REQUEST_CONTEXT injection tokens for exactly this (null in the browser).
+Also audit the transfer cache: withHttpTransferCacheOptions({ includeRequestsWithAuthHeaders: true }) will serialise responses to authenticated requests into the HTML, correct only if that HTML is never cached by a C D N or shared proxy.
+
+XSRF. For cookie-based auth you need antiforgery.
+HttpClient reads the XSRF-TOKEN cookie and sends it as X-XSRF-TOKEN, "on all mutating requests (such as POST ) to relative and same origin URLs, but not on GET or HEAD requests", configurable with withXsrfConfiguration({ cookie Name, header Name }), disabled with withNoXsrfProtection().
+On the dot NET side, configure IAntiforgery to emit a non-HttpOnly cookie under that name and validate the matching header. Bearer tokens in memory do not need this; cookies always do.
+
+When a chatty component tree forces a B F F.
+Angular's D I makes it easy for twelve components to each own a service that each calls an endpoint, and the network tab shows it:
+an order screen issuing calls for order, customer, addresses, payment methods, shipment, and audit trail, each with its own preflight, each waterfalled behind the previous component's render.
+Options in order of cost:
+aggregate on the client (one service, one fork Join / resource ), aggregate on the server (a screen-shaped endpoint), or a backend-for-frontend, a thin dot NET service owned by the frontend team that composes the domain A P Is, returns exactly the view model the screen needs,
+and holds the tokens server-side.
+The B F F is also the standard answer to "where do refresh tokens live" when the security team refuses browser storage: the cookie is between the browser and the B F F, and the B F F talks to the A P Is with its own credentials.
+
+Contract drift. HttpClient.get() is a cast, not validation, the generic disappears at runtime, so a renamed field on the dot NET DTO produces undefined in the U I, not an error.
+Options: generate clients from the OpenAPI document (NSwag or Kiota) so a rename fails the build, or validate at the boundary (a Zod schema in http Resource 's parse ).
+Also decide who owns casing, System.Text.Json camel-cases by default while [JsonPropertyName] overrides quietly, and map A S P dot NET Core's ProblemDetails (RFC 9457) into one typed error shape in a single error interceptor rather than in every subscriber.
+
+In the real world: an internal app is moved from "SPA served by the same A S P dot NET Core host" to "SPA on a C D N, A P I on api company com " for a caching win, and average page load gets worse.
+The cause was invisible in the A P I's own metrics, which only counted GET s: every authenticated call now carried an Authorization header from a different origin, so each unique URL paid an OPTIONS preflight first, and the busiest screen issued fourteen of them before rendering.
+Server-side timings looked perfect; the browser waterfall showed the truth. Two changes fixed it, SetPreflightMaxAge so the browser stopped re-asking, and an aggregation endpoint that collapsed the fourteen calls into two.
+The line worth remembering: the C D N move did not make the A P I slower, it made every request cost two round trips, and only the browser could see it.
+
+In the real world: a team adds SSR to an existing cookie-authenticated app to fix a search-engine complaint. In dev everything renders. In production, logged-in users get a flash of the signed-out layout on every hard navigation, and one screen renders a stale tenant's data.
+Two separate bugs with one root cause, the server has no browser. The signed-out flash was the server calling the A P I without the user's cookie; the cross-tenant leak was the transfer cache configured with includeRequestsWithAuthHeaders: true while a reverse proxy cached the HTML.
+Forwarding cookies through the REQUEST token fixed the first; turning the auth-header caching off (and adding Cache-Control: private, no-store on rendered HTML) fixed the second.
+SSR moves your auth assumptions into a process that has none of the browser's guarantees, and the failure looks like a U I glitch rather than a security finding.
+
+-- pause --
+Section 3. Code and diagrams.
+
+-- pause --
+Component lifecycle.
+
+Most code only needs ngOnInit (or field initialisation with signals) and ngOnDestroy.
+Modern signal-based code rarely needs lifecycle hooks at all: input() replaces ngOnChanges, resource() replaces the ngOnInit fetch, DestroyRef / takeUntilDestroyed() replaces ngOnDestroy, and afterNextRender() replaces the browser-only half of ngAfterViewInit.
+The one hook signals cannot replace is ngOnChanges when you genuinely need the previous value, SimpleChanges (generic since v21) still carries previous Value.
+
+-- pause --
+How a change actually reaches the DOM (zoneless).
+
+The mechanism to be able to narrate: a signal write does not render anything. It marks the views that read that signal for refresh, marks their ancestors so the traversal can reach them, and notifies the scheduler. Rendering happens later, once, for the whole batch.
+
+-- pause --
+Standalone versus NgModule comparison.
+
+Less ceremony; clearer dependencies; better tree-shaking.
+
+-- pause --
+Signal-based component (modern Angular).
+
+No ngOnInit, no subscription, no loading / error signals to hand-maintain, no cancellation to write, no markForCheck().
+Compare this with the pattern it replaces, effect(() goes to this service get(this.id()).subscribe(v goes to this value set(v))), which has none of those guarantees and is the anti-pattern interviewers look for.
+
+-- pause --
+Service with HttpClient + signals.
+
+Note the shape of the boundary: reads are resources, writes are HttpClient calls followed by an explicit reload(). That is the closest Angular equivalent to C Q R S on the client, and it answers "how do you keep the list fresh after a mutation" without a global store.
+
+-- pause --
+Folder structure (typical Angular project).
+
+Group by feature, not by file type. Inside each feature, components or services or models live together.
+
+-- pause --
+Lazy loading routes.
+
+When the user navigates to /orders, the bundle downloads, initial app stays small.
+
+-- pause --
+Angular + dot NET A P I integration.
+
+ng serve proxies /api/* to your dot NET backend. cores isn't a concern in dev (same origin via proxy); enable cores for prod.
+
+-- pause --
+Single-flight token refresh (the 401 stampede).
+
+Three details that make this correct rather than merely plausible: the HttpContext flag (not a URL substring) keeps the refresh call out of its own interceptor; refresh$ is nulled in finalize so a later expiry starts a fresh call instead of replaying a stale one;
+and only 401 triggers refresh, a 403 means the token is fine and the user simply lacks the permission, so refreshing loops forever for no benefit.
+
+-- pause --
+Section 4. Common pitfalls.
+
+effect() used as a fetcher or a deriver. No cancellation, no ordering guarantee, no loading or error state, and a real chance of a write-read loop. Derive with computed(), reset with linked Signal(), fetch with resource() / http Resource() / rx Resource().
+Since v19 signal writes inside effects no longer throw, so the framework will not stop you.
+Mutating an object or array and calling set() with the same reference. Default equality is Object.is, so nothing changes and nothing renders. Replace the reference ( update(r goes to [.r, x]) ) or supply an equal function deliberately.
+@for (x of items; track x), reference identity, usually written by the migration schematic because it cannot infer a key. With immutable data every row is destroyed and rebuilt: lost focus, reset scroll, re-initialised child components. Use track x.id.
+Assuming OnPush is opt-in. Since v22 it is the default; Default is now Eager and deprecated. New components in an old codebase will not react to mutated shared state.
+"Zoneless is just deleting zone.js." Anything depending on NgZone.on Stable / is Stable, on fake Async timing, or on a library that pushes state from a bare callback needs work. Use PendingTasks for "the app is busy", afterNextRender() for browser-only DOM work.
+Calling inject(), effect(), to Signal() or takeUntilDestroyed() outside an injection context, NG0203, and usually only on one code path so it ships. Move to a field initialiser, pass an injector / DestroyRef, or wrap in runInInjectionContext.
+Silencing ExpressionChangedAfterItHasBeenCheckedError with set Timeout. Production never throws it, it renders the stale value instead. The error is telling you a render pass has side effects; fix the pass.
+Subscribing without unsubscribing. Prefer the async pipe, a resource, or takeUntilDestroyed(). A bare .subscribe() in a component also means the H T T P request is never cancelled on navigation.
+Retrying everything in an interceptor. retry() applied globally will replay non-idempotent POST s. Scope retry by method or by HttpContext.
+Refreshing tokens per-401 instead of once. Parallel 401 seconds produce parallel refreshes; with refresh-token rotation the server treats the reuse as theft and kills the session. Single-flight it.
+Route guards treated as authorisation. can Activate on a lazy route still downloads the chunk (use can Match ), and neither protects the A P I. The server enforces; the guard is U X.
+Posting form.value from a typed reactive form. Disabled controls are excluded, getRawValue() is what you meant.
+CommonModule imported everywhere out of habit. Control flow is built into the compiler now; import the individual pipes you actually use.
+Referencing a @defer red component from outside the block (a view Child, the placeholder). Deferral silently does nothing and the bundle never shrinks, verify with build stats.
+Treating HttpClient.get() as validation. The generic is erased; a renamed dot NET property becomes undefined, not an error. Generate the client from OpenAPI or validate at the boundary.
+Interceptor attaching the bearer token to every URL, including third-party hosts. Gate on your own A P I origin.
+
+-- pause --
+Section 5. Interview-ready summary.
+
+Angular = TypeScript-first opinionated framework with class-based components and hierarchical D I.
+Standalone: stable v15, generated by ng new from v17, the implicit default from v19. NgModules did compilation scope + provider scope + lazy-load unit; those jobs moved to imports, route-level providers, and load Component / load Children.
+Signals: developer preview v16, stable v17 ( effect followed in v20). Producers or consumers, dependencies re-recorded per run, computed lazy + memoised, glitch-free graph, Object.is equality by default.
+effect() is for syncing with the non-reactive world, not deriving ( computed ), not resetting ( linked Signal ), not fetching ( resource ). allowSignalWrites was removed in v19, writes are legal, still usually wrong.
+Signal inputs or outputs or queries: input() 17.1, model() + queries 17.2, output() 17.3, all stable in v19. Decorator forms still supported.
+Async as state: resource / rx Resource (v19 experimental), http Resource (19.2), all stable in v22, cancellation via abort Signal, status or error or is Loading as signals, reads only.
+Control flow ( @if / @for / @switch ) preview v17, stable v18, *ng If and friends deprecated v20; track is mandatory because reference identity destroyed and rebuilt rows.
+inject() (v14) enables the functional A P Is, guards, resolvers, interceptors, composable inject helpers, and requires an injection context ( NG0203 otherwise).
+Change detection: zone.js patched async A P Is and ticked; v18 added a scheduler with explicit notification sources; zoneless was experimental v18, provideZonelessChangeDetection() in v20, stable v20.2, default v21. OnPush is the default strategy from v22 ( Default to Eager, deprecated).
+Forms: typed reactive forms since v14 ( form.value is partial, getRawValue() is not); Signal Forms experimental v21, stable v22 in @angular or forms or signals.
+
+Expected interview questions:
+
+"What is a standalone component, and what happened to NgModules?", Components declare their own template dependencies via imports.
+NgModules did three jobs; standalone kept the injector hierarchy and only changed where things are declared: compilation scope on the component, provider scope on routes or bootstrap Application, lazy loading via load Component / load Children. Stable v15, default v19.
+"What are signals, and how is a computed different from a BehaviorSubject you map?", A signal is a producer that tracks its consumers; reading inside a reactive context creates the dependency.
+computed is lazy and memoised, its dependency set is re-recorded on every evaluation, and the graph is glitch-free, a diamond dependency recomputes once and never exposes a half-updated state. combine Latest gives you neither laziness nor glitch-freedom.
+"When is effect() the right tool?", Synchronising signal state into something that is not reactive: a third-party widget, local Storage, imperative canvas or DOM, analytics. Not derivation, not fetching. Component effects run during change detection; root effects run as microtasks.
+Since v19 writes are allowed, which makes discipline the developer's job.
+"What exactly marks a view dirty?", A template-bound input receiving a new value (by reference), an event from that view or a child, AsyncPipe emitting (it calls markForCheck() ), a signal read by that template changing, or ComponentRef.set Input().
+markForCheck() marks the view and its ancestors for the next scheduled check; detect Changes() checks this view synchronously now; ApplicationRef.tick() runs the whole app.
+"Why does ExpressionChangedAfterItHasBeenCheckedError only appear in dev?", Angular runs a second verification pass in development and compares bindings. Production skips the pass, so the same bug ships as a stale DOM rather than an exception.
+"What replaces zone.js in a zoneless app?", A scheduler notified by five things: markForCheck(), ComponentRef.set Input(), a signal read in a template changing, host or template listener callbacks, and attaching a view already marked dirty.
+NgZone.on Stable / onMicrotaskEmpty / on Unstable never emit and is Stable is always true, so SSR and tests use PendingTasks / afterNextRender() instead. NgZone.run / runOutsideAngular still work.
+"How do signals let Angular skip subtrees?", A signal write marks the reading view for refresh and its ancestors for traversal, so the check walks straight to the affected view and skips unrelated branches, even Eager ones.
+" resource() versus an effect() that fetches?", The resource gets cancellation ( abort Signal fires when params change), correct ordering, status / error / is Loading signals, and reload(). The effect version has to reimplement all four and usually reimplements none.
+"How do you attach tokens and handle a 401 storm?", Functional interceptor + HttpContext opt-outs; a single shared refresh Observable ( share Replay, cleared in finalize ) so N concurrent 401 seconds produce one refresh; retry the original request once; treat 403 as terminal.
+With rotation on the server, parallel refreshes can invalidate the session outright.
+"Why does cookie auth break under SSR?", There is no browser on the server: no cookie jar, no automatic credential attachment, no origin for relative URLs.
+Forward the incoming request's cookies using the REQUEST token and make the URL absolute; audit includeRequestsWithAuthHeaders on the transfer cache before it bakes authenticated responses into shared HTML.
+"Angular versus React?", Angular: opinionated framework, D I and routing in the box, one upgrade path, signals now aligning it with the wider reactivity trend. React: library plus ecosystem choices, more flexibility, more decisions per team.
+Angular's payoff is consistency across many teams and years; React's is optionality.
+
+-- pause --
+Section 6. Interview Cross-Questioning Drill.
+
+Q: What is the order of Angular component lifecycle hooks, and when do you actually use each one?-- think --
+A: Constructor to ngOnChanges (first call, before ngOnInit) to ngOnInit to ngDoCheck to ngAfterContentInit to ngAfterContentChecked to ngAfterViewInit to ngAfterViewChecked to ngOnDestroy.
+In practice: constructor (or field initialisers) for D I; ngOnInit for initial data fetch and subscriptions; ngOnChanges to react to @Input changes; ngOnDestroy for cleanup.
+Signal-based components bypass most of them: input() replaces ngOnChanges, resource() replaces the ngOnInit fetch, DestroyRef / takeUntilDestroyed() replaces ngOnDestroy, and afterNextRender() replaces the browser-only part of ngAfterViewInit.
+effect() is not a general lifecycle replacement, it is for syncing to non-reactive A P Is.
+
+Cross-Q: When would you use ngOnChanges over signal inputs?-- think --
+A: When you need the previous value. SimpleChanges carries previous Value / current Value / first Change (and is generic over the component type since v21); a signal input only gives you the current value.
+The signals-native alternative is linked Signal, whose computation receives previous.source and previous.value, enough for "keep the selection if it is still valid", not for "animate from old to new".
+
+Cross-Q²: A parent re-renders the component with new inputs rapidly and each change triggers an H T T P call from ngOnChanges. What breaks, and what is the modern fix?-- think --
+A: Every input change fires a request with no cancellation and no ordering guarantee, so a slow early response can overwrite a fast later one. The RxJS fix is to push inputs into a Subject and switch Map to the call.
+The modern fix is http Resource / resource with the input signal in params: a change aborts the in-flight request via abort Signal and the resource's own value / error / is Loading signals replace the hand-rolled state.
+Note that moving the same code into effect() fixes nothing, an effect has no cancellation either.
+
+-- pause --
+Drill 2, OnPush change detection.
+
+Q: What is OnPush change detection, and what is the default today?-- think --
+A: OnPush means the view is checked only when it is dirty.
+It becomes dirty when a template-bound input receives a new value (reference comparison), an event fires in that view or a child, an AsyncPipe in the template emits (it calls markForCheck() ), a signal read by the template changes, or ComponentRef.set Input() is called.
+The other strategy checks the component every time traversal reaches it. As of v22, OnPush is the default and the eager strategy has been renamed ChangeDetectionStrategy.Eager, with Default deprecated as an alias, the v22 migration writes Eager onto existing components to preserve behaviour.
+
+Cross-Q: If you mutate an object passed in as an input instead of replacing its reference, does the template update?-- think --
+A: Not because of the input. Reference comparison says nothing changed, so the view is never marked dirty, the DOM only catches up if something else dirties that view (an event in it, an async pipe emission).
+This is why OnPush pushes you toward immutable updates: this.order = { .this.order, status: 'Paid' }, or better, hold the state in a signal so the read itself registers the dependency.
+
+Cross-Q²: Does the strategy still matter in a zoneless, all-signals app?-- think --
+A: Less, but it is not a no-op, that is a common overclaim. Zoneless changes what schedules a check, not what gets checked once one runs: a check still traverses from the root, and an Eager component on that path is still checked even if nothing it reads changed.
+What makes the strategy nearly irrelevant is signals, not zoneless: a signal write marks precisely the reading view for refresh and its ancestors for traversal, so the traversal walks the marked path instead of the whole tree.
+In a mixed app, signals here, mutable service state and async pipes there, OnPush is still doing real work, and since v22 you get it whether you asked or not.
+
+-- pause --
+Drill 3, Standalone components versus NgModules.
+
+Q: What problem did NgModules solve, and why are standalone components preferred now?-- think --
+A: NgModules were declaration boundaries, you had to declare every component, directive, and pipe in exactly one module, import modules to get their exports, and manage the provider scope.
+The problem: it added boilerplate, "did I declare it in the right module?" errors, and made code splitting less precise. Standalone components declare their own imports directly. No module needed; the bundler can statically analyze exactly what each component uses.
+
+Cross-Q: If a legacy NgModule-based app migrates to standalone, what happens to providers registered in the NgModule's providers array?-- think --
+A: You move them to the bootstrap Application config ( provide Xxx() functions) or to ApplicationConfig. Feature-level providers that were in lazy-loaded modules move to the route's providers array in the route config. The D I tree topology is preserved; the declaration container changes.
+
+Cross-Q²: Can a standalone component use a non-standalone directive from a legacy NgModule?-- think --
+A: Yes, import the entire NgModule into the standalone component's imports array. The standalone component acts as a module consumer. This is the migration bridge: old NgModules expose their exports; new standalone components import those modules.
+Over time, individual pieces get converted to standalone and the NgModule wrapper shrinks.
+
+-- pause --
+Drill 4, Angular D I: provided In versus component providers.
+
+Q: What is the difference between provided In: 'root' and registering a service in a component's providers array?-- think --
+A: provided In: 'root' registers the service in the root injector, one singleton for the entire app. Component providers: [MyService] creates a new instance scoped to that component subtree, destroyed with the component.
+Use root for shared state (OrderService, AuthService); use component providers for isolated state (a dialog's own form service, a chart component's data adapter).
+
+Cross-Q: What is an InjectionToken and when would you use it over providing a class directly?-- think --
+A: InjectionToken is a D I key for non-class values (primitives, config objects, factory functions) where using the class itself as the token would be ambiguous. Example: APP_CONFIG = new InjectionToken('app.config').
+Use it when the thing you're injecting isn't a class (a string URL, a feature flag object, an abstract interface with multiple implementations).
+
+Cross-Q²: Two components both inject ProductService. One has providers: [ProductService] on it; the other does not. Do they share the same instance?-- think --
+A: No. The component with providers: [ProductService] has its own child injector that shadows the root instance. It and its descendants get the local instance. The other component walks up to the root injector and gets the root singleton.
+This is why component-level providers are useful for per-instance state, but dangerous if you accidentally expect them to share data.
+
+-- pause --
+Drill 5, Lazy loading and load Children.
+
+Q: How does lazy loading work in Angular routing, and what is the load Children syntax?-- think --
+A: load Children is a route property that returns a Promise of a routes array (or legacy NgModule). The bundler (webpack or esbuild) creates a separate JS chunk for everything imported in that function. On first navigation to that path, Angular downloads the chunk, then activates the route.
+Syntax: load Children: () goes to import('./orders or orders.routes').then(m goes to m.ORDERS_ROUTES). For a single component: load Component: () goes to import('./dashboard.component').then(m goes to m.DashboardComponent).
+
+Cross-Q: What is the difference between load Children and load Component ?-- think --
+A: load Component lazy-loads a single standalone component as the route's component, no child routes. load Children lazy-loads a routes array, enabling a whole sub-tree of routes (nested routes, guards, resolvers) to be split into one chunk.
+Use load Component for leaf routes; load Children for feature sub-apps with their own route hierarchy.
+
+Cross-Q²: A user navigates to /orders, the chunk loads and the component renders, then navigates away and back. Does the chunk download again?-- think --
+A: No. Once a lazy chunk is downloaded and executed, its module or routes are registered in the router and the JS bundle is cached by the browser. Subsequent navigations to the same route reuse the already-loaded chunk.
+The H T T P download is a one-time cost per session (modulo cache invalidation by file hash changes).
+
+-- pause --
+Drill 6, Angular signals versus RxJS observables for state.
+
+Q: When should you reach for a signal versus a BehaviorSubject for holding component or service state?-- think --
+A: Signals for current-value state: simple reads, reactive templates, computed derivations. No subscription boilerplate, no unsubscribe risk. BehaviorSubject (RxJS) when you need stream operators on state changes, debounce, switch Map, combine Latest, or when the state feeds a pipeline.
+Modern guidance: default to signal; reach for Observable only when the time-based or combinatorial RxJS operators are needed.
+
+Cross-Q: How do you bridge a signal to an Observable and vice versa?-- think --
+A: to Observable(my Signal) wraps a signal in a cold Observable that emits on every signal change (from @angular or core or rxjs-interop ). to Signal(my Observable$, { initial Value: [] }) subscribes to an Observable and exposes its latest value as a read-only signal.
+The initial Value is returned before the first emission. require Sync: true can be used if the Observable is known to emit synchronously (for example, BehaviorSubject).
+
+Cross-Q²: to Signal is called outside an injection context. What happens and how do you fix it?-- think --
+A: It throws NG0203: to Signal() can only be used within an injection context. The fix: call to Signal in the class field initializer, constructor, or inject context, not in a lifecycle hook or an async callback.
+If you must call it late, pass an explicit Injector as the second argument: to Signal(obs$, { injector: this.injector }).
+
+-- pause --
+Drill 7, Template-driven versus reactive forms.
+
+Q: When would you choose template-driven forms over reactive forms?-- think --
+A: Template-driven for simple single-component forms with trivial validation: login, contact, filters. The form model lives in the template via ng Model; quick to write; no FormBuilder import.
+Reactive forms for: dynamic field arrays ( FormArray ), cross-field validators, async validators, programmatic state manipulation, unit testing form logic in isolation from the template, or any form that evolves at runtime.
+
+Cross-Q: How do you add a custom validator to a reactive form control?-- think --
+A: A custom validator is a function (control: AbstractControl) goes to ValidationErrors | null. Synchronous validators go in the second argument of new FormControl(value, [my Validator]). Async validators go in the third: new FormControl(value, null, [myAsyncValidator]).
+Cross-field validators target the FormGroup: this fb group({. }, { validators: passwordMatchValidator }).
+
+Cross-Q²: A form has 100 fields. Reactive forms generate a massive FormGroup. At what point would you split it, and what pattern do you use?-- think --
+A: Split into nested FormGroup s (logical sub-groups: shipping Address, billing Address, items) or use FormArray for repeating groups. For very large forms, split into wizard steps, each step is its own component with its own FormGroup; the parent composes them.
+Avoid one monolithic group; it makes validation logic unreadable and change detection heavier when any field changes.
+
+-- pause --
+Drill 8, Route guards: CanActivate, CanDeactivate, CanMatch.
+
+Q: What is the difference between CanActivate, CanDeactivate, and CanMatch?-- think --
+A: CanActivate, runs before entering a route; used for auth checks, permission gates. If it returns false or a UrlTree redirect, navigation is blocked. CanDeactivate, runs before leaving a route; used to confirm unsaved changes ("are you sure you want to leave?").
+CanMatch, runs before route matching even begins; used to conditionally present different routes for the same path (for example, show admin versus user version of a page based on role).
+
+Cross-Q: Can a guard be async, and how does that interact with the user experience?-- think --
+A: Yes, guards can return Observable, Promise, or UrlTree. Angular waits for the guard to resolve before activating. This means async guards (for example, verifying a token with the server) block navigation, the URL bar updates but the component doesn't render until the guard resolves.
+Always show a loading indicator during this time; use a resolver for data, not guard.
+
+Cross-Q²: A user is on a form with unsaved changes, clicks the browser back button, and your CanDeactivate returns false. What actually happens, and what's the limitation?-- think --
+A: Angular cancels the programmatic navigation and stays on the current route. However, browser history isn't rewound perfectly, the back button press is consumed; pressing back again would navigate away.
+For truly blocking the back button, you'd need to manipulate history.push State which is fragile and bad U X. The better pattern: show a custom modal prompt and offer "save and leave" / "discard and leave" / "cancel".
+
+-- pause --
+Drill 9, ViewChild, ContentChild, ViewChildren.
+
+Q: What is the difference between ViewChild, ContentChild, and ViewChildren?-- think --
+A: @ViewChild queries a single element or directive in the component's own template. @ContentChild queries content projected into the component via, from the parent's template, not the component's own. @ViewChildren returns a QueryList of all matching elements in the template.
+Use ViewChild to access native elements ( ElementRef ) or child component methods; use ContentChild for components that wrap or decorate projected content (for example, a TabPanel reading its Tab children).
+
+Cross-Q: When are ViewChild results available, and what lifecycle hook ensures you can use them safely?-- think --
+A: @ViewChild is populated after the view is initialized, available in ngAfterViewInit (or in ngOnInit with { static: true }, which only works for elements not inside a conditional). Accessing it earlier returns undefined.
+Signal queries, view Child(), view Children(), content Child(), content Children(), added in 17.2 as developer preview and stable in v19, return signals instead: Signal, or a non-optional type with view Child.required().
+You read them in a template, a computed() or an effect(), and the resolution timing is handled by change detection. There is no static option and no QueryList.
+
+Cross-Q²: ContentChild targets projected content. What if the parent conditionally renders the projected element with @if? Does the query become null?-- think --
+A: Yes, queries are dynamic and reflect the current content. With decorators you observe that via QueryList.changes; with signal queries there is no .changes Observable, because the query is a signal: derive from it ( computed(() goes to this.tabs().length) ) or react in an effect().
+That is usually the better ergonomics, but it catches people migrating a component that subscribed to changes to run imperative setup, that setup now belongs in an effect() or afterNextRender().
+
+-- pause --
+Drill 10, Angular Universal (SSR) and hydration.
+
+Q: What does Angular Universal do, and what is hydration?-- think --
+A: Server-side rendering executes the app in Node and returns populated HTML, so bots and users get content without waiting for the JS bundle.
+(The "Angular Universal" name is historical, the packages consolidated into @angular or ssr.) Hydration takes that HTML and makes it interactive without re-rendering: non-destructive hydration was developer preview in v16 and stable in v17, where it became the default for new SSR apps.
+It reuses the server-rendered DOM instead of discarding and rebuilding it, which is what removed the visible content flash older SSR had.
+
+Cross-Q: What is Transfer State and why is it needed with SSR?-- think --
+A: Data fetched on the server is invisible to the client, so without it the browser re-fetches everything immediately after hydration, double load, double cost, visible flicker. Angular serialises server-side HttpClient responses into the HTML payload and replays them on the client.
+It is on by default with provideClientHydration(); you tune it with withHttpTransferCacheOptions({ include Headers, includeRequestsWithAuthHeaders, includePostRequests, filter }) or switch it off with withNoHttpTransferCache(). Resources participate too, keyed by their id option.
+The security question to raise unprompted: enabling includeRequestsWithAuthHeaders bakes authenticated responses into HTML that a C D N might cache.
+
+Cross-Q²: A component uses window.local Storage for feature detection. It works in the browser and crashes on the server. What is the idiomatic fix?-- think --
+A: window, document and local Storage do not exist in Node. The old fix is isPlatformBrowser(inject(PLATFORM_ID)). The modern one is afterNextRender(() goes to {. }) (or afterEveryRender() ), which never executes during SSR, the docs specifically recommend it over platform checks.
+Note the v20 rename: after Render() became afterEveryRender() with no backwards-compatible alias, so code written against v16, v19 will not compile after the upgrade.
+
+-- pause --
+Drill 11, H T T P interceptors.
+
+Q: How do you chain multiple H T T P interceptors in Angular, and in what order do they execute?-- think --
+A: Pass them to with Interceptors([a, b, c]) in provideHttpClient(.). They execute in array order on the way out and unwind in reverse on the way back, same shape as A S P dot NET Core middleware. Each receives (req, next) and runs in an injection context, so inject() works.
+Legacy class-based interceptors are bridged with withInterceptorsFromDi(); when both are present the D I-based ones run after the functional ones, which is an ordering trap mid-migration. HttpRequest is immutable, modify with req.clone({ set Headers }).
+
+Cross-Q: Where should retry live, the interceptor or the service?-- think --
+A: next(req).pipe(retry({ count: 3, delay: 1_000 })) in an interceptor retries every request in the app, including non-idempotent POST s, which can double-charge a customer. Either scope it ( if (req.method === 'GET') ) or drive it per call through an HttpContextToken.
+Service-level retry is right when the policy differs per endpoint. Never apply both, the counts multiply.
+
+Cross-Q²: An interceptor refreshes the token on 401. How do you avoid re-entering the interceptor, and what happens when six requests 401 at the same moment?-- think --
+A: Do not gate on req url includes('/auth or refresh'), a query string, an absolute URL, or a similarly named endpoint breaks it. Use HttpContext: new HttpContext().set(SKIP_AUTH, true) on the refresh call and an early return when the interceptor sees the flag.
+For the storm: hold one shared Observable for the in-flight refresh ( share Replay({ buffer Size: 1, ref Count: false }) ), have every 401 subscribe to it, and clear the field in finalize so the next expiry starts a new call.
+Retry the original request exactly once, and treat 403 as terminal, refreshing a valid token that simply lacks a permission loops forever.
+Without single-flighting, refresh-token rotation on the server sees six presentations of the same refresh token, treats the reuse as theft, and revokes the whole session.
+
+-- pause --
+Drill 12, Angular C L I builders and workspace configuration.
+
+Q: What is an Angular C L I builder and how does the workspace configuration control the build?-- think --
+A: A builder is a function that implements a named build task (build, serve, test, lint). The C L I delegates to builders declared in angular.json under each project's architect targets, together with their options and per-configuration overrides.
+The esbuild or Vite-based application builder became the default for new projects in v17 ( @angular-devkit or build-angular:application, also available as @angular or build:application ), replacing the webpack browser builder; it also unified browser and server builds behind one target.
+Vitest is the default unit-test runner from v21 ( @angular or build:unit-test ), with Karma or Jasmine still selectable via --test-runner set to karma.
+
+Cross-Q: How would you add a custom build step (for example, generate a version.json from git) to an Angular build?-- think --
+A: Write a custom builder (or wrap an existing one) using @angular-devkit or architect, implement BuilderOutput and register it in a package. For simpler cases, use pre or post build scripts in package.json: "prebuild": "node scripts or version.js".
+For complex build orchestration, Nx or custom builder composition is cleaner than shell scripts.
+
+Cross-Q²: The team wants to enable strict TypeScript, strict templates, and strict bundle budgets. Where and how are these configured?-- think --
+A: Two different files, and mixing them up is a common slip.
+tsconfig.json: "strict": true under compiler Options for TypeScript, and angularCompilerOptions for the Angular compiler, strict Templates: true, plus extended Diagnostics to promote warnings such as NG8113 (unused standalone imports) to errors.
+angular.json: bundle budgets under architect build configurations production budgets, with maximum Warning / maximum Error per budget type ( initial, anyComponentStyle, bundle );
+exceeding the error threshold fails the build, which is how you keep a regression from silently re-inflating the initial chunk.
+
+-- pause --
+Drill 13, Zone.js role and zone-less Angular.
+
+Q: What exactly does Zone.js do in Angular, and why is it being removed?-- think --
+A: Zone.js monkey-patches the browser's async A P Is, set Timeout, set Interval, requestAnimationFrame, XHR or fetch, addEventListener, and Promise via a ZoneAwarePromise, so callbacks execute inside a tracked context.
+NgZone counts tasks in that context and emits onMicrotaskEmpty when the queue drains, which historically ran ApplicationRef.tick(). That is why set Timeout(() goes to this.count++) updates the template: zone.js told Angular something asynchronous finished.
+Notice what it never knew, whether any state actually changed. Removal timeline: experimental in v18, provideZonelessChangeDetection() in v20, stable in v20.2, default for new apps in v21, where Zone.js is the opt-in via provideZoneChangeDetection().
+
+Cross-Q: What is the cost of Zone.js, and what breaks without it?-- think --
+A: Two costs: the patched-A P I overhead on every async call, and a full application check after async work that frequently changed nothing (a tooltip's set Timeout, a mousemove listener). Dropping it also removes the polyfill from the bundle.
+Without it, nothing renders unless something notifies the scheduler: a signal read in a template changing, markForCheck() (including from AsyncPipe ), a host or template listener, ComponentRef.set Input(), or attaching an already-dirty view.
+The concrete breakages are NgZone.onMicrotaskEmpty / on Unstable / on Stable never emitting and NgZone.is Stable always being true, so anything gating on stability (SSR serialisation, splash-screen removal, some test helpers) must move to PendingTasks or afterNextRender().
+
+Cross-Q²: A library triggers U I updates from its own set Timeout. You have migrated to zoneless and it stops updating. What do you do?-- think --
+A: NgZone.run() and runOutsideAngular() still exist and are documented as safe to keep in zoneless apps, but run() no longer causes a check by itself, that assumption is where people go wrong.
+The fixes that work:
+have the callback write into a signal that the template reads (best, it becomes a normal notification source), or inject ChangeDetectorRef and call markForCheck() in the callback (adequate), or wrap the library in a thin adapter service that exposes signals so no component sees the imperative A P I.
+If the work is long-running and SSR or tests must wait for it, wrap it in inject(PendingTasks).run(.) as well.
+
+-- pause --
+Drill 14, Pipes: pure versus impure.
+
+Q: What is the difference between a pure and an impure pipe in Angular?-- think --
+A: A pure pipe runs only when its input reference changes, Angular memoizes the result. Because templates can call pipes many times per CD cycle, pure pipes are cheap.
+An impure pipe ( pure: false in @Pipe ) runs on every CD cycle regardless of input reference changes, it sees mutations inside arrays or objects. Impure pipes are expensive; use them sparingly (for example, async pipe, JsonPipe in dev mode, slice on an array that's mutated in-place).
+
+Cross-Q: AsyncPipe is impure. Why, and what is the implication for performance?-- think --
+A: AsyncPipe must subscribe to Observables and BehaviorSubjects that can emit new values independently of the component's inputs changing. A pure check on the Observable reference would never re-render because the reference doesn't change, only the emitted value does.
+Being impure lets it check the latest emitted value on every CD. Implication: components using async pipe benefit greatly from OnPush strategy, which limits how often the impure check runs.
+
+Cross-Q²: You write a custom pipe that calls an H T T P service to format a value (for example, resolve a user ID to a name). What class of problems does this create?-- think --
+A: Pure pipes run per reference change, but they're synchronous; async work inside requires returning an Observable (which async pipe handles) or caching. If you make it impure to re-run frequently, you call the H T T P service on every CD cycle, a catastrophic number of H T T P requests.
+The correct pattern: pre-resolve data in the component or service, pass the resolved name as the pipe input instead of the ID, or use a resolver in routing.
+
+-- pause --
+Drill 15, Angular testing: TestBed, harnesses, async helpers.
+
+Q: What is TestBed and what does it set up?-- think --
+A: TestBed is Angular's testing module, it creates a mini Angular environment for component or service tests. TestBed.configureTestingModule({ imports, providers, declarations }) configures which classes are available.
+TestBed.create Component(MyComponent) instantiates the component inside a host fixture with a real DOM (using jsdom). You get a ComponentFixture, access fixture.component Instance for the class, fixture.native Element for the DOM, and fixture.debug Element for Angular's element wrapper.
+
+Cross-Q: What is a component harness and why is it preferred over querying DOM elements directly in tests?-- think --
+A: A harness ( ComponentHarness from @angular or cdk or testing ) is a typed A P I for interacting with a component from a test, clicks, gets text, fills inputs, without knowing its internal DOM structure. It's stable against template refactors (renaming CSS classes doesn't break tests).
+Angular Material ships harnesses for all its components. For custom components, write your own harness to make tests readable and resilient.
+
+Cross-Q²: A component test that uses HttpClient fails because the real H T T P is called. What is the right setup, and how do you verify the correct request was made?-- think --
+A: Use provideHttpClientTesting() in TestBed.configureTestingModule({ providers: [.] }). Inject HttpTestingController. After the code under test runs and triggers an H T T P call, flush it: const req = http Mock.expect One('/api or orders'); req.flush(mock Data).
+Assert on req request method, headers, and body. Call http Mock.verify() at the end of each test to ensure no unexpected requests were made. This is the Angular equivalent of mocking HttpClient with Moq in dot NET.
+
+-- pause --
+Drill 16, The signal graph: laziness, equality, glitches.
+
+Q: Walk me through what happens internally when you call set() on a signal that three computeds and one template depend on.-- think --
+A: The write bumps the signal's version and pushes a "possibly dirty" notification to its consumers, transitively, it does not evaluate anything.
+Consumers that are computeds simply mark themselves stale; the template view is marked for refresh and its ancestors marked so the traversal can reach it, and the scheduler is notified.
+Later, when something reads a computed (the template during the check, say), the computed verifies whether its dependencies' versions actually changed and only then recomputes, caching the result. So the write cost is graph marking; the recompute cost is paid on read, once, in dependency order.
+
+Cross-Q: What does "glitch-free" mean here, and where does RxJS differ?-- think --
+A: In a diamond, a feeds b and c, both feed d, a single write to a must never let d observe a new b with a stale c, and must not evaluate d twice. Pull-based evaluation with version checks gives you that by construction.
+combine Latest(b$, c$) is push-based: it emits once when b updates and again when c does, so downstream code sees the intermediate state and runs twice. It is also why computed needs no distinctUntilChanged ceremony.
+
+Cross-Q²: Your computed returns a filtered array and a child OnPush component still re-renders on every unrelated change. Why, and what are the two fixes?-- think --
+A: Array.prototype.filter allocates a new array every evaluation, and the default equality is Object.is, so every recompute looks like a change to every consumer. Fix one: supply an equal comparator on the computed so an element-wise identical result is treated as unchanged.
+Fix two, usually better: stop reallocating, keep stable item references, split the derivation so the expensive part depends on fewer signals, or push the filtering down into per-row components.
+Adding a deep-equality function to a large collection can cost more than the render you are avoiding, so measure rather than reaching for it reflexively.
+
+-- pause --
+Drill 17, Migrating a v8-era application to signals.
+
+**Q: You inherit a 300-component Angular app on Default change detection with BehaviorSubject services and ng For everywhere. Plan the modernisation.*.
+A: Sequence it by risk, and never mix two migrations in one pull request. (1) Upgrade one major at a time, running the official schematics per step, standalone ( ng generate @angular or core:standalone ), control flow ( ng generate @angular or core:control-flow ), the initializer renames.
+(2) Fix the track keys the control-flow schematic could not infer; that alone often removes visible jank. (3) Convert state to signals service by service, leaving RxJS in place for streams, and expose as Readonly() signals plus explicit mutation methods.
+(4) Only then take on OnPush / Eager and zoneless, feature by feature, because those are the ones that surface latent mutable-state bugs. (5) Adopt resource() / http Resource() for new reads instead of rewriting existing services wholesale.
+
+Cross-Q: Which parts of that plan do you refuse to do, and why?-- think --
+A: A big-bang rewrite of forms to Signal Forms (reactive forms are not deprecated and the form layer holds the domain rules); ripping out NgRx purely because signals exist (see the next drill);
+and converting every BehaviorSubject mechanically to to Signal(), which preserves the old design while adding a new dependency.
+The other refusal: turning on zoneless globally as step one, do it per-feature behind a flag, because the failures are silent (nothing renders) rather than loud.
+
+Cross-Q²: How do you catch "component silently stops updating" regressions during this migration?-- think --
+A: They do not throw, so tests must assert rendered output after a state change, not just that the state changed, which most legacy unit tests do not.
+Practical measures: a small set of end-to-end journeys per feature as the real safety net; enabling OnPush on a feature and running its tests with fixture.detect Changes() calls removed so a missing notification actually fails;
+and shipping behind a per-feature flag so the blast radius is one screen.
+In v22 this is not optional, new components default to OnPush, so the failure mode arrives on its own.
+
+-- pause --
+Drill 18, When NgRx was the wrong call.
+
+Q: A team put NgRx in a mid-sized crud app in 2019. Was that wrong, and what would you do now?-- think --
+A: The honest answer is "it depends on what they were buying". NgRx pays for itself when many distant components share mutable state, when you need time-travel debugging or replayable actions, or when effects orchestrate complex async workflows.
+It is overpriced when the real requirement was "cache the current customer and let three components read it", which is now a service with a signal, and was a BehaviorSubject before. The cost is visible in the ratio: three files, an action, a reducer, a selector and an effect to change one field.
+What I would do now: keep the store for genuinely global, cross-cutting state, move screen-local state into signals in feature services, and replace the "fetch on action, store the result" effects with resources unless something else genuinely reacts to those actions.
+
+Cross-Q: Does adopting signals mean dropping the store?-- think --
+A: No, and saying so is a red flag in an interview. NgRx exposes signal-based selectors and there is a signal-store variant, so the two coexist. Signals replace BehaviorSubject -as-state; they do not provide a single mutation log, middleware, or dev-tooling over transitions.
+The question to ask is whether anyone actually uses those properties.
+
+Cross-Q²: What is the migration risk in moving store state into signals?-- think --
+A: You lose the discipline the store imposed. A signal exposed as writable from a service is a global mutable variable with better ergonomics, any component can set() it.
+Preserve the boundary deliberately: private writable signal, public as Readonly(), mutations only through named methods, and derived state via computed() rather than components recomputing the same projections independently.
+
+-- pause --
+Drill 19, Injection contexts in practice.
+
+Q: What is an injection context, and which A P Is require one?-- think --
+A: The window during which Angular can resolve dependencies for the thing being constructed: class construction and field initialisation, provider factory functions, the invocation of functional guards or resolvers or interceptors, and anything inside runInInjectionContext(injector, fn).
+inject(), effect(), to Signal(), to Observable() and takeUntilDestroyed() all require one; outside it you get NG0203.
+
+Cross-Q: Give a concrete case where the error only shows up in production.-- think --
+A: An inject() call inside a lifecycle hook or an async callback on a rarely used code path, an error handler, a lazy route's edge case, a retry branch. Nothing in the type system flags it, unit tests that never take that branch pass, and the error surfaces to a user.
+The structural fix is to capture what you need in field initialisers ( private injector = inject(Injector), private destroy Ref = inject(DestroyRef) ), then use runInInjectionContext or the explicit destroy Ref parameter later.
+
+Cross-Q²: How does this compare with A S P dot NET Core D I?-- think --
+A: dot NET resolves through an IServiceProvider you hold, so "context" is just having the provider; the analogue of NG0203 is capturing a scoped service in a singleton, which fails at scope-validation time rather than at the call site.
+Angular's two injector trees (environment and element) have no direct dot NET equivalent, the element injector is essentially "a D I scope per component instance", which dot NET only approximates per request.
+InjectionToken is the counterpart to keyed services plus IOptions, needed for the same reason: interfaces do not survive to runtime.
+
+-- pause --
+Drill 20, The dot NET seam: auth, cores, SSR.
+
+Q: Your Angular app authenticates against an A S P dot NET Core A P I. Walk through the decisions.-- think --
+A: First, token transport: bearer tokens in memory (never local Storage if XSS is a realistic threat) with a refresh path, or HttpOnly cookies with antiforgery.
+Cookies need SameSite / Secure set correctly and only work cleanly when the SPA and A P I are same-site, otherwise you are into third-party-cookie territory and a B F F becomes the pragmatic answer. Second, attachment: one functional interceptor scoped to your own A P I origin.
+Third, refresh: single-flight, retry once, 403 terminal. Fourth, cores: prefer same-origin behind a reverse proxy so it never applies; if it does apply, remember AllowCredentials() forbids a wildcard origin, and set a preflight max-age so OPTIONS is not paid per request.
+
+Cross-Q: The same app is server-side rendered and users appear logged out in the SSR HTML. Diagnose it.-- think --
+A: There is no browser on the server: no cookie jar, no automatic credential attachment, and relative URLs have no origin. The server-side HttpClient calls therefore go out unauthenticated (or fail to resolve) and the app renders its logged-out shell, which then flips after hydration.
+The fix is a server-only interceptor that injects the REQUEST token ( @angular or core, null in the browser), copies the incoming cookie header onto the outgoing request, and rewrites the URL to an absolute A P I origin.
+Then check the transfer cache settings, because caching authenticated responses into HTML is a data-leak risk if that HTML is ever shared.
+
+Cross-Q²: The order screen makes eleven A P I calls and feels slow on mobile. What do you change, and in what order?-- think --
+A: Measure first: how many of those are waterfalled behind a parent render, and how many pay a preflight.
+Then, cheapest to most invasive: parallelise what is independent ( fork Join or several resources issued together, not chained); collapse duplicated lookups behind a cached service; deal with the preflight tax (same-origin proxy or max-age);
+then aggregate on the server with a screen-shaped endpoint;
+then a B F F if the aggregation logic starts embedding frontend concerns that the domain A P Is should not own.
+Deferring widgets with @defer helps perceived performance but does not reduce the call count, do not present it as the fix for chattiness.
+
+-- pause --
+Section 7. Cheat Sheet.
+
+Standalone: stable v15, ng new default v17, implicit default v19 ( standalone: false is the opt-out).
+Signals: preview v16, stable v17; effect() / linked Signal() / to Signal() stable v20. Default equality Object.is.
+computed is lazy + memoised; the graph is glitch-free, a diamond recomputes once, never half-updated.
+effect() = sync to non-reactive world. Not derive ( computed ), not reset ( linked Signal ), not fetch ( resource ). allowSignalWrites removed in v19, writes allowed, still usually wrong.
+Signal members: input() 17.1, model() + queries 17.2, output() 17.3, all stable v19; decorators not deprecated.
+resource / rx Resource v19, http Resource 19.2, experimental until stable in v22; cancellation via abort Signal, reads only.
+@for track is mandatory: reference identity destroys and rebuilds rows (focus, scroll, child state), not just performance.
+Control flow preview v17 to stable v18; *ng If / *ng For / *ng Switch deprecated v20; @let stable v19.
+inject() (v14) needs an injection context, NG0203 outside one; runInInjectionContext / captured DestroyRef are the escapes.
+Dirty markers: new input reference, event in the view or children, AsyncPipe emission, signal read in template, ComponentRef.set Input().
+markForCheck (mark + ancestors, next tick) not equal to detect Changes (this view, now) not equal to ApplicationRef.tick (whole app).
+NG0100 is dev-only: production renders the stale value instead of throwing.
+Zoneless: experimental v18 to provideZonelessChangeDetection() v20 to stable v20.2 to default v21; NgZone.on Stable / is Stable are inert, use PendingTasks / afterNextRender().
+OnPush is the default from v22; Default to Eager, deprecated.
+@defer stable v18 ( on idle|viewport|interaction|hover|immediate|timer, when, prefetch ); incremental hydration default in v22 with hydrate triggers.
+HttpClient: fetch backend default in v22 ( with Fetch() deprecated); HttpContext for per-request opt-outs; single-flight the token refresh.
+Forms: form.value excludes disabled controls, getRawValue(); Signal Forms stable v22 ( @angular or forms or signals ).
+can Match blocks the lazy chunk download; can Activate does not, and neither is authorisation.
+
+-- pause --
+Section 8. Walkthrough, Bundle bloat investigation.
+
+Problem: a production Angular app ships a multi-megabyte initial bundle, first contentful paint on a throttled mobile connection is unacceptable to the business, and the page stays busy while the user scrolls without interacting with anything.
+
+Diagnosis: build with stats ( ng build --configuration production --stats-json ) and open the treemap in a bundle analyser; run source-map-explorer on the emitted chunks for a second opinion. Two distinct problems usually show up together and must be separated, because they have different fixes:
+
+Bundle composition, a monolithic date library and a whole-namespace lodash import ( import _ from 'lodash' ), plus every feature sitting in the initial chunk because nothing is lazily routed.
+Runtime cost, a performance profile taken while scrolling shows change-detection frames with no state change behind them: the classic zone.js signature, where a scroll listener or an animation set Timeout inside a third-party widget ticks the whole application.
+
+Fix, in the order that gives feedback fastest:
+
+Stop shipping code nobody needs. Replace namespace imports with named ones ( import { debounce } from 'lodash-es' ), tree-shaking only works on ES module named exports, and a namespace import defeats it by construction. Swap monolithic libraries for tree-shakable equivalents.
+Split by route. load Component: () goes to import('./features or orders or order-list.component').then(m goes to m.OrderListComponent) for leaf routes, load Children for feature sub-trees.
+Add @defer for heavy below-the-fold widgets, then re-run the stats build to prove the chunk actually moved, a single reference from outside the block silently disables deferral.
+Add budgets so it cannot regress. architect build configurations production budgets with maximum Error on the initial bundle turns the next regression into a failed build instead of a slow page.
+Then address the runtime. Move hot components' state to signals and adopt zoneless ( provideZonelessChangeDetection(); the default from v21, and remember the A P I was provideExperimentalZonelessChangeDetection() in v18, v19).
+If zoneless is too big a step for the whole app, provideZoneChangeDetection({ event Coalescing: true }) and ng Zone.runOutsideAngular() around the offending listener remove most of the idle-scroll work on their own.
+
+Why it works: the two problems were independent, code splitting fixes download and parse, zoneless or signals fix work per frame after load. Teams that only do the first still have a page that feels sticky under interaction; teams that only do the second still have a slow first paint.
+Re-measure after each step with the same throttled profile and the same build configuration, and record the numbers in the pull request so the next regression has a baseline to fail against.
+
+-- pause --
+Section 9. Self-test.
+
+Without a stable identity, Angular cannot tell whether items in the new collection map to existing rendered DOM nodes. Pre-v17 *ng For defaulted to identity tracking (object reference), which caused full re-renders whenever the array was rebuilt (common with NgRx selectors returning new arrays).
+Mandatory track forces an explicit key so Angular reuses DOM, preserves focus, and avoids cascading re-init of child components.
+
+Template-driven forms suit very simple flows, login, contact us, single-field filters, where the entire form lives in one component, validation is trivial, and you want minimal code.
+Reactive forms win for: dynamic field arrays, cross-field validation, async validators, programmatic state manipulation, isolated unit testability, and any form whose shape evolves at runtime.
+
+Change detection stops being triggered by "an async task finished" and starts being triggered by explicit notifications: a signal read in a template changing, markForCheck() (including from AsyncPipe ), a host or template listener, ComponentRef.set Input(), or attaching an already-dirty view.
+NgZone.on Stable / onMicrotaskEmpty / on Unstable never emit and is Stable is always true, so anything gating on stability moves to PendingTasks or afterNextRender(); NgZone.run / runOutsideAngular still work but no longer cause a check by themselves.
+Libraries that push state from bare callbacks need a signal-writing adapter. Timeline: experimental v18, provideZonelessChangeDetection() in v20, stable in v20.2, the default for new apps in v21, where Zone.js is the opt-in via provideZoneChangeDetection().
+
+Signals are synchronous values with automatic dependency tracking, read with (), fast, simple, integrate with templates without subscribe.
+BehaviorSubject is an Observable stream, composes with RxJS operators (debounce, switch Map, combine Latest), supports time-based logic, but requires subscription management. Rule: use signals for component or service state; use Observables for streams of events over time.
+Bridge with to Signal() and to Observable().
+
+inject() runs in any injection context, class field initializers, constructor bodies, provider factories, and the invocation of functional guards, resolvers and interceptors. Constructor params cannot serve those functional A P Is because there is no class.
+It also enables composable inject-helpers ( injectRouteParam('id') returning a signal), inheritance without super(.) plumbing, and field-initialiser ordering so effect() / to Signal() can use injected dependencies.
+Outside a context it throws NG0203; runInInjectionContext(injector, fn) is the escape hatch. Available since v14; functional guards followed in v14.2.
+
+An effect gives you re-execution and nothing else.
+It has no cancellation, so a rapid sequence of input changes leaves overlapping requests whose responses can land out of order and overwrite each other; no status, so loading / error become two more hand-maintained signals; and no protection against writing a signal it also reads.
+resource() / http Resource() / rx Resource() (experimental v19, 19.2, stable v22) give all of it: params is reactive, a change fires the previous call's abort Signal, and value / status / error / is Loading / has Value() / reload() are part of the A P I.
+Note that Angular removed the allowSignalWrites guardrail in v19, so the framework will no longer stop you writing the anti-pattern.
+
+A view becomes dirty when a template-bound input receives a new value (reference comparison), an event fires in that view or a descendant, an AsyncPipe in the template emits, a signal the template read changes, or ComponentRef.set Input() is called.
+markForCheck() marks this view and its ancestors so the next scheduled check reaches it, it checks nothing itself. detect Changes() synchronously checks this view and its children right now, outside the scheduler, which is how you produce ExpressionChangedAfterItHasBeenCheckedError in a parent.
+ApplicationRef.tick() runs a full check from the root and is essentially never called from application code.
+
+Since v22, components without an explicit strategy are OnPush (and ChangeDetectionStrategy.Default is renamed Eager and deprecated; the update migration writes Eager onto existing components to preserve behaviour).
+What breaks is any component that renders from state nothing marks it dirty for: a service field mutated in place, an array push ed into, an object property assigned. Under the eager strategy the next traversal re-read those values; under OnPush nothing dirties the view.
+The durable fix is to hold that state in a signal, then the template read is the subscription, rather than scattering markForCheck() calls.
+
+The track expression is the identity contract between your data and the DOM.
+With the wrong key, reference identity against immutable data, or $index against a reordered list, Angular concludes the old rows are gone and new ones arrived: it destroys the DOM nodes and the child component instances and creates fresh ones.
+Everything living in those nodes goes with them: input focus and caret position, scroll position, CSS transitions mid-flight, uploads in progress, and any state held inside row components.
+The performance cost is real but secondary; the user-visible bugs arrive first, which is why v17's control flow made the clause mandatory instead of defaulting to identity the way *ng For did.
+
+Single-flight the refresh: one shared Observable created on the first 401, share Replay({ buffer Size: 1, ref Count: false }) so later 401 seconds attach to the same call, and the field cleared in finalize so a future expiry starts a fresh one.
+Each waiting request then retries once with the new token.
+Keep the refresh call out of its own interceptor with an HttpContextToken rather than a URL substring check, and treat 403 as terminal, the token is valid, the permission is missing, and refreshing loops.
+The failure mode without this: with refresh-token rotation enabled on the A S P dot NET Core side, N parallel refreshes present the same token N times, the server treats reuse as token theft, and the user is logged out by the very mechanism meant to keep them signed in.
