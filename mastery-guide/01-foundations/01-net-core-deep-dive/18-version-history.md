@@ -502,6 +502,6 @@ _Last reviewed: 2026-05-07. Re-verify the .NET 10 specifics against the latest r
 
 ---
 
-[← Previous: Hands-On Mini Project — TaskFlow API](17-taskflow-mini-project.md) · [↑ Back to top](#net-version-history-net-7--net-10) · [Next: SOLID Principles →](../02-solid-principles.md)
+[← Previous: Hands-On Mini Project — TaskFlow API](17-taskflow-mini-project.md) · [↑ Back to top](#net-version-history-net-7--net-10) · [Next: Cryptography, Hashing & Encoding →](19-cryptography-hashing-and-encoding.md)
 
 <!-- nav-footer-end -->

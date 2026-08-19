@@ -2164,6 +2164,7 @@ Reject it as a blanket rule. `ValueTask` only avoids an allocation on the **sync
 
 ## Cross-references
 
+- **[Concurrency & Parallelism](20-concurrency-and-parallelism.md)** — the other half of this topic: the TPL's data-parallel APIs (`Parallel.For`/`ForEach`/`ForEachAsync`), PLINQ, partitioning, `Channel<T>` producer/consumer pipelines, the concurrent collections' real guarantees, and the .NET memory model.
 - **[.NET Runtime & CLR](01-net-fundamentals.md)** — CLR lifecycle, thread model fundamentals, GC pressure from boxing and Task allocations.
 - **[Dependency Injection](02-dependency-injection.md)** — lifetime scoping of services resolved inside async methods, and why captive dependencies bite harder under concurrency.
 - **[Middleware in ASP.NET Core](04-middleware.md)** — where `HttpContext.RequestAborted` comes from and how cancellation flows through the pipeline.

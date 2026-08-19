@@ -12,7 +12,7 @@
 
 ---
 
-This is the deep-dive chapter of the [Mastery Guide](../../README.md), covering .NET 10 + ASP.NET Core in detail across 18 focused topic files. Each topic file carries its own in-file Table of Contents.
+This is the deep-dive chapter of the [Mastery Guide](../../README.md), covering .NET 10 + ASP.NET Core in detail across 20 focused topic files. Each topic file carries its own in-file Table of Contents.
 
 ## Master Table of Contents
 
@@ -34,6 +34,8 @@ This is the deep-dive chapter of the [Mastery Guide](../../README.md), covering 
 16. [Interview Prep — Quick Reference, Revision Sheet & Mind Map](./16-interview-prep.md)
 17. [Hands-On Mini Project: TaskFlow API](./17-taskflow-mini-project.md)
 18. [.NET Version History (.NET 7 → .NET 10)](./18-version-history.md) — feature-by-feature reference across recent releases
+19. [Cryptography, Hashing & Encoding](./19-cryptography-hashing-and-encoding.md) — encoding vs hashing vs encryption, password hashing, HMAC, AES-GCM, Data Protection
+20. [Concurrency & Parallelism](./20-concurrency-and-parallelism.md) — TPL, PLINQ, partitioning, `Channel<T>`, concurrent collections, the memory model
 
 ---
 

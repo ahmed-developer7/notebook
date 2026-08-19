@@ -1,0 +1,1350 @@
+-- pause --
+Section 1. Why It Matters.
+
+Interviewers open this topic with one question, and it is almost never "explain AES". It is some variant of:
+
+"What's the difference between encoding, hashing and encryption?"
+
+They ask it because the industry gets it wrong constantly. Base64 is called "encryption" in bug reports, in code comments, in vendor documentation, and in production incident write-ups.
+A senior candidate who cannot draw the line cleanly, reversible without a key, one-way, reversible with a key, has just told the interviewer that the rest of the security conversation is going to be shallow.
+
+The second question is "how do you store a password", and the third is "how do you generate a secure token". Both have a standard wrong answer that sounds competent: SHA256.HashData(password) for the first, Guid.NewGuid().ToString() for the second.
+Both are wrong for reasons you can state precisely, and the precision is the point. "Use bcrypt" is a memorised answer.
+"A password hash must be slow because the threat model is an offline attacker with the dumped table and a GPU farm, and SHA-256 is designed to be fast" is an understood answer, and it survives the follow-up.
+
+This page is the mechanism behind those answers:
+what each primitive actually guarantees, which dot NET A P I implements it, what the framework already does for you (A S P dot NET Core Identity and Data Protection do more than most candidates realise), and where "we use H T T P S" stops being an answer.
+
+One framing to carry through the whole page: cryptography fails at the joins, not at the algorithms. Nobody in a normal engineering career breaks AES.
+They reuse a GCM nonce, compare an HMAC with ==, encrypt with CBC and forget the MAC, ship a container with no shared Data Protection key ring, or store a password with a fast hash. Every one of those is a joinery mistake, and every one of them is an interview question.
+
+-- pause --
+Section 2. Table of Contents.
+
+Introduction, including The Three-Way Distinction.
+Real-World Analogy: The Shipping Depot.
+Encoding, and Why It Is Not a Security Control.
+Hashing, One-Way, No Key.
+Hashing for Integrity versus Hashing for Passwords.
+Password Hashing, including What A S P dot NET Core Identity Actually Uses.
+HMAC and Timing-Safe Comparison.
+Symmetric Encryption, including Why Raw AES-CBC Is a Mistake.
+Asymmetric Cryptography.
+Randomness: RandomNumberGenerator versus Random.
+Storing Tokens and A P I Keys at Rest.
+A S P dot NET Core Data Protection.
+Where T L S Fits.
+Choosing a Primitive, Decision Table.
+Common Pitfalls.
+Best Practices.
+Real-World Scenarios.
+Interview-Ready Summary.
+Interview Cross-Questioning Drill.
+Cheat Sheet.
+Walkthrough.
+Self-Test.
+Cross-References.
+Sources.
+
+-- pause --
+Section 3. Introduction.
+
+-- pause --
+The Three-Way Distinction.
+
+This is the question. Answer it in one breath, then expand.
+
+Reversible?, Yes, by anyone, No, by anyone, Yes, with the key.
+Key involved?, No, No (plain hash) / yes (HMAC), Yes, always.
+Output size, Grows with input, Fixed, regardless of input, Grows with input (+ IV or nonce or tag).
+What it is for, Making bytes survive a transport that can't carry them, Fingerprinting, verification, storage of things you never need back, Confidentiality.
+Is it a security control?, No, Only within a protocol, Yes.
+dot NET example, Convert.ToBase64String, Base64Url.EncodeToString, SHA256.HashData, Rfc2898DeriveBytes.Pbkdf2, AesGcm, RSA, IDataProtector.
+
+The three sentences to lead with:
+
+Encoding is a transport concern. It has no key and no secret. Anyone who can see the encoded value can decode it, and that is the intended behaviour, not a weakness. Base64 exists because SMTP, H T T P headers, URLs and X M L attributes are not binary-safe.
+Hashing is one-way by construction. There is no key and no "unhash". You verify by re-computing the hash of a candidate and comparing.
+Encryption is reversible and keyed. The security lives entirely in the key. Everything else, algorithm, mode, ciphertext, is assumed public. (This is Kerckhoffs's principle, and it is worth saying out loud: an algorithm whose security depends on nobody knowing how it works is not a cryptosystem.)
+
+-- pause --
+Why Base64 Keeps Getting Called Encryption.
+
+Three reasons, and naming them shows you have met the confusion in the wild rather than only in a textbook:
+
+It looks like ciphertext. cGFzc3dvcmQxMjM= is unreadable to a human. Unreadable-to-a-human and unreadable-to-an-attacker are completely different properties, and the eye does not distinguish them.
+It shows up next to real security. JWTs are three base64url segments. H T T P Basic auth is Authorization: Basic plus base64 of user:password. Both appear in security contexts, so the encoding gets credit for the security around it.
+It is trivially reversible and nobody bothers. No tool prompts you for a key, so the absence of a key never registers.
+
+In the real world: a fintech integration ships credentials to a partner in a config file, base64-encoded, with a code comment reading // encrypted connection string. The reviewer sees an unreadable blob and approves.
+Eighteen months later the repository is made internal-public for a hackathon and someone runs base64 -d on the file out of curiosity. The decision that cost them was not "we chose weak encryption", it was "we never checked whether there was a key".
+The fix, once found, was two lines: move the value to the secret store and inject it from configuration. The audit that followed took three weeks.
+
+In the real world: an incident review of a token-leak concludes "the tokens were encrypted in the log, so exposure is limited." The tokens were JWTs. A J W T is signed, not encrypted, the payload is base64url and any log reader can decode the claims, including the subject, tenant, roles and expiry.
+The signature stops forgery, not reading. The team had conflated the two and downgraded the incident severity on the strength of it. Signed means "you can't change it"; encrypted means "you can't read it". The severity was re-raised the next day.
+
+-- pause --
+The Three Guarantees, Named.
+
+When an interviewer pushes past the definitions, they are usually fishing for the CIA-style vocabulary attached to the right primitive:
+
+Confidentiality, The adversary cannot read it, Encryption (AES-GCM, RSA-OAEP).
+Integrity, The adversary cannot change it undetected, MAC / signature / AEAD tag.
+Authenticity, It came from who it claims to have come from, HMAC (shared key) or digital signature (private key).
+Non-repudiation, The sender cannot later deny sending it, Digital signature only, an HMAC cannot provide it.
+
+That last row is a genuinely good cross-question. An HMAC cannot give you non-repudiation because both parties hold the same key: either could have produced the tag, so neither can prove the other did. A signature can, because only the holder of the private key can produce it.
+This is exactly why webhook providers use HMAC (you only need to know it came from the provider, and you both share the secret) while code signing and J W T issuance in a federated system use asymmetric signatures.
+
+-- pause --
+Section 4. Real-World Analogy: The Shipping Depot.
+
+Barcode label, maps to, Base64 / hex / URL encoding.
+Tamper-evident seal, maps to, Hash (SHA-256).
+Depot's stamp on the seal, maps to, HMAC / signature.
+Locked container, maps to, Encryption (AES, RSA).
+Locked and sealed container, maps to, AEAD (AES-GCM).
+A different key per customer, rotated quarterly, held in the safe, maps to, Key management (Data Protection key ring, Key Vault).
+The armoured van between depots, maps to, T L S.
+The warehouse the container sits in overnight, maps to, At rest, the van does not help here.
+
+That last row is the whole of Where T L S Fits in one line.
+
+-- pause --
+Section 5. Encoding, and Why It Is Not a Security Control.
+
+-- pause --
+The A P Is.
+
+Version gates that matter if you target more than one TFM:
+
+Convert.ToBase64String / FromBase64String, maps to, Long-standing (dot NET Framework era).
+Convert.ToHexString / FromHexString, maps to, dot NET 5.
+System.Buffers.Text.Base64Url, maps to, dot NET 9 (also via the Microsoft.Bcl.Memory package for older TFMs).
+
+Before Base64Url existed, the A S P dot NET Core answer was WebEncoders.Base64UrlEncode / Base64UrlDecode from Microsoft.AspNetCore.WebUtilities. If you are on a shared library targeting dot NET 8 or earlier, that is still the reach.
+
+-- pause --
+Why Base64Url Exists.
+
+Standard Base64 emits +, / and =. All three are meaningful in a URL: + decodes to a space in application or x-www-form-urlencoded, / is a path separator, = is a query-string assignment.
+Put a raw Base64 token in a query string and you have a bug that fires only for the subset of tokens that happen to contain one of those characters, which is why it survives every manual test and then breaks intermittently in production. Base64url swaps + to -, / to _ and drops the padding.
+This is why J W T segments are base64url and not base64, and it is why a hand-rolled J W T parser that calls Convert.FromBase64String on a segment throws FormatException intermittently.
+
+-- pause --
+Size, Not Security.
+
+Encoding costs bytes, and that is the only trade-off it has. Base64 emits 4 output characters for every 3 input bytes; hex emits 2 characters per byte. Those are definitional ratios, not measurements, you can derive them from the alphabet size (6 bits per Base64 char, 4 bits per hex char).
+It matters when you base64 a payload into a header, a cookie or a database column and then discover the size limit.
+
+In the real world: a team stores a signed session payload in a cookie. Locally it fits.
+In production, tenants with many role claims push the encoded cookie past the browser's per-cookie size limit and the cookie is silently dropped, users appear logged out at random, only in one region, only for admins. Nothing errors.
+The fix was to stop putting the claim set in the cookie and put an opaque identifier there instead, with the claims server-side. The lesson they wrote down: encoding inflates, and the inflation is where your capacity planning breaks, long before any security question arises.
+
+-- pause --
+The Rule.
+
+Encoding never appears in a threat model as a mitigation. If the sentence "we base64-encode it" is offered as the answer to "how is this protected", the answer is "it isn't".
+
+Two legitimate uses that sound like security but are not:
+
+Obfuscation for accident-avoidance. Base64-ing a value so it does not get eyeballed by someone shoulder-surfing a log. Fine as a courtesy; worthless against an attacker; must never be counted as a control.
+Transport safety for something already protected. Base64 of a ciphertext or a signature is completely correct, the security came from the layer underneath.
+
+-- pause --
+Section 6. Hashing, One-Way, No Key.
+
+-- pause --
+The Properties You Are Expected to Name.
+
+Collision resistance is the property that dies first, and the distinction between it and second-preimage resistance is a standard follow-up. MD5 and SHA-1 are collision-broken, an attacker can construct two documents with the same digest, which kills them for signatures and certificates.
+That is not the same as being able to recover a password from a SHA-1 hash. Both are dead for new work; know why each is dead, because "it's old" is not an answer.
+
+-- pause --
+The dot NET A P I Shape.
+
+Since dot NET 5 the one-shot static HashData methods are the idiomatic form. They allocate less and remove the using dance:
+
+dot NET 9 added an algorithm-agnostic entry point on CryptographicOperations (moniker list is net-9.0 onward, so it is available on dot NET 10 but is not new there). It is useful when the algorithm comes from configuration rather than being fixed at compile time:
+
+️ HashAlgorithmName is a struct wrapping a string. new HashAlgorithmName("SHA256") and HashAlgorithmName.SHA256 are equal, but new HashAlgorithmName("sha256") is a different value and will fail at the point of use. Use the static properties.
+
+-- pause --
+Non-Cryptographic Hashes Are a Different Tool.
+
+Object.GetHashCode() is a hash and is not a cryptographic hash.
+It exists to bucket items in a Dictionary, it has no preimage or collision resistance worth the name, and, importantly for anyone tempted to persist one, string hash codes in dot NET Core are randomised per process by default, so the same string yields different values across runs.
+Persisting a GetHashCode() result is a bug that only manifests after a restart.
+
+In the real world: a caching layer keys entries by key.GetHashCode() to save space in a distributed cache. It works in every test, in every local run, and in the first pod.
+Deployed across a replica set, the pods disagree about the key for the same string, so each pod caches independently and cache hit rate collapses to the reciprocal of the replica count, but nothing errors, and the only symptom is a database that gets busier every time they scale out.
+The fix was to key on the string, or on a stable hash. The rule to carry: GetHashCode is an in-process, single-run implementation detail. Anything crossing a process boundary or a restart needs a stable hash.
+
+-- pause --
+Section 7. Hashing for Integrity versus Hashing for Passwords.
+
+This is the section where the same primitive is right for one job and catastrophically wrong for the other, and being able to explain why is the difference between a memorised answer and an understood one.
+
+Say the mechanism, not the rule. SHA-256 is engineered to be fast and to parallelise, it is used to checksum multi-gigabyte artefacts and to secure block chains where throughput is the product.
+Those same properties, pointed at a table of password digests, let an attacker test candidate passwords at whatever rate their hardware allows.
+Human-chosen passwords come from a distribution small enough that this matters: the attacker is not searching 2²⁵⁶, they are searching a wordlist plus mutations.
+A password KDF deliberately spends C P U (and, for Argon2 or scrypt, memory) per guess so that the attacker's rate collapses, while the honest server pays that cost exactly once per login.
+
+The memory-hardness point is worth having ready. GPUs and ASICs are wildly good at parallel SHA-256 and much worse at algorithms that demand a large working set per guess, because memory does not parallelise as cheaply as arithmetic.
+That is the entire design goal of scrypt and Argon2 and the reason OWASP's Argon2id recommendation is stated as a memory figure first.
+
+In the real world: a legacy system stores passwords as unsalted SHA-1 because "SHA-1 was fine in 2011". After a breach, the recovery team measures how far the attacker got by seeing which accounts were re-used elsewhere.
+Accounts with passwords in the top few million of any public wordlist were compromised essentially at breach time.
+The interesting detail: because the hashes were unsalted, the attacker did not need to crack per-user at all, identical hashes revealed identical passwords across accounts, so cracking one common password unlocked every account that shared it in a single pass.
+Salting alone would not have made the hashes strong, but it would have forced per-user work and removed the "these 40,000 users all chose the same password" signal for free.
+
+-- pause --
+Where a Plain Hash Is the Right Answer.
+
+Do not over-correct. A fast unkeyed hash is correct for:
+
+File / artefact integrity. Publishing SHA-256 checksums next to a download, verifying a package after transfer.
+Content addressing and deduplication. Blob stores keyed by digest, git object IDs.
+ETags and change detection. "Has this document changed since I last saw it?"
+Hashing a high-entropy secret you generated. See Storing Tokens and A P I Keys at Rest, a 256-bit random token is not guessable, so slowing the hash buys nothing.
+
+And the caveat that turns integrity into a security control: an unkeyed hash proves nothing about origin. If the attacker can modify the data, they can usually modify the stored digest alongside it. A checksum published on the same compromised server as the file is theatre.
+The moment the digest itself is attacker-reachable, you need a key, an HMAC or a signature. That is the bridge into the next two sections.
+
+-- pause --
+Section 8. Password Hashing.
+
+-- pause --
+What a Work Factor Is.
+
+A work factor is a tuning parameter that buys time. It has a different shape per algorithm, and knowing the shape is the cross-question:
+
+PBKDF2, iteration count, linear in C P U time.
+bcrypt, cost (log₂ of rounds), each +1 doubles the work.
+scrypt, N (C P U or memory), r (block size), p (parallelism), memory-hard.
+Argon2id, m (memory KiB), t (time or passes), p (parallelism), memory-hard.
+
+The bcrypt one catches people out, and the arithmetic is the answer: the cost parameter is a base-2 exponent, so going from 10 to 12 is 2² = four times the work, not "a bit more". Say "log scale" and you have answered it.
+
+How to choose one. The honest method is not a number from a blog post, it is a measurement plus a policy:
+
+Decide a per-verification latency budget on your production hardware, the largest cost a login can absorb without feeling slow, given your concurrency. State it as a number your team agreed, not one you read somewhere.
+Measure the algorithm on that hardware at candidate parameters, this is the one place you must benchmark rather than quote.
+Floor it at the current OWASP minimum. Never go the published floor even if your hardware is slow.
+Write the parameters into the stored hash and re-tune on a schedule.
+
+Step 3's floors, from the OWASP Password Storage Cheat Sheet as of this review:
+
+Argon2id, maps to, m set to 19456 (19 MiB), t set to 2, p set to 1 (with higher-memory / lower-time variants listed as equivalents).
+scrypt, maps to, N set to 217 (128 MiB), r set to 8, p set to 1 (down to N set to 213, r set to 8, p set to 10 as an equivalent trade).
+bcrypt, maps to, work factor 10 or higher; "as large as verification server performance will allow".
+PBKDF2-HMAC-SHA256, maps to, 600,000 iterations.
+PBKDF2-HMAC-SHA512, maps to, 220,000 iterations.
+PBKDF2-HMAC-SHA1, maps to, 1,400,000 iterations, legacy only.
+
+️ Re-check these before you quote them in an interview conducted long after 2026-08. OWASP revises them; the method does not change.
+
+Two bcrypt details worth carrying, both from the same OWASP source: bcrypt has a maximum input length of 72 bytes (longer passwords are silently truncated, so a "128-character passphrase" may be no stronger than its first 72 bytes), and if you pre-hash to work around that,
+OWASP's recommended construction is bcrypt(base64(hmac-sha384(data:$password, key:$pepper)), $salt, $cost), the base64 step exists because a raw binary pre-hash can contain a null byte, which some bcrypt implementations treat as a terminator.
+
+-- pause --
+Why the Salt Is Stored Beside the Hash.
+
+The most common misconception is that the salt is a secret. It is not, and the interviewer will ask.
+
+A salt is a uniqueness device, not a secrecy device. Its job is to make sure that two users with the same password produce two different stored values. That single property buys three things:
+
+Precomputation dies. A rainbow table (or any precomputed hash to password map) is built for unsalted hashes. Add a unique per-user salt and the attacker would need one table per salt, which is precisely the precomputation they were trying to avoid.
+Cross-account correlation dies. Without a salt, identical hashes advertise identical passwords, so cracking one password unlocks every account that shares it. With salts, every account costs a full attack independently.
+**Cross-site correlation dies.** A hash of password123 from your dump can no longer be matched against a hash of password123 from someone else's dump.
+
+None of those benefits require the salt to be hidden. The attacker who has your salt has, by definition, already got your database, and the salt only helps them attack that one user.
+If you tried to keep it secret you would have created a second key-management problem for no gain, and you would have to solve "where does the salt live" for every verification. Storing it beside the hash is the correct design, not a compromise.
+Every modern password-hash format is self-describing for exactly this reason: the stored string carries the algorithm, the parameters and the salt, so verification needs nothing but the stored value and the candidate password.
+
+A pepper is the thing people are reaching for when they want a secret. A pepper is a site-wide secret mixed in in addition to the salt, and OWASP's framing is the useful one: it is "shared between stored passwords" and "should not be stored along with the generated hash".
+It lives in a KMS or HSM or an environment secret, so a pure database dump (sequel injection, backup leak) is not enough to start cracking.
+It is a defence-in-depth layer, not a substitute for a KDF, and it brings its own rotation problem, so treat it as an optional extra you can justify, not a default.
+
+-- pause --
+What A S P dot NET Core Identity Actually Uses.
+
+This is the concrete-knowledge question, and most candidates cannot answer it. The type is PasswordHasher, implementing IPasswordHasher, from Microsoft.Extensions.Identity.Core.
+
+Two documented formats, straight from the PasswordHasher.cs header comment in dotnet or aspnetcore:
+
+So the answers to the questions you will actually be asked:
+
+Algorithm: PBKDF2. Not bcrypt, not Argon2.
+PRF: HMAC-SHA512 in V3 (V2 used SHA1).
+Salt: 128-bit, generated with RandomNumberGenerator, stored inside the encoded value.
+Subkey: 256-bit.
+Default iterations: PasswordHasherOptions.IterationCount, the docs state "Gets or sets the number of iterations used when hashing passwords using PBKDF2. Default is 100,000."
+Default compatibility mode: PasswordHasherOptions.CompatibilityMode "Defaults to 'A S P dot NET Identity version 3'."
+Comparison: on dot NET Core the verification path uses CryptographicOperations.FixedTimeEquals.
+The version byte is the first byte of the payload, which is what makes silent migration from V2 to V3 possible.
+
+️ The number that makes this interesting. Identity's default is 100,000 PBKDF2-HMAC-SHA512 iterations. OWASP's current floor for PBKDF2-HMAC-SHA512 is 220,000. The framework default is therefore the current OWASP recommendation, and raising IterationCount is a one-line change.
+Being able to say that, with both numbers attributed, is a very strong answer, because it shows you read the guidance rather than trusting the default.
+
+The rehash path. VerifyHashedPassword returns a PasswordVerificationResult with three members: Failed (0), Success (1), and SuccessRehashNeeded (2), documented as "password verification was successful however the password was encoded using a deprecated algorithm and should be rehashed and updated".
+That third state is how you migrate an entire user base without a mass reset: the only moment you ever hold the plaintext password is a successful login, so that is the only moment you can re-hash it.
+
+UserManager already does this for you when you go through CheckPasswordAsync; the code is what to write when you have your own store.
+
+In the real world: a team raises IterationCount from the default to a modern value and deploys. Login latency for existing users does not change at all, because every stored hash still carries its own iteration count in the payload and is verified with that count.
+Only new and re-hashed passwords use the new value. They initially read the unchanged latency as "the config didn't take" and rolled back. The mechanism they had missed: the stored format is self-describing, so a parameter change is forward-only by design.
+The correct move was to keep the change and let SuccessRehashNeeded migrate the base over the following weeks.
+
+-- pause --
+Argon2 and bcrypt in dot NET.
+
+Neither is in the BCL. Argon2 support has been requested since January 2017 and remains an open A P I idea on dotnet or runtime#19933 rather than a shipped feature.
+The structural reason is worth knowing:
+dot NET's System.Security.Cryptography largely delegates to the platform (CNG on Windows, OpenSSL on Linux, Apple's frameworks on macOS), and Argon2 is not uniformly available across those, so shipping it would mean either a managed implementation or an uneven cross-platform story.
+
+Practically, that leaves you three defensible positions:
+
+Use Identity's PBKDF2 with a raised iteration count. Boring, in-box, FIPS-friendly, no third-party dependency. Entirely acceptable and OWASP-listed.
+Take a third-party Argon2id or bcrypt package and plug it in behind IPasswordHasher. Say out loud that you are adding an unaudited-by-Microsoft dependency to the authentication path and that you will pin and monitor it.
+Delegate the whole problem to an identity provider (Entra ID, Auth0, Okta, Cognito) and never store a password.
+
+Answering "Argon2id, obviously" without knowing it is not in the BCL is the trap. Answering "PBKDF2-HMAC-SHA512 at or the OWASP floor, because it is what Identity ships and it is on the approved list; I'd move to Argon2id if the threat model justified the dependency" is the senior answer.
+
+-- pause --
+If You Are Rolling the Storage Format Yourself.
+
+Two A P I notes you should be able to state:
+
+The string and ReadOnlySpan overloads convert the password using UTF-8. If you must match a legacy store that used a different encoding, encode yourself and use the ReadOnlySpan overload.
+The old new Rfc2898DeriveBytes(password, salt) constructors are obsolete (SYSLIB0041) because they defaulted to SHA-1 and a low iteration count. Use the static Pbkdf2 one-shots.
+
+-- pause --
+Timing and User Enumeration.
+
+If your login handler returns immediately when the user does not exist, but runs a deliberately-expensive KDF when the user does exist, you have built a user-enumeration oracle out of a stopwatch, and the better your work factor, the louder the signal. The mitigation is to always do the work:
+
+Note what else has to match: the response body and status code must be identical too. "Invalid email or password" for both cases, not "no such user" and "wrong password".
+
+-- pause --
+Section 9. HMAC and Timing-Safe Comparison.
+
+-- pause --
+What HMAC Adds.
+
+A plain hash answers "has this changed since somebody hashed it". An HMAC answers "has this changed since someone holding the key hashed it". The key turns integrity into authenticity.
+
+Why HMAC and not H(key || message). This is the classic follow-up.
+The naive "secret prefix" construction is vulnerable to a length-extension attack against Merkle, Damgård hashes such as SHA-256:
+because the hash's internal state at the end of the message is the output, an attacker who knows H(key || m) and len(key) can compute H(key || m || padding || m') for a suffix m' of their choosing, without knowing the key.
+HMAC's nested H(K⊕opad || H(K⊕ipad || message)) structure is specifically designed to close that.
+
+-- pause --
+Timing-Safe Comparison Is Not Optional.
+
+CryptographicOperations.FixedTimeEquals(ReadOnlySpan, ReadOnlySpan) is documented as determining "the equality of two byte sequences in an amount of time that depends on the length of the sequences, but not their values". It has been in the BCL since dot NET Core 2.1.
+
+The mechanism, because "it's constant time" alone is not an answer. == on strings and SequenceEqual on arrays return as soon as they find a mismatch.
+An attacker who can submit many signatures and measure response time can therefore learn how many leading bytes were correct, and can then discover the tag one byte at a time. That turns a 2²⁵⁶ search into roughly 32 times 256 attempts.
+FixedTimeEquals XORs every byte and accumulates, then checks the accumulator once, so the loop always runs to completion.
+
+Read the guarantee precisely, this is the cross-question. The documented property is that the time depends on the length but not the values. So:
+
+It does not hide the length. If your comparison returns early because the lengths differ, you have leaked the length.
+In practice this is fine for fixed-size tags (an HMAC-SHA256 tag is always 32 bytes), but if you compare variable-length secrets, hash both sides to a fixed length first and compare the hashes.
+It protects the comparison only. If you decoded the attacker's hex with something that early-exits on invalid input, or looked the A P I key up in a dictionary before comparing, you may have leaked elsewhere.
+
+dot NET 11 note (not available on dot NET 10): the docs list CryptographicOperations.VerifyHmac(HashAlgorithmName, ReadOnlySpan key, ReadOnlySpan source, ReadOnlySpan hash) returning bool, with the moniker list showing net-11.0 only. It packages compute-then-fixed-time-compare into one call.
+On dot NET 10 you write the two steps yourself.
+
+-- pause --
+Webhook Signature Verification, End to End.
+
+Five things a reviewer should look for, all of them present above: raw body, timestamp inside the signed payload, freshness window, defensive decode, fixed-time compare.
+
+In the real world: a payments webhook handler verifies the signature over JsonSerializer.Serialize(dto) after model binding. It passes every test against the provider's sample payload, because the sample happens to round-trip identically.
+In production, the provider emits "amount": 10.00 and dot NET's serializer re-emits 10, so the recomputed HMAC differs and every real webhook is rejected as a forgery. The team's first fix was to disable signature verification "temporarily".
+Sign and verify the exact bytes on the wire, the moment you deserialise, you have lost the thing that was signed.
+
+In the real world: an internal service compares an A P I key with if (provided == expected). It sits behind the corporate VPN, so nobody worries about timing.
+A compromised laptop on the same network gives an attacker a low-latency, low-jitter path to the service, exactly the conditions under which a byte-at-a-time timing attack becomes practical rather than theoretical. The remediation was a one-line change to FixedTimeEquals.
+The lesson the team recorded: "it's internal" removes network noise, which makes timing attacks easier, not harder.
+
+-- pause --
+Section 10. Symmetric Encryption.
+
+-- pause --
+Default to AEAD.
+
+AEAD, Authenticated Encryption with Associated Data, gives you confidentiality and integrity in a single primitive, with one key and no way to forget the second half. In dot NET the in-box AEAD for AES is System.Security.Cryptography.AesGcm.
+
+Facts to have ready:
+
+AesGcm.NonceByteSizes is documented as "12 bytes (96 bits)", a single supported size, not a range.
+Tag size is 12, 16 bytes depending on platform; GCM natively produces 16 and shorter tags are truncations. Use 16.
+AesGcm(byte[]) and AesGcm(ReadOnlySpan) are obsolete from dot NET 8 (SYSLIB0053).
+The reason is genuinely interesting and is a good thing to be able to explain: the old constructors inferred the tag size from whatever tag you passed to Decrypt, so an attacker who could supply a short tag effectively reduced the authentication strength.
+The new constructors make you declare the expected size up front, and Encrypt / Decrypt then enforce it.
+TagSizeInBytes exposes what the instance was constructed with.
+
+-- pause --
+Nonce Reuse Is the Catastrophic Failure.
+
+Say this plainly, because it is the number one AEAD interview trap. Reusing a (key, nonce) pair in GCM is not a small weakness, it is a break.
+Two messages encrypted under the same key and nonce let an attacker XOR the ciphertexts to cancel the keystream and recover the XOR of the plaintexts; worse, it enables recovery of GCM's authentication subkey, which lets the attacker forge tags for that key from then on.
+Integrity is gone, not just confidentiality.
+
+The counter approach fails in exactly the environments where it is most tempting. A pod restart that resets an in-memory counter, a database restored from a snapshot, two replicas both starting at zero, all of them reuse nonces.
+Random-per-message needs no coordination, which is why it is the default advice.
+
+In the real world: a team encrypts stored payment tokens with AES-GCM and derives the nonce from the row's primary key so decryption "doesn't need to store the nonce".
+A later migration re-seeds the identity column after a table rebuild, and new rows reuse primary keys that already existed in an archive table encrypted with the same key. The archive and the live table now share (key, nonce) pairs.
+They discovered it not through an attack but during a routine crypto review. Remediation was a full re-encryption under a new key. The nonce is not a secret, store it next to the ciphertext. Twelve extra bytes per row was always the cheap option.
+
+-- pause --
+Why Raw AES-CBC Without a MAC Is a Mistake.
+
+Aes.Create() gives you a block cipher with a mode, and CBC is the mode most people reach for. It provides confidentiality and nothing else. Two concrete consequences:
+
+1. Malleability. In CBC, each ciphertext block is XORed into the next block's decryption. Flip a bit in ciphertext block n and you flip the corresponding bit in plaintext block n+1 (while turning block n into garbage).
+An attacker who knows the plaintext structure can therefore make targeted, predictable edits to it without the key. {"role":"user"} becoming {"role":"admin"} is the toy example; the real ones look like flipping an amount's sign or a boolean flag.
+
+2. Padding oracles. CBC needs padding.
+If your decrypt path distinguishes "padding was invalid" from "padding was fine but the content was wrong", by exception type, by error message, by status code, or by response time, you have built a padding oracle,
+and an attacker can decrypt arbitrary ciphertext one byte at a time without ever learning the key.
+This is a real, repeatedly-exploited class of bug, not a theoretical one, and it is very hard to close by careful error handling alone because timing counts as a signal.
+
+Both problems have the same root: CBC has no way to answer "did someone change this?" The fix is a MAC, and specifically encrypt-then-MAC, encrypt the plaintext, then MAC the ciphertext (plus the IV and any context), and on the way back verify the MAC before you attempt to decrypt.
+If verification fails you never run the decryption code at all, so there is no oracle to probe.
+
+The practical guidance: do not hand-roll encrypt-then-MAC if you can use AesGcm. You would be re-implementing, with two keys and a comparison you must remember to make timing-safe, something the BCL already does correctly.
+Reach for Aes in CBC mode only when an external format forces it, and then MAC it, with a separate key, over IV ‖ ciphertext, and verify with FixedTimeEquals.
+
+Worth knowing for the follow-up: A S P dot NET Core Data Protection's default is AES-256-CBC for confidentiality with HMACSHA256 for authenticity, encrypt-then-MAC, assembled correctly, by the framework.
+That is the shape you would otherwise be building by hand, and it is a good argument for using Data Protection instead.
+
+-- pause --
+Key Length and Key Management.
+
+AES-128 and AES-256 are both fine; AES-256 is the common default and costs a little more work per block. The interesting part is never the key length, it is where the key lives.
+
+And the question that follows: how do you rotate? The answer that works is a key ID stored with the ciphertext. Prefix every payload with the identifier of the key that encrypted it; keep old keys available for decryption; encrypt new data with the current key.
+Without a key ID you cannot rotate without re-encrypting the entire corpus in one transaction, which is why "we'll rotate later" so often becomes "we never rotated". Data Protection's key ring is exactly this pattern, productised.
+
+CryptographicOperations.ZeroMemory(Span) will overwrite a key buffer when you are done with it.
+Use it, but do not oversell it in an interview: it does not help with string (immutable, copied by the garbage collector), and the honest framing is "it shortens the window in which the key sits in a heap buffer", not "the key is now unrecoverable from memory".
+
+-- pause --
+Section 11. Asymmetric Cryptography.
+
+-- pause --
+The Split.
+
+Keys, One shared secret, Key pair: private + public.
+Speed, Fast; suitable for bulk data, Slow; suitable for small payloads.
+Distribution problem, Both parties must already share the secret, Publish the public key freely.
+Non-repudiation, No, either party could have produced it, Yes, only the private key holder could sign.
+Typical use, Encrypting data at rest, session traffic, Signing, key exchange, certificates.
+
+The one-line version: symmetric solves confidentiality cheaply once you have a shared key; asymmetric solves the problem of not having one.
+Real systems use both, this is what "hybrid encryption" means, and it is what T L S does: an asymmetric handshake establishes a symmetric session key, and every byte of application data after that is symmetric.
+
+️ Never encrypt bulk data with RSA. RSA can only encrypt a payload smaller than its modulus minus padding overhead, and it is orders of magnitude slower per byte.
+If you find yourself chunking data through RSA, stop: generate a random symmetric key, encrypt the data with AES-GCM, and encrypt the key with RSA. That is hybrid encryption and it is the correct shape.
+
+-- pause --
+Signing: RSA versus ECDSA.
+
+RSASignaturePadding has exactly two values: Pkcs1 ("PKCS #1 v1.5 padding mode") and Pss ("PSS padding mode"). PKCS#1 v1.5 is the older, deterministic scheme and remains everywhere for compatibility, J W T's RS256 is RSASSA-PKCS1-v1_5 with SHA-256.
+PSS is randomised and has a modern security proof; J W T's PS256 is RSA-PSS. Prefer PSS when you control both ends; use PKCS#1 v1.5 when a protocol or peer requires it.
+Do not describe PKCS#1 v1.5 signatures as broken, the badly-broken one is PKCS#1 v1.5 encryption padding (Bleichenbacher), which is a different construction. Getting that distinction right is a strong signal.
+
+DSASignatureFormat is the ECDSA interop trap. An ECDSA signature is a pair (r, s), and there are two ways to write it down: a DER-encoded SEQUENCE (what OpenSSL and X.509 use, variable length) and a fixed-length concatenation of r ‖ s (what JOSE or J W T ES256 uses).
+dot NET's default for ECDsa.SignData(byte[], HashAlgorithmName) is not interchangeable with the other format, and "my ES256 J W T validates in dot NET but not in the Node service" is almost always this. The DSASignatureFormat overloads exist to let you say which one you want.
+
+-- pause --
+Choosing Between Them.
+
+Key size for comparable strength, Large (2048 or 3072 or 4096-bit), Small (P-256 / P-384).
+Signature size, Large, proportional to key size, Small.
+Signing cost, Slow, Fast.
+Verification cost, Fast, often faster than ECDSA, Moderate.
+Can also encrypt?, Yes (RSA-OAEP, small payloads), No, ECDSA signs only; use ECDH for key agreement.
+Hardware or legacy support, Universal, Excellent but slightly less universal.
+Failure mode to fear, Small keys; PKCS#1 v1.5 encryption padding, Nonce reuse or bias in signing leaks the private key.
+
+The asymmetry in the cost rows is the good detail: RSA verification is cheap and RSA signing is expensive; ECDSA is the other way round. So the choice can be driven by which side you do more of.
+A J W T issuer signs once per login and every downstream service verifies on every request, that workload shape favours RSA verification cost, which is part of why RS256 is so entrenched. A system where every device signs constantly and a central service verifies favours ECDSA.
+
+The ECDSA failure mode is worth naming because it is famous: ECDSA requires a per-signature random value, and if that value is ever repeated or predictable across two signatures with the same key, the private key can be recovered algebraically from the two signatures.
+This is how several high-profile key compromises happened. It is a reason to use the platform's implementation and never a hand-rolled one.
+
+-- pause --
+Certificates, Briefly.
+
+An X.509 certificate is a public key plus identity claims, signed by a CA. It solves the distribution problem: you can now trust a public key you have never seen before because someone you already trust vouched for it.
+For loading, prefer X509CertificateLoader over the X509Certificate2 file and byte-array constructors, those constructors carry an obsoletion, and Microsoft's own Data Protection samples now call X509CertificateLoader.LoadCertificateFromFile.
+Check the diagnostic ID against your target framework before you change existing code.
+
+In the real world: a service signs JWTs with HS256 and shares the signing secret with eleven downstream services so they can validate tokens. Any one of those eleven can now mint tokens for any user, because with a shared symmetric key verification and signing are the same capability.
+A single compromised service is a full authentication bypass across the estate.
+Moving to RS256, issuer holds the private key, everyone else fetches the public key from a JWKS endpoint, reduced the blast radius from eleven services to one, and made key rotation a matter of publishing a new JWKS entry rather than coordinating an eleven-way secret change.
+
+-- pause --
+Section 12. Randomness: RandomNumberGenerator versus Random.
+
+-- pause --
+The Two Classes.
+
+Microsoft's own note on the Random class page is the citation to use: "To generate a cryptographically secure random number, such as one that's suitable for creating a random password, use one of the static methods in the RandomNumberGenerator class."
+
+The mechanism behind that note: Random is a deterministic algorithm advanced by internal state. Its entire future output is a function of that state.
+An attacker who can observe enough outputs can, for a known algorithm, recover the state and predict everything that follows, including values you never showed them. A CSPRNG is designed so that observing output gives no computational advantage in predicting further output.
+
+-- pause --
+The A P I Surface.
+
+RandomNumberGenerator 's remarks say it plainly: "Using the static members of this class is the preferred way to generate random values." You almost never need RandomNumberGenerator.Create().
+
+Version gates, checked against the member pages: GetBytes, Fill, GetInt32 and GetNonZeroBytes are long-standing;
+GetHexString and GetItems are documented from dot NET 8, and GetString and Shuffle sit in the same group, check the moniker list on the member page before relying on one from a library that multi-targets.
+
+Two A P I details worth noticing:
+
+** GetHexString(int string Length, bool lowercase = false) takes a length in characters, not bytes.** GetHexString(32) gives you 32 hex characters, which is 16 bytes = 128 bits of entropy. If you wanted 256 bits, you want GetHexString(64).
+This off-by-two is an easy way to ship a token that is half as strong as you think.
+GetInt32(int to Exclusive) is unbiased. Writing RandomNumberGenerator.GetBytes(4) and taking % range yourself introduces modulo bias, because the byte range does not divide evenly by the target range. Use the provided method.
+
+-- pause --
+Guid.NewGuid() as a Secret, Why Not.
+
+This is a standard question with a standard wrong answer, and the dot NET documentation answers it for you in remarkably direct language. From the Guid.NewGuid remarks:
+
+"On Windows, this function wraps a call to the CoCreateGuid function. The generated GUID contains 122 bits of strong entropy."
+
+"On non-Windows platforms, starting with dot NET 6, this function calls the operating system's underlying cryptographically secure pseudo-random number generator (CSPRNG) to generate 122 bits of strong entropy.
+In previous versions of dot NET, the entropy is not guaranteed to be generated by a CSPRNG."
+
+"It is recommended that applications not use the NewGuid method for cryptographic purposes. First, since a Version 4 UUID has a partially predictable bit pattern, the NewGuid function cannot serve as a proper cryptographic pseudo-random function (PRF).
+Second, NewGuid utilizes at most 122 bits of entropy, regardless of platform. Some cryptographic components set a minimum entropy level on their inputs as a matter of policy. Such policies often set the minimum entropy level at 128 bits or higher."
+
+"If an application requires random data for cryptographic purposes, consider using a static method on the RandomNumberGenerator class."
+
+Unpack that into four points you can deliver:
+
+The type does not carry a CSPRNG guarantee across its history. On non-Windows platforms the CSPRNG guarantee only holds from dot NET 6 onward; before that, the docs say the entropy "is not guaranteed to be generated by a CSPRNG". A library targeting older runtimes cannot assume it.
+A v4 UUID has a partially predictable bit pattern. Six bits are fixed as version and variant markers, so 128 bits of GUID carry at most 122 bits of entropy, and those 6 bits are in known positions.
+122 < 128. Many policies and primitives set a 128-bit floor. A GUID cannot meet a 128-bit-minimum requirement no matter what the platform does.
+The docs tell you to use RandomNumberGenerator instead. You are not offering an opinion; you are quoting the A P I reference.
+
+Add the specification-level version if you want to close it hard. RFC 9562, which supersedes RFC 4122 for UUIDs, states in its Security Considerations: "Implementations SHOULD NOT assume that UUIDs are hard to guess.
+For example, they MUST NOT be used as security capabilities (identifiers whose mere possession grants access)." A password-reset link with a GUID in it is precisely a security capability.
+
+And Guid.CreateVersion7() (dot NET 9+) is worse, not better, for this. A v7 UUID embeds a Unix-epoch timestamp so that IDs sort by creation time, excellent for database index locality, actively harmful for secrecy, because a large, structured, guessable chunk of the value is derived from the clock.
+RFC 9562 makes the same point: "If UUIDs are required for use with any security operation within an application context in any shape or form, then UUIDv4 SHOULD be utilized", and even then, per the paragraph, not as a capability.
+
+In the real world: a password-reset flow emails a link containing Guid.NewGuid(), valid for 24 hours, with no rate limit on the reset-consume endpoint. The team's reasoning was "there are 2¹²² of them".
+The actual exposure came from somewhere else entirely: the GUID was also written to an access log that a third-party log-shipping integration could read, and it appeared in the Referer header when the reset page loaded an external font.
+Neither of those is a guessing attack, but both were only exploitable because the token in the URL was the entire authorisation.
+The redesign generated the token with RandomNumberGenerator.GetBytes(32), stored only its SHA-256 in the database, scoped it to a single user id, expired it in 15 minutes, invalidated it on use, and stopped logging URLs with query strings.
+
+-- pause --
+How Much Entropy, and How to Encode It.
+
+Rules of thumb you can defend: 128 bits is the floor for anything long-lived (A P I keys, session identifiers), 256 bits for anything you would rather over-provision (they cost 16 extra bytes).
+Short human-typed codes, OTPs, device-pairing codes, deliberately have low entropy and must therefore be defended by rate limiting and short expiry, not by the code's length. A 6-digit code has a search space of 10⁶, that is
+log₂(10⁶) approximately 20 bits; the only reason that is acceptable is the attempt ceiling and the short window around it. Get the rate limit wrong and a 6-digit code is guessable by brute force, which is a real and repeatedly-exploited failure of MFA implementations.
+
+-- pause --
+Section 13. Storing Tokens and A P I Keys at Rest.
+
+A question that separates candidates: "You issue A P I keys. How do you store them?"
+
+The wrong answers are "encrypted in the database" (better than plaintext, but you now have a key that decrypts every customer's credential, and an application compromise reveals all of them) and "hashed with bcrypt" (defensible, but you have to run a slow KDF on every single A P I request,
+which is a self-inflicted performance problem).
+
+The right answer distinguishes low-entropy secrets from high-entropy secrets:
+
+Notice what falls out of hashing rather than encrypting: the lookup is an indexed equality search on the hash, so you get O(1)-ish verification and you never hold the plaintext key at all.
+You cannot email a lost key back to a customer, which is the correct behaviour, and is exactly why every provider you have ever used shows an A P I key once and then only its prefix.
+
+In the real world: a platform stores A P I keys encrypted with a single application-wide AES key so support staff can read a key back to a customer who lost it.
+The convenience feature becomes the incident: a read-only database export shared with a vendor is combined with a key that turned up in a container image layer, and every customer's live key is recoverable. Rotating meant contacting every integrator.
+The design that avoids it is not more encryption, it is hashing plus "you can't have it back, generate a new one", a support process change that eliminates a class of breach.
+
+-- pause --
+Section 14. A S P dot NET Core Data Protection.
+
+-- pause --
+What It Is, and Why "Don't Roll Your Own" Has an Address.
+
+Everything in the previous sections, pick an algorithm, generate a key, store it somewhere, rotate it, keep old keys for decryption, bind the ciphertext to a context,
+authenticate as well as encrypt, is work you should not be doing by hand for the common case of "protect a short-lived payload inside my own application".
+A S P dot NET Core's Data Protection stack does it, and the framework already uses it for authentication cookies, antiforgery tokens, and TempData.
+
+-- pause --
+Purposes Are Isolation, Not Naming.
+
+From the purpose-strings documentation: "The purposes parameter is inherent to the security of the data protection system, as it provides isolation between cryptographic consumers, even if the root cryptographic keys are the same." The purpose string is fed into subkey derivation,
+so two protectors with different purposes cannot read each other's payloads even though they share a key ring.
+
+Three rules from the docs, each of which is a potential cross-question:
+
+The purpose need not be secret, only unique. The recommended convention is the namespace and type name of the consuming component, with a version suffix ( Contoso.Security.BearerToken.v1 ) so a future format change is automatically isolated from the old one.
+Purposes are an array and are hierarchical. CreateProtector(["Contoso.Messaging.SecureMessage", $"User: {username}"]) gives per-user isolation for free, a payload minted for user A cannot be unprotected for user B. This is the clean multi-tenant pattern.
+**Never let untrusted input be the sole source of the purposes chain.** The docs' own example: a component that calls CreateProtector([username]) can be tricked by a user registering the name Contoso.Security.BearerToken into minting payloads that another component will accept as bearer tokens.
+Always anchor the chain with a component-owned constant first.
+
+-- pause --
+The Key Ring.
+
+The documented specifics:
+
+A new key gets an activation date of now + 2 days and an expiration of now + 90 days. The 2-day delay exists so the key can propagate to every machine reading the same store before it goes live.
+Default key lifetime is 90 days, configurable via SetDefaultKeyLifetime, and cannot be shorter than 7 days.
+Rolling is automatic: if the default key will expire within 2 days and no successor exists, the system persists a new key activating at the old key's expiry.
+The key ring is cached in memory and re-read approximately every 24 hours, or when the current default key expires, whichever comes first.
+The default payload algorithms are AES-256-CBC for confidentiality and HMACSHA256 for authenticity, with a 512-bit master key from which per-payload subkeys are derived.
+Deleting a key is destructive and permanent, the docs' word is "truly destructive behavior", because there is no override the way there is for revoked keys. A IDeletableKeyManager.DeleteKeys A P I exists for extreme cases; the guidance is not to.
+
+-- pause --
+What Breaks in a Multi-Instance Deployment.
+
+This is the highest-value part of the topic, because the failure is common, the symptom is confusing, and the cause is a default.
+
+Data Protection guesses where to put keys. From the documented heuristic, in order:
+
+Azure App Service to %HOME%\A S P dot NET\DataProtection-Keys, network-backed and synchronised across all machines hosting the app. Not protected at rest. Deployment slots do not share a key ring, swapping Staging into Production means the new slot cannot decrypt what the old one protected.
+User profile available to %LOCALAPPDATA%\A S P dot NET\DataProtection-Keys, encrypted at rest with DPAPI on Windows.
+IIS-hosted to the HKLM registry, ACLed to the worker process account, DPAPI-encrypted.
+None of the to "keys aren't persisted outside of the current process. When the process shuts down, all generated keys are lost."
+
+Case 4 is the container case, and it is where teams get hurt. A plain Linux container with no writable user profile hits the fallback, so every replica generates its own in-memory key ring, and every restart throws it away.
+
+Two things must be true for multiple instances to share protected payloads:
+
+Point 3 is the one nobody expects, and the docs warn about it twice:
+"If you specify an explicit key persistence location, the data protection system deregisters the default key encryption at rest mechanism, so keys are no longer encrypted at rest." You fixed the sharing problem and silently created an at-rest problem.
+Always pair PersistKeysTo* with ProtectKeysWith*.
+
+Point 2 matters because SetApplicationName sets DataProtectionOptions.ApplicationDiscriminator, and "for the apps to be able to read each other's cryptographic payloads, they must have the same application discriminator." Without it,
+the discriminator is derived from the content root path, which differs between a container and a dev box, and can differ between two deployments of the same app.
+
+Storage options, all documented: PersistKeysToFileSystem (a shared volume or UNC path), PersistKeysToAzureBlobStorage, PersistKeysToStackExchangeRedis, PersistKeysToDbContext (E F Core, requires IDataProtectionKeyContext ), PersistKeysToRegistry (Windows only), or a custom IXmlRepository.
+
+️ The Redis footgun, straight from the docs: "Redis doesn't persist data by default when restarting. This can cause Data Protection to issue new keys, invalidating previously protected data." You chose Redis to solve the shared-key-ring problem and got a key ring that evaporates on a cache restart.
+Enable Redis persistence, or pick a store that is durable by nature.
+
+In the real world: a team moves an A S P dot NET Core app from a single V M to a three-replica Kubernetes deployment. Users start reporting random logouts.
+Because the failures are intermittent and correlate with load, the team spends a week on the load balancer, then enables session affinity, which makes the symptom disappear. Six months later a rolling deploy logs everyone out anyway, because affinity cannot help when the pod itself is replaced.
+The actual cause was there from day one: no shared key ring, so each pod's authentication cookies were unreadable by its peers. Session affinity masking a logout bug is a diagnostic, not a fix.
+
+In the real world: a team on Azure App Service uses slot swapping for zero-downtime deploys and cannot understand why every swap signs out their whole user base for a few minutes.
+The documented behaviour is that separate deployment slots do not share a key ring, Staging protected cookies with Staging's keys, and after the swap those keys are no longer the ones the Production slot reads.
+The documented fix is an external key ring provider (Blob Storage, Key Vault, sequel, Redis) so the key ring is slot-independent. They had been treating a configuration default as an unavoidable cost of slot swapping.
+
+-- pause --
+Time-Limited Payloads.
+
+For a payload that must expire, a share link, a magic login link, a signed download URL, there is a purpose-built interface rather than a timestamp you have to remember to check:
+
+The expiry is inside the authenticated payload, so a user cannot extend it by editing anything. Note the documented scope limit: "It is intended that payload lifetimes be somewhat short.
+Payloads protected via this mechanism are not intended for long-term persistence (for example, longer than a few weeks)."
+
+-- pause --
+What Data Protection Is Not For.
+
+Being able to state the boundary is as valuable as knowing the A P I:
+
+Not for long-term data at rest. Keys roll every 90 days and old keys can be deleted or lost; the whole design assumes short-lived payloads. Encrypting a column of customer records with IDataProtector and expecting to read it in five years is a data-loss plan.
+Use envelope encryption with a KMS and an explicit key ID.
+Not for data shared with something outside your application boundary. The format is a dot NET implementation detail with no cross-platform consumer.
+Not a substitute for a secret store. It protects payloads your app produces; it does not manage your database password.
+Not for passwords. Data Protection is reversible. Passwords must not be.
+
+-- pause --
+Section 15. Where T L S Fits.
+
+-- pause --
+One Sentence.
+
+T L S protects data in transit between two endpoints. It says nothing about data at rest, and nothing about what happens to the data once it arrives.
+
+-- pause --
+What T L S Gives You.
+
+Confidentiality in transit, maps to, Symmetric encryption of the session (keys agreed in the handshake).
+Integrity in transit, maps to, The record-layer AEAD, a tampered record fails to authenticate.
+Server authentication, maps to, The certificate chain, validated against a trust store.
+Client authentication, maps to, Only with mutual T L S, which is opt-in and rarely on by default.
+
+-- pause --
+What It Does Not Give You.
+
+Anything at rest. The database file, the backup, the log, the S three bucket, the cache, T L S never touched any of them.
+Anything after termination. Most production T L S terminates at a load balancer, C D N or ingress controller. Traffic from there to your app is a separate hop that must be secured separately, and frequently is not.
+Protection from your own logging. A request body arrives decrypted. If you log it, the secret is now in plaintext in your log pipeline, your log vendor, and your log backups.
+Protection from the endpoints. T L S protects the wire, not the parties. A compromised server sees everything.
+Field-level access control. T L S is all-or-nothing for the connection; it cannot encrypt one column so that the DBA cannot read it.
+
+-- pause --
+Why "We Use H T T P S" Does Not Answer "How Do You Store This at Rest".
+
+Because they are answers to different questions, and the interviewer is checking whether you notice. Line them up:
+
+Can someone on the network read this?, maps to, T L S.
+Can someone with a database backup read this?, maps to, Encryption at rest / hashing / tokenisation.
+Can someone with production log access read this?, maps to, Redaction at the logging boundary.
+Can a DBA read this column?, maps to, Application-level or field-level encryption.
+Can an attacker who dumped the users table log in as someone?, maps to, Password hashing with a KDF.
+Can someone who steals this token replay it?, maps to, Short expiry, binding, revocation.
+
+The senior move when handed "we use H T T P S" as an answer is to ask where T L S terminates and what happens after. In practice the answer is a load balancer, and the next question, "is the hop from the load balancer to the pod encrypted?", is often the first time anyone has thought about it.
+
+In the real world: an audit finding says customer national-insurance numbers must be encrypted. The team's response is that the site is H T T P S-only with HSTS. The auditor asks to see a database backup, opens it in a text editor, and reads the numbers. H T T P S was never the control in question.
+The remediation was field-level encryption with AES-GCM and a KMS-held key, with the tenant id and column name as associated data so a ciphertext could not be moved between rows or columns. Total change: one value converter and a key policy.
+The week it took to agree that H T T P S was not the answer was longer than the week it took to build.
+
+In the real world: a team enables T L S 1.3 everywhere and closes the security ticket.
+Two months later a support engineer finds full request bodies, including card-holder names and a password field from the signup endpoint, in the log aggregator, retained for a year, searchable by anyone with a read seat.
+The request had been decrypted the instant it reached the application, and structured logging serialised the whole model. T L S ends where your code begins, and the logging boundary is where most plaintext leaks actually happen.
+
+-- pause --
+Practical Notes.
+
+Prefer T L S 1.2 as a floor and T L S 1.3 where available. In dot NET, leave SslProtocols at the system default rather than pinning a list, the platform's default moves forward with operating system policy, and a hard-coded list becomes a liability the moment a protocol version is deprecated.
+UseHsts() and UseHttpsRedirection() in A S P dot NET Core handle the browser side. HSTS is a browser instruction and does nothing for A P I-to-A P I traffic.
+Certificate pinning is a real control and a real operational hazard: pin the wrong thing and a routine CA rotation takes your mobile fleet offline. Mention it as a trade-off, never as an unconditional recommendation.
+mutual T L S is where you go when you need to authenticate the client at the transport layer, service-to-service inside a mesh is the common case.
+
+-- pause --
+Section 16. Choosing a Primitive, Decision Table.
+
+Make binary safe for a URL / header / Jason, Base64Url (dot NET 9+) or Convert.ToBase64String, Anything, as a security control.
+Verify a downloaded file is intact, SHA256.HashData, MD5, SHA-1.
+Verify a payload came from a known partner, HMACSHA256.HashData + FixedTimeEquals, Unkeyed hash.
+Store a user password, PasswordHasher (raise IterationCount ) or Argon2id via a package, SHA256.HashData, MD5, encryption.
+Store an A P I key you generated, SHA256.HashData of a 256-bit random value, Encryption; plaintext; a slow KDF.
+Encrypt a field in your own database, AesGcm + a KMS-held key + key ID + AAD, Aes in CBC with no MAC.
+Protect a short-lived payload inside one app, IDataProtector, Hand-rolled AES.
+Expire a share link cryptographically, ITimeLimitedDataProtector, A timestamp in the URL.
+Generate a session id / token / salt / nonce, RandomNumberGenerator, Random, Guid.NewGuid, Guid.CreateVersion7.
+Sign a J W T for many verifiers, RSA ( RS256 / PS256 ) or ECDSA ( ES256 ), HS256 with a widely-shared secret.
+Sign where only two parties are involved, HMAC, Asymmetric, if you don't need non-repudiation.
+Prove who sent something, undeniably, Digital signature, HMAC, both sides can produce it.
+Protect data on the wire, T L S, Application-layer encryption instead of T L S.
+Protect data in a backup, Encryption at rest with managed keys, T L S.
+
+-- pause --
+Section 17. Common Pitfalls.
+
+-- pause --
+1. Calling Base64 Encryption.
+
+Covered at length above; it remains the single most common error in this area. The tell in a code review is a variable named encrypted assigned from Convert.ToBase64String.
+
+-- pause --
+2. SHA256.HashData(password).
+
+Fast by design, therefore wrong by design. Often accompanied by "but we salted it", salting a fast hash removes precomputation but does nothing about the attacker's guess rate, which is the actual threat.
+
+-- pause --
+4. Reusing a GCM Nonce.
+
+A zero nonce, a nonce derived from a database identifier, a counter that resets on restart. Any of these is a full break of both confidentiality and integrity for that key. Random 12 bytes per message.
+
+-- pause --
+5. AES-CBC With No MAC.
+
+Malleable, and a padding-oracle candidate. If you must use CBC, encrypt-then-MAC with a separate key and verify before decrypting. Prefer AesGcm.
+
+-- pause --
+6. Verifying a Signature Over Re-Serialised Jason.
+
+Sign and verify the exact bytes received. Model binding and re-serialisation change whitespace, property order and number formatting.
+
+-- pause --
+7. Guid.NewGuid() as a Secret.
+
+At most 122 bits, a partially predictable bit pattern, and the dot NET docs explicitly recommend against it for cryptographic purposes. Guid.CreateVersion7() is worse because it embeds a timestamp.
+
+-- pause --
+8. No Shared Data Protection Key Ring.
+
+Multi-replica deployment with the default key storage heuristic. Symptom: random logouts, antiforgery failures, everyone signed out on deploy. Fix: PersistKeysTo* + SetApplicationName + ProtectKeysWith*.
+
+-- pause --
+9. Adding PersistKeysTo* and Forgetting ProtectKeysWith*.
+
+Specifying an explicit key repository deregisters the default at-rest key encryption. You solved sharing and quietly created a plaintext key ring.
+
+-- pause --
+10. Hard-Coding a Key Anywhere in the Repository.
+
+Including "just for the test environment" and "it's only base64'd". Git remembers. Rotating a leaked key means rotating everything it ever protected.
+
+-- pause --
+11. Distinguishing Failure Reasons to the Caller.
+
+"Invalid padding" versus "invalid MAC", "no such user" versus "wrong password", "expired token" versus "invalid token", each distinction is an oracle. One generic failure, one status code, one message, and comparable timing.
+
+-- pause --
+12. Encrypting What Should Be Hashed.
+
+Passwords, A P I keys, reset tokens. If you never need the original value back, do not keep the ability to get it back. Reversibility you do not need is a liability you do not need.
+
+-- pause --
+13. Rolling Your Own KDF or MAC Construction.
+
+H(key || message) is length-extension-vulnerable. A loop calling SHA-256 "a lot of times" is not PBKDF2. Use HMACSHA256, use Rfc2898DeriveBytes.Pbkdf2.
+
+-- pause --
+14. No Key ID in the Ciphertext.
+
+Without an identifier saying which key encrypted a payload, rotation requires re-encrypting everything atomically, so rotation never happens. Prefix the key id.
+
+-- pause --
+15. Treating "It's Internal" as a Mitigation.
+
+Internal networks reduce network noise, which makes timing attacks easier. They also do nothing about a compromised service, a misconfigured mesh, or an insider. Verify signatures and use fixed-time comparison on internal endpoints too.
+
+-- pause --
+16. Obsolete A P Is Left in Place.
+
+SYSLIB0041 ( Rfc2898DeriveBytes constructors defaulting to SHA-1 and a low iteration count) and SYSLIB0053 ( AesGcm constructors that infer the tag size). Both are obsoletions with a security rationale, not tidy-ups, do not suppress them with NoWarn and move on.
+
+-- pause --
+Section 18. Best Practices.
+
+Name the primitive before the algorithm. Decide whether you need encoding, hashing, a MAC, or encryption. The algorithm choice is downstream of that and usually obvious once the primitive is settled.
+Use the highest-level A P I that solves the problem. IDataProtector over AesGcm over Aes. Every level you descend is another chance to make a joinery mistake.
+Default to AEAD. AesGcm with a 12-byte random nonce and a 16-byte tag, and use associated data to bind ciphertext to its context.
+Never reuse a (key, nonce) pair. Random nonce per message unless you can prove a counter cannot repeat across restarts, replicas and restores.
+Password storage: a KDF with a tuned work factor, a per-user salt stored beside the hash, and a self-describing format. Raise Identity's IterationCount the 100,000 default and re-hash on SuccessRehashNeeded.
+Compare every secret with CryptographicOperations.FixedTimeEquals. Make it a review checklist item and a lint rule if you can.
+Generate every secret with RandomNumberGenerator. 128 bits minimum, 256 bits when you can afford the width. Never Random, never a Guid.
+Hash high-entropy secrets at rest with SHA-256; hash low-entropy secrets with a KDF. Do not slow-hash an A P I key and do not fast-hash a password.
+Store a key ID with every ciphertext so rotation is possible without a global re-encryption.
+Keys live in a KMS or secret store, never in source, config files, or images. Grant access with a managed identity.
+*Data Protection in production: PersistKeysTo + SetApplicationName + ProtectKeysWith*.** All three, always. Verify the key ring is shared before you scale out, not after.
+Use distinct, versioned purpose strings, anchored with a component-owned constant, with untrusted input only ever appended.
+Fail uniformly. One error shape for all cryptographic failures, and comparable timing on both paths.
+Redact at the logging boundary. T L S ends at your code; the log pipeline is where plaintext escapes.
+Never suppress a SYSLIB crypto obsoletion. Read the diagnostic page, each one exists because the old A P I had a security-relevant defect.
+Write down where T L S terminates. If you cannot say, that is the first thing to find out.
+
+-- pause --
+Section 19. Real-World Scenarios.
+
+-- pause --
+Scenario 1: Encrypting a PII Column with Rotation Support.
+
+Problem: national-insurance numbers must be encrypted at rest, searchable by exact match, with key rotation possible without a big-bang re-encryption.
+
+Solution:
+
+Decisions and why: AES-GCM because the field must be tamper-evident as well as unreadable; AAD so a ciphertext cannot be relocated between tenants or columns; a key id column so rotation is lazy, new writes use the current key, reads look up the key that was used;
+a keyed blind index because a plain SHA-256 of a NINO is brute-forceable (the format constrains the space to something small) whereas an HMAC is not without the key.
+
+-- pause --
+Scenario 2: Migrating a Legacy Password Store.
+
+Problem: an acquired system stores unsalted SHA-1 password hashes. You cannot force a reset for 400,000 users on day one.
+
+Solution: dual-format storage plus opportunistic upgrade.
+
+The part people forget: set a deadline. Track the percentage still on the legacy format, and force a reset for the remainder at a fixed date. Otherwise dormant accounts keep SHA-1 hashes forever, and dormant accounts are exactly the ones nobody notices being taken over.
+
+An alternative worth knowing for the cross-question: wrap rather than migrate.
+Store PBKDF2(SHA1(password)) for every legacy row in a single offline pass, so the whole table is strengthened immediately without anyone logging in, at the cost of a slightly odd composite format you must carry until each user next signs in.
+
+-- pause --
+Scenario 3: Signed, Expiring Download Links.
+
+Problem: authenticated users generate share links to private documents. The link must work without a session, expire in 15 minutes, and be unforgeable.
+
+Solution:
+
+Decision: ITimeLimitedDataProtector rather than a hand-rolled ?expires=. and sig=., because the expiry travels inside the authenticated payload and the framework handles the key ring.
+Note that the token still identifies who it was granted to, so revoking a user's access can be enforced at redemption time, a purely cryptographic link with no server-side check cannot be revoked before it expires.
+
+-- pause --
+Scenario 4: Verifying Inbound Webhooks from Three Providers.
+
+Problem: three payment providers, three signature schemes: one HMAC-SHA256 hex, one HMAC-SHA256 base64 over timestamp.body, one RSA-SHA256 over the raw body.
+
+Solution: one abstraction, three implementations, one shared discipline.
+
+Decision: keyed services (see Dependency Injection) to resolve the verifier by provider name, so adding a fourth provider is a registration rather than a switch.
+The shared discipline lives in a test suite that runs the same three adversarial cases, tampered body, replayed old timestamp, truncated signature, against every implementation.
+
+-- pause --
+Section 20. Interview-Ready Summary.
+
+Encoding is reversible without a key and is not a security control. Base64 is encoding. Hashing is one-way with no key. Encryption is reversible with a key. If the sentence has no key in it and claims confidentiality, it is wrong.
+A J W T is signed, not encrypted. Anyone can read the claims; nobody can change them without the key.
+SHA-256 is right for integrity and wrong for passwords, for the same reason: it is fast. Speed is a feature when you are checksumming a file and a bug when an attacker is guessing candidates from a wordlist.
+Password storage needs a tunable work factor, a unique per-user salt stored beside the hash, and a self-describing format. The salt is not secret; it kills precomputation and cross-account correlation. A pepper is the site-wide secret and lives outside the database.
+A S P dot NET Core Identity's PasswordHasher uses PBKDF2 with HMAC-SHA512, a 128-bit salt, a 256-bit subkey and a default of 100,000 iterations ( PasswordHasherOptions.IterationCount ), in the V3 format { 0x01, prf, iterations, salt length, salt, subkey }.
+OWASP's current floor for PBKDF2-HMAC-SHA512 is 220,000, so the default is the recommendation, raise it, and migrate via PasswordVerificationResult.SuccessRehashNeeded.
+Argon2 is not in the BCL (dotnet or runtime#19933). Your in-box option is PBKDF2; anything else is a third-party dependency in the auth path.
+HMAC turns integrity into authenticity because it is keyed. It cannot give non-repudiation, both parties hold the key. Only a signature can.
+Compare secrets with CryptographicOperations.FixedTimeEquals. It is documented as taking time proportional to length but not values, so it does not hide length. VerifyHmac packages compute-and-compare, but it is dot NET 11, not dot NET 10.
+Default to AES-GCM. 12-byte nonce, 16-byte tag, associated data to bind context. The tag-size-less AesGcm constructors are obsolete (SYSLIB0053) precisely because inferring the tag size weakened authentication.
+Never reuse a (key, nonce) pair in GCM, it breaks confidentiality and lets an attacker forge tags.
+Raw AES-CBC has no integrity, which makes it malleable and padding-oracle-prone. Encrypt-then-MAC, or just use GCM. Data Protection's own default is AES-256-CBC + HMACSHA256, encrypt-then-MAC, assembled correctly by the framework.
+RSA verification is cheap and signing is expensive; ECDSA is the reverse. Prefer RSASignaturePadding.Pss for new work. For ECDSA interop, know that DSASignatureFormat distinguishes DER from the fixed-length r‖s that JOSE uses.
+RandomNumberGenerator for anything secret; Random for anything else. The Random docs say so explicitly.
+Guid.NewGuid() is not a secret: at most 122 bits, a partially predictable v4 bit pattern, and the docs recommend against cryptographic use and point you at RandomNumberGenerator. RFC 9562 adds that UUIDs "MUST NOT be used as security capabilities".
+Guid.CreateVersion7() is worse, it embeds a timestamp.
+Hash high-entropy secrets with SHA-256, not a KDF. There is no wordlist for a 256-bit random value, so slowing the hash costs you throughput and buys nothing.
+Data Protection defaults: AES-256-CBC + HMACSHA256, 512-bit master key, 90-day key lifetime, 2-day activation delay, ~24-hour key ring refresh, purposes derive isolated subkeys. Created or active or expired keys all decrypt; revoked ones do not; deleting a key is irreversible data loss.
+Multi-instance without a shared key ring means random logouts and antiforgery failures. You need PersistKeysTo* and SetApplicationName and ProtectKeysWith*, because naming an explicit store deregisters at-rest key encryption. Sticky sessions masking the symptom is a diagnostic, not a fix.
+T L S protects one hop, in transit. It terminates at the load balancer, it does not touch backups, logs or the database, and "we use H T T P S" answers a different question from "how do you store this at rest".
+
+-- pause --
+Section 21. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once does not make you interview-ready, and in security material a half-remembered answer is worse than none, it produces confident wrong recommendations. Cover the answers, write them cold, then check.
+Where a drill quotes a number, learn the source alongside the number.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Encoding versus hashing versus encryption.
+
+Q: What's the difference between encoding, hashing and encryption?-- think --
+
+A: Encoding is reversible with no key, Base64, hex, URL-encoding. It exists to make bytes survive a transport that can't carry them, and it is not a security control, because anyone who can see the encoded value can decode it.
+Hashing is one-way with no key: fixed-size output, no "unhash", you verify by re-computing and comparing. Encryption is reversible with a key: the security lives entirely in the key, and everything else is assumed public.
+One-line test: if the operation has no key and someone claims it provides confidentiality, they are wrong.
+
+Cross-Q: Where does an HMAC fit in that taxonomy?-- think --
+
+A: It is a keyed hash, one-way like a hash, but with a key like encryption, and it provides authenticity rather than confidentiality.
+The distinction that matters: a plain hash tells you "this hasn't changed since somebody hashed it", which is worthless if the attacker can rewrite the stored digest as well as the data. An HMAC tells you "this hasn't changed since someone holding the key hashed it".
+So it belongs in the hashing column structurally, but in the security model it does a job neither plain hashing nor encryption does.
+
+Cross-Q²: A colleague says "we base64-encode the token before putting it in the URL, so it's protected." Correct them precisely.-- think --
+
+A: Two separate things are being conflated. Base64url in a URL is correct and necessary, the standard Base64 alphabet contains +, / and =, all of which are meaningful in a URL, so encoding is a genuine transport fix.
+But it contributes nothing to protection: no key is involved and any observer decodes it in one command.
+If the token in that URL is a bearer capability, the controls that matter are entropy (256 bits from RandomNumberGenerator ), short expiry, single use, storing only the hash server-side, and keeping URLs with query strings out of logs and Referer headers.
+The encoding is orthogonal to every one of those.
+
+-- pause --
+Drill 2, Why not SHA-256 for passwords.
+
+Q: Why can't you store passwords as SHA-256?-- think --
+
+A: Because SHA-256 is designed to be fast, and the threat model is an offline attacker who has the whole table and wants to test candidate passwords.
+Human-chosen passwords come from a small, predictable distribution, a wordlist plus mutations, not 2²⁵⁶, so the attacker's success is bounded by their guess rate, and a fast hash maximises it.
+A password KDF deliberately spends C P U (and, for Argon2 or scrypt, memory) per guess, so the attacker's rate collapses while the honest server pays the cost once per login.
+
+Cross-Q: We salt our SHA-256. Does that fix it?-- think --
+
+A: No. A salt fixes a different problem. It kills precomputation, rainbow tables are built for unsalted hashes, and it removes cross-account correlation, so identical passwords no longer produce identical stored values. Both are real wins and you should salt regardless.
+But the salt does nothing to the attacker's per-guess cost: they still compute SHA-256 as fast as their hardware allows, just once per (user, candidate) pair instead of once per candidate. Against a targeted attack on one high-value account, salting changes almost nothing.
+The missing property is the work factor.
+
+Cross-Q²: What exactly does memory-hardness buy that iteration count doesn't?-- think --
+
+A: It attacks the attacker's hardware advantage rather than just their time. Iteration count scales linearly in C P U time for everyone, including someone with a rack of GPUs, you slow them down by the same factor you slow yourself down.
+GPUs and ASICs are extraordinarily good at massively parallel SHA-256 because arithmetic units are cheap to replicate. Memory is not: giving ten thousand parallel cores 19 MiB each is expensive in a way that giving them another arithmetic unit is not.
+So a memory-hard KDF narrows the gap between the defender's commodity server and the attacker's specialised hardware, which iteration count alone cannot do. That is why OWASP states the Argon2id recommendation memory-first, m set to 19456 (19 MiB), t set to 2, p set to 1 as the minimum.
+
+-- pause --
+Drill 3, What A S P dot NET Core Identity actually does.
+
+Q: What algorithm does A S P dot NET Core Identity use to hash passwords, out of the box?-- think --
+
+A: PBKDF2, not bcrypt, not Argon2. Specifically the V3 format in PasswordHasher: PBKDF2 with HMAC-SHA512, a 128-bit salt, a 256-bit subkey, and a default of 100,000 iterations.
+The stored value is { 0x01, prf, iteration count, salt length, salt, subkey } with the integers big-endian; the leading 0x01 is the format marker that distinguishes V3 from the older V2 ( 0x00, PBKDF2 with HMAC-SHA1, 1,000 iterations).
+Verification on dot NET Core uses CryptographicOperations.FixedTimeEquals.
+
+Cross-Q: Is 100,000 iterations enough?-- think --
+
+A: It is the current OWASP recommendation, and being able to say that with both numbers attributed is the point. OWASP's Password Storage Cheat Sheet lists 220,000 iterations for PBKDF2-HMAC-SHA512; Identity's PasswordHasherOptions.IterationCount documents a default of 100,000.
+So raising it is a one-line configuration change and a reasonable thing to do on any system you own. The caveat is that iteration count is meant to be tuned against your own hardware and your own latency budget, the OWASP figure is a floor, not a target, and you should measure rather than quote.
+
+Cross-Q²: You raise IterationCount in config. What happens to the 400,000 existing hashes?-- think --
+
+A: Nothing, and that is by design. Every stored V3 hash carries its own iteration count inside the payload, so existing hashes continue to verify at whatever count produced them. Only new hashes use the new value.
+The migration path is PasswordVerificationResult.SuccessRehashNeeded, documented as "password verification was successful however the password was encoded using a deprecated algorithm and should be rehashed and updated".
+A successful login is the only moment you hold the plaintext, so that is where you re-hash and update the row. UserManager.CheckPasswordAsync does this for you; a custom store has to do it explicitly.
+Practical addition: track the percentage still on old parameters and force a reset for the tail, or dormant accounts keep the weak parameters indefinitely.
+
+-- pause --
+Drill 4, Salt placement and secrecy.
+
+Q: Why is the salt stored in the same row as the hash? Doesn't that hand it to the attacker?-- think --
+
+A: Yes, and it does not matter, because the salt is a uniqueness device rather than a secrecy device. Its job is to guarantee that two users with the same password produce different stored values.
+That kills precomputed tables (they are built per-salt, so one table per user is no saving over just attacking each user) and it kills cross-account and cross-site correlation of identical passwords.
+None of those benefits depend on the attacker not knowing the salt, and verification needs the salt, so the only place it can live is beside the hash.
+
+Cross-Q: Then what is a pepper, and why would you add one?-- think --
+
+A: A pepper is a site-wide secret mixed in in addition to the per-user salt, and OWASP's phrasing is the useful one: it is "shared between stored passwords" and "should not be stored along with the generated hash". It lives in a KMS, HSM or environment secret.
+The value is scenario-specific: it defends against an attacker who obtains only the database, sequel injection, a leaked backup, because without the pepper they cannot even begin offline cracking.
+It does nothing against an attacker who has full application compromise, since the app must be able to read it. Treat it as defence in depth with a real cost: peppers are hard to rotate, because rotating one invalidates every stored hash unless you version them.
+
+Cross-Q²: How would you rotate a pepper without a mass password reset?-- think --
+
+A: Version it and re-wrap opportunistically. Store a pepper id alongside each hash; verify with the pepper that id names; on a successful login, re-hash with the current pepper and update the id. That is the same SuccessRehashNeeded shape as an iteration-count change.
+If you need the whole table moved without waiting for logins, the offline option is to store KDF_new(pepper_new, KDF_old_output), a nested construction you apply in one pass, at the cost of a composite format you carry until each user next signs in.
+Both are workable; both need the version marker, which is why "make the stored format self-describing" is the rule that keeps paying.
+
+-- pause --
+Drill 5, Timing-safe comparison.
+
+Q: Why can't you compare an HMAC with == ?-- think --
+
+A: Because == on strings and SequenceEqual on arrays return as soon as they find a mismatch, so the time taken is proportional to how many leading bytes matched.
+An attacker who can submit many candidate signatures and measure response time learns the prefix length, and can then discover the tag one byte at a time, turning a 2²⁵⁶ search into roughly 32 times 256 attempts.
+CryptographicOperations.FixedTimeEquals XORs every byte into an accumulator and checks it once at the end, so the loop always runs to completion regardless of the values.
+
+Cross-Q: What exactly does FixedTimeEquals guarantee, and what does it not?-- think --
+
+A: The documented guarantee is that it determines equality "in an amount of time that depends on the length of the sequences, but not their values". So it hides the values and not the length, if the two spans differ in length it can return early, and that leak is real.
+For a fixed-size tag (HMAC-SHA256 is always 32 bytes) that is a non-issue. For a variable-length secret it is not, and the fix is to hash both sides to a fixed size and compare the digests.
+It also protects only the comparison: if you decoded the attacker's hex with something that early-exits on invalid input, or did a database lookup keyed on the secret before comparing, the leak has just moved.
+
+Cross-Q²: Is there a single call that does compute-and-compare for an HMAC?-- think --
+
+A: Yes, but check your target framework. CryptographicOperations.VerifyHmac(HashAlgorithmName, ReadOnlySpan key, ReadOnlySpan source, ReadOnlySpan hash) returning bool is on Microsoft Learn with a moniker list of net-11.0 only.
+On dot NET 10, which is what this guide targets, you write the two steps yourself: HMACSHA256.HashData(key, source) then FixedTimeEquals. Naming the version gate rather than just naming the A P I is the part that shows you read the docs rather than an autocomplete list.
+
+-- pause --
+Drill 6, AEAD and nonces.
+
+Q: You need to encrypt a field in your database. What do you reach for and why?-- think --
+
+A: AesGcm, AES in Galois or Counter Mode, an AEAD. It gives confidentiality and integrity from one primitive and one key, so there is no second step to forget.
+Construct it with an explicit tag size ( new AesGcm(key, 16) ), use a 12-byte random nonce per message ( AesGcm.NonceByteSizes is documented as 12 bytes / 96 bits), and pass associated data that binds the ciphertext to its context, tenant id, column name, format version.
+Store nonce ‖ tag ‖ ciphertext, plus a key id so you can rotate.
+
+Cross-Q: Why does the constructor take a tag size at all? The old one didn't.-- think --
+
+A: The tag-size-less constructors were obsoleted as SYSLIB0053 in dot NET 8, and the reason is a genuine weakness. AES-GCM natively produces a 16-byte tag, and shorter tags are truncations of it.
+The old AesGcm inferred the expected tag length from whatever tag you handed to Decrypt, so if you took the tag from attacker-supplied input and passed it through, an attacker could supply a 12-byte tag and you would validate against 12 bytes, reducing the forgery difficulty.
+Declaring the size up front means Encrypt and Decrypt enforce it and a short tag is rejected rather than accepted.
+
+Cross-Q²: What actually happens if you reuse a nonce with the same key?-- think --
+
+A: It is a full break, not a degradation, and it is worth being emphatic. GCM is a counter mode: the nonce plus key produce a keystream that is XORed with the plaintext.
+Encrypt two messages under the same (key, nonce) and XORing the two ciphertexts cancels the keystream entirely, yielding the XOR of the two plaintexts, recoverable with any structure or known-plaintext.
+Worse, nonce reuse in GCM enables recovery of the authentication subkey, after which the attacker can forge valid tags for that key. So you lose confidentiality and integrity.
+That is why the advice is a random 12-byte nonce per message rather than a counter: counters look tidy and then get reset by a pod restart, a database restore, or a second replica starting at zero.
+
+-- pause --
+Drill 7, CBC without a MAC.
+
+Q: What's wrong with Aes.Create() in CBC mode, encrypting and storing the result?-- think --
+
+A: It provides confidentiality and nothing else, and "nothing else" has two sharp edges.
+Malleability: in CBC each ciphertext block is XORed into the next block's decryption, so flipping a bit in ciphertext block n flips the corresponding plaintext bit in block n+1, an attacker who knows the plaintext structure can make targeted, predictable edits without the key.
+Padding oracles: CBC needs padding, and if your decrypt path distinguishes "bad padding" from "bad content" by exception, message, status code or timing, an attacker can decrypt arbitrary ciphertext a byte at a time without ever learning the key.
+
+Cross-Q: Can you fix it by catching all exceptions and returning a single generic error?-- think --
+
+A: Not reliably, and this is the important part. You can close the explicit signals, exception types, messages, status codes, but a padding failure and a content failure typically take different amounts of work, so timing remains a channel, and it is very hard to equalise by hand.
+The structural fix is encrypt-then-MAC: MAC the ciphertext (plus the IV and any context) with a separate key, and on the way back verify the MAC before you decrypt at all. If verification fails you never enter the decryption code, so there is no oracle to probe.
+Order matters, MAC-then-encrypt forces you to decrypt before you can check, which is precisely the shape you were trying to avoid.
+
+Cross-Q²: A S P dot NET Core Data Protection defaults to AES-256-CBC. Isn't that the thing you just told me not to do?-- think --
+
+A: No, the default is **AES-256-CBC for confidentiality and HMACSHA256 for authenticity**, derived from a 512-bit master key per payload. That is encrypt-then-MAC, assembled correctly, with two derived subkeys and a comparison the framework gets right. The thing to avoid is CBC alone.
+This is actually the best argument for using Data Protection: it is exactly the construction you would otherwise hand-roll, with the parts you would be most likely to get wrong already done. If you are writing your own, AesGcm is simpler than reproducing it.
+
+-- pause --
+Drill 8, Randomness and Guid.
+
+Q: How do you generate a secure token?-- think --
+
+A: RandomNumberGenerator.GetBytes(32) for 256 bits of entropy, then encode for transport, Base64Url.EncodeToString on dot NET 9+, or Convert.ToHexString. 128 bits is the floor for anything long-lived; 256 costs sixteen extra bytes and removes the argument.
+Store only a SHA-256 of the token server-side, scope it to a subject, expire it, and invalidate it on use.
+
+Cross-Q: What's wrong with Guid.NewGuid().ToString()? It's random and it's unique.-- think --
+
+A: The dot NET documentation answers this directly, which is the best possible citation. Three points.
+One: it is at most 122 bits of entropy regardless of platform, because a v4 UUID spends six bits on version and variant markers, and the docs note that some cryptographic policies set a 128-bit minimum, which a GUID structurally cannot meet.
+Two: the docs say a v4 UUID "has a partially predictable bit pattern" and therefore "cannot serve as a proper cryptographic pseudo-random function".
+Three: on non-Windows platforms the CSPRNG guarantee only holds from dot NET 6 onward, before that "the entropy is not guaranteed to be generated by a CSPRNG". The docs close with the recommendation to use RandomNumberGenerator instead.
+At the spec level, RFC 9562's Security Considerations say implementations "SHOULD NOT assume that UUIDs are hard to guess" and "MUST NOT be used as security capabilities (identifiers whose mere possession grants access)", which is exactly what a reset link is.
+
+Cross-Q²: What about Guid.CreateVersion7() in dot NET 9+, that's newer, is it better?-- think --
+
+A: Better for databases, worse for secrets.
+A v7 UUID embeds a Unix-epoch millisecond timestamp in its high bits so that IDs sort by creation time, which is excellent for B-tree index locality and terrible for unpredictability, a large,
+structured portion of the value is derived from the clock and is therefore guessable by anyone who knows roughly when it was created.
+RFC 9562 says as much: if a UUID is needed for any security operation, v4 "SHOULD be utilized", and even then not as a capability. So CreateVersion7() is a good default for primary keys and a bad one for tokens.
+Using it as a database id and RandomNumberGenerator for the secret, as two separate columns, is the right shape.
+
+-- pause --
+Drill 9, Hashing an A P I key.
+
+Q: You issue A P I keys to customers. How do you store them?-- think --
+
+A: Generate 256 bits with RandomNumberGenerator.GetBytes(32), show the encoded key to the customer exactly once, and store only SHA256.HashData(raw), indexed. Verification hashes the presented key and does an indexed lookup by hash.
+Also store a short display prefix so the U I can show "sk_live_a7Fq. ", plus tenant, created, expires and revoked columns.
+
+Cross-Q: Why SHA-256 and not bcrypt? You just spent five minutes telling me fast hashes are bad.-- think --
+
+A: Because the reason fast hashes are bad for passwords does not apply. A KDF's whole purpose is to make each guess expensive, and guessing is only a threat when the search space is small, human-chosen passwords come from a wordlist.
+A 256-bit value generated by a CSPRNG has no wordlist and no structure; there is nothing to guess. Slowing the hash therefore buys zero security and costs you a KDF on every single A P I request, which is a self-inflicted latency and capacity problem.
+The rule is entropy-driven: low-entropy secret to slow KDF; high-entropy secret to fast hash.
+
+Cross-Q²: Why hash at all rather than encrypt, given support would like to read a key back to a customer?-- think --
+
+A: Because encryption means you retain the ability to recover every customer's live credential, so a database export plus a leaked key is a total compromise, and application compromise is enough on its own, since the app must be able to decrypt.
+Hashing removes the capability entirely: there is no key in your system that turns the stored value back into a credential. The support workflow that wants read-back is the thing to change, not the storage.
+"You can't have it back, generate a new one" is what every provider you have ever integrated with does, and it is why.
+The operational tell that you got it right: a hash also gives you an indexed equality lookup, so verification is a single index seek with no secret comparison in application code at all.
+
+-- pause --
+Drill 10, Data Protection in a multi-instance deployment.
+
+Q: You move an A S P dot NET Core app from one V M to three replicas and users start getting randomly logged out. What happened?-- think --
+
+A: No shared Data Protection key ring.
+Authentication cookies are protected with IDataProtector, and by default the system guesses where to store keys: Azure App Service uses a network-backed %HOME%\A S P dot NET\DataProtection-Keys; a machine with a user profile uses %LOCALAPPDATA%, DPAPI-encrypted on Windows;
+IIS uses an ACLed HKLM registry key.
+If none of those apply, the plain container case, the documented behaviour is that "keys aren't persisted outside of the current process. When the process shuts down, all generated keys are lost." So each replica has its own in-memory key ring and cannot decrypt its peers' cookies.
+Random logouts is exactly the expected symptom.
+
+Cross-Q: The team turned on sticky sessions and the problem went away. Is that a fix?-- think --
+
+A: No, it is a diagnostic. If session affinity fixes a logout bug, you have proved the instances disagree about keys. Affinity papers over steady-state traffic and fails the moment the pod a user is pinned to is replaced: every rolling deploy, every autoscale-down, every crash.
+It also blocks you from ever load-balancing properly. The real fix is three calls: PersistKeysTo* for a shared durable store, SetApplicationName so every instance uses the same application discriminator, and ProtectKeysWith* for at-rest key encryption.
+
+Cross-Q²: Why is ProtectKeysWith* in that list, the default was encrypting keys at rest already, wasn't it?-- think --
+
+A: It was, and specifying an explicit store turns it off.
+The documentation warns about this twice: "If you specify an explicit key persistence location, the data protection system deregisters the default key encryption at rest mechanism,
+so keys are no longer encrypted at rest." So the moment you add PersistKeysToFileSystem or PersistKeysToAzureBlobStorage to fix the sharing problem, you have silently created a plaintext key ring, and that key ring protects every auth cookie in the system.
+Pair it with ProtectKeysWithAzureKeyVault, ProtectKeysWithCertificate or ProtectKeysWithDpapi.
+A related trap in the same family: if you pick Redis as the shared store, the docs note Redis "doesn't persist data by default when restarting", so a cache restart discards the key ring and invalidates everything, enable persistence or choose a durable store.
+
+-- pause --
+Drill 11, Purpose strings.
+
+Q: What is the purpose parameter on CreateProtector for?-- think --
+
+A: Isolation, not naming. The documentation calls it "inherent to the security of the data protection system" because the purpose is fed into subkey derivation: two protectors with different purposes derive different subkeys from the same key ring and therefore cannot read each other's payloads.
+So a share-link token can never be replayed as a bearer token, even though both were minted by the same application with the same master key. The convention is namespace-plus-type-plus-version, Contoso.Security.BearerToken.v1, so that a format change is automatically isolated from the old format.
+
+Cross-Q: Does the purpose string need to be secret?-- think --
+
+A: No, only unique. The docs are explicit: "The purpose string doesn't have to be secret.
+It should simply be unique in the sense that no other well-behaved component will ever provide the same purpose string." That is why using the consuming type's namespace works so well: it is already guaranteed unique within your application and it documents itself in the code.
+
+Cross-Q²: Can I put the username in the purposes chain for per-user isolation?-- think --
+
+A: Yes, and it is the recommended multi-tenant pattern, but never as the sole element, and the docs give the attack.
+If a secure-messaging component calls CreateProtector([username]), a user who registers the name Contoso.Security.BearerToken causes that component to mint payloads under the bearer-token purpose, which another component will then happily accept as authentication tokens.
+The correct form anchors the chain with a component-owned constant and appends the untrusted part: CreateProtector(["Contoso.Messaging.SecureMessage", $"User: {username}"]).
+Purposes are an ordered array and are compared ordinally element by element, so the hierarchy is real isolation, not string concatenation.
+
+-- pause --
+Drill 12, T L S boundaries.
+
+Q: An auditor says customer data must be encrypted. Someone answers "the site is H T T P S-only". Is that an answer?-- think --
+
+A: It answers a different question. T L S gives confidentiality and integrity in transit between two endpoints, plus server authentication via the certificate chain.
+It says nothing about the database file, the nightly backup, the log pipeline, the cache, or the message bus, and in most deployments it does not even cover the whole path, because T L S terminates at a load balancer, C D N or ingress and the hop from there to the application is a separate concern.
+The question "can someone with a backup read this?" is answered by encryption at rest, hashing, or tokenisation, never by T L S.
+
+Cross-Q: Where is the most common place plaintext actually leaks in a T L S-everywhere system?-- think --
+
+A: The logging boundary.
+T L S ends where your code begins, so the request body arrives decrypted; structured logging that serialises the bound model will happily write a password, a card number or a bearer token into the log aggregator, where it is retained for months and searchable by anyone with a read seat.
+The second most common is exception detail, a stack trace or an E F Core parameter dump that includes the values. The control is redaction at the point of logging, plus a deny-list test in CI that fails the build if a known sensitive property name appears in a log template.
+
+Cross-Q²: If T L S terminates at the load balancer, what would you actually do about the hop behind it?-- think --
+
+A: First, find out, most teams cannot answer this, and the answer is usually "plaintext H T T P inside the VPC".
+Then choose based on threat model and cost:
+re-encrypt to the backend (the load balancer opens a second T L S connection to the pod), or adopt mutual T L S between services so both ends authenticate and the traffic is encrypted regardless of network position, typically via a service mesh so certificate rotation is not your problem.
+The reason to care is not only eavesdropping: an unauthenticated internal hop means anything that can reach the pod's port can impersonate the load balancer, so header-based trust, X-Forwarded-For, X-Authenticated-User, is forgeable. That is usually a bigger hole than the encryption.
+
+-- pause --
+Drill 13, HMAC versus signature.
+
+Q: A partner needs to verify that a message came from us. HMAC or digital signature?-- think --
+
+A: It depends on how many parties there are and whether anyone needs to prove it to a third party. HMAC if it is a two-party relationship and you already have a way to share a secret, it is fast, small, and simple, which is why almost every webhook provider uses it.
+A digital signature if there are many verifiers (you do not want to distribute a shared secret to twelve consumers), if you cannot securely establish a shared secret, or if you need non-repudiation.
+
+Cross-Q: Say more about non-repudiation, why can't an HMAC give it?-- think --
+
+A: Because both parties hold the same key, so either could have produced the tag. If the partner claims you sent a message and you deny it, the tag proves nothing: the partner could have generated it themselves.
+With a signature, only the holder of the private key can produce a valid signature, so the verifier can demonstrate to a third party that the message came from the key holder. That is why code signing, certificate issuance and legally-significant documents use signatures and never MACs.
+The trade is cost and key management: signatures are slower and you now have a private key with a lifecycle.
+
+Cross-Q²: Your JWTs use HS256 and eleven services validate them. What is wrong with that?-- think --
+
+A: Every one of those eleven services can mint tokens, not just validate them, because with a symmetric key signing and verification are the same capability.
+So a single compromised downstream service, the least-maintained one, typically, is a full authentication bypass for the entire estate: it can issue a token for any user with any claims. Rotation is also an eleven-way coordinated change, which means it never happens.
+Moving to RS256 or ES256 fixes both: the issuer holds the private key, everyone else fetches the public key from a JWKS endpoint and can only verify. Blast radius drops from eleven services to one, and rotation becomes "publish a new JWKS entry and retire the old one" with an overlap window.
+
+-- pause --
+Drill 14, Choosing and rotating a key.
+
+Q: You are encrypting a database column with AES-GCM. Where does the key come from and how do you rotate it?-- think --
+
+A: The key comes from a KMS or secret store, Key Vault, Secrets Manager, Vault, read at startup via a managed identity, never from source, config in the repo, or an image layer. Rotation requires one design decision made before the first row is written: store a key id alongside every ciphertext.
+New writes use the current key; reads look up the key the id names; old keys stay available for decryption. Without the id, rotation means re-encrypting the entire corpus atomically, which is why "we'll rotate later" reliably becomes "we never rotated".
+
+Cross-Q: What does associated data give you here that the key doesn't?-- think --
+
+A: It binds the ciphertext to its context, defeating a relocation attack that encryption alone does not touch. Suppose every row's NINO is encrypted with the same key.
+Without AAD, an attacker with write access to the database can copy tenant A's ciphertext into tenant B's row, they never decrypt anything, but tenant B now sees tenant A's data, and every authentication check passes because the ciphertext is genuinely valid.
+Passing $"{tenant Id}|nino|v1" as associated data makes the tag depend on the tenant and the column, so the relocated ciphertext fails to authenticate. AAD is authenticated but not encrypted, which is exactly right for context that is not itself a secret.
+
+Cross-Q²: Your key was in a container image layer that got pushed to a public registry. What is the incident response?-- think --
+
+A: Treat every payload that key ever protected as compromised, and work in that order. Contain: revoke the key in the KMS so nothing can use it, and rotate to a new key immediately so new writes are safe.
+Assess: enumerate what that key protected and for how long, this is where a key id column earns its keep, because it tells you exactly which rows are affected instead of "all of them, probably".
+Remediate: re-encrypt affected data under the new key; for anything that was a credential rather than data, rotation is not enough and you must invalidate, force password resets, revoke A P I keys, invalidate sessions.
+Prevent: the key was in an image layer, so the gap is build-time secret scanning and a policy that images never contain secrets; move to runtime injection via managed identity.
+The thing not to do is rotate quietly and skip the assessment, because the exposure window is what determines the notification obligation.
+
+-- pause --
+Section 22. Cheat Sheet.
+
+The three-way distinction: encoding = reversible, no key, not a security control, hashing = one-way, no key, encryption = reversible, keyed. Base64 is encoding.
+J W T = base64url segments + a signature. Signed, not encrypted, anyone reads the claims.
+Base64 versus Base64Url: + / = versus - _ and no padding. System.Buffers.Text.Base64Url is dot NET 9+; Convert.ToHexString is dot NET 5+.
+Hash one-shots: SHA256.HashData (dot NET 5+), HMACSHA256.HashData(key, source) (dot NET 6+), CryptographicOperations.HashData(HashAlgorithmName,. ) (dot NET 9+).
+Passwords: slow KDF + per-user salt stored beside the hash + self-describing format. Salt is unique, not secret. Pepper is site-wide and lives outside the DB.
+OWASP floors (re-check them): Argon2id m set to 19456, t set to 2, p set to 1, bcrypt cost at least 10, PBKDF2-HMAC-SHA256 600,000, PBKDF2-HMAC-SHA512 220,000, scrypt N set to 217, r set to 8, p set to 1. bcrypt truncates at 72 bytes.
+Identity's PasswordHasher: V3 = PBKDF2 / HMAC-SHA512 / 128-bit salt / 256-bit subkey / 100,000 iterations default / format {0x01, prf, iters, salt Len, salt, subkey}. V2 = PBKDF2 / HMAC-SHA1 / 1,000 iters / {0x00, salt, subkey}. Migrate on PasswordVerificationResult.SuccessRehashNeeded.
+Argon2 is not in the BCL, dotnet or runtime#19933.
+Integrity versus passwords: SHA-256 is right for one and wrong for the other, and the reason is the same, it is fast.
+HMAC = keyed hash to authenticity. No non-repudiation (both sides hold the key). Never H(key ‖ msg), length extension.
+Compare with CryptographicOperations.FixedTimeEquals. Time depends on length, not values, so it does not hide length. VerifyHmac is dot NET 11.
+AES-GCM: new AesGcm(key, 16) (tag-size-less ctors obsolete, SYSLIB0053), nonce 12 bytes, random per message, tag 16 bytes, AAD binds context. **Nonce reuse = confidentiality and integrity break.**.
+CBC alone = malleable + padding oracles. Encrypt-then-MAC, verify before decrypting, or just use GCM.
+RSA versus ECDSA: RSA verification cheap / signing expensive; ECDSA the reverse. Prefer RSASignaturePadding.Pss for new work. DSASignatureFormat distinguishes DER from JOSE's fixed-length r‖s. Never bulk-encrypt with RSA, hybrid.
+Randomness: RandomNumberGenerator.GetBytes or Fill or GetInt32, plus GetHexString / GetItems (dot NET 8+). GetHexString(n) counts characters, not bytes.
+Guid.NewGuid() is not a secret: at most 122 bits, partially predictable v4 pattern, CSPRNG guaranteed on non-Windows only from dot NET 6; docs say use RandomNumberGenerator. RFC 9562: UUIDs "MUST NOT be used as security capabilities". CreateVersion7() is worse, timestamped.
+Token at rest: 256-bit random to store SHA256 of it, index the hash, show the plaintext once.
+Data Protection defaults: AES-256-CBC + HMACSHA256, 512-bit master key, 90-day key lifetime (min 7), 2-day activation delay, ~24 hours key ring refresh, created or active or expired all decrypt, revoked does not, deleting is permanent.
+Multi-instance: PersistKeysTo* and SetApplicationName and ProtectKeysWith*, explicit persistence deregisters at-rest key encryption. Redis needs persistence enabled. App Service slots do not share a key ring.
+Purposes derive isolated subkeys. Not secret, must be unique, versioned, hierarchical arrays. Never untrusted input alone.
+T L S = one hop, in transit, terminates at the LB. Not backups, not logs, not the database. "We use H T T P S" answers a different question from "how is this stored at rest".
+
+-- pause --
+Section 23. Walkthrough.
+
+A composite scenario assembled from the way this failure usually presents. The shape is what to rehearse, not the specific details.
+
+Symptom: after migrating an A S P dot NET Core storefront from a single V M to a three-replica container deployment, support tickets appear saying "I keep getting logged out". Not everyone, not consistently. The rate correlates loosely with traffic.
+Nothing in the application logs looks like an error, no exceptions, no failed authentications, just requests arriving with no authenticated principal.
+
+Diagnosis chain:
+
+Reproduce with intent. Log in, then hammer refresh. Roughly one request in three loses the session. One in three, with three replicas, is not a coincidence, it is a per-instance problem, and the ratio names the cause before anything else does.
+
+Check the warning-level logs, not just errors. The Microsoft.AspNetCore.DataProtection category is emitting warnings about being unable to unprotect a payload, and about the key ring not containing a valid default key. Nobody had looked, because the dashboards filtered to Error and.
+
+Ask where the keys live. The image is a plain mcr microsoft com or dotnet or aspnet base with no writable user profile, no IIS, not App Service. That is case 4 of the documented storage heuristic: "If none of these conditions match, keys aren't persisted outside of the current process.
+When the process shuts down, all generated keys are lost." Each replica generated its own key ring at startup.
+
+Confirm the mechanism. The authentication cookie is a Data Protection payload. Replica A protects it with A's key; the next request load-balances to B; B has never seen that key and Unprotect throws; the cookie middleware treats an unreadable cookie as "no cookie" and the user is anonymous.
+There is no error because this is the designed behaviour for a cookie that cannot be validated, a tampered cookie should also produce exactly this outcome.
+
+Note what the previous architecture was hiding. On the single V M, the app ran under a Windows service account with a user profile, so keys landed in %LOCALAPPDATA%\A S P dot NET\DataProtection-Keys, DPAPI-encrypted, and survived restarts.
+The bug was latent for years; containerisation removed the accident that had been protecting them.
+
+The wrong turn taken first: session affinity was enabled at the ingress, and the tickets stopped. This was recorded as the fix. Six weeks later a rolling deploy signed out the entire user base at once, because affinity cannot pin a user to a pod that no longer exists.
+Sticky sessions making a logout bug disappear is a diagnostic result, not a remedy, it proves the instances disagree about keys.
+
+Root cause: no shared, durable Data Protection key ring across replicas.
+
+Fix:
+
+Three lines, three distinct jobs:
+
+PersistKeysToAzureBlobStorage, a durable store every replica reads and writes, so there is one key ring.
+SetApplicationName, sets DataProtectionOptions.ApplicationDiscriminator. Without it, the discriminator derives from the content root path, which differed between the old V M and the container.
+Two deployments of the same application would otherwise refuse to read each other's payloads even sharing a store.
+ProtectKeysWithAzureKeyVault, because naming an explicit store deregisters the default at-rest key encryption. Skipping this would have swapped a sharing bug for a plaintext-key-ring bug, and the second is worse: the key ring protects every authentication cookie in the system.
+
+Deployment note that mattered: the fix could not be shipped as a straight cutover. The new configuration starts a fresh key ring in blob storage, so every existing cookie, protected by a per-pod in-memory key that is about to disappear, becomes unreadable. Everyone gets logged out once.
+That was scheduled for a low-traffic window and announced, rather than discovered.
+
+Post-mortem actions: a startup health check that resolves IKeyManager, calls GetAllKeys() and fails readiness if the ring is empty or unshared, so the misconfiguration cannot reach production silently; Data Protection warnings promoted into the alerting pipeline;
+and an added line in the containerisation runbook, "if the app uses cookie auth, antiforgery or TempData, it needs an explicit key ring before it is scaled past one instance."
+
+What to say in an interview: "The tell was the ratio, one failure in three with three replicas points at per-instance state, not at the load balancer. Data Protection's key storage is a heuristic, and the container case falls through to 'keys live in memory and die with the process'.
+The fix is three calls, and the third one, ProtectKeysWith*, exists because specifying an explicit store turns off at-rest key encryption. Most write-ups of this bug stop after the first two."
+
+-- pause --
+Section 24. Self-Test.
+
+Nothing is encrypted. Base64 is an encoding, reversible by anyone, no key involved, so the A P I key is stored in plaintext with an extra step. The variable name is the actual defect, because it will convince the next reader that the value is protected.
+
+The review comment should separate two things. Naming: rename to encodedApiKey at minimum, so nobody inherits the misconception. Storage: the key should not be in a config file at all.
+Move it to a secret store read at startup via a managed identity, or, if this is a key your system issues rather than consumes, store only SHA256.HashData(raw) and never keep the plaintext.
+
+The generalisation worth stating: encoding never appears in a threat model as a mitigation. If the answer to "how is this protected" is "we base64 it", the answer is "it isn't".
+Base64 is entirely correct as transport packaging for something already protected, a ciphertext, a signature, and never as the protection itself.
+
+In-box PBKDF2. Identity's V3 format is PBKDF2 with HMAC-SHA512, a 128-bit salt, a 256-bit subkey and a default of 100,000 iterations, and PasswordHasherOptions.IterationCount raises it in one line.
+PBKDF2 is on OWASP's list, is FIPS-friendly, adds no third-party dependency to the authentication path, and the migration story ( SuccessRehashNeeded ) is already built.
+The weakness is real though: PBKDF2 is C P U-hard only, so it does not blunt the GPU or ASIC advantage the way a memory-hard KDF does.
+Note also that the 100,000 default sits OWASP's current 220,000 floor for the SHA-512 variant, so shipping the default unchanged is itself a finding.
+
+Third-party Argon2id. Memory-hardness attacks the attacker's hardware advantage rather than only their time, which is why OWASP lists Argon2id first. It is the better primitive.
+The cost is that Argon2 is not in the BCL (dotnet or runtime#19933), so you are adding an unaudited-by-Microsoft dependency to the most security-sensitive path in the application, and you own its patching, its pinning and its supply-chain risk.
+You also need to tune m, t and p against your own hardware, and getting memory parameters wrong can make login a memory-pressure problem under concurrency.
+
+Where it actually lands. For most business applications, raised-iteration PBKDF2 behind IPasswordHasher is the right call, defensible, boring, no new dependency. Argon2id earns its dependency when the password store is a genuinely high-value target and someone owns the library's lifecycle.
+The third option beats both when it is available: federate to an identity provider and never store a password. What is not defensible either way is shipping the 100,000 default with no measurement and no rehash path.
+
+String equality returns as soon as it finds a differing character, so the time taken is proportional to the length of the matching prefix. That difference is small but measurable, and it is systematic, averaging over many requests pulls it out of the noise.
+
+Concretely: the attacker sends a request with signature 00000., then 01000., then 02000., through all 256 values of the first byte, timing each. The value whose response is consistently slowest is the correct first byte, because it is the only one where the comparison proceeded to the second byte.
+Fix the first byte, repeat for the second. A 32-byte HMAC falls in roughly 32 times 256 measured requests rather than 2²⁵⁶ guesses.
+
+The fix is one line: CryptographicOperations.FixedTimeEquals(computed, provided), which XORs every byte into an accumulator and checks it once, so the loop always runs to completion.
+
+Two things to add for the sceptic. First, "we're behind a VPN so there's too much jitter" gets it backwards, a low-latency internal network removes noise and makes the attack easier, not harder.
+Second, know the limit of what you are buying: FixedTimeEquals is documented as taking time proportional to length but not to values, so it does not hide a length mismatch. For a fixed-size tag that is fine; for variable-length secrets, hash both sides first.
+
+Defect 1, the token is a GUID.
+At most 122 bits of entropy, with a partially predictable v4 bit pattern that the dot NET docs say "cannot serve as a proper cryptographic pseudo-random function";
+the docs recommend RandomNumberGenerator instead, and RFC 9562 says UUIDs "MUST NOT be used as security capabilities (identifiers whose mere possession grants access)", which is exactly what this link is.
+Fix: RandomNumberGenerator.GetBytes(32), encoded with Base64Url.
+
+Defect 2, the token is stored in plaintext. Anyone with read access to the database, a backup, or a log of that table can reset any pending account. Fix: store SHA256.HashData(raw) and look up by hash. Fast hashing is correct here because a 256-bit random value has no wordlist to guess.
+
+Defect 3, 24-hour validity. A long window on a full account-takeover capability. Fix: 15 minutes, and invalidate on use.
+
+Defect 4, no evident single-use or invalidation. Nothing described marks the token consumed, so it works repeatedly until it expires, and issuing a new one does not kill the old.
+Fix: mark consumed inside the same transaction as the password change, and invalidate all outstanding tokens for that user on issue and on success.
+
+Defect 5, the token is the whole authorisation. Nothing binds it to the user, so a lookup that matches only on token value is one bug away from resetting the wrong account. Fix: store the subject with the hash and verify both.
+
+Defect 6, it is in a URL. URLs land in server access logs, proxy logs, browser history, and the Referer header if the reset page loads any third-party resource.
+Fix: strip query strings from access logs, set a Referrer-Policy, and prefer a POST-with-token form over a bare GET link where the U X allows.
+
+Defect 7, no rate limiting mentioned. Even a strong token wants a ceiling on consume attempts, and the request endpoint needs one too or it becomes an email-bombing and enumeration vector. Fix: rate-limit both, and return an identical response whether or not the address exists.
+
+Integrity breaks first, silently. CBC gives confidentiality only. Because each ciphertext block is XORed into the next block's decryption, flipping a bit in ciphertext block n flips the corresponding plaintext bit in block n+1 (block n itself becomes garbage).
+An attacker who knows the plaintext layout can make targeted edits without the key: flip a flag, change a sign, corrupt a field they want to fail open. Nothing detects this, because there is nothing in the scheme whose job is to detect it.
+
+Confidentiality breaks second, through the oracle. CBC requires padding, and the decrypt path must handle invalid padding somehow.
+If an attacker can distinguish "padding invalid" from "padding valid but content wrong", they can decrypt arbitrary ciphertext a byte at a time, the classic padding-oracle attack, without ever recovering the key.
+
+Why uniform error handling is not enough. You can equalise the explicit signals: same exception swallowed, same status code, same body.
+But the two paths do different amounts of work, one aborts during unpadding, the other proceeds through content processing, so they take different amounts of time, and timing is a signal.
+Equalising that by hand is genuinely hard and fragile under refactoring; it is not a thing to defend in a review.
+
+The structural fix is ordering, not error handling. Encrypt-then-MAC: compute a MAC over IV ‖ ciphertext with a separate key, and on the way back verify the MAC with FixedTimeEquals before attempting decryption.
+If it fails you never enter the decryption code, so there is no oracle to probe and no timing difference to measure. MAC-then-encrypt does not work, because you must decrypt in order to check.
+
+And the practical answer: do not build this. Use AesGcm, which is encrypt-then-MAC done correctly in one A P I with one key. If you cannot, an external format mandates CBC, then two keys, MAC over IV ‖ ciphertext, verify first.
+Worth noting that A S P dot NET Core Data Protection's own default is AES-256-CBC plus HMACSHA256, which is this construction assembled correctly by the framework; the thing that is broken is CBC alone.

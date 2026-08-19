@@ -8,14 +8,14 @@ The base layer: .NET runtime, C#, OOP / SOLID, and the data structures + algorit
 
 | # | Topic | Status | Priority | Phase |
 |---|---|---|---|---|
-| 1 | [.NET Core Deep Dive](./01-net-core-deep-dive/README.md) (18 sub-topics) | Not Started | High | Phases 1–11 |
+| 1 | [.NET Core Deep Dive](./01-net-core-deep-dive/README.md) (20 sub-topics) | Not Started | High | Phases 1–11 |
 | 2 | [SOLID Principles](./02-solid-principles.md) | Not Started | High | Phase 1 |
 | 3 | [Data Structures](./03-data-structures.md) (pointer to DSA) | Not Started | Medium | Phase 11 |
 | 4 | [Searching Algorithms](./04-searching-algorithms.md) (pointer to DSA) | Not Started | Medium | Phase 11 |
 | 5 | [C# Mastery](./05-csharp-mastery/README.md) (9 sub-topics) | Not Started | High | Phase 1 |
 | 6 | [DSA — Data Structures & Algorithms](./06-dsa/README.md) (7 sub-topics) | Not Started | High | Phase 11 |
 
-The **.NET Core Deep Dive** is a folder containing 18 focused topic files (originally `DOTNET_COMPREHENSIVE_GUIDE.md`, plus a version-history reference for .NET 7–10). Open its [README](./01-net-core-deep-dive/README.md) for the full TOC.
+The **.NET Core Deep Dive** is a folder containing 20 focused topic files (originally `DOTNET_COMPREHENSIVE_GUIDE.md`, plus a version-history reference for .NET 7–10, a [Cryptography, Hashing & Encoding](./01-net-core-deep-dive/19-cryptography-hashing-and-encoding.md) deep dive, and a [Concurrency & Parallelism](./01-net-core-deep-dive/20-concurrency-and-parallelism.md) deep dive). Open its [README](./01-net-core-deep-dive/README.md) for the full TOC.
 
 The **C# Mastery** sub-chapter is a 9-file basics-to-advanced path through the C# language itself — fundamentals, type system, OOP, generics, delegates/events, language LINQ, nullability + pattern matching, reflection + source generators, and memory/performance idioms.
 

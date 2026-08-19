@@ -1234,6 +1234,7 @@ Key Vault + Managed Identity adds what a file cannot: per-secret access auditing
 ---
 ### Cross-References
 
+- [Cryptography, Hashing & Encoding](./19-cryptography-hashing-and-encoding.md) — the primitives underneath this page: password hashing work factors, HMAC and timing-safe comparison, AES-GCM, and the Data Protection key ring.
 - [Authentication & Authorization (API)](../../02-api-development/02-authentication-and-authorization.md) — API-layer how-to.
 - [API Security](../../02-api-development/04-api-security.md) — endpoint-level checklist.
 - [Advanced Auth](../../02-api-development/17-advanced-auth.md) — refresh rotation, mTLS, federation.

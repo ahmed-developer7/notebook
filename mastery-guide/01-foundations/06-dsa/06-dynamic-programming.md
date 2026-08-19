@@ -40,6 +40,10 @@ For senior engineers in production: DP shows up in route planning (Bellman-Ford 
 
 When NOT to use DP: when greedy works (and is simpler), when the problem isn't recursive, when N is small enough that brute force is fine. Recognize when the recursion tree has overlapping subproblems; otherwise it's just divide-and-conquer.
 
+> 🌍 **In the real world**: DP rarely arrives labelled. A pricing service had a "best bundle for this basket" endpoint written as a straightforward recursive search over which discounts to apply — try each applicable promotion, recurse on the rest, keep the best. It shipped against a catalogue with six promotions and was instant. Two years later a partner was onboarded with twenty-two, and the endpoint started timing out at the gateway for exactly the customers whose baskets were worth the most. Nobody had written anything slow; the code was the same code. What changed was the input size crossing the point where 2ⁿ stops being small, and the search had been recomputing "best discount for this remaining basket" thousands of times over. Adding a dictionary keyed by the remaining-basket state was a nine-line diff. The lesson worth carrying into an interview is that the moment you write a recursive method whose parameters repeat, you have written a DP whether or not you noticed — and the failure mode is not gradual, it is a cliff you fall off when a customer grows.
+
+> 🌍 **In the real world**: the reverse mistake is more expensive to unwind. A team building a route-optimisation feature reached for a DP because "route planning is DP" and built a `dp[stop, visitedMask]` table before checking the requirement, which was *order the day's stops by earliest deadline and warn if any is unreachable*. That is a sort plus a scan. The bitmask DP was correct, was slower, capped the feature at 20 stops because of `2^n`, and took three sprints. It was replaced by forty lines. Recognising DP is a skill; so is recognising that a problem which merely *sounds* combinatorial has a greedy or sorting answer, and interviewers probe the second one by asking "is there anything cheaper?" after you propose the table.
+
 ## Core concepts
 
 ### DP fundamentals — overlapping subproblems + optimal substructure
@@ -69,7 +73,7 @@ Fib(5)
     └── Fib(1) = 1
 ```
 
-`Fib(2)` is computed 3 times; `Fib(3)` is computed 2 times. For `Fib(50)`, naive recursion makes ~10⁹ calls.
+`Fib(2)` is computed 3 times; `Fib(3)` is computed 2 times. The total call count is exactly `T(n) = 2·Fib(n+1) − 1` — one call per node of that tree. `T(5) = 2·8 − 1 = 15`, which is the number of nodes drawn above. `T(50) = 2·Fib(51) − 1 = 40,730,022,147`, so roughly **4×10¹⁰ calls**, not the "about a billion" that gets repeated. Being able to derive that closed form on the spot is worth more than remembering the magnitude: it is the same argument that shows the tree has exponentially many nodes but only `n+1` distinct values in it.
 
 **With memoization**:
 
@@ -90,11 +94,39 @@ int Fib(int n)
 }
 ```
 
-`Fib(50)` now makes ~50 calls. From O(2ⁿ) to O(n).
+`Fib(50)` now computes **51 distinct subproblems** and makes about 100 calls in total, roughly half of which return straight from the cache. From O(2ⁿ) to O(n).
+
+> ⚠️ **This code is wrong for `n ≥ 47`, and nothing tells you.** `Fib(46) = 1,836,311,903` fits in an `int`; `Fib(47) = 2,971,215,073` does not (`int.MaxValue` is `2,147,483,647`). C# arithmetic is **unchecked by default**, so the addition wraps to a negative number, the cache dutifully stores the wrong value, and every later result built on it is wrong too. Nothing throws. The DP is not what broke — the accumulator type is. Fixes, in order of preference: use `long` (buys you to `Fib(92)`), use `System.Numerics.BigInteger` if the problem really is unbounded, or — if the question is "how many ways", which is the common case — work modulo a prime, which is why competitive problems specify "answer modulo 10⁹+7". You can also make the failure loud project-wide with `<CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>` in the `.csproj` (the compiler default is unchecked; Microsoft Learn, *Compiler Options — language feature rules*), or locally with a `checked { }` block, which converts the silent wrap into an `OverflowException`.
+
+> 🌍 **In the real world**: a logistics service had a DP that counted the number of valid delivery route permutations for a customer's constraints and displayed it on a planning screen. The table was `int`. For eighteen months every customer's count fitted comfortably. Then a warehouse with a much larger fan-out was onboarded, the count overflowed, and the screen showed a **negative number of routes**. The bug report was filed against the front end for "rendering a minus sign", and the first fix was a `Math.Abs` in the view model — which made the number positive, plausible, and still wrong. The real defect was three layers down, in an `int` accumulator inside a counting DP, and the reason it survived review is that overflow in C# is silent by design. Counting DPs are the single most common place a senior .NET engineer meets unchecked arithmetic in anger; if the recurrence is a sum of counts, decide the accumulator type deliberately and write down why.
 
 **Optimal substructure** — the optimal solution to the whole is built from optimal solutions to parts. For Fibonacci: `Fib(n) = Fib(n-1) + Fib(n-2)`. For shortest path: shortest path from A to C = (shortest path from A to B) + (shortest path from B to C) for some intermediate B.
 
 If you can write a recurrence relation expressing the answer in terms of smaller answers, you have optimal substructure.
+
+**The unifying model: a DP is a DAG, and both implementations are graph traversals.**
+
+Nearly everything else on this page falls out of one picture, and it is the picture that separates a candidate who has memorised recurrences from one who can derive them. Draw a node for every subproblem. Draw an edge from `u` to `v` when computing `u` needs `v`. That graph must be **acyclic** — if `u` needs `v` and `v` needs `u`, neither is ever computable and no amount of caching rescues it. A DP *is* the evaluation of a value over the nodes of a DAG:
+
+| DP vocabulary | What it is in the DAG |
+|---|---|
+| Optimal substructure | Each node's value is a function of its successors' values alone |
+| Overlapping subproblems | Some node has in-degree > 1 |
+| Divide and conquer | Every node has in-degree 1 — the DAG *is* a tree, so there is nothing to cache |
+| Memoization | Depth-first traversal from the answer node; the cache is what makes each node compute once |
+| Tabulation | Visiting nodes in a **topological order**, so successors are always finished first |
+| Time complexity | Nodes + edges = (number of states) × (choices per state) |
+| Space complexity | Nodes you must keep alive at once |
+
+The last row is the fastest way to get a DP's complexity right under pressure: **count the states, count the choices per state, multiply.** Knapsack has `n × C` states and 2 choices → O(n·C). Bitmask TSP has `2ⁿ × n` states and `n` choices → O(2ⁿ·n²). Edit distance has `m × n` states and 3 choices → O(m·n). You never have to reason about the recursion tree again.
+
+The DAG view also answers three questions the table view leaves mysterious.
+
+*Why does iteration order matter?* Because tabulation is correct **only if your loop order is a topological order** of the dependency DAG. The reverse-capacity loop in 1-D knapsack (pitfall 4) is not a trick to memorise: `dp[c]` after item `i` depends on `dp[c − w[i]]` *before* item `i`, and descending `c` is the topological order that respects it. Iterating upward reads a node that has already been overwritten by the current item — which is precisely what "the item got counted twice" means.
+
+*Why does memoization sometimes beat tabulation despite identical Big-O?* Because tabulation visits every node of the DAG whether or not it is reachable from the answer node, and DFS visits only the reachable subgraph.
+
+*What do I do when the dependency graph has a cycle?* **Add a dimension that makes it acyclic.** Shortest path in a graph with cycles is not DP-able on state `(node)` — `d[v] = min over u of d[u] + w(u,v)` is circular. Bellman-Ford's real state is `(node, edges used so far)`, and the edge count strictly increases along every transition, so *that* graph is a DAG; the familiar `V−1` relaxation passes are its topological sweep. Every "I added a dimension and suddenly it worked" story in DP is this same move.
 
 ### Memoization vs tabulation
 
@@ -131,6 +163,125 @@ int FibTab(int n)
 
 For most interview answers: write memoization first (faster to derive); convert to tabulation if asked to optimize space.
 
+**The memo store is the real design decision.** "Add memoization" sounds like one thing. In C# it is a choice between four stores with different lookup costs and different ways of going wrong, and the interviewer who asks "what would you cache it in?" is asking about exactly this.
+
+| Store | What one lookup actually does | Right when | How it bites |
+|---|---|---|---|
+| `T[]` / `T[,]` + a sentinel | index arithmetic, one bounds check, one read | state is dense and indexed by small integers | the sentinel turns out to be a legal answer |
+| `Dictionary<TKey,TValue>` | hash the key, index `_buckets`, walk a chain through `_entries` comparing keys | state is sparse, or the key is not a small integer | key allocation per probe; a rehash mid-run |
+| `ConcurrentDictionary<TKey,TValue>` | the same work, with lock-free reads and fine-grained write locks | the memo is shared across requests or threads | `GetOrAdd`'s factory runs *outside* the lock and may run more than once |
+| `IMemoryCache` | a `ConcurrentDictionary` probe plus expiration bookkeeping | the memo must outlive a request and be evictable | it grows until the process dies unless `SizeLimit` is set *and* every entry declares a `Size` |
+
+The first row is the one to reach for, and it is also the one with the trap that costs the most production hours.
+
+> ⚠️ **The sentinel bug: `default` means "not computed", and `default` is also an answer.** A `bool[]` memo defaults to `false`. In a yes/no DP, `false` is also a perfectly good answer — so the cache never records a negative result, and the memoisation silently does nothing on exactly the inputs that need it most.
+>
+> ```csharp
+> // WRONG — `false` means both "no" and "haven't looked yet"
+> bool[] memo = new bool[s.Length + 1];
+> bool CanSegment(int i)
+> {
+>     if (i == s.Length) return true;
+>     if (memo[i]) return true;                 // only a *positive* result is ever a hit
+>     foreach (var w in words)
+>         if (s.AsSpan(i).StartsWith(w) && CanSegment(i + w.Length))
+>             return memo[i] = true;
+>     return false;                             // never recorded → recomputed every time
+> }
+> ```
+>
+> On a string that *can* be segmented the code looks fine, because the first success short-circuits everything. On a string that cannot, it degenerates back to the exponential search it was supposed to replace. The three fixes, in order of preference:
+>
+> 1. **A sentinel outside the value range.** `sbyte[]` (or `int[]`) filled with `-1`; `0` = no, `1` = yes. One array, one branch.
+> 2. **A parallel `bool[] computed`.** Two arrays, no encoding cleverness, and it works for *any* value type. Two reads instead of one, and two cache lines instead of one.
+> 3. **`bool?[]` / `int?[]`.** No boxing — `Nullable<T>` is a struct — but the cell grows: `Nullable<int>` is a `bool` plus an `int` aligned to 4 bytes, so a cell that was 4 bytes becomes 8 and the table doubles. Clearest to read, most expensive to store.
+>
+> The same trap wears different hats. `int[]` zero-filled for a *counting* DP where `0` ways is a real answer. `int[]` zero-filled for a *minimising* DP where `0` cost is a real answer. The habit worth forming: after you choose the memo array type, say out loud "and the value that means *not yet computed* is ___" — if you cannot finish the sentence, you have the bug.
+
+> 🌍 **In the real world**: a fraud-screening service decided whether a transaction narrative could be decomposed entirely into known merchant patterns — a word-break DP over a pattern dictionary — and memoised it into a `bool[]`. It passed review, passed its tests, and ran for a year. Its p99 was terrible and nobody could explain it, because the p50 was fine and the slow requests were not correlated with narrative length in any obvious way. They were correlated with the *answer*: every narrative that decomposed cleanly hit the memo and returned fast, and every narrative that did not fell through the un-memoised negative path and did the full exponential walk. The test corpus was, of course, mostly known-good narratives. The fix was a change of element type — `bool[]` to `sbyte[]` with a `-1` fill and `0`/`1` for the two answers — and the reusable lesson is sharper than "initialise your memo": a cache whose miss marker collides with a real value does not fail, it *degrades asymmetrically*, and asymmetric degradation is invisible to any test suite built from happy-path examples.
+
+**Key design, when the state will not fit in array indices.** A `Dictionary` memo is the right call for sparse state, and the way it is usually written throws away most of the benefit:
+
+```csharp
+// WRONG — allocates a string on every probe, including every cache HIT
+var memo = new Dictionary<string, int>();
+if (memo.TryGetValue($"{i},{j},{mask}", out var hit)) return hit;
+```
+
+Interpolation runs before the lookup, so the allocation happens whether or not the key is present — and cache hits are, by construction, the common case. Three better keys, in ascending order of effort:
+
+- **`ValueTuple`** — `Dictionary<(int i, int j, int mask), int>`. No allocation; `ValueTuple<T1,T2,T3>.GetHashCode` funnels into [`HashCode.Combine`](https://learn.microsoft.com/en-us/dotnet/api/system.hashcode.combine), and the comparison is field-by-field. This is the default answer and it is almost always good enough.
+- **A packed integer key** — when every component has a known bound, `(long)i << 40 | (long)j << 20 | (long)mask` collapses the state to a single `long`. Hashing a `long` is trivial and equality is one comparison. Write the packing and unpacking as a pair of small methods next to each other so the widths cannot drift apart.
+- **A flat array with a sentinel** — the packed key *is* an index. If the packed range is small enough to allocate, you have just turned the dictionary back into row one of the table above.
+
+Two more `Dictionary` details that matter for a memo specifically. It grows by rehashing every entry into a larger `_entries` array when it fills, so a memo that will hold a known number of states should be constructed with that capacity (`new Dictionary<TKey,TValue>(expectedStates)`) — otherwise a long DP run pays a sequence of full rehashes it did not need. And `Dictionary` resolves collisions by **chaining** through an `int next` index in each entry, not by open addressing, so a bad key distribution lengthens chains rather than clustering probes.
+
+> ⚠️ **`CollectionsMarshal.GetValueRefOrAddDefault` looks made for memoisation and is unsafe for recursive memoisation.** The API — [added in .NET 6](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.collectionsmarshal.getvaluereforadddefault) — hands back `ref TValue` to the slot and tells you via `out bool exists` whether it was already there, so a get-or-insert costs one hash instead of two. Exactly the shape a memo wants. But the documented remark is: *"Items should not be added to or removed from the `Dictionary<TKey,TValue>` while the ref `TValue` is in use."* A recursive memo does precisely that — the computation you run to fill the slot recurses and inserts *other* keys, any one of which can trigger a resize that allocates a new `_entries` array. Your `ref` then points into the old, orphaned array, and the write lands nowhere:
+>
+> ```csharp
+> // WRONG — Solve() inserts into `memo`, which may resize and invalidate `slot`
+> ref int slot = ref CollectionsMarshal.GetValueRefOrAddDefault(memo, key, out bool exists);
+> if (!exists) slot = Solve(key);   // the assignment can be written to a dead array
+> ```
+>
+> There is no exception and no corruption you can see; the entry simply stays `0` and gets recomputed forever, which is the sentinel bug again by another route. The honest conclusion is worth saying in an interview: for *recursive* memoisation the ref APIs buy nothing safe, because the compute step is the thing that mutates the dictionary. They are excellent for the tabulation-shaped fill, where you compute the value first and only then take the ref, and for read-modify-write over a dictionary of struct values where nothing is inserted in between.
+
+**Thread safety, if the memo outlives one call.** A pure DP function is a perfect candidate for a process-wide cache, and a plain `Dictionary` in a singleton is not safe to share. Concurrent writes can leave the bucket chains inconsistent, and the symptom is not an exception — it is a thread that never returns from a lookup. If you share the memo, use `ConcurrentDictionary`, and know one thing about `GetOrAdd`: the docs state that *"the `valueFactory` delegate is called outside the locks"* and that *"if you call `GetOrAdd` simultaneously on different threads, `valueFactory` may be called multiple times, but only one key/value pair will be added."* For a pure DP that is harmless — two threads compute the same number and one result is discarded. It stops being harmless the moment the factory does anything else: increments a counter, writes a log line, charges something.
+
+> 🌍 **In the real world**: a pricing service memoised its bundle-optimisation DP into a `static readonly Dictionary<PricingKey, decimal>` on a singleton, because "the answer only depends on the inputs, so it's safe to share." Under single-request load tests it was a large win. In production, two or three pods per week would go to 100% CPU on one core and stop serving, with no exception in the logs and a perfectly healthy-looking heap dump — the classic signature of two threads having written to a `Dictionary` concurrently and left a bucket chain pointing at itself, so a subsequent read walks it forever. Restarting the pod "fixed" it, which is why it took four months to escalate. The change was one word, `Dictionary` to `ConcurrentDictionary`, and the review conversation that followed was the valuable part: `GetOrAdd` may run the factory more than once for the same key, which was fine here and would not have been fine if the factory had also been emitting a metric per computation. The transferable point is that "pure function, therefore thread-safe" reasons about the *function* and says nothing about the *container* you cached it in.
+
+> 🌍 **In the real world**: the same service warmed that cache overnight with a `BackgroundService` that precomputed each tenant's table in parallel:
+>
+> ```csharp
+> for (int t = 0; t < tenants.Count; t++)
+>     tasks.Add(Task.Run(() => Warm(tenants[t])));   // captures `t`, not its value
+> await Task.WhenAll(tasks);
+> ```
+>
+> A `for` loop declares **one** variable and every lambda closes over that same variable, so by the time the tasks ran, `t` was `tenants.Count`. The job logged a handful of `ArgumentOutOfRangeException`s each night and was triaged for months as "flaky data" — because it *was* doing work, just all of it for whichever tenants happened to win the race, and none for the rest. The observable symptom was not the exception; it was that the first request of the morning for most tenants was slow, which everyone had rationalised as JIT warm-up. C# 5 changed the `foreach` iteration variable to be per-iteration precisely to kill this class of bug, and the language design notes are explicit that the `for` loop variable was deliberately **not** changed, because a `for` loop's variable is genuinely one variable that the loop mutates. The one-line fix is `int index = t;` inside the body — or `foreach (var tenant in tenants)`, which has been safe since C# 5. Worth carrying: "it works in a `foreach`" is not evidence that it works in a `for`, and a background job is the worst place to have this bug because nobody is watching the response.
+
+**Recursion depth is a hosting concern, not a style preference.** The page's own pitfall list and drills quote thresholds for when memoised recursion overflows the stack; treat those as folklore. The real quantities are: the thread's stack is a fixed reservation made when the thread is created, and each frame consumes as much of it as that method's locals, spills and saved registers need — so the safe depth depends on the method, not on a number you can memorise. What you *can* rely on is the failure mode: a [`StackOverflowException` cannot be caught](https://learn.microsoft.com/en-us/dotnet/api/system.stackoverflowexception) and terminates the process, so a deep DP is an availability bug rather than a request failure.
+
+Two defences, both cheap:
+
+```csharp
+// 1. Refuse before you fall over. Throws InsufficientExecutionStackException,
+//    which IS catchable, so a request fails instead of the pod dying.
+System.Runtime.CompilerServices.RuntimeHelpers.EnsureSufficientExecutionStack();
+
+// 2. Or decide for yourself what to do about it.
+if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+    return SolveIteratively(state);   // fall back to the explicit-stack version
+```
+
+Microsoft Learn describes `EnsureSufficientExecutionStack` as ensuring *"that the remaining stack space is large enough to execute the average .NET function"* against *"an artificially limited stack that preserves enough space for an exception to be raised."* It is what compiler-services code — Roslyn's expression walkers among them — uses for exactly this problem. The structural fix is still the same one: if the recursion depth is a function of user-supplied data, convert to tabulation or to an explicit `Stack<T>`, and cap the input.
+
+> 🌍 **In the real world**: a rules engine evaluated customer-authored expression trees with a memoised recursive walk, and the memo made it fast enough that nobody looked at it again. A customer's rule generator emitted a deeply right-nested boolean chain — thousands of levels — and the evaluator pods began dying mid-request: no exception, no stack trace, container exit code and a "Stack overflow." line on stdout. The first attempt was a `try`/`catch` around the walk, which does nothing, because `StackOverflowException` is not deliverable to managed code. The second was to run the evaluation on a `Thread` created with a larger `maxStackSize`, which moved the cliff by a constant and left it in place. What actually held was two changes: a `RuntimeHelpers.TryEnsureSufficientExecutionStack()` check at the top of the recursive method that returned a 422 with the offending rule id, and a documented nesting limit enforced at rule-save time. The interviewable framing is that memoisation bounds the *number* of subproblems and does nothing at all about the *depth* of the chain to reach them — those are different resources and only one of them is on the heap.
+
+**How to settle memoisation vs tabulation on your own workload.** Both are the same asymptotics, so the question is constants, and the honest answer is a sweep rather than a remembered multiplier. The shape:
+
+```csharp
+[MemoryDiagnoser]                          // adds the Allocated column
+public class DpBenchmarks
+{
+    [Params(64, 512, 4096)]                // the sweep is the experiment
+    public int N;
+
+    [Params(0.05, 1.0)]                    // fraction of the state space actually reachable
+    public double Density;
+
+    private Input _input = default!;
+
+    [GlobalSetup] public void Setup() { /* build inputs once, outside the measured region */ }
+
+    [Benchmark(Baseline = true)] public int Tabulated() { /* fills every state */ }
+    [Benchmark] public int MemoDictionary() { /* Dictionary<(int,int), int> */ }
+    [Benchmark] public int MemoArray()      { /* int[,] with a -1 sentinel */ }
+}
+```
+
+Read it in this order. (1) At `Density = 1.0`, tabulation should win, and if it does not, your memo array is doing something tabulation is not — usually skipping bounds checks or fitting in cache. (2) At low `Density`, the gap should *reverse*, because tabulation is paying for states nobody reaches; if it does not reverse, your state space is not as sparse as you believed and you should drop the dictionary. (3) `Allocated` is the column that decides the production question — the dictionary memo allocates per distinct state, the array memo allocates once, and tabulation allocates once; a per-request DP with a large `Allocated` is a GC problem regardless of which one has the better `Mean`.
+
 ### State design
 
 The hardest part of DP is figuring out what the **state** is. State = the parameters that uniquely identify a subproblem.
@@ -157,6 +308,45 @@ The hardest part of DP is figuring out what the **state** is. State = the parame
 4. Identify base cases.
 
 For interview problems, ~80% of DP problems fit one of: 1D index, 2D `(i, j)`, knapsack-style `(item, capacity)`, bitmask.
+
+**The test that tells you the state is right: sufficiency.** "Parameters that uniquely identify a subproblem" is circular — the subproblem is whatever the parameters say it is. The non-circular version is a property of the *problem*, and it is the single most useful thing on this page:
+
+> A state is **sufficient** when any two ways of arriving at it have interchangeable futures. If two different prefixes both land on state `s`, and the optimal continuation from `s` is not the same for both, then `s` is not a state — it is a summary that threw away something the future needed.
+
+This is the Markov property wearing an algorithms hat, and it is exactly the property that makes a cache *legal*. Memoisation is the claim "I have seen this before, and the answer is the same as last time." If two arrivals at `s` have different best futures, that claim is a lie and the cache will happily serve you the wrong one. Nothing throws; the answer is just wrong for some inputs.
+
+The test is mechanical. Take your proposed state, construct two distinct prefixes that reach it, and ask whether a single number can be the answer for both:
+
+*Maximum profit from at most K stock trades.* Proposed state: `(day)`. Two prefixes reach day 5 — one having used all K trades, one having used none. The best future is obviously different. `(day)` is insufficient. Add the trade count: `(day, tradesUsed)`. Now two prefixes reaching `(day 5, 2 trades used)` still differ — one is holding a share and one is not, and only one of them can sell tomorrow. Add it: `(day, tradesUsed, holding)`. Now the futures genuinely are interchangeable, and the recurrence writes itself.
+
+Each round of that test adds exactly one dimension, and each dimension you add is a thing the future cares about that you had been discarding. That is the whole of state design. A useful phrasing to carry into an interview, because it converts a creative act into a procedure: **"if I handed this subproblem to a colleague on an index card, what would have to be written on the card for them to finish it without seeing the rest of the input?"** Everything on the card is the state. Anything you find yourself wanting to shout across the room is a dimension you have missed.
+
+> 🌍 **In the real world**: a subscription platform priced add-on bundles with a DP over `(addOnIndex)` — for each add-on in a fixed order, take it or leave it, keep the cheapest total. It was correct for two years. Then a contract type was introduced with an annual discount cap: once a customer's cumulative discount crossed a threshold, further discounts stopped applying. The DP was not changed, because on the face of it nothing about the *choices* had changed. But the state was now insufficient: two different sets of earlier add-ons could reach the same `addOnIndex` with different accumulated discount, and the best future differed between them. The output was still a plausible number — always within a few percent, never negative, never null — so no test caught it and no alert fired. Finance found it in a quarterly reconciliation, eleven months later. The fix was `(addOnIndex, discountUsedInBuckets)`, which multiplied the state space by the bucket count and ran fine. The lesson that generalises past pricing: **a new business rule that mentions "so far", "cumulative", "up to", "at most", or "remaining" is a new state dimension**, and if you add the rule without adding the dimension you get a DP that is wrong quietly rather than loudly.
+
+**The move that unlocks the hard problems: swap the state and the value.** When the natural index is huge but the natural *answer* is small, index by the answer and store the constraint. Whole families of "how did anyone think of that?" algorithms are this one substitution.
+
+- **LIS.** Natural DP: `dp[i]` = length of the longest increasing subsequence ending at `i`, transition scans all `j < i`, O(n²). Now invert — index by *length* and store the *tail*: `f[len]` = the smallest value that can end an increasing subsequence of length `len`. `f` is automatically sorted (a longer subsequence cannot have a smaller tail), so the transition is a binary search rather than a scan, and O(n²) becomes O(n log n). The `tails` array in the code above is not a trick bolted onto a sort; it is the DP table of the inverted state. That is the answer to "explain why the O(n log n) LIS works," and it is a much better answer than describing the mechanics.
+- **Knapsack.** Natural DP: `dp[i, c]` = max value achievable with the first `i` items in capacity `c`, giving O(n·C). Invert: `g[i, v]` = the *minimum weight* needed to achieve value exactly `v` with the first `i` items, giving O(n·ΣV) where ΣV is the total value of all items. Read the answer off as the largest `v` whose `g[n, v] ≤ C`. Same problem, same optimum, and you get to pick whichever of `C` and `ΣV` is smaller — which matters enormously when capacity is a currency amount in minor units and values are small integers, or the reverse. This inversion is also the scaffolding for the standard fully-polynomial approximation scheme for knapsack: round the values down to a coarser grid, which shrinks `ΣV` by a controllable factor, and the value-indexed DP inherits the bound.
+
+The trigger to look for: **one of your dimensions ranges over something enormous, and the quantity you are storing ranges over something small.** Trade them.
+
+**Shrinking a state you already have.** Four moves, roughly in order of how often they apply:
+
+1. **Drop a dimension that is a function of the others.** If your transitions always advance `i + j` by exactly one, then `j = step − i` and `dp[step, i]` carries the same information as `dp[i, j]` in one fewer dimension — sometimes turning a 3-D table into a 2-D one.
+2. **Canonicalise symmetric states.** If `(a, b)` and `(b, a)` are the same subproblem, sort the pair before it becomes a key. Half the table disappears, and so does a class of duplicate-work bug.
+3. **Quantise a continuous dimension** — money into minor units, time into slot indices. Cheap and usually correct, but be honest about what happened: once you have bucketed, you are solving a discretised problem, and the optimum of the discretised problem is not necessarily the optimum of the original. Say so out loud; interviewers notice when a candidate quietly turns an exact algorithm into an approximation.
+4. **Drop history you are keeping "just in case."** Every dimension you cannot justify with the sufficiency test above is multiplying the table for nothing.
+
+**Do the memory arithmetic before you write the code, not after.** The DAG view gives it to you in one line: nodes are states, so the bill is `(number of states) × sizeof(cell)`. This is the calculation that decides whether a DP is a solution or a story about how you ran out of RAM, and it takes ten seconds:
+
+| DP | States | Cell | Table |
+|---|---|---|---|
+| Edit distance, 10k × 10k strings | 10⁸ | `int`, 4 B | ~400 MB — allocatable but on the LOH, and unnecessary (see rolling arrays) |
+| Knapsack, 200 items, capacity in pence up to £1,000 | 200 × 10⁵ = 2×10⁷ | `int`, 4 B | ~80 MB per request |
+| Bitmask TSP, 20 cities | 2²⁰ × 20 ≈ 2.1×10⁷ | `double`, 8 B | ~168 MB |
+| Bitmask TSP, 25 cities | 2²⁵ × 25 ≈ 8.4×10⁸ | `double`, 8 B | ~6.7 GB — the feature does not exist |
+
+The last two rows are why the "bitmask DP works up to about 20–25" rule of thumb exists, and stating the arithmetic rather than the rule of thumb is the difference between having memorised a limit and understanding one.
 
 ### Classic problems
 
@@ -240,6 +430,8 @@ int Lcs(string s1, string s2)
 O(m × n) time, O(m × n) space (reducible to O(min(m, n)) with rolling).
 
 **Use cases**: diff tools, version control, plagiarism detection, DNA alignment.
+
+Note the phrasing of the space bound: rolling arrays get you O(min(m, n)) *for the length*. Recovering the actual subsequence from two rows is not possible by backtracking, because the rows you would backtrack through no longer exist. That is not the end of the story — see [Space optimization](#space-optimization) for the divide-and-conquer trick that gets both — but it is the reason the naive answer to "space-optimise it" costs you the diff.
 
 #### Edit distance (Levenshtein)
 
@@ -385,7 +577,19 @@ Classic interval DP.
 
 **Greedy** makes the locally-optimal choice and never looks back. Examples: Dijkstra, Huffman coding, fractional knapsack, activity selection. Greedy works when local choices compose to global optimum (provable via exchange arguments).
 
-**When greedy fails**: 0/1 knapsack with `weights = [3, 5, 7], values = [3, 5, 9], capacity = 10`. Greedy by value/weight picks `7 (value 9)` then `3 (value 3)` = total 12. Optimal: `5 + 5` (no, only one each)... actually `3 + 7 = value 12`. With weights = `[2, 3, 4], values = [3, 4, 5], capacity = 5`: greedy by value/weight (4/3 ≈ 1.33) picks 3, then can fit 2 → value 7. Optimal: 3 + 2 = value 7 too. Bad example. The famous failing case: coin change with denominations `[1, 3, 4]` and amount 6 — greedy picks 4 then 1+1 = 3 coins; DP gets 3+3 = 2 coins.
+**When greedy fails** — two counterexamples worth having memorised, because "greedy might not be optimal" is not an answer and a concrete failing input is:
+
+- **0/1 knapsack**, greedy by value/weight ratio: `weights = [10, 20, 30]`, `values = [60, 100, 120]`, `capacity = 50`. Ratios are 6, 5, 4, so greedy takes item 0 (weight 10, value 60) and item 1 (weight 20, value 100), leaving 20 units of capacity that item 2 cannot fit into — total **160**. The optimum takes items 1 and 2 for exactly 50 units and **220**. Greedy's mistake is structural, not unlucky: filling capacity with the best *rate* leaves a remainder that no remaining item can use, and only the fractional variant lets you sell that remainder.
+- **Coin change**, greedy by largest coin: denominations `[1, 3, 4]`, amount 6. Greedy takes 4, then 1 + 1 — **3 coins**. The optimum is 3 + 3 — **2 coins**.
+
+**When greedy coin change *is* safe, and how you would know.** A denomination set for which greedy is always optimal is called **canonical**, and canonicity is a property of the specific set, not of the problem. It is not a matroid property — coin systems are not matroids, and the matroid greedy theorem does not apply to them. What is true is that the question is decidable and cheap:
+
+- **Kozen and Zaks (1994)** proved that if a system `1 = c₁ < c₂ < … < c_m` is *not* canonical, the smallest counterexample `x` lies strictly between `c₃ + 1` and `c_m + c_{m−1}`, and that these bounds are tight. So you can settle it exhaustively: run both greedy and the DP over that finite window and compare. For a real currency this is a loop of a few hundred iterations you can put in a unit test.
+- **Pearson (2005)** gave an O(m³) algorithm that decides canonicity directly, by showing that the smallest counterexample must be one of O(m²) candidate values.
+
+Sterling `[1, 2, 5, 10, 20, 50, 100, 200]` and US `[1, 5, 10, 25]` are canonical, which is why the intuition feels universal. Bespoke ladders are frequently not. `[1, 20, 50]` fails at 60: greedy pays 50 + ten 1s = **11**, the optimum is three 20s = **3**. Note where 60 sits — inside `(c₃ + 1, c_m + c_{m−1}) = (51, 70)`, exactly as the theorem predicts.
+
+> 🌍 **In the real world**: a loyalty programme let customers redeem points for fixed-denomination vouchers, and the redemption service picked vouchers greedily — largest first — because "that's how change works." The ladder was not a currency; it had been chosen by the marketing team and revised twice, and one revision left it non-canonical. Customers redeeming certain amounts received more, smaller vouchers than necessary. Nothing was *wrong* in an accounting sense — the totals reconciled to the penny — so it survived audit; it surfaced as support tickets about "why did I get eleven vouchers" and was initially triaged as a UX complaint. The fix was not to rewrite the greedy as a DP, which would have been the reflex answer. It was to add a startup assertion: given the configured ladder, brute-force every amount in the Kozen–Zaks window and fail fast if greedy ever loses to the DP. Greedy stayed, because for the (repaired) ladder it is provably right and it is one line. The reusable idea is that "prove the greedy choice property" sounds like a whiteboard exercise and is often a small, permanent, automated check — and that a denomination table owned by a non-engineering team is a configuration input, so it deserves a validation rule like any other.
 
 **Divide and conquer** splits, solves recursively, combines — but subproblems don't overlap. Mergesort, binary search, FFT.
 
@@ -420,6 +624,8 @@ int LcsRolling(string s1, string s2)
 
 O(m × n) time, **O(n) space**.
 
+Two things in that loop are worth naming rather than copying. `(prev, curr) = (curr, prev)` swaps the *references* — it is a tuple deconstruction of two locals, not an array copy, so the swap is free; writing `prev = curr` and then `curr = new int[n + 1]` instead would allocate a row per iteration of `i` and is the most common way this optimisation gets un-optimised during a refactor. And the `Array.Clear(curr)` is redundant *here* — every cell `curr[1..n]` is unconditionally written on the next pass and `curr[0]` is always 0 — but it is load-bearing in any rolling DP where a cell is written only under a condition, because the stale value left over from row `i − 2` is a perfectly plausible-looking number. Keep the clear unless you have checked that every cell is written; the cost is one `memset` per row and the bug it prevents is silent.
+
 For 0/1 knapsack: even better — iterate capacity in reverse and use **one** row.
 
 ```csharp
@@ -435,6 +641,47 @@ int KnapsackOptimized(int[] weights, int[] values, int capacity)
 
 O(n × capacity) time, **O(capacity) space**.
 
+**You do not actually have to choose between linear space and reconstruction.** The standard claim — and this page makes it twice below — is that rolling arrays give you the value and cost you the path. That is true of the *naive* rolling array and false of the problem. **Hirschberg's algorithm** (D. S. Hirschberg, *A linear space algorithm for computing maximal common subsequences*, CACM 18(6), 1975) recovers the full alignment in O(min(m, n)) space and O(m·n) time, by combining the rolling array with divide and conquer:
+
+1. Split `s1` at its midpoint `i = m/2`.
+2. Run the forward rolling DP over rows `0..i`, keeping only the final row: this gives, for every `j`, the best score for `s1[0..i]` against `s2[0..j]`.
+3. Run the *same* DP backwards over rows `m..i` on the reversed strings, keeping only its final row: the best score for `s1[i..m]` against `s2[j..n]`.
+4. Add the two rows elementwise and take the argmax. That `j*` is the column the optimal alignment crosses at row `i` — a single point on the path, found in linear space.
+5. Recurse on the two quadrants `(0..i, 0..j*)` and `(i..m, j*..n)`.
+
+The recursion halves the problem each time and the work at each level is proportional to the sub-rectangle, so the total is a geometric series summing to roughly twice the single-pass cost — quadratic time still, with a small constant multiplier, in linear space. That trade (constant-factor time for an order-of-magnitude in space) is why it is the standard technique in sequence alignment, and a variant of the same idea appears in Myers' diff algorithm (E. W. Myers, *An O(ND) Difference Algorithm and Its Variations*, Algorithmica 1(2), 1986), which is what `git diff` is built on.
+
+You will rarely implement it under interview time pressure. Knowing it exists is what matters, because "you lose reconstruction" is a claim a good interviewer will push on, and the correct answer is: *you lose it if you just keep two rows; if you need both, the technique is Hirschberg's, and it costs you a constant factor of time rather than the space.*
+
+> 🌍 **In the real world**: a document-comparison service ran edit distance over full contract texts and OOM-killed its pods on the largest ones — a 60,000-character pair is a 3.6 × 10⁹-cell table, which is not a memory-tuning problem, it is an arithmetic one. The team space-optimised to two rows overnight and the crashes stopped. Three weeks later the product owner asked why the "show me the changes" view had quietly become a similarity percentage. Nobody had connected the two: the rolling arrays had thrown away the table the renderer backtracked through, and the renderer had been changed to display the only thing still available. The eventual design kept both paths — the full table below a size threshold where holding it is affordable, and a linear-space Hirschberg pass above it — but the interesting failure was organisational: a space optimisation silently deleted a *feature*, because the feature depended on an intermediate data structure nobody had written down as an interface.
+
+**Where the space actually goes in .NET, and what to do about it.** The asymptotics are only half the story once the DP runs per request. Three mechanisms decide whether an O(n) table is free or expensive:
+
+- **85,000 bytes is a cliff, not a slope.** An object at or above 85,000 bytes is allocated on the [large object heap](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/large-object-heap). Divide through, remembering the array's own header: an `int[]` crosses the line a little over 21,000 elements, a `double[]` a little over 10,600. LOH objects are collected only during a generation 2 collection, and the GC *sweeps* rather than compacts them by default. Microsoft's own guidance on the page is explicit: "we recommend that you allocate a pool of large objects that you reuse instead of allocating temporary ones." A per-request DP table just over the line is the textbook way to turn a healthy service into one whose GC trigger reason is `AllocLarge`.
+- **`ArrayPool<T>` is the pool that guidance is asking for**, and it has two documented behaviours that break DP code written against `new int[]` habits. `Rent(minimumLength)` "retrieves a buffer that is **at least** the requested length" — so `dp.Length` is no longer your table width and every loop bound must come from your own `n`, not from the array. And "the array returned by this method **may not be zero-initialized**" — so a DP that relies on `default` base cases reads whatever the previous tenant left behind.
+
+  ```csharp
+  var dp = ArrayPool<int>.Shared.Rent(capacity + 1);
+  try
+  {
+      Array.Clear(dp, 0, capacity + 1);          // required: Rent does not zero
+      for (int i = 0; i < weights.Length; i++)
+          for (int c = capacity; c >= weights[i]; c--)   // note: `capacity`, never `dp.Length`
+              dp[c] = Math.Max(dp[c], dp[c - weights[i]] + values[i]);
+      return dp[capacity];
+  }
+  finally { ArrayPool<int>.Shared.Return(dp); }  // or Return(dp, clearArray: true)
+  ```
+
+  `Return(dp, clearArray: true)` clears on the way out instead of on the way in; pick one end and be consistent, because doing neither is the bug and doing both is waste. Clearing on return is the right default when the buffer held anything sensitive, since it stops the data being visible to the next renter.
+- **Small rows can skip the heap entirely.** `Span<int> row = stackalloc int[n]` allocates on the stack, costs no GC anything, and is bounded by the stack you do not have much of — so it needs a size guard (`n <= 128` or similar, falling back to the pool) and it must not be inside a loop, because `stackalloc` inside a loop keeps consuming stack until the *method* returns, not until the iteration ends.
+
+One layout note that costs nothing to get right: C# multidimensional arrays are laid out in **row-major** order — ECMA-335 requires that "the elements associated with the rightmost array dimension shall be laid out contiguously from lowest to highest index" — so in `dp[i, j]` the `j` loop must be the inner one for the reads to be sequential. Both 2-D samples on this page already do that. If a DP inner loop is genuinely hot, the next step is to flatten to a single `int[]` and index `i * width + j` yourself, which also lets you take a `Span<int>` over one row and hand it to code that only needs the row.
+
+> 🌍 **In the real world**: a data-import API deduplicated incoming customer records with an edit-distance pass and allocated `new int[a.Length + 1, b.Length + 1]` per comparison. Field lengths were modest, but the tables were routinely a few hundred kilobytes, so every one of them landed on the LOH. Under normal load nothing looked wrong. During the monthly bulk import the service spent most of its wall-clock time in generation 2 collections; a PerfView trace made it unambiguous, because every GC in the window had trigger reason `AllocLarge` and an LOH survival rate near zero — the pure signature of large, short-lived allocations. The first fix was rolling two rows, which dropped the tables under the 85,000-byte line and solved it. The team then went further and rented the rows from `ArrayPool<int>.Shared`, and *that* is where the second, worse bug arrived: `Rent` returns a dirty buffer, the base-case row was assumed to be zeroed, and the dedupe started producing distances that were too small, so unrelated records were merged. It shipped, because the outputs were still numbers in the right range. The two lessons stack: allocation size is a *behavioural* property in .NET, not just a resource cost; and moving from `new` to a pool changes the initialisation contract, which is exactly the kind of assumption a DP's base cases are made of.
+
+> 🌍 **In the real world**: a shift-scheduling DP stored more than a score per cell — a `double` score, the index of the choice that produced it, and a `long` bitmask of constraints satisfied, so 24 bytes once padded — in a `struct Cell` held in a `List<Cell>`. The inner loop did the obvious thing, `var cell = dp[i]; cell.Score = best; dp[i] = cell;`, because `dp[i].Score = best` does not compile against a `List<T>` indexer. That is two full 24-byte copies per write, in the hottest loop in the service. The recursive helper made it worse by taking `Cell` by value on every call. The engineer who picked it up added `in` to the parameter and expected an improvement, and got none — because `Cell` was not declared `readonly struct`, and when you invoke a non-readonly instance member (a method, or a property getter not marked `readonly`) through an `in` parameter of a non-readonly struct, the compiler must insert a **defensive copy** so the callee cannot mutate the caller's value. The properties on `Cell` were exactly that, so the "optimisation" reintroduced the copy it was meant to remove and added an indirection on top. Three changes fixed it properly: mark the type `readonly struct` so `in` stops copying; move the table from `List<Cell>` to `Cell[]` and write through `ref Cell slot = ref dp[i];`, which mutates in place; and where a `List<T>` genuinely had to stay, use `CollectionsMarshal.AsSpan(list)` to get a `Span<Cell>` over the backing store so `span[i].Value = best` compiles and mutates. The senior point is that `in` is not free and `struct` is not automatically fast — both are contracts with the copy rules, and reading them backwards makes hot loops slower while looking like tuning.
+
 ### Bitmask DP
 
 When state includes a subset of N items, encode the subset as a bitmask (N ≤ 20-25 typical).
@@ -444,7 +691,7 @@ When state includes a subset of N items, encode the subset as a bitmask (N ≤ 2
 State: `(mask, current)` where `mask` is the bitmask of visited cities, `current` is the current city.
 
 ```csharp
-int Tsp(double[,] dist)
+double Tsp(double[,] dist)          // returns double, not int — see the note below
 {
     int n = dist.GetLength(0);
     var dp = new double[1 << n, n];
@@ -472,13 +719,60 @@ int Tsp(double[,] dist)
     for (int u = 1; u < n; u++)
         if (dp[full, u] + dist[u, 0] < answer)
             answer = dp[full, u] + dist[u, 0];
-    return (int)answer;
+    return answer;
 }
 ```
 
-O(N² × 2^N) time, O(N × 2^N) space. Practical for N ≤ 20 or so.
+O(N² × 2^N) time, O(N × 2^N) space.
+
+> ⚠️ **Why this returns `double` and not `int`.** An earlier form of this sample ended `return (int)answer;`, and `answer` can legitimately still be `double.PositiveInfinity` — when `n == 1` the final loop never executes, and in a graph with unreachable pairs no complete tour exists. Casting an infinity to `int` in C# is a *narrowing* conversion whose behaviour changed under you: through .NET 8 on x86/x64 an out-of-range `double` → `int` produced `int.MinValue`, and since **.NET 9** the conversion [saturates](https://learn.microsoft.com/en-us/dotnet/core/compatibility/jit/9.0/fp-to-integer), so the same code now yields `int.MaxValue` (and `NaN` yields `0`). Either way it is silent, and both answers are wrong in opposite directions — a "no tour exists" case that used to report a hugely negative cost now reports a hugely positive one, so an upgrade can flip a bug from "route looks free" to "route looks impossible" without a single line changing. The rule: **an infinity sentinel must be tested, never cast.** Return the `double`, or check `double.IsPositiveInfinity(answer)` and return a nullable / throw. If you use `int.MaxValue` as the sentinel instead, the mirror-image trap is adding to it — `int.MaxValue + 1` wraps to `int.MinValue` under C#'s default unchecked arithmetic, which is why the coin-change sample above guards with `if (sub != int.MaxValue)` before adding.
+
+**What actually caps N, and it is memory, not clock speed.** Count states and multiply, exactly as the DAG model says. `dp` is `2^N × N` cells:
+
+| N | Cells | `double` (8 B) | `int` (4 B) |
+|---|---|---|---|
+| 16 | 1.05 × 10⁶ | ~8 MB | ~4 MB |
+| 20 | 2.10 × 10⁷ | ~168 MB | ~84 MB |
+| 22 | 9.23 × 10⁷ | ~738 MB | ~369 MB |
+| 25 | 8.39 × 10⁸ | ~6.7 GB | ~3.4 GB |
+
+That is the whole of the "N ≤ 20–25" rule of thumb, and it is worth deriving rather than quoting, because it also tells you the two levers. Each extra city multiplies the table by `2 × (N+1)/N`, so halving the cell — costs in integer minor units rather than `double` — buys back roughly one city and nothing buys five. Note also that `Array.MaxLength` (`0x7FFFFFC7` elements) is documented as applying to *single-dimension, zero-bound* arrays only, so flattening a large table to `int[]` introduces an element-count ceiling that `int[,]` does not have; at these sizes the byte count is the binding constraint either way.
+
+Exactly half of the table is structurally dead — `dp[mask, u]` is only meaningful when bit `u` is set in `mask`, and summed over all masks the set bits are half the `(mask, u)` pairs. There is no cheap dense packing that removes it, which is worth saying out loud rather than being caught out by.
+
+**The bit operations, with the BCL members that exist.** `System.Numerics.BitOperations` (.NET Core 3.0 and later) maps directly onto hardware instructions where the platform has them:
+
+```csharp
+BitOperations.PopCount((uint)mask);          // how many cities visited
+BitOperations.TrailingZeroCount((uint)mask); // index of the lowest set bit
+BitOperations.LeadingZeroCount((uint)mask);
+BitOperations.Log2((uint)mask);
+```
+
+Two idioms that come up constantly and are easy to get wrong from memory:
+
+```csharp
+// Iterate the set bits of `mask`, lowest first, without scanning all N positions
+for (int m = mask; m != 0; m &= m - 1)
+{
+    int bit = BitOperations.TrailingZeroCount((uint)m);
+    // ...
+}
+
+// Enumerate every SUBSET of `mask`, including mask itself, excluding the empty set
+for (int sub = mask; sub != 0; sub = (sub - 1) & mask)
+{
+    // ...
+}
+```
+
+The submask loop is the one to be able to justify: summed over all masks it visits 3^N pairs, not 4^N, because each of the N bits is independently in `sub`, in `mask \ sub`, or in neither. That is the complexity of subset-partition DPs — set cover, assignment-with-groups, "split these jobs into shifts" — and 3^N is a genuinely different regime from 4^N.
+
+**When N is past the ceiling: meet in the middle.** For subset-sum-shaped problems (does a subset hit a target? what is the closest achievable total?) the escape hatch is Horowitz and Sahni's technique (E. Horowitz and S. Sahni, *Computing partitions with applications to the knapsack problem*, JACM 21(2), 1974): split the N items into two halves, enumerate all 2^(N/2) subset sums of each half, sort one side, and binary-search it for each element of the other. Time O(2^(N/2) · N), space O(2^(N/2)) — which moves the practical ceiling from around 25 items to around 40. It is not a DP at all; it is the answer to "your bitmask DP does not fit, now what," and having it ready is a much stronger response than "then the problem is intractable."
 
 NP-hard problems often have bitmask DP solutions for small N.
+
+> 🌍 **In the real world**: a field-service product shipped an "optimal visit order" feature built as bitmask TSP over `double[1 << n, n]`, validated against the pilot customer's 14 stops, and gated at 20 in the UI with a tooltip. The gate was a guess, not a calculation. A larger customer's dispatchers asked for 24, an engineer raised the constant, and the service started getting OOM-killed by the orchestrator during the morning planning window — the table at 24 is 2²⁴ × 24 × 8 bytes, about 3.2 GB, in a pod with a 2 GB limit. What made it a bad afternoon rather than a five-minute revert is that the process death took the *whole* planning batch with it, so unrelated customers lost their routes too. Two things came out of it. The limit became a computed one — the code now works out the table size and refuses the request with a clear error rather than attempting the allocation — and the cell type went from `double` to `int` minor units, which halves the table and bought back roughly one city. The framing worth stealing: for an exponential algorithm, the input limit is not a policy decision, it is arithmetic, and a limit that was chosen rather than derived will be raised by someone who does not know that.
 
 ## Code & diagrams
 
@@ -547,16 +841,23 @@ Answer: dp[4, 5] = 7 (items 0 and 1).
 
 1. **No memoization on recursive solution.** Naive recursion is O(2ⁿ); memoized is O(n) or O(n × m). The transformation is mechanical; always check for overlapping subproblems before submitting "exponential" as the answer.
 2. **Off-by-one in tabulation.** `dp` array size n+1 vs n; loop bounds `<=` vs `<`. Pick a convention (1-indexed or 0-indexed) and stay consistent.
-3. **Forgotten base cases.** `dp[0]` left at default 0 when it should be `int.MaxValue` (impossible) — DP propagates the wrong value. Always initialize all base cases explicitly.
+3. **Forgotten base cases, and the default that isn't one.** A `new int[]` arrives zero-filled, and zero is a *base case* in some DPs (`dp[0] = 0` coins for amount 0) and a *wrong answer* in others (every non-base cell of a minimising DP should start at an "impossible" sentinel, not at 0, or the minimum will happily choose the uninitialised cell). Initialise every cell deliberately: `Array.Fill(dp, sentinel)` first, then write the base cases over the top.
 4. **Wrong direction of iteration.** For 0/1 knapsack with single row: capacity iterates **reverse** (so item-i isn't double-counted). For unbounded knapsack: forward. Easy to flip and get wrong answer.
 5. **State that misses a dimension.** Solving "min cost to reach (i, j) on a grid" with `dp[i, j]` works. Adding a constraint "with at most K right moves" needs `dp[i, j, k]`. Forgetting a dimension makes the recurrence wrong.
 6. **Memoization key collision.** If state is `(i, j)`, key into `Dictionary<(int, int), int>`. Mixing two state schemes into one dictionary causes wrong cache hits.
-7. **Recursion stack overflow on memoized recursion.** Memoization stores results, but each call still uses stack. For depth > 10⁵, convert to tabulation.
+7. **Recursion stack overflow on memoized recursion.** Memoization bounds the number of subproblems solved; it does nothing about the *depth* of the chain needed to reach them, and every live call still holds a frame. There is no depth number to memorise — a frame costs as much as that method's locals and spills — so the rule is about the shape, not the size: if recursion depth is a function of user-supplied input, it is an availability bug, because `StackOverflowException` is uncatchable and kills the process. Guard with `RuntimeHelpers.TryEnsureSufficientExecutionStack()` and convert to tabulation or an explicit `Stack<T>`.
 8. **DP where greedy works.** Activity selection (greedy by end time) is O(n log n); writing a DP makes it O(n²). Recognize greedy.
 9. **DP where divide-and-conquer works.** Mergesort isn't DP — subproblems don't overlap. Don't shoehorn DP onto problems with independent subproblems.
 10. **Bitmask DP with n > 25.** 2^30 = 10⁹ states; doesn't fit. Bitmask DP only works for small n.
 11. **Mutable state in memoization.** If subproblem result depends on a mutable accumulator (e.g., a path list), memoization gives wrong results. Either copy state or design a pure recurrence.
-12. **Reconstructing the actual solution from DP table.** DP gives the *value* of the optimal; reconstructing the actual choices requires backtracking through the table or storing decisions.
+12. **Reconstructing the actual solution from DP table.** DP gives the *value* of the optimal; reconstructing the actual choices requires backtracking through the table or storing decisions. With rolling arrays the table is gone — but see Hirschberg's algorithm, which recovers the path in linear space for a constant factor of time.
+13. **A memo sentinel that is also a legal answer.** `bool[]` where `false` means both "no" and "not computed"; `int[]` where `0` is a real count or a real cost. The memo silently stops working for exactly those results. Use a sentinel outside the value range, a parallel `bool[] computed`, or `T?`.
+14. **Memoizing an impure function.** If the result depends on anything not in the key — the clock, a cached exchange rate, a static counter, an ambient tenant — the cache serves the first caller's answer to everyone. The key must contain every input the value depends on, or the function must not be memoized.
+15. **A shared memo that is a plain `Dictionary`.** A memoized service registered as a singleton is a multi-threaded write target. Concurrent writes corrupt the bucket chains and the symptom is a thread spinning forever inside a lookup, not an exception. Use `ConcurrentDictionary`, and remember its `GetOrAdd` factory runs outside the lock and may execute more than once per key.
+16. **A pooled or reused DP buffer that was not cleared.** `ArrayPool<T>.Rent` returns a buffer that "may not be zero-initialized" and one that is "at least" the requested length. Clear it at one end (rent or return, not both), and take every loop bound from your own `n` rather than from `buffer.Length`.
+17. **Casting an infinity or `MaxValue` sentinel.** `(int)double.PositiveInfinity` is silent and its result changed in .NET 9 (saturating: now `int.MaxValue`, previously `int.MinValue` on x86/x64). `int.MaxValue + 1` wraps negative under default unchecked arithmetic. Test sentinels; never cast or add to them unguarded.
+18. **A memo that never stops growing.** In a request-scoped DP the cache dies with the request. Promote it to a singleton or an `IMemoryCache` for reuse and it becomes an unbounded retention: every distinct state anyone ever asked for, held for the life of the process. Bound it — `MemoryCacheOptions.SizeLimit` with a `Size` on every entry, or an explicit eviction policy.
+19. **Precomputing DP tables in a loop with captured loop variables.** `for (int i = 0; i < n; i++) tasks.Add(Task.Run(() => Build(items[i])));` captures the single `i`, which is `n` by the time most of the tasks run. C# 5 made the `foreach` iteration variable per-iteration; the `for` loop variable was deliberately left shared. Copy to a local inside the body, or use `foreach`.
 
 ## Interview-ready summary
 
@@ -574,8 +875,11 @@ Answer: dp[4, 5] = 7 (items 0 and 1).
   - Matrix chain multiplication: 2D interval DP, O(n³).
 - **DP vs greedy**: greedy works when local optima compose; DP needed otherwise. Coin change with `[1, 3, 4]` is the classic where greedy fails.
 - **Space optimization**: rolling arrays. LCS goes from O(m × n) to O(min(m, n)). Knapsack from 2D to 1D (with reverse iteration for 0/1).
-- **Bitmask DP**: state encodes a subset; O(2^n × n²) typical; works for n ≤ 20-25.
-- **Reconstruction**: DP gives the value; backtrack through the table for the actual choices.
+- **Bitmask DP**: state encodes a subset; O(2^n × n²) typical; the n ≤ 20-25 ceiling is a memory calculation (`2^n × n × sizeof(cell)`), not a CPU one. Past it, meet-in-the-middle handles subset-sum shapes at O(2^(n/2)).
+- **Reconstruction**: DP gives the value; backtrack through the table for the actual choices. Space-optimised *and* reconstructible is possible — Hirschberg's algorithm, at roughly 2× the time.
+- **State sufficiency**: two prefixes reaching the same state must have interchangeable futures. If they don't, the memo is serving one prefix's answer to the other, and the DP is wrong rather than slow.
+- **In C#, "add memoization" is a storage decision**: array + sentinel (dense, small-integer state), `Dictionary` with a `ValueTuple` key (sparse), `ConcurrentDictionary` (shared), `IMemoryCache` (must outlive the request, needs a size limit). The sentinel must not be a legal answer.
+- **Allocation is behaviour, not just cost**: a per-request table at or above 85,000 bytes lands on the LOH and drives gen-2 collections. Shrink it before you pool it.
 
 ## Interview Cross-Questioning Drill
 
@@ -607,11 +911,11 @@ Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
 >
 > **Cross-Q**: Same Big-O — what's the constant-factor difference?
 >
-> **A**: Memoization has function-call overhead + dictionary/array lookup overhead per state visit. Tabulation has a tight loop with array indexing. For tight inner loops at n = 10⁶+, tabulation is typically 2-5× faster on constants alone. For one-time interview-scale problems (n ≤ 10⁴), either works.
+> **A**: Name the mechanisms rather than a multiplier, because the multiplier depends entirely on how much work the transition does. Per state visited, memoization pays a **call** (argument setup, a frame, a return), a **cache probe** (for a `Dictionary`: hash the key, index `_buckets`, walk the chain in `_entries` comparing keys), and a **cache write** on a miss. Tabulation pays an **array index** — a multiply-add and a bounds check the JIT can often hoist out of the loop — and its access pattern is sequential, so the prefetcher works. Against that, memoization visits only reachable states and tabulation visits all of them. Which side wins is a property of your transition cost and your state density, which is why the answer to "which is faster" is a `[Params]` sweep, not a number. See the benchmark shape in the [Memoization vs tabulation](#memoization-vs-tabulation) section.
 >
 > **Cross-Q²**: When does memoization actually win on perf?
 >
-> **A**: When the state space is sparse — only ~10% of all theoretical states are reachable. Tabulation iterates *all* states (even unreachable ones); memoization only computes reachable ones. For graph-shaped DP where only some `(node, state)` combinations are valid, memoization can be 10× faster despite the dictionary overhead.
+> **A**: When the state space is *sparse* — when the reachable subgraph of the dependency DAG is a small fraction of the nominal `states = ∏ dimension sizes` product. Tabulation's cost is proportional to the nominal count; memoization's is proportional to the reachable count. So the win scales with the density ratio, and it can be arbitrarily large: a DP whose state is `(node, mask)` but where only a handful of masks are legal per node has a nominal table that may not even be allocatable and a reachable set that fits in a dictionary. The corollary matters just as much — at density near 1.0 the dictionary overhead is pure loss, so "memoize for sparse, tabulate for dense" is the rule and measuring your density is how you apply it.
 
 ### Drill 3 — Space optimization
 
@@ -621,7 +925,7 @@ Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
 >
 > **Cross-Q**: What's the trade-off?
 >
-> **A**: You lose the ability to reconstruct the actual solution (just the value). For "minimum edit distance = 5" you still get 5, but to recover the specific edit sequence you need the full table. For length-only / value-only queries, optimize freely. For reconstruction, keep the full table or recompute on demand.
+> **A**: The naive rolling array loses the ability to reconstruct the actual solution — you still get "minimum edit distance = 5", but the rows you would backtrack through have been overwritten. For length-only or value-only queries, optimize freely. If you need both, the correct answer is not "keep the full table": it is **Hirschberg's algorithm** (CACM, 1975), which finds the column where the optimal path crosses the middle row by adding a forward row and a backward row, then recurses on the two quadrants. Linear space, still quadratic time with a small constant multiplier. Knowing that the trade is "constant factor of time" rather than "space or the path, pick one" is the senior answer here.
 >
 > **Cross-Q²**: Knapsack 1D — why iterate capacity in reverse?
 >
@@ -733,7 +1037,7 @@ Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
 >
 > **Cross-Q**: Coin change — when can greedy work?
 >
-> **A**: Only for "canonical" denomination sets. US coins `[1, 5, 10, 25]` — greedy works (provable via matroid theory). Arbitrary set `[1, 3, 4]` for amount 6 — greedy picks 4+1+1=3 coins; DP finds 3+3=2. Greedy validity depends on the *specific denominations*, not just the problem shape. If unsure: DP is safe.
+> **A**: Only for **canonical** denomination sets. US `[1, 5, 10, 25]` and sterling `[1, 2, 5, 10, 20, 50, 100, 200]` are canonical; the arbitrary set `[1, 3, 4]` at amount 6 is not — greedy picks 4+1+1 = 3 coins, DP finds 3+3 = 2. Greedy validity depends on the *specific denominations*, not on the problem shape, so it is a property you have to check per coin system. Two results make checking cheap. **Kozen and Zaks (1994)** proved that if a system `1 = c₁ < … < c_m` is non-canonical, the smallest counterexample lies strictly between `c₃ + 1` and `c_m + c_{m−1}` — a finite window you can brute-force in a unit test. **Pearson (2005)** gave an O(m³) decision algorithm. Note what this is *not*: it is not a matroid argument. Matroid theory explains greedy for MST and for scheduling-with-deadlines; coin systems are not matroids, and citing matroids here is a common and checkable error. If unsure: DP is safe.
 >
 > **Cross-Q²**: Fractional knapsack vs 0/1 — different answer?
 >
@@ -747,11 +1051,11 @@ Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
 >
 > **Cross-Q**: What about cache locality?
 >
-> **A**: Tabulation usually wins — iterates the DP array sequentially, cache-friendly. Memoization's dictionary lookups + recursion scatters access — cache-unfriendly. For tight CPU-bound loops at large n, tabulation can be 5-10× faster on constants alone despite identical Big-O.
+> **A**: Tabulation usually wins on locality — it walks the table in address order, so the hardware prefetcher predicts the next line and the JIT can hoist bounds checks out of a counted loop. Memoization scatters: a `Dictionary` probe reads `_buckets` then jumps into `_entries` at a data-dependent index, and the recursion interleaves those reads with frame setup. Both are the same Big-O; the difference is entirely in how many cache lines each state visit touches, which is why the honest form of this answer is a measurement rather than a factor. Note that the direction can reverse for a *sparse* DP, where tabulation's sequential walk is sequential over states nobody needs.
 >
 > **Cross-Q²**: What's the deciding factor in production?
 >
-> **A**: Stack risk. Memoization recurses; for state depth > 10⁴, you risk `StackOverflowException`. Tabulation iterates; no stack risk. For production-grade DP with potentially deep states (long strings, large numbers), tabulation is the safer choice. Use memoization for prototyping; harden to tabulation if the path is hot.
+> **A**: Stack risk, and it is a step change rather than a gradient. Memoization recurses, and a `StackOverflowException` **cannot be caught** — the process terminates, taking every other in-flight request with it, with no exception in the logs. Tabulation iterates; there is no stack to exhaust. There is no depth threshold worth memorising, because a frame costs whatever that method's locals and spills cost; the question to ask instead is *"can input data make this deeper?"* If yes, that is an availability bug and tabulation (or an explicit `Stack<T>`) is the fix, with `RuntimeHelpers.TryEnsureSufficientExecutionStack()` as the guard while you get there. Use memoization for prototyping; harden the hot or input-driven paths.
 
 ### Drill 13 — State definition — the hardest part
 
@@ -779,7 +1083,7 @@ Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
 >
 > **Cross-Q²**: Why N=25 limit?
 >
-> **A**: 2^N states × N transitions = 2^25 × 25 ≈ 800M ops. At ~100M ops/sec for C# array indexing, that's ~10 seconds. Beyond N=25, both memory (2^N × N bits × bytes) and time explode. For N=20: 1M states × 20 = 20M ops ≈ 200 ms — fast. Bitmask DP shines at the small-N-but-hard-problem boundary.
+> **A**: Do the arithmetic rather than quoting the rule — memory is what binds first, and it is a two-line calculation. The table is `2^N × N` cells. At N=20 with a `double` cell that is 2²⁰ × 20 × 8 B ≈ **168 MB**; at N=22, ≈ **738 MB**; at N=25, ≈ **6.7 GB**. A service pod does not have 6.7 GB, so the feature does not exist at 25 regardless of how patient you are about CPU. The levers this exposes: halving the cell (integer minor units instead of `double`) buys about one more city, and nothing buys five, because the table doubles per city. Say the arithmetic in the interview — it demonstrates you can derive the boundary instead of having memorised one, and it is the same "count the states, multiply by the cell size" move that sizes every other DP.
 
 ### Drill 15 — DP on trees
 
@@ -795,6 +1099,62 @@ Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
 >
 > **A**: When state requires multiple values per node. Example: "house robber on a tree" — at each node, track two states: `(max if not robbed, max if robbed)`. Returning a tuple from the recursive call. The recurrence: `notRobbed = max(child.notRobbed, child.robbed) summed over children; robbed = node.val + sum of child.notRobbed`. Compose carefully; the tuple is essentially the state's second dimension.
 
+### Drill 16 — What do you memoize *into*?
+
+> **Q**: You've decided on top-down. What do you store the memo in, in C#?
+>
+> **A**: Four options with different costs. **`T[]` or `T[,]` with a sentinel** — index arithmetic and a bounds check; right whenever the state is dense and indexed by small integers, which is most interview DPs. **`Dictionary<TKey,TValue>`** — hash, bucket index, walk the chain in `_entries`; right when the state is sparse or the key isn't small integers. Key it with a `ValueTuple`, never an interpolated string. **`ConcurrentDictionary`** — same shape, safe to share, and its `GetOrAdd` factory runs outside the lock so it can execute more than once per key. **`IMemoryCache`** — when the memo must outlive the request and be evictable; needs `SizeLimit` and a per-entry `Size` or it grows forever. Sizing rule for the first: pre-size the dictionary with the expected state count, or a long run pays a sequence of full rehashes.
+>
+> **Cross-Q**: You picked `int[]` and initialised it to zero. What breaks?
+>
+> **A**: `0` is a legal answer in most DPs, so "not computed yet" and "the answer is zero" become indistinguishable. Reads miss forever, or worse, hit and return a value that was never computed. The same trap bites hardest with `bool[]` in a yes/no DP: `false` means both "no" and "unvisited", so only positive results are ever cached and the algorithm degrades back to exponential on precisely the inputs that answer "no". Fixes: a sentinel outside the value range (`Array.Fill(dp, -1)`), a parallel `bool[] computed`, or `int?[]` — no boxing, but `Nullable<int>` is a `bool` plus an `int` with alignment padding, so the cell goes from 4 bytes to 8 and the table doubles.
+>
+> **Cross-Q²**: `CollectionsMarshal.GetValueRefOrAddDefault` gives you get-or-insert in one hash. Why not use it for the memo?
+>
+> **A**: Because the documented contract is "items should not be added to or removed from the `Dictionary` while the `ref TValue` is in use," and recursive memoization violates it by construction: the computation you run to fill the slot recurses and inserts other keys, and any insert can trigger a resize that reallocates `_entries`. Your `ref` then points into the orphaned array and the write is lost — silently, with no exception, leaving the entry at its default and recomputing forever. It's the right tool for a tabulation-shaped fill where you compute the value first and take the ref second, and the wrong tool here.
+
+### Drill 17 — Is your state sufficient?
+
+> **Q**: What does it mean for a DP state to be "correct"? Not "does it work" — what's the property?
+>
+> **A**: **Sufficiency**: any two paths that arrive at the same state must have interchangeable futures. If two different prefixes both reach state `s` and the optimal continuation from `s` differs between them, `s` is not a state, it's a lossy summary — and memoization is then actively wrong, because the cache's whole premise is "same state, same answer." This is the Markov property; it's what makes caching *legal* rather than merely fast.
+>
+> **Cross-Q**: Test it on "maximum profit from at most K stock transactions."
+>
+> **A**: Propose `(day)`. Two prefixes reach day 5, one having used all K trades and one none; their futures differ, so it fails. Add trades: `(day, tradesUsed)`. Two prefixes reach `(day 5, 2 used)`, one holding a share and one not; only one can sell tomorrow, so it still fails. Add the position: `(day, tradesUsed, holding)`. Now the futures genuinely are interchangeable. Each failed test named exactly one missing dimension — that's the procedure, and it turns state design from a creative act into a checklist.
+>
+> **Cross-Q²**: What's the production smell that a state has gone insufficient?
+>
+> **A**: A new requirement containing the words "so far", "cumulative", "remaining", "up to", or "at most". Those phrases are dimensions. Adding such a rule to the transition without adding it to the state gives you a DP that is right whenever the constraint isn't binding — which is most inputs — and wrong for the extremes. The output stays plausible, so tests pass and monitoring is quiet; it surfaces in reconciliation months later.
+
+### Drill 18 — Linear space *and* the path
+
+> **Q**: You space-optimised edit distance to two rows and the caller still needs the edit script. Now what?
+>
+> **A**: Hirschberg's algorithm. Split `s1` at its midpoint. Run the forward rolling DP down to that row, keeping only the final row; run the same DP backwards from the end up to that row on reversed inputs, keeping only its final row; add the two rows elementwise and take the argmax. That column is where the optimal path crosses the midpoint — one point on the path, found in O(n) space. Recurse on the two quadrants. Work halves each level, so the total is about twice a single pass: **O(m·n) time, O(min(m,n)) space, full reconstruction.**
+>
+> **Cross-Q**: What's the cost you're accepting?
+>
+> **A**: A constant factor of time (roughly 2×, from the geometric series) and considerably more code than "keep two rows." You're trading CPU for memory, which is the right trade when the table is the thing that OOMs you and the wrong trade when it isn't. The practical design is a threshold: full table below a size where it's cheap, Hirschberg above it.
+>
+> **Cross-Q²**: Where would I have seen this?
+>
+> **A**: Sequence alignment (it was published for exactly that, CACM 1975) and diff tools — Myers' diff algorithm, which `git diff` is built on, carries a linear-space refinement built on the same divide-at-the-middle idea.
+
+### Drill 19 — The DP that costs you memory you didn't budget
+
+> **Q**: Your DP allocates its table per request. What do you have to know about that in .NET?
+>
+> **A**: The 85,000-byte line. At or above it, the object goes on the **large object heap**, which is collected only with generation 2 and swept rather than compacted by default. Dividing through (and allowing for the array header), an `int[]` crosses it a little over 21,000 elements and a `double[]` a little over 10,600. So a DP table that looks like an ordinary local variable can be the reason your service's GC trigger reason is `AllocLarge` and its gen-2 rate is high. Microsoft's own LOH guidance says to pool and reuse large objects rather than allocating temporary ones.
+>
+> **Cross-Q**: So you switch to `ArrayPool<int>.Shared`. What breaks?
+>
+> **A**: Two documented behaviours that DP code routinely assumes away. `Rent(minimumLength)` returns a buffer that is "**at least**" the requested length, so `buffer.Length` is no longer your table width and any loop bounded by it walks into another tenant's data. And the returned array "**may not be zero-initialized**", so every base case that relied on `default` is now reading whatever the previous renter left. Clear at exactly one end — `Array.Clear(buf, 0, n)` after rent, or `Return(buf, clearArray: true)` — and take every bound from your own `n`.
+>
+> **Cross-Q²**: How would you decide between pooling and just making the table smaller?
+>
+> **A**: Make it smaller first, because it's strictly better: a rolling array that drops the table under 85,000 bytes removes the LOH problem *and* the pooling complexity *and* the initialisation hazard. Reach for the pool only when the table is irreducibly large. And measure the right column — `[MemoryDiagnoser]`'s `Allocated` is total churn per operation, not peak live set, so it answers "how hard is this on the collector," not "will this fit in the container." Those are different failure modes with different fixes.
+
 </details>
 ## Cheat Sheet
 
@@ -807,16 +1167,47 @@ Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
 - **LCS / edit distance**: 2D O(m×n); space-optimize to two rows.
 - **LIS**: O(n²) DP or O(n log n) with patience-sort + binary search.
 - **Bitmask DP**: state = subset bitmap; n ≤ ~20 (2^n states).
-- **Greedy ≠ DP**: greedy works only when local optima compose globally — coin change with `[1,3,4]` breaks it.
+- **Greedy ≠ DP**: greedy works only when local optima compose globally — coin change with `[1,3,4]` breaks it. Greedy change-making is safe only for *canonical* denomination sets; Kozen–Zaks bounds the smallest counterexample below `c_m + c_{m−1}`, so an exhaustive check is a unit test, not a research project.
+- **State is sufficient** when two arrivals at the same state have interchangeable futures. That is what makes the cache legal. "So far", "cumulative", "remaining" in a requirement = a new dimension.
+- **Swap state and value** when one dimension is huge and the stored quantity is small: LIS `dp[i]=length` → `f[len]=min tail` (O(n log n)); knapsack `dp[i,c]=max value` → `g[i,v]=min weight` (O(n·ΣV)).
+- **Size the table before coding**: states × sizeof(cell). Bitmask TSP at N=20 is ~168 MB of `double`; at N=25 it is ~6.7 GB. That is the real "N ≤ 20–25" rule.
+- **Memo sentinel**: `default` must not be a legal answer. `bool[]` where `false` means "no" is the classic silent failure.
+- **85,000 bytes** puts a DP table on the LOH (gen-2, swept not compacted) — a little over 21,000 `int`s. Rolling arrays first; `ArrayPool` second — and `Rent` returns a longer, uncleared buffer.
+- **Linear space and reconstruction** are both achievable: Hirschberg's algorithm, ~2× time.
+- **Stack**: memoisation bounds the number of subproblems, not the depth. `StackOverflowException` is uncatchable; guard with `RuntimeHelpers.TryEnsureSufficientExecutionStack()`.
 
 ## Walkthrough — Exponential recursion on coin change
 
 <details>
 <summary>📖 Click to expand — worked walkthrough scenario</summary>
 
-**Problem**: A subscription billing service computes the *minimum* number of coupon stacks (in denominations `[1, 5, 10, 25, 50]`) to cover a refund amount. Naive recursion `int Min(int amount) => coins.Where(c => c <= amount).Min(c => 1 + Min(amount - c));` works for amounts ≤ 30 but hangs for amount = 100 in production. CPU at 100% for 60+ seconds.
+**Problem**: A subscription billing service computes the *minimum* number of coupon stacks (in denominations `[1, 5, 10, 25, 50]`) to cover a refund amount. Naive recursion works for small amounts but hangs for amount = 100 in production, with CPU pinned on one core until the gateway times the request out.
 
-**Diagnosis**: Add a counter inside the recursive function and run for amount = 30 in a unit test — counter reads ~10⁶ calls. For amount = 100, it would be ~10²⁰ — exceeding the age of the universe in seconds. Recognize the structure: `Min(100)` calls `Min(99), Min(95), Min(90), Min(75), Min(50)`; `Min(99)` calls `Min(98), Min(94), Min(89), Min(74), Min(49)`. The same subproblems (`Min(75)`, `Min(50)`, etc.) are recomputed exponentially. This is *overlapping subproblems* — the canonical DP signal.
+```csharp
+// The shipped version — note that it does not even terminate correctly as written
+int Min(int amount) => coins.Where(c => c <= amount).Min(c => 1 + Min(amount - c));
+```
+
+Two defects, and it is worth separating them because only one of them is the DP lesson. First, **there is no base case**: at `amount == 0` the `Where` yields nothing and `Enumerable.Min` over an empty sequence of a non-nullable value type throws `InvalidOperationException: Sequence contains no elements`. The correct recursion is `amount == 0 ? 0 : coins.Where(...).Min(...)`. Second, and this is the real subject, it is exponential.
+
+**Diagnosis**: don't guess at the magnitude — derive it. Let `T(a)` be the number of calls for amount `a`. The body makes one call per usable coin, so
+
+```
+T(0) = 1
+T(a) = 1 + Σ  T(a − c)     over coins c ≤ a
+```
+
+That is itself a five-line DP, and running it over `[1, 5, 10, 25, 50]` gives exact counts you can reproduce rather than remember:
+
+| amount | calls |
+|---:|---:|
+| 20 | 752 |
+| 30 | 16,068 |
+| 40 | 343,065 |
+| 50 | 7,325,746 |
+| 100 | 32,528,290,937,758 |
+
+Roughly a 21× jump per ten units of amount, which is the signature of exponential growth in `a` — the dominant root of that linear recurrence, not any constant raised to the amount. Thirty-two *trillion* calls will not complete inside a request, which is the observed behaviour; the useful discipline is that the counter in a unit test at amount = 30 and again at 40 gives you the growth ratio, and the ratio is the diagnosis. Recognize the structure too: `Min(100)` calls `Min(99), Min(95), Min(90), Min(75), Min(50)`; `Min(99)` calls `Min(98), Min(94), Min(89), Min(74), Min(49)`. The same subproblems (`Min(75)`, `Min(50)`, …) are recomputed over and over. This is *overlapping subproblems* — the canonical DP signal.
 
 **Fix**: Add memoization (top-down) or tabulation (bottom-up). Both are O(amount × coins).
 
@@ -845,9 +1236,9 @@ for (int a = 1; a <= amount; a++)
 return dp[amount];
 ```
 
-amount = 100 now runs in microseconds.
+**Why it works**: memoization caches each subproblem's answer the first time it is computed; subsequent calls hit the cache in O(1). Count the states and the choices per state, as the DAG model says: 101 states (amounts 0 through 100), 5 choices each, so **at most 505 transition evaluations** replace 32,528,290,937,758 calls. Same recurrence, same answer, and the work is now linear in the amount.
 
-**Why it works**: Memoization caches each subproblem's answer the first time it's computed; subsequent calls hit the cache in O(1). The total work shrinks from O(coins^amount) to O(amount × coins) — for amount=100, coins=5, that's 500 operations instead of 5¹⁰⁰. Note that *greedy* (always pick the largest coin ≤ remaining) gives the right answer for `[1, 5, 10, 25, 50]` but breaks for arbitrary denominations — DP is the safe general solution.
+Two footnotes a senior candidate should add unprompted. The memo array is `int[]` filled with `-1` rather than left at its default, because `0` is the legal answer for amount 0 and would collide with "not computed"; that choice is deliberate, not incidental. And *greedy* — always take the largest coin that fits — does give the right answer for `[1, 5, 10, 25, 50]`, because that set is canonical. It is not right in general: `[1, 20, 50]` at amount 60 makes greedy pay eleven coupons where three suffice. If the denomination table is configuration rather than a constant, validate it (see [DP vs greedy](#dp-vs-greedy-vs-divide-and-conquer)) rather than assuming.
 
 </details>
 ## Self-test
@@ -885,13 +1276,54 @@ Greedy wins when (a) the problem has the *greedy choice property* — locally op
 <details>
 <summary>4. Analyze: explain space optimization for the LCS problem from O(m×n) to O(min(m,n)).</summary>
 
-LCS recurrence: `dp[i, j] = dp[i-1, j-1] + 1` if match, else `max(dp[i-1, j], dp[i, j-1])`. Notice the recurrence only references row `i-1` (previous) and row `i` (current). You don't need rows `0..i-2` ever again. Replace the 2D table with two 1D arrays (`prev`, `curr`); after computing `curr` for row `i`, swap them. Memory drops from O(m×n) to O(2 × min(m,n)) ≈ O(min(m,n)). For m,n=10⁴, that's 80 KB instead of 800 MB. Trade-off: you lose the table needed to reconstruct the actual subsequence (only the length survives). For length-only queries, do the optimization; for reconstruction, keep the full table or recompute on demand.
+LCS recurrence: `dp[i, j] = dp[i-1, j-1] + 1` if match, else `max(dp[i-1, j], dp[i, j-1])`. Notice the recurrence only references row `i-1` (previous) and row `i` (current). You don't need rows `0..i-2` ever again. Replace the 2D table with two 1D arrays (`prev`, `curr`); after computing `curr` for row `i`, swap the *references* — a tuple deconstruction, not a copy. Memory drops from O(m×n) to O(2 × min(m,n)) ≈ O(min(m,n)).
+
+Do the arithmetic, because it is what makes the optimisation worth doing: at m = n = 10⁴ the full table is (10⁴+1)² ints ≈ 10⁸ cells × 4 bytes ≈ **400 MB**, on the large object heap and collected only with gen 2; two rows are 2 × 10,001 × 4 ≈ **80 KB** in total, each row about 40 KB — comfortably under the 85,000-byte LOH threshold, so each is an ordinary gen-0 allocation. The optimisation changes the *kind* of allocation, not just its size.
+
+Trade-off: the naive two-row form loses the table needed to reconstruct the actual subsequence, so only the length survives. For length-only queries, optimise freely. If you need the path *and* the space, the answer is Hirschberg's algorithm (linear space, full reconstruction, roughly 2× the time), not "keep the full table."
 </details>
 
 <details>
 <summary>5. You see a memoization that uses `Dictionary<(int, int, int), int>` and is slower than expected. Hypothesize why.</summary>
 
-Several costs: (a) `Dictionary` lookup hashes the tuple and probes a bucket — much slower than array indexing; (b) `(int, int, int)` boxing is avoided with `ValueTuple` but `GetHashCode` for value tuples isn't always stellar; (c) cache misses — dictionary entries are scattered in memory. If the state ranges are bounded (e.g., `0 ≤ i ≤ 1000`, `0 ≤ j ≤ 1000`, `0 ≤ k ≤ 100`), replace the dictionary with `int[1001, 1001, 101]` initialized to a sentinel (`-1`). Lookup becomes O(1) array indexing with predictable cache behavior — typically 5-50× faster than dictionary memoization. Use a dictionary only when state is sparse or the keys are unbounded.
+Work through what a probe actually costs, rather than reaching for a multiplier. **(a) Every lookup does more work than an index.** `Dictionary` hashes the key, masks it to a bucket, reads `_buckets`, then follows the `int next` chain through `_entries` comparing keys — versus an array index, which is a multiply-add and one bounds check the JIT can frequently hoist out of a counted loop. **(b) The access pattern is data-dependent.** The bucket index comes from a hash, so consecutive states land in unrelated cache lines and the prefetcher cannot help; a table walk is sequential. **(c) It may be growing under you.** A memo that fills as the DP runs rehashes every entry into a larger `_entries` array each time it fills — pre-size it with `new Dictionary<TKey,TValue>(expectedStates)`. **(d) Check the key isn't allocating.** `ValueTuple` is a struct and does not box (its `GetHashCode` funnels into `HashCode.Combine`), but an interpolated string key allocates on *every* probe including hits, which is the single most common version of this bug.
+
+The fix, when the state ranges are bounded (say `0 ≤ i ≤ 1000`, `0 ≤ j ≤ 1000`, `0 ≤ k ≤ 100`): replace the dictionary with `int[1001, 1001, 101]` filled with a `-1` sentinel. Before you do, price it — 1001 × 1001 × 101 × 4 bytes ≈ 405 MB, which is on the large object heap and may be worse than the dictionary was. That calculation is the actual decision: array memo when the nominal state space is both bounded *and* affordable; dictionary when it is sparse, unbounded, or too big to allocate. And whichever you pick, settle "which is faster" with a `[Params]` sweep over state density, not with a remembered ratio.
+</details>
+
+<details>
+<summary>6. A colleague memoizes a yes/no DP into a `bool[]` and reports that it "works but isn't any faster." Diagnose it without running it.</summary>
+
+`bool[]` is zero-initialised, so `false` is simultaneously "the answer is no" and "I haven't computed this yet." Only *positive* results are ever recorded as cache hits. On an input whose answer is yes, the first success short-circuits the search and everything looks fine; on an input whose answer is no, every subproblem is recomputed and you are back to the exponential search the memo was supposed to remove. So the profile is not "uniformly slow" — it is fast on yes, exponential on no, which is why a test corpus built from valid examples never catches it.
+
+Three fixes, in order of preference. **A sentinel outside the value range**: `sbyte[]` or `int[]` filled with `-1`, with `0` = no and `1` = yes; one array, one branch, one cache line. **A parallel `bool[] computed`**: no encoding, works for any value type, costs a second read. **`bool?[]`**: clearest to read, no boxing (`Nullable<T>` is a struct), but the cell carries a flag plus the value with alignment padding, so the table grows.
+
+The generalisation is the part worth saying: this is not a `bool` problem, it is a *sentinel collision* problem. `int[]` for a counting DP where zero ways is a real answer, or a minimising DP where zero cost is a real answer, has the identical defect. After choosing the memo type, finish the sentence "and the value meaning *not yet computed* is ___."
+</details>
+
+<details>
+<summary>7. Your DP is correct and your service's gen-2 collection rate tripled after you shipped it. Explain the mechanism and the fix ladder.</summary>
+
+The mechanism is the **large object heap**. Any object at or above 85,000 bytes is allocated on the LOH, which is collected only during a generation 2 collection and is swept rather than compacted by default. Dividing through (allowing for the array header), an `int[]` crosses that line a little over 21,000 elements and a `double[]` a little over 10,600 — so a per-request DP table of quite modest dimensions is a large object, and a stream of them drives gen-2 collections whose trigger reason a PerfView trace will show as `AllocLarge`, with an LOH survival rate near zero. That last detail is the tell: the objects are large *and* short-lived, which is the worst combination, because you pay full-heap collections to reclaim garbage that died immediately.
+
+The fix ladder, cheapest and safest first:
+
+1. **Make the table smaller.** Rolling arrays. If two rows put you under 85,000 bytes, the problem is gone entirely and you have added no complexity, no pooling, and no new failure mode. Always try this first.
+2. **Reduce the cell.** `int` instead of `long`, minor units instead of `double`, `sbyte` for a small enumeration. Halving the cell halves the table.
+3. **Pool it.** `ArrayPool<T>.Shared.Rent`/`Return` — Microsoft's own LOH guidance recommends reusing a pool of large objects rather than allocating temporary ones. But this changes two contracts your DP probably depends on: `Rent` returns a buffer "at least" the requested length (so `buffer.Length` is no longer your width) and one that "may not be zero-initialized" (so `default` base cases are now garbage). Clear at exactly one end and bound every loop by your own `n`.
+4. **`stackalloc` for genuinely small rows**, behind a size guard, and never inside a loop — `stackalloc` releases at method exit, not iteration exit.
+
+Say which column you would measure, too: `[MemoryDiagnoser]`'s `Allocated` is total churn per operation, not peak live set. Churn is a throughput problem; live set is an OOM problem. This is the first.
+</details>
+
+<details>
+<summary>8. Explain the O(n log n) LIS as a dynamic program, not as a trick.</summary>
+
+The O(n²) version indexes by position and stores a length: `dp[i]` = length of the longest increasing subsequence ending at index `i`, and the transition scans every `j < i`. The O(n log n) version **swaps the state and the value**: `f[len]` = the smallest value that can end an increasing subsequence of length `len`.
+
+That inversion is the whole algorithm. Because a longer increasing subsequence can never have a smaller tail than a shorter one, `f` is automatically sorted — so the transition, "find the shortest subsequence whose tail is at least `x` and improve its tail to `x`," becomes a binary search instead of a linear scan. Appending when `x` exceeds every tail is the case where the answer grows. `f.Count` at the end is the length. `f` itself is not the subsequence, which is why reconstruction needs a separate parent array.
+
+The reason to be able to say this rather than just code it: the same substitution is a general technique, not an LIS quirk. Whenever one dimension of your state ranges over something enormous and the quantity you are *storing* ranges over something small, trade them. Knapsack does it too — `dp[i, c]` = max value in capacity `c` costs O(n·C), while `g[i, v]` = minimum weight to reach value `v` costs O(n·ΣV), and you get to pick whichever of capacity and total value is smaller. Interviewers who ask "can you do better than O(n²)?" are usually asking whether you know this move exists.
 </details>
 
 ## Cross-references
@@ -914,6 +1346,27 @@ Several costs: (a) `Dictionary` lookup hashes the tuple and probes a bucket — 
 - Erickson, *Algorithms* (free PDF) — chapter on DP, particularly the "smart" insights about recurrence design.
 - LeetCode — *Dynamic Programming I* and *II* learn paths.
 - NeetCode YouTube channel — DP problem walkthroughs.
+
+**Primary sources for the specific claims on this page**
+
+- D. S. Hirschberg, *A linear space algorithm for computing maximal common subsequences*, Communications of the ACM 18(6), 1975, 341–343 — linear space **with** reconstruction.
+- E. W. Myers, *An O(ND) Difference Algorithm and Its Variations*, Algorithmica 1(2), 1986 — the diff algorithm behind `git diff`, including its linear-space refinement.
+- D. Kozen and S. Zaks, *Optimal bounds for the change-making problem*, ICALP 1993; Theoretical Computer Science 123(2), 1994, 377–388 — the smallest counterexample for a non-canonical coin system lies strictly between `c₃ + 1` and `c_m + c_{m−1}`, and the bounds are tight.
+- D. Pearson, *A polynomial-time algorithm for the change-making problem*, Operations Research Letters 33(3), 2005, 231–234 — O(m³) decision procedure for canonicity.
+- E. Horowitz and S. Sahni, *Computing partitions with applications to the knapsack problem*, Journal of the ACM 21(2), 1974 — meet-in-the-middle, O(2^(n/2)).
+- R. Bellman, *Dynamic Programming*, Princeton University Press, 1957 — the origin of the term and of the principle of optimality.
+
+**.NET behaviour cited above**
+
+- Microsoft Learn — [Large object heap (LOH)](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/large-object-heap): the 85,000-byte threshold, gen-2 collection, sweep rather than compact, and the recommendation to pool large objects.
+- Microsoft Learn — [`ArrayPool<T>.Rent`](https://learn.microsoft.com/en-us/dotnet/api/system.buffers.arraypool-1.rent): "a buffer that is at least the requested length"; "the array returned by this method may not be zero-initialized."
+- Microsoft Learn — [`CollectionsMarshal.GetValueRefOrAddDefault`](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.collectionsmarshal.getvaluereforadddefault) (.NET 6+): "Items should not be added to or removed from the `Dictionary<TKey,TValue>` while the ref `TValue` is in use."
+- Microsoft Learn — [`ConcurrentDictionary<TKey,TValue>.GetOrAdd`](https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2.getoradd): "the `valueFactory` delegate is called outside the locks"; it "may be called multiple times, but only one key/value pair will be added."
+- Microsoft Learn — [`RuntimeHelpers.EnsureSufficientExecutionStack`](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.runtimehelpers.ensuresufficientexecutionstack) and [`TryEnsureSufficientExecutionStack`](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.runtimehelpers.tryensuresufficientexecutionstack): throws / returns `false` against "an artificially limited stack."
+- Microsoft Learn — [Floating point-to-integer conversions are saturating](https://learn.microsoft.com/en-us/dotnet/core/compatibility/jit/9.0/fp-to-integer): behavioural change in **.NET 9**; out-of-range now clamps to `MinValue`/`MaxValue` and `NaN` yields `0`, where x86/x64 previously produced `MinValue` in both directions.
+- Microsoft Learn — [`Array.MaxLength`](https://learn.microsoft.com/en-us/dotnet/api/system.array.maxlength) (.NET 6+): applies to single-dimension, zero-bound arrays only.
+- ECMA-335, *Common Language Infrastructure*: array elements are laid out in row-major order — "the elements associated with the rightmost array dimension shall be laid out contiguously from lowest to highest index."
+- Eric Lippert, *Closing over the loop variable considered harmful* (Microsoft Learn archive) — C# 5 made the `foreach` iteration variable per-iteration; the `for` loop variable was deliberately left as a single shared variable.
 
 </details>
 <!-- nav-footer-start -->
