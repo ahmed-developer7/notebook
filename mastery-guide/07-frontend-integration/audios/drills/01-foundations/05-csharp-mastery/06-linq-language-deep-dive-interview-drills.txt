@@ -1,0 +1,457 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Deferred execution.
+
+Q: I write var q = list.Where(x goes to Side(x));, when does Side run?-- think --
+
+A: Not when the Where line executes. Where returns one of link's lazy iterator types, on dot NET 10 you'll see ListWhereIterator / ArrayWhereIterator / IEnumerableWhereIterator in the debugger depending on the source ( Enumerable+WhereListIterator and friends on dot NET 8 and earlier).
+Side runs only when something iterates q: a foreach, a ToList(), a Count(), a First(), et cetera The Where call itself just captures the source and the delegate.
+
+Cross-Q: If I do q.Count() and then q.First(), does Side run once per element or twice?-- think --
+
+A: Twice. Each materialization ( Count, First, ToList, foreach ) re-enumerates the source, Side is called freshly for every element on every iteration. If Side is expensive or has side effects, you'll see them multiplied. The fix is var materialized = q.ToList(); then operate on the list.
+
+Cross-Q²: ReSharper / Rider flag this as a warning. Why does the IDE care?-- think --
+
+A: Because multiple-enumeration is the most common link performance bug. The warning ("Possible multiple enumeration") catches the pattern of accepting IEnumerable and then doing Any() + Count() + foreach on it.
+The fix is either to materialize with .ToList(), or to change the parameter type to IReadOnlyList so the caller knows the A P I will iterate multiple times. The warning is the analyzer's way of saying "you've assumed this is a list, but the type doesn't promise that."
+
+-- pause --
+Drill 2, Multiple enumeration.
+
+Q: What's the cost of multiple enumeration on an E F Core query?-- think --
+
+A: Each enumeration is a full database round-trip. If the query loaded 10,000 rows once, double iteration is 20,000 rows over the wire, 2 times deserialization, 2 times sequel execution. For a method that does if (orders.Any()). foreach (var o in orders)., that's two queries when one would do.
+ReSharper or Rider flag this; senior reviewers catch it.
+
+Cross-Q: Fix void Process(IEnumerable orders) { if (!orders.Any()) return; foreach (var o in orders) Handle(o); }.-- think --
+
+A: Either materialize at the start, var list = orders as IReadOnlyCollection ?? orders.ToList(); if (list.Count == 0) return; foreach (var o in list) Handle(o);, or change the parameter type to IReadOnlyList so the caller materializes before passing in.
+The materialize-at-start pattern is safer for library code; the parameter-type fix is cleaner for internal code where you can dictate the contract.
+
+Cross-Q²: When would multiple enumeration NOT be a bug?-- think --
+
+A: When the source is intentionally a "live view" you want to re-read each time (a ConcurrentDictionary.Values, a sensor feed that should be polled fresh).
+And when the source is a small in-memory List, the link overload for Count() short-circuits to ICollection.Count (O(1)), so two enumerations are still cheap. It's only a bug when the source is deferred (re-runs work) or single-pass (throws on second enumeration).
+
+-- pause --
+Drill 3, IQueryable versus IEnumerable.
+
+Q: What's the difference between IQueryable and IEnumerable ?-- think --
+
+A: IEnumerable is "things I can iterate one element at a time", the operators take Func (a delegate) and run in-process. IQueryable is "things I can describe a query against", the operators take Expression> (a tree) which a provider walks and translates to sequel or Mongo or et cetera
+The source DbSet is IQueryable because E F Core wants to compose your Where / Select calls into sequel.
+
+Cross-Q: At what point does an E F Core chain switch from sequel to in-memory?-- think --
+
+A: When the chain hits a materialization operator ( ToList, ToArray, ToListAsync, First, Any, et cetera), or when you explicitly call AsEnumerable(). After that point, the rest of the chain operates on materialized objects in memory.
+The pre-materialization part runs as sequel; the post-materialization part runs as link-to-Objects.
+
+Cross-Q²: Show me a subtle bug where someone thinks they're filtering in sequel but they're not.-- think --
+
+A: db.Orders.Where(o goes to MyHelper.IsBigSpender(o)).ToList();, MyHelper.IsBigSpender is a static C sharp method EF can't translate. In E F Core 2 (silent client eval), this loaded ALL orders into memory then filtered in C sharp, catastrophic on a large table.
+In E F Core 3+, it throws "could not be translated." The fix: inline the logic ( Where(o goes to o.Total > 1000) ), or use [DbFunction] for sequel-side equivalent, or accept materialization first if the result set is small.
+
+-- pause --
+Drill 4, OrderBy().OrderBy() overwrite.
+
+Q: orders.OrderBy(o goes to o.CustomerId).OrderBy(o goes to o.CreatedAt), what's the bug?-- think --
+
+A: The second OrderBy discards the first sort. The final result is ordered only by CreatedAt. The author probably meant OrderBy(o goes to o.CustomerId).ThenBy(o goes to o.CreatedAt), multi-key sort.
+
+Cross-Q: Why does the A P I allow this without an error?-- think --
+
+A: Because OrderBy is just a regular link operator returning IOrderedEnumerable. Chaining OrderBy after it is technically valid, it re-sorts from scratch. ThenBy exists specifically to preserve the previous ordering. The A P I is consistent; the misuse is a domain knowledge issue.
+Modern analyzers (Roslyn, ReSharper) flag chained OrderBy as suspicious for this reason.
+
+Cross-Q²: For IQueryable via E F Core, does this generate one ORDER BY or two?-- think --
+
+A: One. E F Core's translator follows the last OrderBy chain, the first sort is shadowed. sequel ORDER BY CreatedAt is the only clause emitted. The "two sorts" intent is invisible in the generated sequel, which is exactly the problem: in code review you can't catch it by looking at sequel logs.
+
+-- pause --
+Drill 5, Count() versus Any().
+
+Q: When would I prefer list.Count() > 0 over list.Any() ?-- think --
+
+A: Never, with one nuance, if you actually need the count and want to check non-zero at the same time, store it: var n = list.Count(); if (n > 0) {. use n. }. For pure existence checks, Any() is always at least as good and often dramatically faster.
+
+Cross-Q: Why is Any() faster on a deferred sequence?-- think --
+
+A: Any() short-circuits on the first element, it advances the enumerator once, sees MoveNext returns true, returns true. Count() walks the entire sequence to count it. For an infinite sequence, Any() returns; Count() never returns.
+For a million-element sequence with a deferred filter, Any() is O(1) if any match exists; Count() is always O(n).
+
+Cross-Q²: What does E F Core generate for each?-- think --
+
+A: Any() to an EXISTS subquery (on sequel Server, SELECT CASE WHEN EXISTS (SELECT 1 FROM Orders WHERE.) THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END ), the database is free to stop at the first qualifying row. Count() to SELECT COUNT(*) FROM Orders WHERE., it must visit every matching row.
+For a selective indexed predicate the two are close; the gap grows with the number of rows that match, because only one of them can stop early. Don't quote a multiplier, read the execution plan for your predicate. Prefer Any for existence; use Count only when you need the number.
+
+-- pause --
+Drill 6, Single versus First versus SingleOrDefault.
+
+Q: I'm looking up a user by email. Which is right: First, Single, FirstOrDefault, or SingleOrDefault ?-- think --
+
+A: Depends on the contract. If email is unique and you expect a match: Single. If email is unique but the user might not exist: SingleOrDefault. If you don't care about duplicates and just want any matching row: First / FirstOrDefault.
+The right answer asserts the data contract, Single* says "exactly one, or it's a bug."
+
+Cross-Q: Why use Single if First is faster?-- think --
+
+A: Because Single is a runtime assertion of uniqueness. If your data is supposed to be unique but isn't (constraint violation, bug, race), First silently picks one and hides the bug. Single throws, immediately surfacing the data corruption.
+The performance difference is one extra row: E F Core emits TOP 1 / LIMIT 1 for First and TOP 2 / LIMIT 2 for Single, where the second row is the "is there a duplicate?" probe. Reading one extra row from an index is not a reason to pick the weaker contract.
+Pick the operator that makes the invariant explicit.
+
+Cross-Q²: For a List where 0 is a valid value, what's wrong with list.FirstOrDefault(x goes to x > some Threshold) ?-- think --
+
+A: The default for int is 0. If no element matches, you get 0, indistinguishable from a real 0 in the data. Either (a) use Cast().FirstOrDefault() to get null for missing, or (b) check Any first, or (c) for nullable reference types where null is unambiguous, the issue doesn't arise.
+This is the same trap that makes int? Find() better than int Find() in many A P Is.
+
+-- pause --
+Drill 7, GroupBy semantics.
+
+Q: What does orders.GroupBy(o goes to o.CustomerId) return?-- think --
+
+A: IEnumerable>, a sequence of groups. Each IGrouping has a .Key (the grouping value) and IS IEnumerable (the items in the group). You can iterate groups with foreach (var g in groups) foreach (var o in g).. The grouping is deferred but each iteration materializes the entire source.
+
+Cross-Q: I want a Dictionary> instead. How?-- think --
+
+A: orders.GroupBy(o goes to o.CustomerId).ToDictionary(g goes to g.Key, g goes to g.ToList()). Or use ToLookup: orders.ToLookup(o goes to o.CustomerId) returns ILookup, basically a multi-dictionary, similar A P I but one operator instead of two.
+
+Cross-Q²: I GroupBy and ToList against E F Core's DbSet with no aggregation. Why does it sometimes fail to translate?-- think --
+
+A: E F Core's GroupBy translation requires the projection to shape data the database can produce in one query, typically GroupBy(key).Select(g goes to new { g.Key, Count = g.Count() }) or other aggregates.
+Just GroupBy(.).ToList() asks the database to return "groups of full rows," which doesn't fit a sequel GROUP BY shape (sequel GROUP BY requires aggregates in the select). Older E F Core versions fell back to client-side eval (load everything, group in memory); E F Core 3+ throws.
+Fix: do the aggregation in the Select after the GroupBy.
+
+-- pause --
+Drill 8, Where then Select versus Select then Where.
+
+Q: For E F Core, does it matter whether Where comes before or after Select ?-- think --
+
+A: Functionally, the database optimizer typically flattens either form into the same plan, so the sequel is similar. Semantically, Where before Select is almost always correct because (a) Select can drop columns the Where needs, and (b) Where first limits the working set before projection.
+
+Cross-Q: Give me a case where Select first breaks the query.-- think --
+
+A: db.Orders.Select(o goes to new { o.Id, o.Total }).Where(x goes to x.CustomerId == cid);, the Select projects away CustomerId, so the subsequent Where doesn't compile (or, with dynamic link, fails at runtime).
+The fix: filter first while all columns are still in scope, then project to the shape you want.
+The "filter first" pattern is the safe default.
+
+Cross-Q²: For in-memory IEnumerable, does ordering matter?-- think --
+
+A: Marginally. Where first avoids projecting elements that get filtered out, saves the lambda invocations and tuple allocations. Select first invokes the projection lambda for every element, even those the Where will drop.
+For cheap projections it doesn't matter; for expensive projections (allocations, computation), filter first.
+
+-- pause --
+Drill 9, IAsyncEnumerable versus Task>.
+
+Q: When would you return IAsyncEnumerable instead of Task> ?-- think --
+
+A: When the result might be large enough that holding it all in memory is wasteful, or when you want the consumer to start processing as items arrive (streaming).
+Examples: a paginated A P I returning thousands of items, a sequel cursor over millions of rows, server-sent events, a long-running computation that emits incremental results.
+
+Cross-Q: What does the consumer lose with IAsyncEnumerable ?-- think --
+
+A: Random access ( result[i] ), cheap Count (must walk), and easy re-iteration (typically a single forward pass).
+Operators are no longer a differentiator: as of dot NET 10, System.Linq.AsyncEnumerable ships in the box with the standard operators over IAsyncEnumerable, using plain overloads for sync and async selectors and *Async terminals ( ToListAsync, AnyAsync ).
+Before dot NET 10 you needed the System.Linq.Async package with its WhereAwait / SelectAwait naming, mention that only as history, and remove the package reference when you upgrade, because it conflicts with the in-box version.
+What the consumer really commits to is the streaming pattern: await foreach (var x in source)., no peeking ahead, and a resource (connection, file handle) held open for the duration.
+
+Cross-Q²: How do I cancel an await foreach over an IAsyncEnumerable ?-- think --
+
+A: Pass a CancellationToken via .WithCancellation(ct) on the source. The producer must declare [EnumeratorCancellation] CancellationToken ct = default on its parameter for the token to actually flow through. Without WithCancellation, the producer's token stays default.
+The consumer can also break out of the await foreach to stop early; the runtime calls DisposeAsync on the enumerator, which lets the producer clean up.
+
+-- pause --
+Drill 10, Query syntax let.
+
+Q: What does let totalWithTax = o.Total * 1.08m compile to in method syntax?-- think --
+
+A: Select(o goes to new { o, totalWithTax = o.Total * 1.08m }), a projection into a transparent anonymous type that carries both the original o and the new value. Subsequent query clauses see both, projected through this anonymous type. Each let adds another layer of this projection.
+
+Cross-Q: Why is method syntax awkward for multiple let bindings?-- think --
+
+A: Because you must manage these transparent identifiers manually, Select(o goes to new { o, a }) then Select(t goes to new { t, b }) then Where(t goes to t t a > 0), and the dotted access ( t t a ) grows with each let.
+The compiler does this for you in query syntax; doing it by hand is error-prone and unreadable. Multiple let bindings are the strongest argument for query syntax.
+
+Cross-Q²: For an E F Core IQueryable, do let bindings translate to sequel?-- think --
+
+A: Yes, they become anonymous-type projections which E F Core can compose into the sequel SELECT. The let'd value either gets inlined into wherever it's referenced (if it's a simple expression) or becomes a subquery / C T E if used multiple times.
+Performance is usually identical to writing the expression inline; the let mostly aids readability.
+
+-- pause --
+Drill 11, Custom link operator, Chunk.
+
+Q: Before dot NET 6 added Chunk, how would you implement it?-- think --
+
+A: An extension method on IEnumerable that yields IReadOnlyList buckets of the requested size. The body iterates the source, accumulates items into a List, and yield return s the bucket each time it fills. After the loop, yield the final partial bucket if non-empty.
+The body MUST be wrapped in a non-iterator validating method, otherwise argument validation runs lazily, on the first MoveNext, not when the consumer calls Chunk(.).
+
+Cross-Q: Show me the wrapper pattern for eager validation.-- think --
+
+A: csharp.
+public static IEnumerable> Chunk(this IEnumerable source, int size).
+{.
+if (source is null) throw new ArgumentNullException(nameof(source));
+if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size));
+return ChunkIterator(source, size); // delegate to iterator.
+}.
+
+private static IEnumerable> ChunkIterator(IEnumerable source, int size).
+{.
+var bucket = new List(size);
+foreach (var item in source).
+{.
+bucket.Add(item);
+if (bucket.Count == size) { yield return bucket; bucket = new List(size); }.
+}.
+if (bucket.Count > 0) yield return bucket;
+}.
+
+The public method validates eagerly; the private iterator runs lazily. Without this split, a misuse like Chunk(null, 5) would only throw when the consumer iterated, surprising and hard to debug.
+
+Cross-Q²: When should a custom link operator NOT use yield return ?-- think --
+
+A: When the algorithm needs the whole source up front, Reverse (must know the last element first), OrderBy (must compare all elements), Partition (returns two disjoint sets in one pass), or any aggregate. yield return makes sense only for streaming, element-at-a-time operators.
+The BCL's Reverse actually does buffer internally, confirming the rule.
+
+-- pause --
+Drill 12, ToDictionary and duplicate keys.
+
+Q: orders.ToDictionary(o goes to o.CustomerId), what happens if two orders share a CustomerId ?-- think --
+
+A: ToDictionary throws ArgumentException on the second duplicate. The first occurrence is inserted; the second triggers the collision, and the exception terminates the operation.
+
+Cross-Q: I want to keep the first one and silently drop duplicates. How?-- think --
+
+A: Either use GroupBy first, orders.GroupBy(o goes to o.CustomerId).ToDictionary(g goes to g.Key, g goes to g.First()), or use ToLookup if you want a one-to-many indexed structure: orders.ToLookup(o goes to o.CustomerId) returns an ILookup.
+ToLookup allows multiple values per key, never throws on duplicates, and gracefully returns empty for missing keys.
+
+Cross-Q²: Why does ToDictionary throw but ToLookup doesn't?-- think --
+
+A: Because Dictionary is by definition unique-keyed, two values per key violates its contract; the only safe behavior is to throw. ILookup is multi-keyed by design (each key maps to an IEnumerable ), so duplicates are expected.
+The naming is consistent: Dictionary = unique; Lookup = multi-valued index.
+
+-- pause --
+Drill 13, EF.Functions.Like versus .Contains.
+
+Q: Why does E F Core have EF.Functions.Like(name, "%pattern%") when I can just write name.Contains("pattern") ?-- think --
+
+A: .Contains("x") translates to Name LIKE '%x%' COLLATE. in many databases (with E F Core inferring the database's default LIKE pattern). But you can't directly control the pattern, _, %, [abc] are reserved in sequel LIKE syntax.
+EF.Functions.Like(name, "%a_e") gives you direct access to the full LIKE expressiveness, single-char wildcard _, character classes, escape characters.
+
+Cross-Q: What about regex? Can I do Regex.IsMatch(name, pattern) in a Where clause?-- think --
+
+A: It depends entirely on the provider, and this is a good example of "translation is a provider capability, not a link feature." On sequel Server there is no built-in regex, so Regex.IsMatch doesn't translate and E F Core throws.
+On Postgres Q L it does: the Npgsql provider translates Regex.IsMatch(column, "A") to the database's own regex operator, column ~ 'A', so the filter runs server-side and can still use indexes.
+The portable answer is to write the predicate with translatable operators ( StartsWith, Contains, EF.Functions.Like ) where you can, use provider-specific translations deliberately when you can't, and only fall back to materialize-then- Regex.IsMatch when the result set is already small.
+
+Cross-Q²: sequel LIKE 'foo' and C sharp == "foo", same?-- think --
+
+A: Close but not identical. Default sequel collation typically treats LIKE as case-insensitive ( 'Foo' LIKE 'foo' is true with default collation on sequel Server, false on Postgres). C sharp == on strings is case-sensitive.
+If you want guaranteed case-insensitive matching across providers, use string.Equals(a, b, StringComparison.OrdinalIgnoreCase) (in-memory) or explicitly lower(a) = lower(b) (sequel via EF.Functions.ILike on Postgres or LOWER(col) ).
+
+-- pause --
+Drill 14, null in link predicates.
+
+Q: users.Where(u goes to u.IsActive) where IsActive is bool?. What does NRT tell you?-- think --
+
+A: Compile error, bool? is not implicitly convertible to bool.
+You have to pick the semantics for null explicitly, and each spelling means something different: Where(u goes to u.IsActive == true) keeps only the definitely-active ( null excluded); Where(u goes to u.IsActive == false) keeps only the definitely-inactive ( null also excluded, since null != false );
+Where(u goes to u.IsActive != true) keeps inactive and unknown; Where(u goes to u.IsActive.GetValueOrDefault()) treats unknown as inactive.
+Three-valued data has three answers and the compile error is the language forcing you to choose one.
+
+Cross-Q: What about users.Where(u goes to u.Name.StartsWith("a")) when Name is string? ?-- think --
+
+A: With NRT on, the compiler warns: CS8602: Dereference of a possibly null reference (since Name might be null and calling StartsWith on null throws). Fix: Where(u goes to u.Name?.StartsWith("a") == true) (the ?.
+short-circuits to null, and null == true is false) or Where(u goes to u.Name is not null and and u.Name.StartsWith("a")). NRT is the lightweight defense.
+
+Cross-Q²: For E F Core, does it translate u.Name == null differently than u.Name == "" ?-- think --
+
+A: Yes, and this is a subtle source of bugs. E F Core translates u.Name == null to sequel Name IS NULL.
+For u.Name == "", it generates Name = '' AND on some versions adds Name IS NOT NULL to match C sharp semantics (since C sharp null == "" is false but sequel NULL = '' is NULL /false anyway, the IS NOT NULL is sometimes redundant). The asymmetry: "" == null (false) versus NULL = '' (NULL).
+E F Core normalizes most cases, but custom comparisons may not, always use literal == / != operators in predicates and test the generated sequel.
+
+-- pause --
+Drill 15, Aggregate for implementing Sum.
+
+Q: Implement Sum for IEnumerable using Aggregate.-- think --
+
+A: source.Aggregate(0, (acc, x) goes to acc + x);, start with seed 0, fold each element by adding it to the accumulator. The Aggregate overload with explicit seed is the right one because an empty sequence should return 0, not throw (which the no-seed overload would do).
+
+Cross-Q: How would you implement Max without using the no-seed overload that throws on empty?-- think --
+
+A: Fold a state tuple that records whether anything was seen, then decide at the end:
+csharp.
+public static int MaxOrThrow(IEnumerable source).
+{.
+var (max, has Any) = source.Aggregate(.
+(Max: int.MinValue, HasAny: false),
+(acc, x) goes to (x > acc.Max? x: acc.Max, true));
+
+return has Any? max: throw new InvalidOperationException("Sequence contains no elements");
+}.
+
+Note the seed overload is required, the no-seed overload uses the first element as the seed and throws on an empty sequence before your fold ever runs. The idiomatic alternative is to let that happen: source.Aggregate((max, x) goes to x > max?
+x: max) throws on empty, which is exactly Max 's documented contract.
+
+Cross-Q²: For dot NET 6+, MaxBy(key Selector) exists. Is OrderByDescending(key Selector).First() slower?-- think --
+
+A: This is a trap question, and the confident wrong answer is "yes, O(n log n) versus O(n)." On current dot NET, Enumerable.First type-tests its source for link's internal iterator type and calls its TryGetFirst;
+the ordered iterator's override is a single linear pass tracking the running extreme, with no sort at all, you can read it in OrderedEnumerable.SpeedOpt.cs in dotnet or runtime.
+Same for Take(n) on an ordered sequence, which runs a partial quicksort documented as O(n + k log k) average rather than a full sort.
+The fast path is lost if anything sits between the ordering and the First ( OrderBy(k).Where(p).First() does sort), and it isn't compiled in under the size-optimized link feature switch.
+So: prefer MaxBy because it states the intent in one operator, not because the alternative is asymptotically worse. The senior signal here is refusing to repeat a performance claim you haven't checked.
+
+-- pause --
+Drill 16, Expression trees.
+
+Q: Func f = o goes to o.Total > x; and Expression> e = o goes to o.Total > x;, same source text. What does the compiler emit for each?-- think --
+
+A: For the Func, a method (usually on a compiler-generated closure class) plus a delegate pointing at it, the body becomes I L.
+For the Expression, no method body is emitted at all; instead the compiler emits calls into System.Linq.Expressions that construct a tree at runtime:
+a LambdaExpression whose body is a BinaryExpression of node type GreaterThan, with a MemberExpression for o.Total on the left and, on the right, a MemberExpression reading the field x from a ConstantExpression holding the closure instance.
+The lambda is data, not code.
+
+Cross-Q: Why does that right-hand side matter to E F Core?-- think --
+
+A: Because it's the difference between a parameter and a literal. A captured local produces a field-access node, and EF turns that into @__x_0, the sequel string is the same for every value, so EF's query cache and the database's plan cache both hit.
+Writing the value inline ( o.Total > 1000m ) produces a ConstantExpression, and EF bakes 1000.0 into the sequel, a different expression tree and a different sequel string per value, so EF recompiles and the server accumulates near-identical plans.
+It's also why hand-building trees with Expression.Constant is a documented performance trap, and why E F Core 8 or 9 added EF.Constant and EF.Parameter to override the default in each direction.
+
+Cross-Q²: You want to reuse one predicate for both a DbSet and an in-memory cache. How?-- think --
+
+A: Write it once as Expression>, pass it directly to db.Orders.Where(.), and keep a .Compile() d Func in a static field for the in-memory callers. What you cannot do is write it as a Func and hope EF copes, a delegate is opaque to the provider.
+And you must write it in the expression-tree subset of C sharp: no pattern matching, no ?., no interpolated strings, no tuple literals. The direction of travel is always tree to delegate, never the reverse.
+
+-- pause --
+Drill 17, Streaming versus buffering.
+
+Q: GroupBy is documented as deferred, and also described as reading the whole source. Which is it?-- think --
+
+A: Both, and they aren't in tension. Calling GroupBy does no work, it returns an object. The first MoveNext on that object consumes the entire source to discover every key and bucket every element.
+So it's deferred in the "nothing happens on the call" sense and eager in the "one MoveNext costs O(n) time and O(n) memory" sense. OrderBy and Reverse are the same shape. Where, Select and Take are the genuinely streaming operators: one element per MoveNext, O(1) memory.
+
+Cross-Q: Which of these terminate, Fib().Where(even).Take(5), Fib().OrderBy(n goes to n).Take(5), Fib().Distinct().Take(5) ?-- think --
+
+A: The first and third. Where / Take are streaming, so five even Fibonacci numbers come out and iteration stops. Distinct yields each new element as it sees it, it accumulates a set of seen values, so memory grows, but it produces output immediately, and Take(5) stops it.
+OrderBy cannot yield anything until it has seen the last element, and there isn't one, so it hangs. The rule of thumb: any operator that needs to compare or group across the whole sequence must buffer it, and buffering plus infinite equals hang.
+
+Cross-Q²: An export streams rows to the response with O(1) memory. Someone adds .OrderBy(r goes to r.Date). What breaks, and what are the options?-- think --
+
+A: Peak memory becomes O(n), every row is buffered before the first byte is written, so the largest exports, the ones that most need streaming, are the ones that OOM.
+The options in order of preference: sort in the database and keep streaming ( ORDER BY costs the server, not your process); sort by a key you can stream on, for example read in an order the source already provides; or accept the buffering and bound the export size explicitly.
+What isn't an option is leaving it and hoping, the change looks identical in call syntax to a Where, which is exactly why it passes review.
+
+-- pause --
+Drill 18, Custom operators and IQueryable.
+
+Q: "You can't write custom link operators for IQueryable, they don't translate." Is that right?-- think --
+
+A: It's too broad. public static IQueryable NotDeleted(this IQueryable q) goes to q.Where(x goes to x.DeletedAt == null); works perfectly: your method runs at composition time, on the client, and appends standard nodes to the tree. The provider never learns that NotDeleted existed.
+What genuinely breaks is calling your own method inside a lambda, Where(o goes to o.IsBigSpender()), because that becomes a MethodCallExpression the provider has no translation for. The reviewable rule is about the signature: IQueryable in and IQueryable out is safe; entity in and bool out is not.
+
+Cross-Q: What does a custom operator cost on the IEnumerable side?-- think --
+
+A: It's an opaque iterator, so it breaks link's operator fusion. Where(p).Select(f) collapses into one fused iterator inside System.Linq; Where(p).MyOp().Select(f) cannot, so you pay an extra object and an extra MoveNext frame per element for everything downstream.
+Irrelevant almost everywhere, worth knowing in a hot loop, put custom operators at the ends of a hot chain rather than the middle.
+
+Cross-Q²: Your custom operator has to buffer, say, "sort each key's group and take the top 3." Where does the argument validation go, and why?-- think --
+
+A: In a non-iterator public wrapper that validates and then returns the private iterator method.
+If you validate inside the iterator, the body doesn't run until the consumer's first MoveNext, so an ArgumentOutOfRangeException for take: -1 is thrown from a foreach in somebody else's assembly rather than from the call that was wrong.
+That's a genuine library-design rule and it's what System.Linq itself does for every operator with arguments to check.
+
+-- pause --
+Drill 19, Who actually runs an IQueryable.
+
+Q: I call db.Orders.Where(p).OrderBy(k) and nothing happens. Then I call .Count() and sequel runs. Walk me through the machinery.-- think --
+
+A: Queryable.Where doesn't filter, it calls source.Provider.CreateQuery(.) with a MethodCallExpression whose Method is Queryable.Where itself, whose first argument is the tree built so far, and whose second is your lambda wrapped in Expression.Quote.
+That returns another IQueryable and touches no data. OrderBy does the same again. Count() is a terminal operator, so it calls Provider.Execute(.) instead, and that is the call that translates the tree and issues sequel.
+ToList() goes through the other door: there's no Queryable.ToList, so it's Enumerable.ToList enumerating the queryable through its IEnumerable face, which triggers the provider's enumeration path.
+
+Cross-Q: Why does every expression visitor over a queryable tree start with a StripQuotes helper?-- think --
+
+A: Because the arguments of a MethodCallExpression must themselves be Expression s, and a lambda already is one, so Queryable wraps it in a UnaryExpression of node type Quote. call.Arguments[1] is therefore a Quote node, not a LambdaExpression, and casting it directly is an InvalidCastException.
+StripQuotes unwraps .Operand until the node type is no longer Quote.
+
+Cross-Q²: list.AsQueryable().ToListAsync() throws. Why, and what does that tell you about mocking DbSet ?-- think --
+
+A: AsQueryable() over an in-memory list gives you EnumerableQuery, whose provider is IQueryProvider and nothing more. EF's async operators need the source to support async, EF defines IAsyncQueryProvider: IQueryProvider with ExecuteAsync for exactly this, so they throw InvalidOperationException.
+The deeper point is about test design: you can write a fake async provider that delegates to link-to-Objects and make the error go away, but then your tests run link-to-Objects, which translates everything.
+A Where calling a client method, a GroupBy with no aggregate, an interpolated string in a Select, all pass in the fake and throw in production. Query tests belong against a real provider; mock the things that aren't queries.
+
+-- pause --
+Drill 20, AsParallel().
+
+Q: A colleague adds .AsParallel() to a link chain and the numbers don't move. What are the possible reasons?-- think --
+
+A: In rough order of likelihood: (1) PLINQ decided not to parallelise, it's conservative by default and picks the sequential algorithm when the parallel one looks expensive, so nothing ran in parallel at all; use WithExecutionMode(ParallelExecutionMode.ForceParallelism) to test the hypothesis.
+(2) The work is I O-bound, so extra threads just wait. (3) The sequence is short or the delegate is cheap, and the partition-and-merge overhead ate the gain. (4) The chain ends in a foreach, which merges all results back onto one thread, ForAll avoids that merge.
+(5) One partition has all the expensive elements.
+
+Cross-Q: Explain (5). How can partitioning alone ruin the speedup?-- think --
+
+A: The default strategy depends on the type of the source.
+For an array or IList, PLINQ uses range partitioning with no load balancing:
+each worker is handed a contiguous index range up front and there is no work stealing, so if the expensive elements cluster, sorted input often makes them cluster, one worker runs long while the rest idle, and the query takes as long as the worst partition.
+For a non-indexable IEnumerable it uses chunk partitioning, which is self-balancing because workers come back for more. The fix for the skewed array case is to pass Partitioner.Create(source, load Balance: true) as the query's source.
+
+Cross-Q²: What changes about correctness, not speed, when you add AsParallel() ?-- think --
+
+A: Four things. Result order becomes unspecified unless you add AsOrdered(), which buffers and sorts, partly undoing the point. Exceptions come back wrapped in an AggregateException rather than as themselves, so existing catch (FormatException) blocks stop matching.
+Your delegates must be thread-safe and side-effect-free; Select(x goes to { list.Add(x); return x; }) is a data race that corrupts a List silently.
+And cancellation is cooperative at the query level, the docs warn a cancelled query "might continue to process some elements after the cancellation token is set", so a long per-element delegate has to check the token itself.
+
+-- pause --
+Section 2. Self-test.
+
+IEnumerable.Where takes Func, a delegate; the body executes in-process. IQueryable.Where takes Expression>, a tree representing the code, which the provider walks to translate (EF to sequel, MongoDB driver to BSON, et cetera).
+The same source text e goes to e.Age > 18 compiles to either, depending on what the receiver expects: to a method plus a delegate for the first, to tree-building calls into System.Linq.Expressions for the second.
+
+The trap is what happens if you build the Func into a variable first and then pass it to a DbSet. It does not fail to compile and it does not throw.
+Queryable.Where isn't applicable, so overload resolution falls back to Enumerable.Where via IQueryable 's IEnumerable base, the whole table is materialized and the predicate runs in memory, silently. The tell is in the sequel log: a SELECT with no WHERE.
+Declare shared predicates as Expression> and .Compile() them for the in-memory callers, never the other way round.
+
+link operators on IEnumerable are deferred, Where returns one of link's lazy iterator objects that applies the predicate during iteration. Until you foreach, .ToList(), .Count(), or otherwise enumerate, the predicate never runs.
+This is why side effects in lambdas are dangerous: re-enumerating runs them again. To force eager execution, materialize with .ToList().
+To check this in the debugger, hover the variable, its runtime type is an iterator ( ListWhereIterator and friends on dot NET 9 or 10, Enumerable+WhereListIterator on earlier versions), not T[] / List.
+
+Task> waits until all items are available, then returns the buffered list, high memory if items are large or many, but allows random access and re-iteration.
+IAsyncEnumerable streams: each await foreach step awaits the next item; the producer can backpressure; the consumer can stop early without paying for unread items.
+Use IAsyncEnumerable for: streaming sequel cursors, paginated A P Is, server-sent events, large file processing where holding the whole set would exceed memory.
+Trade-offs: forward-only, no cheap Count, and, the one people miss, the underlying resource stays open for the whole consumption, so a slow consumer holds a database connection for the duration.
+(E F Core does stream sequel results this way via AsAsyncEnumerable(); what doesn't happen is further link over the async stream being pushed into sequel, once you're in IAsyncEnumerable, the operators from System.Linq.AsyncEnumerable run in your process.)
+
+Answer the question the interviewer is actually asking, which is whether you know how System.Linq behaves rather than whether you can recite Big-O.
+If customers is IEnumerable, this is not the bug it looks like: Where(.) returns a link iterator, OrderBy wraps it in an ordered iterator, and First() type-tests for that iterator and calls its TryGetFirst, which is a single linear pass tracking the running minimum, no sort happens.
+Rewriting it as customers.Where(c goes to c.IsActive).MinBy(c goes to c.Name) is a readability win, not a complexity win.
+
+Where it is a real problem: (a) if the ordered sequence is consumed by anything other than First / Take / ElementAt, .OrderBy(k).Where(p).First() sorts, because Where hides the ordered iterator; (b) if the app runs with the size-optimized link feature switch, which compiles the fast paths out;
+(c) if it's List.Sort or Array.Sort rather than link.
+And if customers is IQueryable, none of this applies, it's ORDER BY Name with TOP 1 / LIMIT 1, and the fix is a database index on Name, not a link operator. So the correct answer is "on 1M in-memory rows, probably nothing, show me the profile, and let's check whether this is even the slow part."
+
+MyHelper.IsAdult is a static C sharp method, EF's expression visitor doesn't know how to translate it to sequel because it's not in the provider's known-method set.
+Fixes: (1) inline the logic, Where(u goes to u.Age >= 18) translates trivially; (2) use a [DbFunction] -mapped function backed by a sequel function;
+(3) split the query, translate as much as possible ( Where(u goes to u.Age >= 18) ), materialize, then apply complex C sharp logic in-process ( AsEnumerable().Where(u goes to MyHelper.IsAdult(u.Age)) ).
+Choice depends on data volume, option 3 is fine for small results, deadly for large. A fourth option is often the best one for shared rules: expose the rule as a static Expression> IsAdult goes to u goes to u.Age >= 18; and pass it to Where directly, with a cached .Compile() for in-memory callers.
+
+No method body is emitted.
+The compiler emits calls into System.Linq.Expressions that build a LambdaExpression at runtime:
+a BinaryExpression of node type GreaterThan, MemberExpression(o.Total) on the left, and, this is the part that matters, not Expression.Constant(1000m) on the right, but a MemberExpression reading the captured field from a ConstantExpression holding the closure instance.
+The tree stores the path to the value, not the value. That's what lets E F Core emit WHERE Total > @__threshold_0 instead of baking a literal in, which in turn is what lets EF's query cache and the database's plan cache hit across calls.
+Write the number inline instead and you get a ConstantExpression, a different sequel string per value, and a plan-cache entry per value.
+
+Any three of: pattern matching ( o is { Status: Open }, switch expressions), the null-conditional operator ?., interpolated strings, tuple literals and tuple ==, with expressions, collection expressions, Index / Range ( 1,.
+), throw expressions, await, statement-bodied lambdas, calls with named or optional arguments.
+The reason is structural rather than incidental: expression trees can't gain new node types without breaking every library that interprets them, so most C sharp features added after C sharp 3 are simply unrepresentable.
+The practical consequence is that a predicate you intend to share with a provider has to be written in the C sharp 3 subset, and any "let's modernize this lambda" refactor can turn a working query into a compile error, or, worse, into a Func that silently binds to Enumerable.Where.
+
+Ask where. A link chain allocates once per construction, an iterator per operator (fewer, because adjacent Where / Select calls fuse into a single iterator inside System.Linq ), a delegate per lambda, and a closure object per capturing lambda scope.
+That's a fixed cost paid once per query, which is irrelevant in a request handler that runs one query and dominant in a query built inside a loop that runs thousands of times per request. So the response is: keep link everywhere, and rewrite as loops only where a profiler has named the site.
+Two cheap defences in the meantime, mark hot-path lambdas static so accidental captures become compile errors, and watch for helpers typed IEnumerable that box a List 's struct enumerator on every call.
+Measure with [MemoryDiagnoser] and read the Allocated column, which is stable across machines, before the Mean column, which isn't.

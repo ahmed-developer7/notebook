@@ -1,0 +1,592 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Cost of reflection.
+
+Q: Why is method Info.Invoke(obj, args) slower than a direct method call?-- think --
+
+A: Not because "reflection is slow", because Invoke has one signature for every method in existence, so everything a normal call resolves at compile time has to be resolved per call.
+Concretely: an object[] allocation for the arguments, a box per value-type argument, runtime validation of count and assignability plus by-ref and Type.Missing handling, an unbox-and-store on the way in, a box on the way out, and no possibility of inlining.
+All of that is a fixed cost per call, independent of what the target does, which is why it's dominant on a property getter and invisible on a method that hits a database. Adding GetMethod(name) inside the loop layers a metadata lookup and more allocations on top.
+I'd avoid quoting a multiplier: the ratio is entirely a function of the target's own cost.
+
+Cross-Q: How would you get close to direct-call cost?-- think --
+
+A: Stop using the object[] convention. Three options in ascending order of flexibility. (1) MethodInfo.CreateDelegate(), the generic overloads shipped in dot NET 5; the non-generic CreateDelegate(Type) is much older.
+You get a real delegate; invoking it is one indirection, no array, no boxing, no validation. (2) MethodInvoker.Create(method Base) (dot NET 8), when the signature isn't statically known so you can't name a Func<>.
+It builds an invocation stub specialized to that method's signature once, so the validation isn't repeated; the trade documented by Microsoft is that it skips Type.Missing default-value lookup and the target may be inlined out of stack traces.
+(3) Expression.Lambda().Compile() when the shape is composed at runtime, but note it emits via DynamicMethod, and under Native A O T there is no DynamicMethod, so expressions fall back to the interpreter.
+
+Cross-Q²: Why is CreateDelegate faster than a compiled expression tree?-- think --
+
+A: CreateDelegate binds a delegate straight at the target method, the invocation is an ordinary delegate call.
+Expression.Lambda(.).Compile() emits a new method through DynamicMethod whose body calls the original, so you pay an extra frame, plus a substantial one-time compile cost, plus the memory for the generated method.
+Use CreateDelegate when you have a MethodInfo and know the signature; use expression trees when you need to build something, a getter with a type conversion, a composed predicate, a constructor call with defaults.
+And know the A O T asymmetry: CreateDelegate is fine under Native A O T, Compile() silently degrades to interpretation.
+
+-- pause --
+Drill 2, Reflection versus source generators.
+
+Q: When is reflection the right tool over source generation?-- think --
+
+A: When the types aren't known at compile time, plugin loaders that drop DLLs into a folder at runtime, scripting hosts (Roslyn-scripted user code), ORMs over arbitrary user entities, D I containers scanning unknown assemblies.
+Source generators only see what's in your compilation; if your code is "load whatever is in /plugins and instantiate every IPlugin," generators can't help.
+Reflection is also fine for one-time startup work, service registration, attribute scanning at init, where a per-type cost paid once, before the first request, is not on any latency budget you care about.
+The caveat is that "startup" stops being free when the process starts often: at hundreds of instances or in a scale-to-zero serverless model, startup reflection is the p99, which is exactly the pressure that produced compiled models and the configuration-binding generator.
+
+Cross-Q: And when does source generation crush reflection?-- think --
+
+A: When the same reflective work happens repeatedly at runtime on types known at build time, Jason serialization, logging, model binding, regex compilation, mapper code.
+Source generators emit the specialized code at compile time: no runtime metadata lookups, no metadata structures to allocate, A O T-compatible, trimmer-safe.
+Microsoft's own write-up on the System.Text.Json generator reports "up to 40% or more startup time reduction, private memory reduction, throughput speed increase (in serialization optimization mode), and app size reduction", worth citing as their number rather than one of mine,
+and worth noting that the biggest single component is startup, because the reflection path's cost is dominated by building JsonTypeInfo on first use.
+Logging via [LoggerMessage] does the level check before touching any argument, so a disabled level costs nothing at all.
+
+Cross-Q²: A library author has a reflection-based A P I and wants to add source-gen support. What's the migration shape?-- think --
+
+A: The pattern is to keep the reflection path as fallback and let users opt in to source-gen. System.Text.Json is the reference: JsonSerializer.Serialize(obj) still works (reflection); JsonSerializer.Serialize(obj, AppJsonContext.Default.UserDto) uses a generated context.
+The library exposes a JsonSerializerContext base class with virtuals; the generator emits a partial class overriding those virtuals with type-specialized code. Users can mix both modes in the same app.
+Same pattern works for logging, mapping, validation libraries, keep reflection for "unknown types," generate code for "known types."
+
+-- pause --
+Drill 3, Why attributes are baked at compile time.
+
+Q: Why do attributes have to be evaluated at compile time?-- think --
+
+A: Attributes are emitted into the assembly's metadata at compile time, they're not stored as runtime objects until something reads them. The compiler validates the attribute call (constructor arguments must be constants), encodes them in the metadata tables, and stops there.
+Some attributes like [Obsolete] and [Conditional] are also acted upon by the compiler itself during compilation, [Obsolete] triggers warnings on use sites, [Conditional("DEBUG")] causes the compiler to skip emitting calls when the symbol isn't defined.
+
+Cross-Q: That means attribute constructor arguments must be. what?-- think --
+
+A: Compile-time constants, literals, const fields, enum values, typeof expressions, nameof, single-dimensional arrays of these, and named-property assignments to the same.
+Note the sharp edge: a const string works and a static readonly string does not, because readonly is a runtime guarantee and const is a compile-time substitution, the compiler needs the actual bytes to write into the metadata blob.
+You also cannot pass a method result, a constructed object ( [Foo(new Uri("."))] ), or any runtime expression. The workaround for a non-constant is always the same: pass a string or a typeof and resolve it in the consumer.
+
+Cross-Q²: If attributes are stored as metadata, when does an attribute object actually get constructed?-- think --
+
+A: Lazily, on every reflection access. Calling member.GetCustomAttribute() makes the runtime construct a fresh FooAttribute instance from the stored metadata, actually running its constructor with the encoded args.
+Each call allocates a new one, caching is your job, and it requires loading the assembly the attribute type lives in and executing code from it.
+If that's a problem (a build tool inspecting untrusted assemblies, a MetadataLoadContext where nothing can execute), use GetCustomAttributesData() instead: it returns CustomAttributeData describing the constructor reference and the encoded arguments, with nothing constructed.
+Two caveats, it reports the values as written, not whatever the constructor would have normalised them to, and it has no inherit: true, so it never walks the base chain.
+
+-- pause --
+Drill 4, [CallerMemberName].
+
+Q: How does [CallerMemberName] work?-- think --
+
+A: It's a compile-time call-site injection attribute. When a method has a parameter marked [CallerMemberName] string member Name = "", the compiler injects the calling member's name (method, property, event) as the default value at each call site.
+The injection happens at compile time, no reflection at runtime. The default value can still be overridden explicitly.
+
+Cross-Q: Where's this used in real-world code?-- think --
+
+A: Two canonical patterns. (1) INotifyPropertyChanged, protected void OnPropertyChanged([CallerMemberName] string name = "") goes to PropertyChanged?.Invoke(this, new(name));, setters call OnPropertyChanged() with no argument, and the compiler injects the setter's property name.
+Eliminates the nameof(MyProperty) string-typing in every setter. (2) Your own logging helper, since you can't put the attribute at a call site, it goes on the parameter of the helper you call:
+csharp.
+void LogFailure(Exception ex, [CallerMemberName] string method = "", [CallerLineNumber] int line = 0).
+goes to _logger.LogError(ex, "Failed in {Method} at line {Line}", method, line);
+
+// call site, no arguments, compiler fills both in.
+LogFailure(ex);
+
+Note what this buys over a stack trace: it's resolved at compile time, so it survives inlining, release builds, and trimmed deployments where StackTraceSupport may be off.
+
+Cross-Q²: What's [CallerArgumentExpression] and when did it ship?-- think --
+
+A: C sharp 10 (2021). It captures the textual expression passed for a different parameter. Canonical use: ArgumentNullException.ThrowIfNull(object? arg, [CallerArgumentExpression(nameof(arg))] string?
+param Name = null), calling ThrowIfNull(user.Profile) injects "user.Profile" as the param name into the exception message. You get accurate exception text without manually writing the name. Used everywhere in the modern BCL for argument validation.
+
+-- pause --
+Drill 5, Positional versus named attribute arguments.
+
+Q: What's the difference between [Foo("bar", baz: 5)] 's "bar" and baz: 5 ?-- think --
+
+A: "bar" is a positional argument, it must match a constructor parameter by position. baz: 5 is a named argument, it must match a public read or write property or field (not a constructor parameter) on the attribute class.
+Positional args go to the constructor; named args are set via property assignment after construction.
+
+Cross-Q: Can the same name be both a positional and a named arg?-- think --
+
+A: Technically yes if the attribute defines a constructor param and a property of the same name, but it's a code smell. The compiler disambiguates by position versus syntax ( Foo("x") is positional; Foo(arg: "x") is the named form bypassing the constructor).
+The convention is: constructor params for required values, properties for optional values. [AttributeUsage(AttributeTargets.Class, AllowMultiple = true)], AttributeTargets.Class is positional (required by ctor); AllowMultiple is named (optional property).
+
+Cross-Q²: Why does [Required] work without any args but [Range(1, 100)] requires both?-- think --
+
+A: [Required] has a parameterless constructor, no positional args needed. [Range] has a constructor Range(int min, int max), both positional args are required because they're constructor parameters with no defaults.
+The attribute author decides which args are mandatory by choosing constructor versus property. Style rule: make truly-required values constructor params (compile-time enforcement), make tuning options properties (named, optional, easier to evolve without breaking existing usages).
+
+-- pause --
+Drill 6, AttributeUsage.Inherited.
+
+Q: What does [AttributeUsage(., Inherited = true)] actually inherit?-- think --
+
+A: When true (the default), the attribute is inherited by derived classes. So if [Audit] is on BaseController and inherited set to true, then UsersController: BaseController also has [Audit] as far as GetCustomAttribute(inherit: true) is concerned.
+When false, the attribute applies only to the exact type it's declared on; derived types don't see it.
+
+Cross-Q: Is inherited the same as inherit: true on the reflection call?-- think --
+
+A: They work together but aren't the same thing. AttributeUsage.Inherited is set at attribute definition time, it says whether this attribute is inheritable in principle.
+MemberInfo.GetCustomAttribute(inherit: true) is set at read time, it says "walk the chain looking for attributes." For inheritance to work, both must be true: the attribute must be defined as inheritable, AND the read call must opt into traversal.
+If AttributeUsage.Inherited = false, the inherit: true on the read does nothing for that attribute.
+
+Cross-Q²: What about interface attributes, does an attribute on an interface flow to implementing classes?-- think --
+
+A: No, AttributeUsage.Inherited only walks the class inheritance chain, not interface implementations. An [Audit] attribute on IService is not discoverable on Service: IService via GetCustomAttribute(inherit: true).
+If you want it you must enumerate the interfaces yourself: type.GetInterfaces().SelectMany(i goes to i.GetCustomAttributes(typeof(AuditAttribute), inherit: false)). The same applies at the member level, an attribute on an interface method does not flow to the implementing method.
+This is the single most common surprise in convention-based discovery, and the reason it hurts is that the failure is silent: you get an empty result, not an exception. Any attribute-driven registry should log its registration count at startup so "found none" is distinguishable from "nothing to do".
+
+-- pause --
+Drill 7, Type.GetMethods() and binding flags.
+
+Q: type.GetMethods() with no arguments, what do you get?-- think --
+
+A: The docs phrase it as "all the public methods of the current Type ", which means public instance and static, equivalent to BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static.
+Excluded: everything non-public (private, protected, internal), and constructors, those need GetConstructors(). On inheritance the rule is asymmetric: inherited public instance methods are returned; inherited public statics are not, unless you ask for FlattenHierarchy.
+FlattenHierarchy is not implicit.
+One more detail people miss: from dot NET 7 the returned order is deterministic (metadata order in the assembly); on dot NET 6 and earlier it was explicitly unspecified, so any code that depends on ordering was always a bug and is now merely a bug that happens to work.
+
+Cross-Q: How do I get private and static methods declared on this type only (no inherited)?-- think --
+
+A: type.GetMethods(BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly). Three flags combined: NonPublic (private + protected + internal), Static (no instance), DeclaredOnly (no inherited).
+Gotcha: the accessibility and the instance or static axes are independent, and you must supply at least one from each or you get nothing back, BindingFlags.Default alone returns an empty array by design.
+Also note NonPublic returns protected and internal methods from base classes but not private ones, since private members aren't inherited. Reaching for everything means Public | NonPublic | Instance | Static, then filtering.
+
+Cross-Q²: What does typeof(int).GetMethod("ToString") do?-- think --
+
+A: It throws AmbiguousMatchException, it does not return null. Int32 has four ToString overloads and the name-only lookup can't choose. That's the important distinction: null means not found; the exception means found several.
+Disambiguate by passing the parameter types, GetMethod("ToString", Type.EmptyTypes) for the parameterless one, or GetMethod("ToString", [typeof(IFormatProvider)]). The reason this matters beyond trivia is that generic helper code written as t.GetMethod(name) is null? throw new(.):.
+looks like it handles every failure and handles exactly one of them; a plugin or config-driven lookup will eventually meet an overloaded name and surface an exception the author never anticipated.
+
+-- pause --
+Drill 8, MethodInfo.Invoke versus Delegate.CreateDelegate.
+
+Q: When would you reach for Delegate.CreateDelegate over MethodInfo.Invoke ?-- think --
+
+A: When you'll call the method many times with a known signature at code-write time. CreateDelegate produces a Delegate you can invoke directly, call overhead is one indirection, similar to a virtual call.
+MethodInfo.Invoke allocates an object[], boxes every value-type argument, validates the arguments on every call, and boxes the return. The trade-off: CreateDelegate requires you to know the signature at compile time to name the right Func<> / Action<> type.
+
+Cross-Q: Sketch the code.-- think --
+
+A:
+csharp.
+// One-time setup (slow):
+var method = typeof(User).GetMethod("GetEmail")!;
+
+// dot NET 5+ generic overload, preferred, no cast:
+var get Email = method.CreateDelegate>();
+
+// Older / non-generic form, note it is an instance method on MethodInfo:
+var getEmail2 = (Func)method.CreateDelegate(typeof(Func));
+
+// Hot path:
+string email = get Email(user);
+
+There is no Delegate.CreateDelegate static, the generic overloads live on MethodInfo. The delegate type must match the method's signature exactly. For an open instance delegate the first parameter is the receiver ( Func above); to bind the receiver up front, use the CreateDelegate(object?
+target) overload and drop it from the signature ( Func ). For statics, no receiver either way.
+
+Cross-Q²: How does this compare to a compiled Expression.Lambda ?-- think --
+
+A: Delegate.CreateDelegate is slightly faster (no extra indirection through generated I L) but only works when the signature is statically known.
+Expression.Lambda().Compile() works for arbitrary I L emission, you can compose property access, method calls, conversions, branches inside an expression tree, then compile.
+Use CreateDelegate for "I have a MethodInfo, want a fast wrapper"; use Expression trees for "I want to dynamically build a getter for property X with type coercion."
+
+-- pause --
+Drill 9, dynamic and the DLR.
+
+Q: What does the DLR do behind the scenes when you call a method on dynamic ?-- think --
+
+A: The compiler turns each dynamic operation into a CallSite with a binder.
+The first execution invokes the binder, which runs the C sharp overload-resolution rules against the runtime types, produces an expression tree for the dispatch, compiles it to a delegate, and installs it in the call site's cache.
+Subsequent executions with the same runtime types run the cached delegate after a type-guard check. Different types add rules to the site's cache (a small polymorphic cache), and beyond that it falls back to a shared L2 cache and then to re-binding.
+
+Cross-Q: So dynamic is faster than MethodInfo.Invoke ?-- think --
+
+A: For repeated calls at a monomorphic site, the same runtime types over and over, a warm dynamic site is typically the better of the two, because it has compiled a typed dispatch and no longer touches MemberInfo or object[].
+For one-off calls or a site that sees many types, it's the worse of the two: you pay binder execution and expression compilation, which is far more than a cached MethodInfo.Invoke costs.
+I'd resist quoting ratios either way, the point is that the two have different shapes: Invoke has a flat per-call cost; dynamic has a large first-call cost amortized over a cache that only pays off if it hits.
+
+Cross-Q²: Why would you not just use dynamic everywhere reflection is needed?-- think --
+
+A: (1) No IntelliSense, the IDE can't help. (2) Runtime errors only, obj.Tyoeo (typo) compiles fine, blows up at runtime. (3) Doesn't compose with generics ( T dynamic doesn't make sense), NRT ( dynamic? is ill-defined), or pattern matching ( if (x is SomeType) requires concrete types).
+(4) A O T-hostile, the DLR emits I L at runtime, which A O T can't precompile. Use dynamic for legacy COM interop, traversing genuinely dynamic data (legacy Jason dynamic A P I), or scripting host bridges. For typed-but-reflection scenarios, prefer cached MethodInfo or compiled delegates.
+
+-- pause --
+Drill 10, System.Text.Json source generation.
+
+Q: What changes between JsonSerializer.Serialize(obj) (reflection) and JsonSerializer.Serialize(obj, ctx.UserDto) (source-gen)?-- think --
+
+A: Reflection mode: on first use, JsonSerializer walks UserDto 's public members via reflection and builds a JsonTypeInfo, property metadata, converters, getter delegates, which it then caches on the JsonSerializerOptions. Steady-state calls reuse that.
+Source-gen mode: a build-time generator emits the JsonTypeInfo as code, so the metadata-building step doesn't happen at runtime at all, and in serialization-optimization (fast-path) mode it also emits a method that writes directly to Utf8JsonWriter with no metadata indirection.
+The headline difference is therefore startup and first-call, not steady-state throughput, plus the thing that actually forces the decision, which is that the reflection path is not A O T-safe.
+
+One real limitation to name, because it catches people: source-gen mode supports only public or internal members and accessors. Putting [JsonInclude] on a private property works in reflection mode and throws NotSupportedException at runtime under source generation.
+
+Cross-Q: Setup for source-gen?-- think --
+
+A: Define a partial context:
+csharp.
+[JsonSerializable(typeof(UserDto))].
+[JsonSerializable(typeof(List))].
+internal partial class AppJsonContext: JsonSerializerContext { }.
+
+// Use at call site.
+var json = JsonSerializer.Serialize(user, AppJsonContext.Default.UserDto);
+
+The generator inspects each [JsonSerializable(typeof(T))] and emits a typed property Default.T returning a specialized JsonTypeInfo.
+JsonSourceGenerationMode.Serialization emits only the fast path (serialize-only, smaller code); Metadata emits the metadata needed for both directions; the default emits both.
+In A S P dot NET Core you don't pass the context at each call, you register it once: options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default).
+
+Cross-Q²: What happens if my options turn on something the fast path can't do?-- think --
+
+A: The serializer detects it and falls back to metadata mode for that type, silently, per type, at runtime.
+The documented list of options the fast path does not support includes Converters, Encoder, NumberHandling, DictionaryKeyPolicy, and, the one people hit, ReferenceHandler, so ReferenceHandler.Preserve for cycles always takes the slow path.
+Attribute-wise, [JsonConverter], [JsonConstructor], and [JsonExtensionData] also disable it.
+Two implications worth stating: (1) benchmark with your options, because a single global converter can quietly disable the fast path everywhere; (2) if you configured JsonSourceGenerationMode.Serialization only, there is nothing to fall back to, and serialization can fail outright for those types.
+As for dynamic, the generator sees object, because dynamic is object plus a marker at the metadata level; it emits polymorphic handling that resolves the runtime type at serialization time, which is exactly the resolution that has nothing to resolve against under A O T.
+The general rule stands: source-gen excels at closed-shape DTOs; open-ended shapes belong in reflection mode, and most apps mix both.
+
+-- pause --
+Drill 11, Reflection emit and dynamic types.
+
+Q: When would you ever use TypeBuilder / ILGenerator ?-- think --
+
+A: Rarely in modern dot NET. The classic use cases were proxy generation (Castle.DynamicProxy, which Moq still builds on), AOP weavers, and O R M accessor generation.
+Modern alternatives: System.Linq.Expressions covers most of these cases with far less code; source generators cover the "I need real types" cases at compile time instead.
+And there is now a hard constraint that settles the argument for a lot of codebases: System.Reflection.Emit is unsupported under Native A O T, it's listed as "no runtime code generation" in the deployment limitations.
+Any library that wants to be A O T-compatible has to have a non-emit path, which is why mocking frameworks built on dynamic proxies remain a reason teams can't A O T their test projects even when the product code is clean.
+
+Cross-Q: What's DynamicMethod then?-- think --
+
+A: A lighter-weight cousin, emit a single method's I L without building a full type. Often paired with MethodBuilder for proxy patterns. The dot NET BCL uses DynamicMethod internally for things like compiled regexes (pre- [GeneratedRegex] ) and reflection delegate creation.
+From user code, the modern equivalent is Expression.Lambda(.).Compile(), it internally emits a DynamicMethod, exposing only the high-level expression-tree A P I.
+
+Cross-Q²: Why are Expression trees a better choice than I L emit for most cases?-- think --
+
+A: (1) Type-safe at construction, the compiler checks Expression.Property(p, "Name") against the declared type; raw I L emit just throws InvalidProgramException at execution if wrong. (2) Composable, you can transform expression trees (replace nodes, rewrite, optimize) before compiling.
+(3) Debuggable, .ToString() on an expression tree gives readable output. (4) Higher-level constructs, Expression.Loop, Expression.TryCatch, Expression.Block model real C sharp semantics; I L emit forces you to manage stack, labels, locals manually.
+Reach for raw I L only when you need I L features Expression trees don't support (fault handlers, value-type vararg, advanced calling conventions).
+
+-- pause --
+Drill 12, Expression trees versus MethodInfo.Invoke.
+
+Q: I have a MethodInfo for GetName(int id). Best way to invoke it 1 million times with different IDs?-- think --
+
+A: Bind a strongly-typed delegate once. Two paths: (1) method Info.CreateDelegate>(), simplest and cheapest per call. (2) Expression tree if you need to inject type coercion or build the call dynamically:
+csharp.
+var p = Expression.Parameter(typeof(int));
+var call = Expression.Call(instance: null, method Info, p);
+var fn = Expression.Lambda>(call, p).Compile();
+for (int i = 0; i < 1_000_000; i++) fn(i);
+
+Either removes the per-call object[], the box of i, the argument validation, and the unbox of the result that method Info.Invoke(null, [i]) pays a million times.
+
+Cross-Q: What about caching MethodInfo and using Invoke, what exactly does that leave on the table?-- think --
+
+A: Caching removes the lookup and the MemberInfo allocations. It leaves the entire calling convention: an object[] allocation per call, a box of the int, count-and-assignability validation, and an unbox of the returned string reference. A bound delegate has none of those.
+This is why "we cached the MethodInfo, it's fine now" is only half a fix, and the allocation column of a benchmark shows the remaining half immediately.
+
+Cross-Q²: Why doesn't dot NET cache the compiled delegate automatically for MethodInfo.Invoke ?-- think --
+
+A: Because Invoke is signature-agnostic by contract, one method that accepts object[] for any target, plus semantics like Type.Missing default-value lookup that a typed stub can't reproduce.
+To specialize, the runtime would have to commit to a signature it doesn't know at the call site, and change documented behaviour.
+dot NET 8 added MethodInvoker (and ConstructorInvoker ) as the opt-in version of exactly that: you create one from a MethodBase, it builds a stub specialized to that signature once, and you cache the invoker.
+The docs are explicit that it's faster "when compatibility with [ Invoke ] isn't necessary and when the caller can cache the MethodInvoker instance", and that it deliberately drops the Missing handling and may let the target be inlined out of stack traces.
+Rule of thumb: more than a handful of calls to MethodInvoker if the signature is dynamic, CreateDelegate if it isn't.
+
+-- pause --
+Drill 13, Detecting [Obsolete]: compile-time versus runtime.
+
+Q: How does [Obsolete] produce a compile warning?-- think --
+
+A: The C sharp compiler inspects the attribute during compilation. When emitting a call to a method, it checks the method's metadata for ObsoleteAttribute; if present, it emits a CS0612 / CS0618 warning (or error if Obsolete(error: true) ).
+The check happens at every call site across the assembly being compiled. No runtime cost, the warning is purely a compile-time signal.
+
+Cross-Q: Could I write my own attribute that produces a compile-time warning?-- think --
+
+A: Not with an arbitrary attribute of your own, [Obsolete] is special-cased by the C sharp compiler. But there is a second attribute in the same club: [Experimental("MYLIB001")] (C sharp 12+).
+The compiler treats it the same way, reporting a diagnostic under the ID you choose at every use site, which callers acknowledge by adding that ID to NoWarn. That covers the "this A P I will change" case without writing any tooling.
+For anything else, "don't call this from a background thread", "this overload is deprecated in favour of that one", you write a Roslyn analyzer: register an OperationKind.Invocation action, inspect the target's attributes, report a Diagnostic.
+That is exactly what the analyzer paired with the [LoggerMessage] generator does for malformed templates. Without an analyzer or one of the two special-cased attributes, your attribute is invisible to the compiler.
+
+Cross-Q²: How does the runtime detect [Obsolete] on a type accessed via reflection?-- think --
+
+A: It doesn't, automatically. [Obsolete] is only a compiler signal. At runtime, reflection sees ObsoleteAttribute like any other custom attribute via GetCustomAttribute(). You can read it and log a warning, but the runtime won't enforce anything.
+Some IDEs and tools (Resharper, IDE0001) flag obsolete reflection usage by static analysis, but the runtime itself is silent. Lesson: [Obsolete] deters compile-site use; runtime or reflection-based use of obsolete A P Is slips through unless your team has analyzer-driven CI checks.
+
+-- pause --
+Drill 14, IsAbstract versus IsInterface.
+
+Q: At runtime, what makes a Type "abstract" versus "interface"?-- think --
+
+A: They're different bits in the TypeAttributes flags stored in the type's metadata. IsInterface is true when the type was declared with the interface keyword (CIL flag ClassSemanticsMask == Interface ).
+IsAbstract is true when the type cannot be instantiated, set for both interfaces and abstract classes (CIL flag Abstract ). So all interfaces are IsAbstract == true, but not all abstract types are IsInterface == true.
+
+Cross-Q: How do I check "is this an abstract class specifically, not an interface"?-- think --
+
+A: type.IsAbstract and and !type.IsInterface. The combination filters out interfaces while keeping abstract class types.
+Useful for D I containers that want to reject "this is unconstructible" types: if (type.IsAbstract) throw new InvalidOperationException("Cannot construct " + type.Name); covers both.
+IsClass is also useful, IsClass and and IsAbstract and and !IsSealed gives you the canonical "abstract class" shape.
+
+Cross-Q²: What about IsSealed, IsValueType, IsEnum ?-- think --
+
+A: IsSealed, type cannot be subclassed (set for sealed class, structs, and enums). IsValueType, derives from System.ValueType (structs, enums). IsEnum, derives from System.Enum.
+IsClass, the docs define it as "a class or a delegate; that is, not a value type or interface", so typeof(Action).IsClass is true.
+It's false for structs and enums even when boxed, and, a genuine trap, it is true for typeof(Enum) and typeof(ValueType) themselves, since those are reference types that merely act as base types. IsValueType and IsClass are mutually exclusive.
+One last thing worth knowing: typeof(T).IsValueType inside a generic method is not a real reflection call at runtime, the jit specializes the method per value-type instantiation and folds the test to a constant, so if (typeof(T).IsValueType) compiles away entirely.
+That's exactly the specialization that must be pre-generated ahead of time under Native A O T.
+
+-- pause --
+Drill 15, Roslyn analyzer versus source generator.
+
+Q: What's the operational difference between a Roslyn analyzer and a source generator?-- think --
+
+A: An analyzer reports diagnostics (warnings, errors, info messages), it tells the user "this code has an issue." A source generator emits new C sharp files that get compiled alongside user code, it tells the compiler "here's more code to compile." Same plugin pipeline, different outputs:
+analyzer = Diagnostic objects; generator = .cs source text.
+
+Cross-Q: Can a single Roslyn component ship both?-- think --
+
+A: Yes, and most do. The pattern: ship a generator + a paired analyzer that catches user errors in how the generator is used. LoggerMessageSourceGenerator ships with an analyzer that flags malformed [LoggerMessage] attributes ("template references {Foo} but parameter is named bar").
+JsonSourceGenerator ships an analyzer for [JsonSerializable] mismatches. The analyzer guides the user; the generator does the heavy lifting. Both live in the same Roslyn component DLL.
+
+Cross-Q²: What's the difference between IIncrementalGenerator and the older ISourceGenerator ?-- think --
+
+A: ISourceGenerator (legacy, dot NET 5-6 era), runs over the entire compilation on every keystroke. For large projects with many generators, this caused IDE slowdowns.
+IIncrementalGenerator (dot NET 6+), declares a dataflow pipeline of inputs and transformations; the framework caches intermediate values and re-runs only the affected steps when an input changes. Same end output (generated source files), dramatically better IDE performance.
+Modern generators always use IIncrementalGenerator; ISourceGenerator is deprecated but still supported for compat.
+
+-- pause --
+Drill 16, RuntimeHelpers.GetHashCode.
+
+Q: What does RuntimeHelpers.GetHashCode(obj) return?-- think --
+
+A: The identity-based hash code for the object, derived from the object's heap address (or a stable identity assigned by the runtime). It ignores any GetHashCode override on the type.
+So two record s that are Equals -equal will have the same obj.GetHashCode() but different RuntimeHelpers.GetHashCode() (because they're different heap objects).
+
+Cross-Q: When do I actually want identity hash instead of value hash?-- think --
+
+A: When you're building an identity-keyed structure, ConditionalWeakTable uses it internally to associate values with specific instances regardless of value equality. Memoization caches that want to dedupe by reference ( Dictionary keyed by ref equality).
+Object tracking in serializers to detect cycles. Debuggers showing "two different record instances that happen to be equal." In ordinary application code, you almost never reach for it, but in framework or serializer code, it's essential.
+
+Cross-Q²: Is RuntimeHelpers.GetHashCode stable across garbage collector compactions?-- think --
+
+A: Yes, that's its key guarantee, and the mechanism is worth knowing because it's often described wrongly. Every managed object on CoreCLR already carries a machine-word object header immediately before its method-table pointer.
+On the first RuntimeHelpers.GetHashCode(obj), the runtime computes a hash and stores it in that existing header word (a flag bit says "these low bits are a hash code rather than a sync-block index"). Subsequent calls read it back.
+So the value survives garbage collector compaction, the address moves, the header moves with the object, and, importantly, the object does not grow: the header is already there whether you call this or not.
+The only case that costs extra storage is when an object needs both a hash and a real sync block, the header word can hold one or the other, not both, so if the object is also contended-locked or acquires COM interop state,
+the runtime "inflates" it by allocating a sync-block entry in a side table and moving the hash there.
+(Weak references are not on that list: they're garbage collector handles in the handle table, not sync-block state.) That inflation is the real cost of lock ing on arbitrary objects, and it is the same header word that pays for it.
+
+-- pause --
+Drill 17, Trim warning versus A O T warning.
+
+Q: Your build emits IL2026 on one call and IL3050 on another. What's the difference and does the same fix work for both?-- think --
+
+A: They come from different analyzers with different concerns. IL2026 is trim analysis: the callee is annotated [RequiresUnreferencedCode], meaning it reflects in a way the trimmer can't follow, so members it needs might be removed from the app.
+The code is fine, the tool just can't prove what to keep. IL3050 is A O T analysis: the callee is annotated [RequiresDynamicCode], meaning it will ask the runtime to produce native code that doesn't exist, MakeGenericType, MakeGenericMethod, Expression.Compile, Reflection.Emit.
+Different fixes: IL2026 can often be resolved by expressing the requirement with [DynamicallyAccessedMembers] so the trimmer preserves the right members, or by preserving explicitly with [DynamicDependency].
+IL3050 usually cannot be annotated away, because there is nothing to preserve, Microsoft's guidance is literally "avoid calling the method at all when building as Native A O T."
+
+Cross-Q: You've decided a specific IL3050 is genuinely unreachable under A O T. How do you say that to the toolchain?-- think --
+
+A: Guard the call with RuntimeFeature.IsDynamicCodeSupported and suppress with [UnconditionalSuppressMessage("Aot", "IL3050:RequiresDynamicCode", Justification = ".")]. Two details matter.
+First, it must be UnconditionalSuppressMessage, not SuppressMessage or #pragma, the latter two are source-only, and the trimmer runs at publish time over I L, so it never sees them.
+Second, the guard isn't decorative: IsDynamicCodeSupported is a recognised feature switch, so under A O T it is folded to a constant false and the whole branch, plus everything only it reached, is removed.
+dot NET 9 lets you build the same thing for your own switches with [FeatureSwitchDefinition] and [FeatureGuard].
+
+Cross-Q²: When is suppressing a trim warning actually wrong, even if the app works today?-- think --
+
+A: When the justification is "this member is used elsewhere in the app, so it'll still be there." The docs call that out as an explicitly invalid suppression.
+Being called is not the same as being a visible target of reflection: a property that nothing reflects on can be inlined, renamed, or moved by the trimmer, the docs note that Native A O T already optimizes such members away and that I L trimming may follow.
+A valid suppression rests on an annotation or a [DynamicDependency] somewhere that makes the member a reflection target the analyzer can see; you are just asserting that the analyzer can't connect the two ends.
+If you can't point at that other end, you don't have a suppression, you have a bug with a comment on it.
+
+-- pause --
+Drill 18, MakeGenericType under Native A O T.
+
+Q: typeof(Handler<>).MakeGenericType(message Type) runs fine in your A O T-published app for a month, then throws on one message type. What happened?-- think --
+
+A: That message type is a struct. The runtime shares one native code body across all reference-type instantiations of a generic, every T is a same-sized pointer, so Handler, Handler, and Handler all run the same machine code and the reflective instantiation finds something to use.
+Value types cannot share: different sizes and layouts mean each needs its own specialized body.
+Under jit that body is compiled on demand; under Native A O T, per the docs, "all instantiations are pre-generated" at publish, and one that is reachable only through MakeGenericType is not statically reachable, so it was never generated.
+There is no code to run and you get an exception at the MakeGenericType /instantiation point. The build warned about this with IL3050.
+
+Cross-Q: Why is that the worst possible failure mode?-- think --
+
+A: Because it's type-dependent, not code-dependent. The same line works for the reference types you tested and fails for a struct you didn't, so the failure is triggered by data shape from a caller, not by a code path you can reach in a test.
+It also means "we published A O T and smoke-tested it" is not evidence of anything, the smoke test exercised the shared body. The only reliable signal was the IL3050 at build time, which someone suppressed.
+
+Cross-Q²: How do you make an open-generic dispatcher A O T-safe?-- think --
+
+A: Make the instantiations statically reachable, which means turning the runtime lookup into build-time code.
+A source generator enumerates every IHandler implementation in the compilation and emits an explicit switch (or a static dictionary of typed factories) mapping message type to a concrete new SpecificHandler().
+Now every instantiation appears in real I L, so the A O T compiler generates it, the trimmer keeps it, and the reflection disappears entirely. The design point generalises: A O T doesn't forbid open generics, it forbids instantiations that only exist in a string or a Type variable.
+If you can't or won't generate, the fallback is a hand-maintained registration list, uglier, same effect, and at least it fails at compile time when someone adds a handler and forgets.
+
+-- pause --
+Drill 19, [UnsafeAccessor].
+
+Q: A test needs to read a private field. Reflection or [UnsafeAccessor] ?-- think --
+
+A: [UnsafeAccessor] (dot NET 8+), unless you need to discover the member name at runtime. You declare an extern static method with no body, and the runtime supplies the implementation by matching the attribute's Kind and Name against the type named by the first parameter.
+The call compiles to a direct field access, no FieldInfo, no boxing, no per-call lookup, and it's fully trim- and A O T-safe, because the accessor is a real method the tooling can see.
+csharp.
+[UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_total")].
+static extern ref decimal Total(Order o);
+
+Total(order) = 42m; // read and write through the ref.
+
+Cross-Q: What are the rules that trip people up?-- think --
+
+A: Four. (1) Only the type named by the first parameter is searched, the hierarchy is not walked, so a base-class private field needs an accessor whose first parameter is the base type. (2) Field accessors must return ref; that's what makes them writable.
+(3) For instance members on a struct, the first parameter must be ref, or you'd mutate a copy. (4) Matching is by ECMA-335 metadata signature including the return type, and if it doesn't match you get MissingFieldException / MissingMethodException at runtime, this is not compile-time-checked.
+Also: always set Name explicitly, because the accessor method's own name is the default and C sharp mangles local-function names into something that won't match.
+Use nameof when the member happens to be visible to you (the docs' own examples do); when it isn't, the usual case, it has to be a string literal.
+
+Cross-Q²: The type I need is internal in another assembly, so I can't even write its name in C sharp. Now what?-- think --
+
+A: dot NET 10's [UnsafeAccessorType], which lets you specify the target type as a fully-qualified string for a parameter or return whose type isn't visible at compile time, internal types in another assembly, private nested types, anything you deliberately don't want to reference.
+Before dot NET 10, [UnsafeAccessor] alone couldn't express this and would fail at runtime.
+Worth flagging the trade honestly: you've now got a string type name in your build, so you've re-acquired the "silent break on rename" property that reflection had, you keep the performance and A O T-safety, not the compile-time checking.
+The better answer, when you own the other assembly, remains [InternalsVisibleTo].
+
+-- pause --
+Drill 20, Why is an incremental generator "incremental"?.
+
+Q: What actually makes IIncrementalGenerator faster than ISourceGenerator ?-- think --
+
+A: It isn't a faster generator; it's a cached pipeline. You don't write "run over the compilation"; you declare a graph of providers and transforms, and the host memoizes each step's output keyed on the equality of that step's inputs.
+On an edit, only steps whose inputs changed re-run, and if a step produces a result Equals to last time's, everything downstream is served from cache and never executes. ISourceGenerator had no such structure, so every keystroke re-ran everything, which is what made IDEs crawl on large solutions.
+
+Cross-Q: So what's the one mistake that silently defeats it?-- think --
+
+A: Putting something without value equality into the pipeline. Compilation, ISymbol, SyntaxNode all compare by reference and are recreated on every keystroke, so every step downstream misses cache forever, and they root the whole compilation in memory.
+The subtler version is a record model that looks value-equal but contains an ImmutableArray, which compares by reference to its backing array; two structurally identical models then compare unequal.
+Both bugs produce byte-identical, entirely correct output and cost only IDE latency, which is why they survive review. The fix is to project down to a small record of strings or enums or bools inside the transform, and give any collection an element-wise IEqualityComparer.
+
+Cross-Q²: And what's the A P I that makes discovery cheap?-- think --
+
+A: SyntaxProvider.ForAttributeWithMetadataName (Roslyn 4.3 / dot NET 7 S D K and later).
+The naive CreateSyntaxProvider invokes your predicate for essentially every node in the compilation on every edit;
+ForAttributeWithMetadataName uses an index the compiler already maintains for attribute usages, so the overwhelming majority of nodes and edits are eliminated before your predicate runs.
+It also resolves using aliases correctly, which hand-rolled "does this node have an attribute whose name ends in Foo " matching gets wrong. Note the shape of the callback: the node handed to you is the target, the class or property the attribute is on, not the attribute syntax.
+
+-- pause --
+Drill 21, Interceptors.
+
+Q: Source generators can only add code. So how does the minimal-A P I request delegate generator replace the binding logic behind app.MapGet(.) without you changing a line?-- think --
+
+A: Interceptors. The generator emits a method annotated [InterceptsLocation(.)] whose data identifies one specific call site, file, position, and a content hash of the call, and the compiler redirects that exact call to the generated method.
+Your source is untouched; the compiled binary calls somewhere else. That's the escape hatch from "generators can only add": they still only add a method, but the compiler rewires an existing call to it.
+It's what lets A S P dot NET Core replace reflection-based parameter binding with generated, A O T-friendly code for endpoints written in ordinary minimal-A P I syntax.
+
+Cross-Q: Why must interceptors always come from a generator, never be hand-written?-- think --
+
+A: Because the location data is positional and hash-checked. The compiler recomputes it on every build, so the moment anyone adds a line the intercepted call, a hand-written attribute points at the wrong place or fails its hash check.
+A generator recomputes it as part of the same compilation, so it's always in sync by construction. This is also why the mechanism is safe rather than terrifying: it can't drift.
+
+Cross-Q²: That still sounds like a package could silently reroute my code. What stops it?-- think --
+
+A: The consuming project has to opt in by namespace: an interceptor is only honoured if its containing namespace is listed in the project's MSBuild property. Adding a NuGet package is not consent; naming its generator's namespace in your own .csproj is.
+In practice you rarely type it yourself, because setting PublishTrimmed or PublishAot is what turns on the in-box generators that use it, which is a reasonable design, since those are exactly the modes where the reflection-based path was going to fail anyway.
+
+-- pause --
+Drill 22, When reflection is still the right answer.
+
+Q: Give me a case where you'd keep runtime reflection in 2026 and defend it.-- think --
+
+A: Anything where the types don't exist at build time. A plugin host loading DLLs dropped into a folder; a scripting or rules engine compiling customer-authored code; a test framework discovering [Fact] methods in an assembly it was handed.
+A source generator can only see what's in your compilation, so it structurally cannot help. Microsoft's trimming docs list dynamic assembly loading as a known incompatibility for exactly this reason.
+The honest framing is that this isn't reflection as a shortcut, it's reflection as the requirement, and the cost is that you give up trimming and A O T for that process.
+
+Cross-Q: You load plugins, run them, and want to unload them. How, and what goes wrong?-- think --
+
+A: A collectible AssemblyLoadContext, base(is Collectible: true), with AssemblyDependencyResolver in the Load override to resolve the plugin's own dependencies from its .deps.json. The critical difference from the old AppDomain.Unload is that this one is cooperative: Unload() only initiates it.
+It completes when no thread has a frame from those assemblies on its stack and nothing outside holds a strong reference to any assembly, type, or instance from the context. What goes wrong is always the same category, something still holds a reference. A cached MethodInfo in a static field.
+A Func<> compiled from plugin code sitting in the host's cache. A strong GCHandle. A background thread the plugin started. A field on your own AssemblyLoadContext subclass, the runtime holds a strong handle to the context while unloading, so those fields stay rooted even after you drop yours.
+Only WeakReference is exempt, which is why the canonical check is a WeakReference to the context plus a bounded garbage collector.Collect() / WaitForPendingFinalizers() loop.
+
+Cross-Q²: It doesn't unload. Walk me through the diagnosis.-- think --
+
+A: The AssemblyLoadContext is kept alive by its LoaderAllocator, so:
+attach WinDbg (or LLDB) with SOS, !dumpheap -type LoaderAllocator to find the instance, then !gcroot to print the chain of references holding it, the first entry is the culprit and it'll be a stack slot, a static, or a garbage collector handle.
+Then ~*e !clrstack across all threads to check whether any of them still has a plugin frame.
+Two things make this harder than it sounds: jit-introduced locals can root an object you never named in source (which is why the sample code puts load-and-run in a [MethodImpl(MethodImplOptions.NoInlining)] method), and statics for reference types are stored in internal object arrays,
+so gcroot shows them as anonymous pinned handles rather than telling you the field name.
+Prevention beats diagnosis: hook the context's Unloading event and clear every cache keyed on plugin types there.
+
+-- pause --
+Section 2. Self-test.
+
+Both run inside the compiler's pipeline as Microsoft.CodeAnalysis.* plugins. An analyzer ( DiagnosticAnalyzer ) emits diagnostics, warnings, errors, info messages, and optionally code fixes through a CodeFixProvider.
+A source generator ( IIncrementalGenerator ) emits new source files that become part of the compilation.
+Practically: analyzers say "this code is wrong"; generators say "here's more code." A modern source generator is incremental, it caches per-input results, so changing one file doesn't re-run the generator over every file.
+
+Bind a factory once, cache it, invoke many times. If the type is known at compile time, the honest answer is that you don't need reflection or an expression tree, a plain cached lambda is the same delegate with none of the ceremony:
+
+If the type is only known at runtime, bind the constructor instead of invoking it:
+
+What you removed: Activator.CreateInstance(type, args) allocates an object[], boxes the int, resolves and validates the constructor against the argument array, and returns object, every call. The cached delegate does none of it; the cached ConstructorInvoker does the resolution and validation once.
+Under Native A O T,
+note that Expression.Compile() is not the right third option here, it falls back to the interpreter, and Activator.CreateInstance on a Type that came from a string is a trim warning waiting to happen unless the parameter is annotated [DynamicallyAccessedMembers(PublicParameterlessConstructor)].
+
+When the types aren't known at compile time, plugin systems where DLLs are dropped into a folder at runtime, scripting hosts, ORMs over user-defined entities discovered at first connection.
+Source generators see only what's in the compilation; if your code says "load whatever DLLs are in /plugins and instantiate every IPlugin," generators can't help. Reflection (or assembly load + interface scanning) is the right tool. Cost: slower first call, no A O T, larger memory footprint.
+Reflection is also fine for compile-time-rare code (D I registration at startup, attribute scanning during initialization) where 1 millisecond doesn't matter.
+
+new Regex(pattern) parses the pattern string at runtime and builds an internal representation, then either interprets it or, with RegexOptions.Compiled, emits I L through DynamicMethod and JITs it. Either way you pay a first-use cost, and the compiled option pays a large one.
+[GeneratedRegex] runs a source generator that emits a Regex subclass as C sharp at build time, with the matching logic written out as ordinary methods.
+So: no pattern parsing at runtime, no Reflection.Emit, no jit step, and the emitted matcher can use techniques the runtime engine can't (it can specialize for the specific pattern rather than staying general).
+
+Three consequences beyond speed, and they're the ones worth leading with: it is A O T-safe ( RegexOptions.Compiled is not, it's runtime code generation, so it degrades or warns under A O T); the generated code is readable and debuggable C sharp you can step into via EmitCompilerGeneratedFiles;
+and the generator parses the pattern at build time, so a malformed pattern surfaces as a build diagnostic rather than an ArgumentException on the request that first hits it.
+If you want a number, generate one for your own patterns, matcher performance is extremely pattern-dependent, and a figure quoted for someone else's regex tells you nothing about yours.
+
+It's a hint to the linker or trimmer that the receiver of this Type will reflect over its public properties. Without the attribute, the trimmer can't prove which members are needed and may strip them, breaking reflection at runtime in trimmed or A O T builds.
+With the attribute, the trimmer preserves all public properties of any type that flows into this parameter.
+Pair it with IL2070 warning resolution: when calling t.GetProperties(), the analyzer requires the source Type came from a parameter or field annotated with [DynamicallyAccessedMembers(PublicProperties)], propagating the requirement up the call stack.
+
+The propagation is the part people underestimate.
+Annotating the parameter doesn't end the conversation;
+it moves the warning to every caller passing an unannotated Type, and you keep annotating outward until either a public A P I boundary (where the requirement becomes part of your contract) or a concrete typeof(X) (where the trimmer can finally satisfy it and stop).
+If the chain never terminates in one of those two, the honest conclusion is that the design is unanalyzable and the fix is [RequiresUnreferencedCode] on the public entry point, telling your callers the truth, rather than a suppression that hides it.
+
+Because of how generic code is shared. The runtime compiles one canonical native body for all reference-type instantiations, every T is a pointer of the same size, so if anything in the program forced Handler into existence, Handler reuses that body.
+Value types cannot share: Handler and Handler have different sizes and layouts and each needs its own specialized body.
+
+Under jit, a missing value-type instantiation is compiled on demand.
+Under Native A O T there is nothing to compile on demand, the docs state that "all instantiations are pre-generated" at publish time, and an instantiation reachable only through a Type variable is not statically reachable, so it was never generated. The build told you: IL3050.
+
+This is worth being able to explain because of the failure shape it produces. The bug is triggered by the type a caller supplies, not by a code path, so tests over reference types pass and the first struct payload in production throws.
+The fix is to make the instantiations statically reachable, a generated switch over concrete types, or an explicit registration list, not to suppress the warning.
+
+[UnsafeAccessor] (dot NET 8+). Reflection with BindingFlags.NonPublic works under jit but is a trim or A O T liability (the trimmer has no reason to keep a private field nothing references) and costs a lookup plus boxing per access.
+[UnsafeAccessor] on an extern static method compiles to a direct field access, nothing to trim away, nothing to look up.
+
+Know the rules you'll be asked about: the first parameter names the owning type and only that type is searched (no hierarchy walk), field accessors must return ref, instance members on structs need a ref first parameter,
+and a mismatch throws MissingFieldException / MissingMethodException at runtime, signature matching is metadata-based and includes the return type, so this is not a compile-checked backdoor.
+Generics require dot NET 9; naming a type you can't reference at all requires dot NET 10's [UnsafeAccessorType].
+
+The "neither" answer is still worth voicing: if you own the other assembly, [InternalsVisibleTo] gives you compile-time checking and none of this. [UnsafeAccessor] is for when you don't.
+
+At what's flowing through the incremental pipeline, because the symptom is a cache miss, not a slow generator. IIncrementalGenerator memoizes each pipeline step keyed on the equality of its inputs; if a step's output compares equal to last time's, everything downstream is skipped.
+Three things break that:
+
+A Compilation, ISymbol, or SyntaxNode in the pipeline. Reference equality, recreated every keystroke, and they root the whole compilation in memory. Project to a small value-equal model inside the transform.
+A record model containing an ImmutableArray. record equality compares that member by reference to its backing array, so structurally identical models compare unequal. Needs an element-wise comparer.
+CreateSyntaxProvider instead of ForAttributeWithMetadataName. The naive predicate is invoked for essentially every node on every edit; the attribute-indexed A P I discards nearly all of them before your code runs, and handles using aliases correctly as a bonus.
+
+What makes this class of bug durable is that it has no symptom in the output, correct code, no diagnostics, nothing a test asserts on. The only signal is editor latency, which developers habitually blame on their machine.
+
+Unload() is cooperative, unlike the old AppDomain.Unload, it initiates unloading and nothing more. It completes only when no thread has a frame from those assemblies on its stack and nothing outside the context holds a strong reference to any assembly, type, or instance from it. Something does.
+
+The usual suspects, all of which are real bugs people ship: a MethodInfo or Type cached in a static; a delegate compiled from plugin code sitting in a host cache; a strong or pinned GCHandle; a background thread the plugin started; a pending RegisteredWaitHandle with a plugin callback;
+and, the sneaky one, a field on your own AssemblyLoadContext subclass, because the runtime holds a strong handle to the context while unloading is in progress, so those fields stay rooted even after you drop your reference.
+Only WeakReference / WeakReference are exempt.
+
+Diagnosis is mechanical: SOS, then !dumpheap -type LoaderAllocator to find the allocator for the context, !gcroot to print the chain holding it, and ~*e !clrstack to check every thread for plugin frames.
+Two things make it harder than it reads, jit-introduced locals can root an object you never named (hence the [MethodImpl(MethodImplOptions.NoInlining)] wrapper in Microsoft's sample), and static reference-type fields appear as anonymous pinned handles rather than named fields.
+
+Prevention: clear every cache keyed on plugin types in the context's Unloading event, and verify with a WeakReference to the context plus a bounded garbage collector.Collect() / garbage collector.WaitForPendingFinalizers() loop.

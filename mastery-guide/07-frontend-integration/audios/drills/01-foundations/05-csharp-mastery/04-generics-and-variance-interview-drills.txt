@@ -1,0 +1,407 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Variance on IEnumerable versus List.
+
+Q: Why is IEnumerable assignable to IEnumerable but List is not assignable to List ?-- think --
+
+A: IEnumerable is declared covariant, T appears only in output positions (the Current property, the enumerator's return). Returning a Dog where an Animal is expected is always safe. List is invariant because T also appears in input positions: Add(T), this[int] = T.
+Permitting List to List would let a caller .Add(new Cat()) through the wider reference, corrupting the dog-typed underlying storage.
+
+Cross-Q: Could the framework retrofit IList to be covariant by changing Add(T) to Add(object) ?-- think --
+
+A: No, it would break every existing IList implementer and consumer, and it would push the type check to runtime (loss of compile-time safety). The actual solution the BCL took is IReadOnlyList (C sharp 4 era): a separate interface that exposes only the read surface, so it's safely covariant.
+Most modern code takes IReadOnlyList or IEnumerable for read-only parameters and gets covariance "for free."
+
+Cross-Q²: Show me the I L difference between a covariant and invariant interface that demonstrates the type-safety guarantee.-- think --
+
+A: In the metadata, the type parameter on IEnumerable is marked with +T (the out flag in GenericParamAttributes.Covariant ). IList has no such flag (defaults to invariant).
+The C L R's type-equivalence checker uses this flag during assignment compatibility: covariant generics check substitutability per-parameter (Dog to and from Animal); invariant ones check exact-match identity. The flag is metadata, not behavior, there's no runtime "covariance check" cost.
+
+-- pause --
+Drill 2, The in T / out T modifiers.
+
+Q: What do in and out mean on a generic type parameter, and where is each legal?-- think --
+
+A: out T declares covariance, T may only appear in output positions (return types, get-only properties, out parameters). in T declares contravariance, T may only appear in input positions (parameters, set-only properties).
+The compiler enforces this positionally at the interface or delegate declaration.
+
+Cross-Q: Can you put both out and in modifiers in the same generic, for example, Func ?-- think --
+
+A: Yes, that's exactly what Func is. Each type parameter has its own variance. T is contravariant (parameter), TResult is covariant (return). So Func is assignable to Func, accepting a narrower input (Dog) and returning a wider output (Animal) is the safe transformation.
+That's two safe substitutions happening in one delegate.
+
+Cross-Q²: Why can a class never be declared variant, for example, why is class Box illegal?-- think --
+
+A: Classes hold state, and state can be written to (fields, properties with setters). Allowing Box to Box would let the consumer write a Cat into a Dog -storage field through the wider reference.
+Variance is a property of interface contracts, where the compiler can verify T is used only in one direction. Classes don't have that guarantee structurally. Workaround: declare a variant interface and have the class implement it: class Box: IReader {. } with IReader.
+
+-- pause --
+Drill 3, Array covariance.
+
+Q: Are arrays in C sharp covariant? Is that safe?-- think --
+
+A: Yes, arrays are covariant, Dog[] IS-A Animal[]. No, it is not safe. Animal[] arr = new Dog[3]; arr[0] = new Cat(); compiles but throws ArrayTypeMismatchException at runtime.
+Every reference-type array store incurs a hidden runtime type check, which is both unsafe (deferred from compile time) and slightly slow.
+
+Cross-Q: Why did the dot NET designers ship this if it's unsafe?-- think --
+
+A: It was inherited from Java 1.0 (dot NET 1.0 era, before generics existed). Without generics, there was no way to write a function that took "an array of any base-or-derived type" except via covariance.
+Generics shipped in dot NET 2.0 (C sharp 2.0) and made the safe IList -style invariant collections the right pattern. By then, array covariance was load-bearing in too many codebases to remove.
+
+Cross-Q²: What's the runtime cost on a tight loop writing to a string[] declared as object[] ?-- think --
+
+A: Each arr[i] = "x" emits a stelem.ref I L instruction, and the jit compiles it into a write preceded by a type check against the array's actual element type, read from the array object's method table, not from the static type of the variable.
+The jit can elide the check when it can prove the element type exactly (the array was new d locally, or its static element type is sealed ); for a genuine upcast it must always check.
+Don't quote a figure for the overhead, it's a compare-and-branch per store, so whether it's measurable depends entirely on what else the loop is doing, and an interviewer who hears "10%" will ask where you measured it.
+Mitigation: declare the array with its real element type, or write through a Span, which is invariant and has no covariance check at all.
+
+-- pause --
+Drill 4, where T: new().
+
+Q: What does where T: new() constrain, and what does the compiler emit when you write new T() ?-- think --
+
+A: It requires T to have a public, parameterless constructor. Roslyn does not emit a newobj, it emits call Activator.CreateInstance().
+The runtime special-cases that generic overload: for a value-type T it collapses to zero-initialization, and for a reference type it resolves the default constructor once and caches it.
+Note also that new() cannot be combined with struct or unmanaged, because every type satisfying those already has an accessible parameterless constructor.
+
+Cross-Q: Is it as fast as a direct new SomeType(), and how would you avoid the difference if not?-- think --
+
+A: Don't assert a figure, say the mechanism and then say you'd measure it. It goes through an activation path rather than a straight newobj, so it is not automatically inlined the way a direct constructor call is, and whether that shows up depends on how hot the path is.
+If a benchmark says it matters, the standard escape is to pass a factory delegate, public T Build(Func factory) goes to factory();, because a lambda over a concrete constructor gives the jit something it can inline.
+D I containers use exactly this shape: they compile a factory once and never call Activator on the resolution path.
+
+Cross-Q²: Can I require a constructor with parameters? for example, where T: new(string) ?-- think --
+
+A: No, the language only allows the parameterless new() constraint.
+For parameterized construction, either (a) require a factory delegate, (b) require an interface with a static abstract Create method (C sharp 11+: where T: IConstructable with static abstract T Create(string) ), or (c) use Activator.CreateInstance(typeof(T), args) with reflection, slow and untyped.
+The static-abstract approach is the modern idiomatic answer.
+
+-- pause --
+Drill 5, where T: struct versus where T: class, jit implications.
+
+Q: How does the jit treat a generic method differently when T is constrained to struct versus class ?-- think --
+
+A: where T: struct to the jit generates a separate body per concrete value type ( Method, Method, Method are distinct machine code). Each body uses inline storage for T, exact sizeof(T), and no boxing on interface calls (constrained call I L prefix).
+where T: class to the jit generates one shared body for all reference-type Ts; T is treated as a pointer-sized object reference at the machine-code level.
+
+Cross-Q: Which is faster in a hot loop, and by how much?-- think --
+
+A: Answer the "which" and refuse the "how much", the multiplier is the trap. Value-type instantiations win on three named mechanisms: elements live inline instead of as separate heap objects (better locality, no allocation), interface calls go through constrained.
+to a direct call that can then inline, and the jit knows sizeof(T) so bulk operations are exact. Reference-type instantiations pay an extra indirection wherever the shared body needs T 's identity.
+How large the gap is depends on element size, loop body, and how much of the working set fits in cache, so the honest answer is "here's the mechanism, and I'd put it under BenchmarkDotNet before quoting a number." The cost on the other side is code size:
+one compiled body per distinct value-type T, which is invisible on a jit server and directly visible in an A O T deployable.
+
+Cross-Q²: If I write where T: struct, IComparable, what's special about the interface call inside the method?-- think --
+
+A: The compiler emits a constrained. I L prefix on the call to IComparable.CompareTo. The jit then resolves the call directly to the struct's own CompareTo method, no boxing, no virtual dispatch.
+This is one of the strongest reasons to add where T: ISomeInterface to value-type generic code: without it, calling the interface method requires boxing T to a heap allocation first. With it, the call is direct and often inlinable.
+
+-- pause --
+Drill 6, where T: unmanaged.
+
+Q: What does where T: unmanaged enable that where T: struct doesn't?-- think --
+
+A: unmanaged means T is a value type containing only blittable types recursively, no references anywhere in the layout. This unlocks sizeof(T), stackalloc T[n], raw pointer/ Span reinterpretation, and FFI patterns.
+struct allows any value type, including KeyValuePair which has a reference field; that breaks pointer-based ops.
+
+Cross-Q: When would you actually use it?-- think --
+
+A: Three places: (1) Serialization, MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref t, 1)) to view a struct as raw bytes for fast serialization. (2) Interop / P or Invoke, passing a struct to native code via pointer.
+(3) Zero-allocation buffers, Span buf = stackalloc T[16]; for a typed buffer on the stack. Outside of perf-sensitive libraries (BCL, Kestrel, RavenDB, et cetera), most code never needs it.
+
+Cross-Q²: Will unmanaged work on Span as a generic argument?-- think --
+
+A: No, Span is a ref struct, not an unmanaged struct. Ref structs can't be heap-allocated, can't be boxed, and can't be used as generic arguments (pre-C sharp 13). C sharp 13 added allows ref struct for this case.
+The two constraints are orthogonal: unmanaged is about blittable layout; allows ref struct is about heap-allocation discipline. You'd use them together if you wanted T to be a ref struct and containing only blittable fields, rare, but valid.
+
+-- pause --
+Drill 7, Generic specialization sharing.
+
+Q: Do List and List share the same jit'd method bodies?-- think --
+
+A: No. List is value-type specialized, gets its own distinct jit'd body with inline int storage. List participates in the reference-type shared body, one body covers List, List, List, all reference Ts. So List is its own machine code; List shares code with every other ref-typed list instantiation.
+
+Cross-Q: What's the consequence for binary size with A O T?-- think --
+
+A: Each value-type T adds one specialization. A binary with List, List, List, List, List,., List carries N+ method bodies. For native A O T ( PublishAot ), this directly grows the deployable. For mobile / IoT, this matters.
+The mitigation: where perf isn't critical, force class constraints or use object -typed inner storage to share the reference-type body.
+
+Cross-Q²: How does PGO (Profile-Guided Optimization) interact with generic specialization?-- think --
+
+A: Dynamic PGO collects type feedback per call site during tier-0 execution and feeds it into the tier-1 recompile.
+For shared reference-type bodies that's the big win:
+the shared code can't statically know T, but PGO can observe that a given call site sees string almost every time and emit a guarded devirtualization, a type check, an inlined string.Equals on the hot path, and a fallback to the virtual call otherwise.
+Value-type instantiations already have T baked in, so PGO's contribution there is the ordinary one (block layout, hot or cold splitting) rather than devirtualization.
+Dynamic PGO has been on by default since dot NET 8; treat "and it got better in later versions" as something to say only if you can name the change.
+
+-- pause --
+Drill 8, typeof(List<>) versus typeof(List).
+
+Q: What's the difference between typeof(List<>) and typeof(List) at runtime?-- think --
+
+A: typeof(List<>) is the open generic type definition, a Type object representing the unconstructed template. typeof(List) is the closed constructed generic type, a distinct Type instance with int substituted. They are different Type objects: typeof(List<>) != typeof(List).
+The open one has IsGenericTypeDefinition = true; the closed one has IsConstructedGenericType = true.
+
+Cross-Q: When would you use the open form?-- think --
+
+A: D I registration, services.AddScoped(typeof(IRepository<>), typeof(EfRepository<>)); registers an open generic; the container constructs the closed pair lazily when something asks for IRepository.
+Also reflection-based code generation, source generators iterate over List<> and emit closed-form code per consumer type. Anywhere you need to "register the template" without committing to a specific T.
+
+Cross-Q²: Can I get the open definition from a closed type at runtime, and vice versa?-- think --
+
+A: Yes, bidirectional. typeof(List).GetGenericTypeDefinition() returns typeof(List<>). typeof(List<>).MakeGenericType(typeof(int)) returns typeof(List). Round-trip is exact: the runtime canonicalizes constructed generics, so typeof(List) == typeof(List<>).MakeGenericType(typeof(int)) is true.
+This is how D I containers and serializers move between open and closed forms.
+
+-- pause --
+Drill 9, MakeGenericType.
+
+Q: When would you use MakeGenericType ?-- think --
+
+A: When you have a closed type only at runtime, typically from configuration, reflection, or a generic interface where the consumer's T is unknown at compile time.
+Examples: D I containers resolving IRepository<> to EfRepository<> for the requested T; serializers building Dictionary from Jason shape; ORMs constructing query expressions over user-defined entity types.
+
+Cross-Q: What's the perf cost?-- think --
+
+A: First call loads metadata, builds the runtime type, and may jit bodies that don't exist yet. Subsequent calls hit the runtime's canonical-type cache and return the same Type instance, so it becomes a lookup. "Expensive once, then cached" is the shape; don't attach a number you haven't measured.
+For hot paths, pre-warm at startup. And say the A O T caveat unprompted, it's the follow-up they're waiting for: under Native A O T, MakeGenericType with a value type argument can throw at runtime because that specialization was never compiled, and the publish-time warning for it is IL3050.
+
+Cross-Q²: How is MakeGenericMethod different, and when do you need it?-- think --
+
+A: MakeGenericMethod operates on MethodInfo (a generic method definition), not Type (a generic type definition). You use it when you have a generic method like T Process(T x) and need to invoke it with a T known only at runtime.
+Pattern: method Info.MakeGenericMethod(typeof(string)).Invoke(instance, new[] { "hello" }). Same caching story as MakeGenericType, first call slow, rest fast. Common in expression-tree compilation and dynamic link.
+
+-- pause --
+Drill 10, Type inference failures.
+
+Q: When does Goo(x) infer the wrong type?-- think --
+
+A: When the argument's static type doesn't match the intended T. The compiler infers T from each argument's compile-time type, not its runtime type. So Goo(x) where x is typed object (but actually holds an int ) infers T = object, not T = int.
+The runtime then treats T as object, with all the boxing or no-specialization consequences.
+
+Cross-Q: Show me a concrete case.-- think --
+
+A: object o = 5; var result = Echo(o);, T is inferred as object, result is object, and inside the generic method any T operations treat the value as a boxed int. The fix: Echo((int)o), explicit type argument plus unbox. Even cleaner: avoid object -typed locals and keep int typed end-to-end.
+
+Cross-Q²: Why doesn't inference look at the target variable's type? int x = Echo(o); could constrain T = int.-- think --
+
+A: C sharp inference is argument-driven, not return-type-driven. The compiler solves the type-parameter equations from the arguments alone, then checks the result is assignable to the target.
+Some languages (Haskell, F sharp) do full bi-directional inference; C sharp does not, because it would complicate overload resolution and produce more ambiguous-call errors. The escape hatch is explicit type arguments.
+C sharp 12 did add limited target-typed inference for new() and collection expressions, but not for arbitrary generic method calls.
+
+-- pause --
+Drill 11, Generic method versus generic class.
+
+Q: When would you write a generic method versus a generic class?-- think --
+
+A: Generic class, when you need to hold typed state across multiple calls: List, Cache, Repository. The T is part of the type's identity. Generic method, when one operation needs to work for many types but the type doesn't persist: IEnumerable.Where, Equals, Max.
+The T lives only for the method invocation.
+
+Cross-Q: What if I want both, a class with a generic method?-- think --
+
+A: Totally legal: public class Cache { public T Convert(TKey k) where T:. { } }. The class is generic in TKey, TValue; the method introduces its own T independent of those. Common pattern in serializers: JsonSerializer.Deserialize(json) is a generic method on a non-generic class.
+Use this when the method's type doesn't need to be remembered by the holder.
+
+Cross-Q²: Can a generic method's T shadow the enclosing class's T ?-- think --
+
+A: Yes, and the compiler warns (CS0693): "type parameter 'T' has the same name as the type parameter from outer type." It compiles, but inside the method, T refers to the method's parameter, not the class's. Always rename one, convention is T for the most-local, TItem / TKey / TValue for the outer.
+Otherwise refactoring sessions become hellish.
+
+-- pause --
+Drill 12, Multiple constraints.
+
+Q: How do you write a constraint that requires T to implement two interfaces and have a parameterless constructor?-- think --
+
+A: where T: IFoo, IBar, new(). The order is enforced by the compiler: primary constraint ( class / struct / notnull /et cetera) first to base class to interfaces to new() to allows ref struct (C sharp 13). Multiple interfaces are comma-separated.
+There's no AND or OR, all listed constraints must hold.
+
+Cross-Q: Can I express "T implements IFoo OR IBar "?-- think --
+
+A: No, generic constraints are conjunctive only (all must hold). To express "either," you either (a) introduce a common base interface that both inherit, (b) split into two overloads with separate constraints, or (c) use a discriminated union at the call site via pattern matching.
+C sharp has discussed "constraint disjunction" in proposals, but it's not landed.
+
+Cross-Q²: What if IFoo and IBar both have a method Save() with different return types?-- think --
+
+A: The compiler picks the one explicitly called: ((IFoo)t).Save() versus ((IBar)t).Save(). If you write t.Save() directly and the signatures conflict (different return types), it's a compile error, ambiguous call. The resolution is explicit interface cast.
+Same principle as default-interface-method diamond ambiguity (CS8705) from the OOP chapter.
+
+-- pause --
+Drill 13, default(T) for unconstrained T.
+
+Q: For an unconstrained T, what does the compiler emit for default(T) ?-- think --
+
+A: The initobj T I L instruction, zero-initializes the memory slot reserved for T. For reference-type T at runtime, this writes null (8 bytes of zero). For value-type T, it writes sizeof(T) bytes of zero. Both cases are essentially free, the jit often elides them when the slot is already zeroed.
+
+Cross-Q: How does this change if I add where T: class ?-- think --
+
+A: The compiler emits ldnull instead of initobj, same result, but encoded as a single I L instruction. Both compile to identical machine code on modern JITs. The difference is the language type of default(T): with class, it's T?
+(nullable); without, it's T (the value of default is the "default for that kind"). The NRT system uses this difference to suppress null warnings when appropriate.
+
+Cross-Q²: I have public T Find(int id) goes to found? value: default; with NRT enabled, and the compiler warns. Why, and how do I fix it?-- think --
+
+A: The warning is "possible null return for a non-nullable type", because T could be a reference type (where default(T) is null ) but is annotated as non-nullable. Three fixes: (1) annotate the return as T?
+, most honest, signals "may be missing." (2) Add where T: notnull and throw on miss, eliminates the null-return path. (3) Use default!
+to suppress, the null-forgiving operator says "trust me, callers will check." Option (1) is best; (3) is the right fallback when the framework forces a specific signature.
+
+-- pause --
+Drill 14, Generic math: Sum.
+
+Q: Write a Sum(IEnumerable xs) that works on int, double, decimal, and custom numeric types.-- think --
+
+A:
+csharp.
+public static T Sum(IEnumerable xs) where T: INumber.
+{.
+T total = T.Zero;
+foreach (var x in xs) total += x;
+return total;
+}.
+
+The where T: INumber constraint requires T implements the master numeric interface (which all BCL numeric types do, and which custom types can implement). T.Zero is a static abstract member, callable on the type parameter. The += resolves to IAdditionOperators.operator +, which INumber requires.
+
+Cross-Q: Why not just require IAdditionOperators since you only use + ?-- think --
+
+A: That's actually the tighter version: where T: IAdditionOperators, IAdditiveIdentity. It allows custom numeric types that don't implement full INumber (for example, a Money type with only +/- semantics, no division or comparison) to use Sum. Best practice: constrain to the minimum needed.
+The looser constraint is more useful at the A P I boundary; the tighter one is correct.
+
+Cross-Q²: How is this compiled, does each Sum, Sum, et cetera get its own machine code?-- think --
+
+A: Yes, generic math rides entirely on value-type specialization. Sum and Sum are distinct jit'd bodies. The += resolves through a constrained. call to the concrete type's op_Addition, which for the primitives is a single machine instruction once inlined, no virtual dispatch, no boxing.
+That's the point: without static abstract members the alternative was an interface call per operation, which would have made the abstraction unusable. The cost is one compiled body per numeric type instantiated.
+Resist quoting a percentage against a hand-written loop; the interviewer's next question is where you measured it.
+
+-- pause --
+Drill 15, Variance with delegates.
+
+Q: Which way round does it go, does Func work where Func is expected, or the reverse? Walk me through the type-safety argument.-- think --
+
+A: Func flows into Func, not the reverse. Func is covariant in TResult because the type parameter only ever appears in the return position.
+A Func produces a Dog; the caller holding it as a Func expects an Animal back and receives a Dog, which is an ordinary safe upcast, every value the delegate can produce satisfies what the caller was promised.
+The reverse fails: a caller holding a Func will assign the result to a Dog variable, and a Func could hand back a Cat. The general test to say out loud: substitution is safe when every value flowing out of the substituted type is still acceptable to the consumer.
+
+Cross-Q: What about Action versus Action, which flows into which, and why?-- think --
+
+A: Action is contravariant in T. An Action handles any Animal as input. It can substitute for Action because anything that can handle any Animal can certainly handle a Dog, a Dog is an Animal. So Action flows into Action (less specific to more specific, in the parameter direction).
+The opposite of Func 's direction. Mnemonic: covariant returns are "wider OK"; contravariant parameters are "wider OK on the way in."
+
+Cross-Q²: Custom delegate types can be variant too, how do you declare a contravariant delegate?-- think --
+
+A:
+csharp.
+public delegate void Handler(T item);
+public delegate TResult Transform(T item);
+
+Same in / out modifiers as interfaces. The compiler enforces the positional constraint: in T must appear only in input positions; out T only in output. The BCL's Func, Action<>, Predicate<> are all declared this way.
+Custom delegates are rare in modern code ( Func and Action cover almost every case), but the variance machinery is the same.
+
+-- pause --
+Drill 16, Boxing in generic methods.
+
+Q: Does where T: IFoo eliminate boxing on a value-type T ?-- think --
+
+A: Yes, for the duration of the generic method. The compiler emits the constrained. I L prefix on calls to interface members on T. The jit then resolves the call directly to the struct's own method implementation, no box, no virtual dispatch.
+Outside the generic method (for example, assigning T to an IFoo variable), the box happens as usual.
+
+Cross-Q: What's the I L look like, and how does the jit handle it?-- think --
+
+A:
+il.
+ldarga.s t // address of T parameter.
+constrained. !!T // back to prefix.
+callvirt IFoo.Method.
+
+The constrained. prefix tells the jit: "if T is a value type, call the struct's method directly without boxing; if T is a reference type, box and dispatch normally." At jit-time, with T known concretely (value-type specialization), the prefix resolves to a static call.
+Reference-type generics still take the boxing path (but only one box per call, and the jit often eliminates it via escape analysis).
+
+Cross-Q²: I have List> and I call Contains(some Pair). Does it box?-- think --
+
+A: Careful, this one depends on whether KeyValuePair implements IEquatable, and it does not.
+EqualityComparer.Default checks for IEquatable first and, per Microsoft Learn, "otherwise. returns an EqualityComparer that uses the overrides of Object.Equals and Object.GetHashCode provided by T." KeyValuePair doesn't override them either, so the comparison lands on ValueType.Equals,
+and because the struct contains a string reference it can't take the bit-comparison fast path, it compares fields by reflection, with boxing on the way in.
+The element storage stays unboxed (the T[] holds the pairs inline), but the comparison does not.
+This is the general senior point about generic collections: value-type elements stay unboxed through storage automatically, but staying unboxed through equality requires IEquatable, and you have to put it there yourself.
+
+-- pause --
+Drill 17, Variance and value types.
+
+Q: IEnumerable converts to IEnumerable. Does IEnumerable convert to IEnumerable ?-- think --
+
+A: No.
+Microsoft Learn states the rule directly: "Variance applies only to reference types; if you specify a value type for a variant type parameter, that type parameter is invariant for the resulting constructed type." IEnumerable to IEnumerable is a compile error, even though int derives from object.
+
+Cross-Q: Why does the runtime draw the line there? int really is an object.-- think --
+
+A: Because a variance conversion has to be free. Assigning IEnumerable to IEnumerable emits no instructions at all, it's the same reference to the same object, and a Dog reference and an Animal reference are bit-identical in representation.
+Getting from int to object is a boxing conversion: it allocates and copies.
+An IEnumerable yields raw int s from inline storage, so an IEnumerable view of it would have to allocate a box per element as it enumerated, and the C L R's assignment-compatibility check has no way to inject per-element allocations into what is supposed to be a no-op cast.
+Variance requires an identity-preserving or reference conversion; boxing is neither.
+
+Cross-Q²: So how do I get the sequence I wanted, and what does it cost?-- think --
+
+A: ints.Cast(), and say the cost in the same breath: it is a new lazy sequence that boxes one element at a time as you enumerate, and boxes again if you enumerate twice. It is not variance and it is not free.
+The better answer in most real code is to make the consuming method generic, Describe(IEnumerable items), which specializes over int and allocates nothing. Reach for Cast only at a boundary you don't control.
+
+-- pause --
+Drill 18, Static state in generic types.
+
+Q: class Counter { public static int Count; }. I do Counter.Count++ and Counter.Count++. What are the two values?-- think --
+
+A: Both are 1.
+The C sharp standard (§15.5.2) says that "each distinct closed constructed type has its own set of static fields, regardless of the number of instances of the closed constructed type", so Counter and Counter have separate Count fields, and separate static constructors that each run once.
+
+Cross-Q: But Counter and Counter share the same jit'd machine code. How can they have different statics?-- think --
+
+A: That's the good version of this question. The shared body is compiled for System.__Canon and contains no hard-coded reference to any instantiation's data.
+Anything requiring the instantiation's identity, including the base address of its static fields, is fetched at runtime from that instantiation's generic dictionary, an array of type handles, method handles and field handles built per closed type.
+So the code is one copy and the data is many; the dictionary is precisely the indirection that makes both true at once.
+
+Cross-Q²: Give me a case where per-closed-type statics are the right design, and a case where they're a bug.-- think --
+
+A: Right: a per-type metadata cache, static class Metadata { public static readonly PropertyInfo[] Properties = typeof(T).GetProperties(); }.
+Access is a static field read with the runtime's type-initializer doing the locking, which beats a ConcurrentDictionary because the lookup is resolved when the instantiation is compiled. Serializers do this.
+Bug: anything intended as a global, a connection counter, a rate-limiter semaphore, a circuit-breaker state, placed on a generic type. It silently becomes one per closed type, so adding a new T multiplies your "global" limit.
+Fix by moving the state to a non-generic static holder that the generic type references.
+
+-- pause --
+Drill 19, Constraints and the method signature.
+
+Q: Can I write void Handle(T x) where T: class and void Handle(T x) where T: struct as two overloads?-- think --
+
+A: No, CS0111, duplicate member, reported at the declaration, not at any call site. Constraints are metadata attached to the type parameter; they are not part of the method's signature. Both declarations are Handle(T).
+Same reason you can't say "T implements IFoo or IBar ", constraints are conjunctive, and there's no disjunction in the language.
+
+Cross-Q: If constraints aren't part of the signature, when does a constraint violation get reported?-- think --
+
+A: At the call site, Repo errors, not the declaration of Repo where T: EntityBase. Which has a versioning consequence worth stating: adding a constraint to a published generic type is a source-breaking change that your consumers discover, not you. Removing one is safe.
+Same asymmetry as tightening a parameter type.
+
+Cross-Q²: What is where T: default, and when do you need it?-- think --
+
+A: C sharp 9, and it's a disambiguator rather than a constraint. Overrides don't restate constraints, they inherit them, which becomes ambiguous when a base type declares both void M(T? item) where T: struct (where T? means Nullable ) and void M(T? item) with no constraint (where T?
+means "maybe-null T"). An override written without a where binds to the first. where T: default says "I mean the one with neither the struct nor the class constraint." It adds no requirement and is legal only on an override or an explicit interface implementation.
+
+-- pause --
+Section 2. Self-test.
+
+Value types vary in size and layout, Dictionary stores a 4-byte key inline, Dictionary a 16-byte one, and the ldobj / stobj / cpblk work the generated code has to do needs the exact size, so no single body can serve both.
+Reference types are uniformly pointer-sized and identical in layout regardless of what they point at,
+which is exactly the reason the runtime's own shared-generics design document gives for sharing: instantiations over reference types "all have the same size or properties or layout or et cetera" One canonical body, compiled for System.__Canon, therefore serves every reference T,
+and anything in it that needs T 's real identity ( typeof(T), new T[n], a static field, a cast) goes through that instantiation's generic dictionary.
+Trade-off: value-type instantiations avoid boxing and indirection but multiply code size; reference-type instantiations are compact but pay a dictionary load wherever identity is needed.
+
+Result needs TError covariant out (you only return errors, never accept) and TValue covariant out (same). Declare it as an interface: public interface IResult {. }. With DbError: Exception and User: object, IResult is implicitly assignable to IResult.
+The class implementation Result: IResult itself can't be variant, only interfaces or delegates can, so callers should consume via the interface.
+
+struct allows any value type, including those containing references (for example, KeyValuePair ). unmanaged is stricter, T must be a value type containing only blittable primitives recursively (no managed references).
+unmanaged enables sizeof(T), stackalloc T[n], raw byte* pinning, and Span over native memory. Use unmanaged only when you need those, for example, for serialization to bytes, FFI, or zero-allocation buffers. Otherwise struct is broader and just as performant for normal generic use.
+
+Two reasons. (1) Variance modifiers ( out, in ) are only allowed on interfaces and delegates, classes can never be declared variant. (2) Even on an interface, out T requires T to appear only in output positions; Value { get; set; } puts T in both get (output, OK) and set (input, not OK).
+Fix options: (a) split into interface IReader { T Value { get; } } and interface IWriter { T Value { set; } }; (b) make the class implement IReader and add a non-generic write path. The compile error is the type system protecting you from a covariance hole.
+
+This is open generic registration. The D I container will resolve any closed IValidator (for example, IValidator ) by constructing the matching closed FluentValidator. One line covers infinite closed types, ideal for cross-cutting interfaces like IRepository<>, IValidator<>, INotificationHandler<>.
+Alternative is per-type registration ( AddScoped,.>() ), verbose, error-prone, but lets you swap a single specialization. Use open registration as the default; override per-type only when one specialization needs a different implementation.

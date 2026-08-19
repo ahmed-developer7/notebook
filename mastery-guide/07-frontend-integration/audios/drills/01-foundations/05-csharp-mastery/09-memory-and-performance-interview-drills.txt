@@ -1,0 +1,601 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Gen 0 versus Gen 2.
+
+Q: What's the difference between a Gen 0 and a Gen 2 collection, and which one hurts p99 latency?-- think --
+
+A: Gen 0 collects newly-allocated objects; runs frequently (every few megabytes), pauses are sub-millisecond, only scans the small Gen 0 region.
+Gen 2 collects long-lived survivors plus the LOH; runs rarely (seconds to minutes), pauses can be tens to hundreds of milliseconds, scans the entire managed heap.
+Gen 2 pauses are what spike p99 latency under load.
+
+Cross-Q: If most allocations die young, why isn't my web service Gen 2-free?-- think --
+
+A: Three sources push objects to Gen 2: (1) LOH allocations, any allocation at least 85,000 bytes goes straight to LOH which is collected as part of Gen 2; (2) closures and async state machines that capture long-lived state survive Gen 0 or 1 and promote;
+(3) caches ( IMemoryCache, static dictionaries) by design hold references to objects that survive multiple collections.
+Profile with dotnet-counters monitor System.Runtime --counters gen-2-gc-count to find the rate; allocation trace with dotnet-trace to find the source.
+
+Cross-Q²: Why doesn't dot NET just have one generation and skip the complexity?-- think --
+
+A: The generational hypothesis, most objects die young. A single-generation collector would trace the entire heap on every collection, paying for objects that are obviously alive (caches, configuration, the D I container).
+Generational tracing lets the garbage collector touch only the small young region most of the time and pay for the full heap rarely.
+The trade-off it buys with is bookkeeping: an old object can reference a young one, so the runtime must record those references or the young collection would be unsound.
+That is what the write barrier and card table do, the jit emits a barrier on every reference store into a heap field, marking the card so a young collection traces only the dirtied portion of the old generations.
+So the honest summary is: generational garbage collector trades a small, constant cost on every reference write for a large saving on every collection. Name the write barrier and you've answered the question behind the question.
+
+-- pause --
+Drill 2, LOH threshold.
+
+Q: Why does the LOH have an 85,000-byte threshold? Why that specific number?-- think --
+
+A: ~85 kilobytes, the cost of copying the object during compaction exceeds the cost of leaving a hole in the heap. The C L R's Gen 0 or 1 or 2 are compacting collectors, they slide surviving objects together to eliminate fragmentation.
+Past some size, moving the object is more expensive than tolerating fragmentation, so LOH is non-compacting by default.
+The exact number was chosen by measurement, not derived, if an interviewer pushes for a reason behind 85,000 specifically, the correct move is to say it was empirically tuned rather than to invent one.
+And it is tunable upward: System.garbage collector.LOHThreshold in runtimeconfig.json (or DOTNET_GCLOHThreshold, hex, as an env var) has existed since dot NET Core 3.0.
+The value must exceed the default and may be capped by the runtime; read back the effective value with garbage collector.GetConfigurationVariables().
+
+Cross-Q: What's the consequence of LOH being non-compacting?-- think --
+
+A: Fragmentation. Repeatedly allocating and freeing differently-sized large objects leaves holes the garbage collector can't combine.
+After a while, the LOH may have 200 megabytes of "free" space scattered across 1000 holes, but a new 5 megabytes allocation can't fit because no single hole is that big.
+You'll see OutOfMemoryException on a process that the operating system thinks has plenty of RAM.
+You can manually trigger an LOH compaction once with GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce followed by garbage collector.Collect(), but it's expensive (full Gen 2 + move every LOH object), only do it after a known bulk-allocation phase.
+
+Cross-Q²: I have a Jason serializer producing 100 kilobytes documents at 1000 req or s. What do I do?-- think --
+
+A: Three layers. (1) Stream to the output, don't materialize the document; use Utf8JsonWriter writing directly to the response Stream. The serializer's internal buffer is pooled ( ArrayPool ) and stays the LOH threshold.
+(2) If you must buffer (for example, to compute Content-Length), rent from ArrayPool.Shared.Rent(102400), pool buffers are reused, no LOH churn. (3) Monitor with dotnet-counters to confirm loh-size is flat over time.
+If you're already using System.Text.Json correctly, all this is done for you, most LOH pressure in modern services comes from logging or custom CSV or X M L generators.
+
+-- pause --
+Drill 3, Pinned Object Heap.
+
+Q: When would you allocate into the Pinned Object Heap, and why does it exist?-- think --
+
+A: POH (Pinned Object Heap, dot NET 5+) is for long-lived buffers that must remain at a fixed memory address, typically passed to native code via P or Invoke or used by zero-copy I O (Kestrel sockets, G R P C).
+Before POH, the only way to pin was fixed blocks or GCHandle.Alloc(Pinned), which kept the object in Gen 0 but un-moveable, causing fragmentation around it. POH allocates these objects in a dedicated region the garbage collector never tries to compact.
+
+Cross-Q: Show me the A P I.-- think --
+
+A:
+csharp.
+// dot NET 5+, allocates directly into POH.
+byte[] buffer = garbage collector.AllocateArray(length: 4096, pinned: true);
+// 'pinned: true' is the POH switch; default false uses regular heap.
+
+// Faster variant, skip zero-init for unmanaged element types.
+byte[] fast = garbage collector.AllocateUninitializedArray(length: 4096, pinned: true);
+
+The returned array can be passed to native code; its address won't change for the lifetime of the array. No fixed block needed.
+
+Cross-Q²: When is POH the wrong choice?-- think --
+
+A: Three cases. (1) Short-lived buffers, POH objects survive Gen 2 collections (treated like Gen 2 by default), so a short-lived POH allocation pays Gen 2 cost forever. Use ArrayPool with clear Array: true instead.
+(2) Buffers that won't be passed to native code, pinning has no benefit; you're just paying for a separate heap region. (3) Hot allocation patterns, POH allocation is the same cost as any heap allocation; pooling beats it. Rule: POH for long-lived interop buffers; pool for everything else.
+
+-- pause --
+Drill 4, stackalloc safety.
+
+Q: Span buf = stackalloc byte[size]; where size comes from a request parameter. Critique.-- think --
+
+A: Stack overflow waiting to happen. The C L R doesn't bounds-check stackalloc against the remaining thread stack; a malicious or buggy size of 10 megabytes immediately terminates the process, no catchable exception.
+Default thread stack is 1 megabyte on Windows, and A S P dot NET Core middleware already consumes hundreds of kilobytes. The remaining headroom is small.
+
+Cross-Q: Show me the safe pattern.-- think --
+
+A: Clamp to a known-safe constant, fall back to ArrayPool:
+csharp.
+const int Threshold = 256;
+byte[]? rented = null;
+Span buffer = size <= Threshold.
+? stackalloc byte[Threshold].
+: (rented = ArrayPool.Shared.Rent(size));
+try {.
+var slice = buffer.Slice(0, size);
+// use slice.
+}.
+finally {.
+if (rented is not null) ArrayPool.Shared.Return(rented);
+}.
+
+This is the canonical dot NET BCL idiom, Utf8JsonReader, Path, Regex all use variants.
+
+Cross-Q²: Why is stackalloc in a for loop dangerous even with bounded size?-- think --
+
+A: The C sharp spec says the lifetime of stackalloc is the enclosing method, not the loop iteration. Each iteration's stackalloc adds to the stack frame and doesn't reclaim until the method returns.
+A loop allocating 256 bytes for 10,000 iterations consumes ~2.5 megabytes of stack, far exceeding the 1 megabyte Windows default. The fix: move the stackalloc outside the loop and reuse the buffer; or use ArrayPool if the size varies.
+The diagnostic that catches this is the code-analysis rule CA2014, "Do not use stackalloc in loops", an analyzer rule, not a compiler warning, so it fires only if analyzers are enabled.
+(Don't confuse it with CS9081, which is a compiler warning about a stackalloc result possibly escaping its method, a different bug.) The safest rule remains "no stackalloc inside loop bodies, ever"; CA2014 's own docs allow suppression only when the loop runs a known-small number of times.
+
+-- pause --
+Drill 5, Span versus byte[].
+
+Q: What does Span buy you over byte[] ?-- think --
+
+A: Three things: (1) Zero-allocation slicing, arr.AsSpan(10, 50) creates a span pointing into arr without allocating; arr.Skip(10).Take(50).ToArray() allocates a new array.
+(2) Unified A P I over heap, stack, and native memory, the same Span works whether the bytes came from new byte[N], stackalloc, or Marshal.AllocHGlobal. (3) Compile-time lifetime safety, the compiler refuses to let a span escape its data's lifetime, preventing use-after-free at the managed level.
+
+Cross-Q: Can I store a Span in a class field?-- think --
+
+A: No, compile error. Span is a ref struct, which the runtime treats as stack-only. The reason: a Span may point to stack memory ( stackalloc ); allowing it as a class field could let the span survive past its stack frame, causing memory corruption.
+For storage, use Memory (regular struct, heap-storable), then convert via .Span for synchronous work.
+
+Cross-Q²: Why can't a Span cross an await ?-- think --
+
+A: Async methods are lowered by the compiler into a state machine, a class that hoists every local that is live across a suspension point into a field, so the method can be paused and resumed. A Span held across the await would become a field of a class, which the ref struct rules forbid.
+Be precise about the version gate, because the blanket rule most people quote is out of date: through C sharp 12 merely declaring a ref struct local anywhere in an async method was an error.
+Since C sharp 13 the declaration is legal and the compiler objects only when the value is still needed after the suspension, Microsoft Learn's ref struct types puts it as "a ref struct variable can't be used in the same block as the await expression", which surfaces as CS4007,
+"Instance of type 'System.Span and lt;int and gt;' cannot be preserved across 'await' or 'yield' boundary." A ref struct parameter is still rejected outright with CS4012, because a parameter is live at every suspension point by definition.
+Workaround unchanged: store Memory across the await, convert to Span only within synchronous segments between awaits. See Type System, ref struct for the full current restriction list.
+
+-- pause --
+Drill 6, ArrayPool cost or benefit.
+
+Q: When does ArrayPool.Rent actually beat new ?-- think --
+
+A: Two conditions, and neither is a number you can memorise.
+First, the buffer must be big enough that the allocation contributes meaningfully to Gen 0 budget consumption, a few hundred bytes, stackalloc beats both and ~85,000 bytes pooling is close to mandatory because you're otherwise allocating straight into the LOH.
+Second, the same path must rent the same size often enough that the buffer stays warm in the pool's per-thread slot or per-core stack, that's what makes a rent a pointer swap rather than an allocation. If either fails, new is competitive and simpler.
+Note the asymmetry that makes this an easy call at the top end: new byte[100_000] is a gen-2 allocation every single time, whereas the pooled version is one allocation ever.
+
+Cross-Q: What's the failure mode I need to test for?-- think --
+
+A: Forgotten Return. The pool degrades to plain allocation when starved; the symptom is allocations creeping up under load, and the root cause is almost always a path that rents but doesn't return when it throws.
+It is not silent, though, which is the part most people don't know: ArrayPool publishes an EventSource named System.Buffers.ArrayPoolEventSource with BufferRented, BufferAllocated, BufferReturned and BufferDropped events, and BufferAllocated carries a reason, Pooled (cold start),
+PoolExhausted (rentals outnumber returns), or OverMaximumSize (you're renting bigger than the pool caches).
+A stream of PoolExhausted under load is the diagnosis. Capture it with dotnet-trace collect --providers System.Buffers.ArrayPoolEventSource. Prevention: try or finally, or MemoryPool.Shared.Rent() for IMemoryOwner: IDisposable.
+
+Cross-Q²: I Return a buffer that held a J W T. Two requests later, the next caller gets the same array. What do they see?-- think --
+
+A: They see your J W T, in the unused portion. Return(arr, clear Array: false) (the default) doesn't zero the buffer, and nothing else does either, I'd correct a common misconception here: neither pool implementation in CoreLib clears automatically for any element type, including reference types.
+So Return(arr, clear Array: true) (or arr.AsSpan(0, length).Clear() before returning) is on you.
+For reference-type arrays there's a second reason beyond disclosure: an uncleared ArrayPool buffer keeps every element reachable from the pool, which is a process-lifetime garbage collector root, a leak that never appears in a reference chain mentioning your code.
+And going the other way, Rent for primitive element types may hand back memory the runtime deliberately did not zero ( garbage collector.AllocateUninitializedArray on the miss path), so you cannot treat the tail of a rented buffer as zeros either.
+Any pool usage in a security-sensitive path needs an explicit clear Array: true and a comment saying why.
+
+-- pause --
+Drill 7, ValueTask versus Task.
+
+Q: When would you switch from Task to ValueTask, and what breaks?-- think --
+
+A: Switch when the method usually completes synchronously (cached result, fast-path check) on a hot path. ValueTask is a struct, so the synchronous path returns a value rather than allocating a Task.
+What breaks: callers can no longer await the same value twice, call .Result before awaiting, or pass it to Task.WhenAll, the struct may wrap a pooled, single-use source. And be precise about what it does not buy you: it removes the Task object, not the async state machine.
+If the method actually suspends, the compiler-generated state machine struct still gets boxed onto the heap, and that box is the larger object. ValueTask is an optimization for the cache-hit shape specifically.
+
+Cross-Q: Should I always return ValueTask from my async methods then?-- think --
+
+A: No. ValueTask is an optimization tool, not a default. Reasons to stick with Task: (1) Caller ergonomics, Task is the universal contract; ValueTask adds caller-side rules they need to remember.
+(2) Caching the result for multiple awaiters, Task is freely awaitable any number of times; ValueTask is not. (3) Composition with Task.WhenAll / Task.WhenAny, these expect Task; vt.AsTask() defeats the optimization.
+Rule: ValueTask for hot-path internal A P Is with synchronous fast-paths; Task for everything else.
+
+Cross-Q²: IAsyncEnumerator.MoveNextAsync() returns ValueTask. Why was that choice made?-- think --
+
+A: Because the allocation would be per element, not per call. When iterating already-buffered data, every MoveNext completes synchronously; returning Task would allocate one object per item, so a single enumeration of N items produces N garbage objects for zero benefit.
+ValueTask with synchronous completion allocates nothing for the whole iteration.
+There is a second reason that's worth knowing because it applies even when the iteration does go async: a ValueTask can be backed by an IValueTaskSource that the enumerator reuses across every MoveNextAsync call, whereas a Task is single-use by construction and must be a fresh object each time.
+So ValueTask is the only choice that can make a long async iteration allocation-free end to end. This is the canonical example of why ValueTask exists, and why IAsyncEnumerable shipped only after ValueTask was stable.
+
+-- pause --
+Drill 8, Defensive copy.
+
+Q: void Method(in BigStruct s) { var x = s.X; } where BigStruct is NOT readonly. Does this copy s ?-- think --
+
+A: Likely yes, depends on what s.X is. If X is a property (a method call) or any non- readonly instance method, the compiler emits a defensive copy: it copies s to a hidden local first, then accesses .X on the copy.
+The reason: without readonly guarantees, the compiler can't prove X 's getter won't mutate s, and the in contract promises the caller's variable doesn't change.
+
+Cross-Q: How do I prevent the defensive copy?-- think --
+
+A: Two options. (1) Make the struct readonly struct, the compiler now knows nothing in the struct can mutate this, so no defensive copy. (2) Mark individual methods or properties readonly (C sharp 8+): public readonly int X goes to _x; or public readonly int Magnitude() goes to..
+The readonly keyword on members promises they don't mutate. Detection: Roslyn analyzer IDE0250 suggests readonly struct; in I L look for the dup / stloc / ldloca pattern before the call.
+
+Cross-Q²: I have a 256-byte struct in a hot loop iterating 100M times. How much does the defensive copy cost?-- think --
+
+A: Don't quote a figure, describe what's being paid, because that's what generalises.
+Per copy: a 256-byte memcpy, a 256-byte stack slot that evicts something else from L1, and, the part people miss, one copy per member access, not one per iteration, since each property getter is a separate call the compiler must protect. So a loop body touching four properties pays four copies.
+On top of the direct cost it blocks optimizations: the hidden copy is an aliasing barrier, so the jit stops hoisting and stops vectorizing.
+And the fix is a single keyword on the type declaration with no call-site change and no behavioural change, combine it with in so void Process(in BigReadOnlyStruct s) passes a pointer instead of 256 bytes.
+If the interviewer wants a number, the correct answer is "I'd put it under [MemoryDiagnoser] with and without readonly and show you", which is also the true answer.
+
+-- pause --
+Drill 9, readonly struct guarantees.
+
+Q: What does the readonly keyword on a struct declaration actually guarantee?-- think --
+
+A: Four things, compile-enforced: (1) All instance fields must be readonly, can only be assigned in the constructor. (2) All instance properties are get-only or init -only, no setters. (3) All instance methods are implicitly readonly, they cannot mutate this.
+(4) Compiler emits no defensive copies when the struct is passed via in or accessed through ref readonly.
+
+Cross-Q: Does readonly struct give me thread safety?-- think --
+
+A: Almost. The struct itself is immutable, so reads from multiple threads are safe. But: when assigning a struct, the assignment is not atomic for structs larger than the native word size (8 bytes on 64-bit). A reader could see a half-updated struct mid-write, torn read.
+To be fully thread-safe across writes, either keep the struct at most 8 bytes, or use Volatile.Read / Interlocked.CompareExchange for assignment, or wrap in a class with a single reference swap. readonly struct solves immutability, not atomic update.
+
+Cross-Q²: What's the difference between readonly struct, record struct, and readonly record struct ?-- think --
+
+A: readonly struct, the keyword constraints, and nothing about equality. Be careful here, because the common wrong answer is "structs get reference equality by default": they do not.
+Every struct inherits ValueType.Equals, which Microsoft's own guidance describes as performing "a value equality check by using reflection to compare the values of every field in the type", correct, but slow, and it goes through Equals(object), so calling it boxes.
+(CoreCLR has a bitwise fast path, gated on the type containing no pointers and being tightly packed, so whether you get the fast or the reflective path depends on your fields.) Separately,
+== is not generated for a plain struct at all, "the == and != operators can't operate on a struct unless the struct explicitly overloads them", so a == b on a bare struct is a compile error.
+record struct, generates Equals(T), IEquatable, GetHashCode, and == / != for you, but its positional properties are mutable ( record struct Point(int X, int Y) has settable X and Y ). readonly record struct, both: immutable and generated value equality.
+For dictionary keys, hot loops, and value-typed coordinates, readonly record struct is the modern best choice, and the reason is concrete rather than stylistic:
+it gives you a non-boxing IEquatable.Equals and a real GetHashCode, which is what Dictionary looks for before it falls back to the slow path.
+
+-- pause --
+Drill 10, IDisposable and finalizers.
+
+Q: I'm writing a class that holds an HttpClient and a FileStream. Do I need a finalizer?-- think --
+
+A: No. Both HttpClient and FileStream are managed IDisposable s, they own their own unmanaged resources (sockets, file handles) and have their own finalizers as safety nets. Your class just needs to implement IDisposable and call Dispose() on both fields.
+Adding a finalizer here would add garbage collector overhead (every instance enters the finalizer queue, survives an extra garbage collector) for zero benefit, the cleanup would happen anyway via the children's finalizers.
+
+Cross-Q: When DO I need a finalizer?-- think --
+
+A: When your class directly owns an unmanaged resource, a raw IntPtr to a native handle, memory from Marshal.AllocHGlobal, or any resource not wrapped in another IDisposable. The finalizer is the safety net in case the caller forgets Dispose().
+In 2026, prefer SafeHandle, its built-in finalizer handles cleanup, so your class needs only IDisposable and no finalizer of its own. The full Dispose pattern with ~MyClass() and protected virtual void Dispose(bool disposing) is now rarely needed in application code.
+
+Cross-Q²: Why does Dispose() typically call garbage collector.SuppressFinalize(this) ?-- think --
+
+A: To tell the garbage collector "this object is fully cleaned up; skip the finalizer".
+Without SuppressFinalize, the object survives one extra garbage collector cycle: it sits in the f-reachable queue, the finalizer thread runs ~MyClass() (which is now redundant work), then it's collected on the next cycle.
+SuppressFinalize removes the object from the finalization queue so it's collected on the first eligible cycle, saves both C P U and one generation of memory pressure.
+Always call it in the Dispose() method when your class has a finalizer, even if the finalizer body is empty after Dispose-cleanup runs.
+
+-- pause --
+Drill 11, IAsyncDisposable.
+
+Q: When would you implement IAsyncDisposable over IDisposable ?-- think --
+
+A: When the cleanup work itself does I O, flushing a network buffer, gracefully closing a sequel connection (which may send a goodbye packet), draining a Channel, awaiting in-flight tasks before disposal.
+Sync Dispose() would block the calling thread, which is unacceptable in async-first code paths (every blocked thread is a thread-pool starvation risk). IAsyncDisposable.DisposeAsync() returns ValueTask and the caller uses await using for scope-bound disposal.
+
+Cross-Q: Should I implement both IDisposable and IAsyncDisposable ?-- think --
+
+A: Usually yes, for maximum caller compatibility. The BCL convention: DisposeAsync() does the real work; Dispose() either calls DisposeAsync().AsTask().GetAwaiter().GetResult() (sync-over-async, with caveats) or duplicates the cleanup logic synchronously.
+HttpClient, Stream, DbContext all implement both. Caveat: await using calls DisposeAsync only; using calls Dispose. If only IAsyncDisposable is implemented and someone writes using x =.;, they get a compile error, explicit but not always desirable.
+
+Cross-Q²: await using versus using: what's the lowered code?-- think --
+
+A: using lowers to a try or finally calling obj.Dispose(). await using lowers to a try or finally calling await obj.DisposeAsync().
+The finally block runs the async dispose synchronously to the surrounding async method's flow, if DisposeAsync throws, the exception surfaces from the enclosing scope, same as sync using.
+One gotcha: await using is only legal inside an async method; using it in a sync context is a compile error (which is what you want, it forces the caller to be async-aware).
+
+-- pause --
+Drill 12, String concat in a hot loop.
+
+Q: Why is result += items[i] in a 10,000-iteration loop catastrophic?-- think --
+
+A: Strings are immutable, so each += allocates a new string equal to result.Length + items[i].Length and copies all of result into it. The allocation count is O(N); the bytes allocated and copied are O(N²), because iteration i re-copies everything the previous i−1 iterations produced.
+Two things follow that make it worse than the big-O suggests: with UTF-16, 85,000 bytes is about 42,500 characters, so past that point every single iteration produces a large object and contributes directly to Gen 2;
+and the intermediates are exactly the objects most likely to still be alive when a collection runs, so they get promoted rather than dying cheaply in Gen 0.
+
+Cross-Q: What are the three fixes ranked by perf?-- think --
+
+A: Rank them by allocation count and bytes copied, which is the property you can reason about without a benchmark. (1) string.Create(len, items, callback) when the total length is computable, exactly one allocation, the result itself, written in place with no intermediate buffer at all.
+(2) StringBuilder with pre-sized capacity, the constructor's capacity is honoured directly, so you get one chunk plus one final copy in ToString().
+(3) StringBuilder without a capacity, starts at 16 chars and links additional chunks as it fills; more allocations than (2), but still linear in the output and, crucially, it never re-copies what it already holds.
+For genuine variable-length building with conditional appends, StringBuilder is the right choice; if you find yourself quoting a multiplier between these three, measure it on your data instead.
+
+Cross-Q²: How does C sharp 10's interpolated string $"x = {n}" differ from string.Format("x = {0}", n) ?-- think --
+
+A: string.Format boxes every value-type argument (N boxes) and parses the format string at runtime (C P U cost) before producing the final string.
+Get the array part right, because it is the half people overstate:
+string.Format has non- params overloads for one, two, and three arguments, and dot NET added a params ReadOnlySpan overload that the compiler stack-allocates beyond that, so no object[] is allocated at any argument count unless you hand it one yourself.
+The boxes are the real cost. $"x = {n}" lowers to DefaultInterpolatedStringHandler, a stack-allocated builder that uses pooled char buffers. Zero boxing (it has AppendFormatted(T value) generic methods, jit-specialized per T ). Zero format-string parsing (the layout is compile-time-known).
+One final allocation: the result string. Now the part to get right, because it is the most commonly repeated error about this feature: that short-circuiting does not apply to ILogger.
+Microsoft.Extensions.Logging has no interpolated-string-handler overload, the proposal to add one (dotnet or runtime #111283) was closed as not planned, so _logger.LogDebug($".") builds and allocates the string before the logger ever sees it,
+and additionally destroys the message template that structured sinks rely on.
+The BCL A P Is that do take a handler and can therefore skip the work are StringBuilder.Append / AppendLine, MemoryExtensions.TryWrite (dot NET 6) and Utf8.TryWrite (dot NET 8). For logging, the answer is the message-template overload or [LoggerMessage], and CA2254 is the analyzer that enforces it.
+
+-- pause --
+Drill 13, string.Create versus StringBuilder.
+
+Q: When does string.Create beat StringBuilder ?-- think --
+
+A: When you know the final length ahead of time. string.Create allocates the result string once and gives you a Span to write into, one allocation, total. StringBuilder always costs at least two: its buffer plus the final string produced by ToString().
+
+Be careful how you describe StringBuilder 's buffer, because the usual description is wrong and an interviewer who has read CoreLib will notice. It is not a single char[] that doubles and copies. It is a linked list of chunks, m_ChunkChars for the current buffer, m_ChunkPrevious for the one before.
+When a chunk fills, ExpandByABlock allocates a new one and relinks; the source comment describes this as "a few O(1) reference adjustments", and existing characters are never re-copied.
+New chunks are sized max(needed, min(current Length, MaxChunkSize)) with MaxChunkSize = 8000 chars, a cap the source says exists "so we stay in the small object heap", since 8,000 chars is 16,000 bytes, well under the 85,000-byte LOH threshold.
+So StringBuilder is engineered to keep its own buffers off the LOH; the string it finally produces is a single allocation and can land there regardless.
+
+Cross-Q: Walk me through a real string.Create example.-- think --
+
+A:
+csharp.
+// Building "Hello, {name}!", total length is known: 9 + name.Length.
+string greeting = string.Create(9 + name.Length, name, (chars, state) goes to.
+{.
+"Hello, ".AsSpan().CopyTo(chars);
+state.AsSpan().CopyTo(chars[7.]);
+chars[7 + state.Length] = '!';
+});
+
+The state parameter avoids the lambda capturing name (which would allocate a closure). The lambda receives Span over the new string's storage, you write the characters directly, no intermediate buffer.
+
+Cross-Q²: What's the catch with string.Create ?-- think --
+
+A: Three. (1) You must compute the final length exactly, write past chars.Length and you get an IndexOutOfRangeException; write less and the string has uninitialized chars at the end. (2) The callback runs synchronously and cannot async-await, no I O inside.
+(3) Captures cost allocation, use the state parameter for any data the callback needs; don't capture outer variables. For unknown lengths or complex logic with conditional content, StringBuilder is still the right tool.
+string.Create is the specialist for known-length single-allocation construction.
+
+-- pause --
+Drill 14, Boxing count.
+
+Q: int i = 5; object o = i; int j = (int)o;, how many heap allocations?-- think --
+
+A: One. The first assignment object o = i boxes, allocates a small object on the heap, copies the value 5 into it, and stores the reference in o. The cast (int)o is an unbox, copies the value back out of the heap object into the stack-allocated j.
+Unboxing doesn't allocate; it reads from existing memory. On x64 that box is a 24-byte object, 16 bytes of header (sync-block index + method-table pointer), 4 bytes of payload, 4 of padding, so the overhead is 20 bytes to carry 4 bytes of data.
+
+Cross-Q: How would I count boxes without running the code?-- think --
+
+A: Three ways. (1) ILSpy / ildasm, look for the box I L opcode; each occurrence is one heap allocation. (2) Roslyn analyzer HAA0601 (heap allocation analyzer), flags suspected boxes at compile time. (3) BenchmarkDotNet [MemoryDiagnoser], measure Allocated column on a [Benchmark].
+For a method that should be allocation-free but reports 24+ bytes per call, there's a hidden box. The fix is usually adding a generic constraint or calling the struct's method directly instead of through an interface.
+
+Cross-Q²: Where do enum boxes happen, and is dot NET 9 better than dot NET Framework 4.8 here?-- think --
+
+A: Three classic enum-boxing spots, and be precise about which ones modern dot NET actually fixed. (1) string.Format("{0}", my Enum) boxes, the parameter is object and always was. (2) Console.WriteLine(my Enum) binds the object overload, boxes.
+(3) my Enum.ToString() still boxes the receiver in I L, because ToString is inherited from System.Enum, which is a class, and enum types don't override it; a constrained. call to a method the value type doesn't implement boxes.
+What modern dot NET improved is (a) the implementation of Enum.ToString and the generic helpers, Enum.GetName(value), IsDefined, GetValues arrived in dot NET 5 and take the value generically, so no box at the call;
+(b) $"{my Enum}", which lowers to the handler's generic AppendFormatted(T) and so doesn't box the argument;
+and (c) on dot NET 9+, the jit can stack-allocate a box that provably doesn't escape, which can make the remaining box free, but that is an optimisation with no guarantee, not a language change.
+The honest one-liner: the way to avoid an enum box is to keep it in a generic T or a strongly-typed parameter and never let it reach an object.
+
+-- pause --
+Drill 15, Boxing in generic methods.
+
+Q: void Compare(T a, T b) where T: IComparable { a.CompareTo(b); }, does this box?-- think --
+
+A: No. The constraint where T: IComparable tells the jit that any concrete T it specializes for implements IComparable. When T is a value type, the jit generates a specialized method body that calls T.CompareTo(T) directly, a non-virtual method call on the struct, no box.
+When T is a reference type, the call is via the interface, but reference types don't box. This is the single most important reason List exists and ArrayList is dead.
+
+Cross-Q: What if I remove the constraint? void Compare(T a, T b) { ((IComparable)a).CompareTo(b); }.-- think --
+
+A: Boxes, for value types. The cast (IComparable)a boxes a to the interface type. The jit specializes the generic but can't prove T implements the interface at compile time, so it must use a runtime cast that allocates.
+Two changes restore zero-box: (1) add the constraint, as shown; or (2) keep no constraint but accept the box (rarely the right answer).
+
+Cross-Q²: I see where T: IComparable in a method, and inside it I do object o = a;. Does that box?-- think --
+
+A: Yes, it boxes for value-type T. The constraint prevents boxing on interface method calls ( a.CompareTo(b) is direct), but assignment to object is a separate operation, the runtime must produce a reference-typed value, which requires boxing the struct.
+Rule: constraints solve boxing on calls through the constraint; they don't solve boxing on assignments to object or to broader interface types. To avoid the box, keep the value in T form and use other constraint-call sites; don't widen to object.
+
+-- pause --
+Drill 16, Server versus Workstation garbage collector.
+
+Q: A S P dot NET Core defaults to which garbage collector mode, and why?-- think --
+
+A: Server garbage collector, but say why it's the default rather than quoting a C P U count, because the mechanism is what's being probed. Microsoft's docs put it as: workstation garbage collector "is the default garbage collector flavor for standalone apps.
+For hosted apps, for example, those hosted by A S P dot NET, the host determines the default garbage collector flavor." Server garbage collector creates one heap and one dedicated garbage collector thread per logical C P U and collects them in parallel,
+which raises allocation throughput (per-C P U heaps mean near-zero contention on the allocation path) and shortens individual pauses.
+The trade-off is a larger memory footprint, because each heap carries its own allocation budget.
+There's one hard rule underneath all of this: "Workstation garbage collection is always used on a computer that has only one logical C P U, regardless of the configuration setting." So on a 1-vCPU container, ServerGarbageCollection set to true is silently a no-op.
+
+Cross-Q: I'm running A S P dot NET Core in a 256 megabytes Kubernetes pod. Should I still use Server garbage collector?-- think --
+
+A: Two separate mechanisms are in play and the version gate matters. (1) The heap hard limit. In a memory-limited environment the runtime treats the container limit as total physical memory and defaults the managed heap to the larger of 20 megabytes and 75% of it.
+That's System.garbage collector.HeapHardLimitPercent; you can lower it, and you should if the process holds a lot of native memory, because the remaining 25% is the budget for everything that isn't the managed heap.
+(2) DATAS, which makes the number of heaps and the gen 0 budget track the application's live data rather than the C P U count.
+DATAS was introduced in dot NET 8 and is enabled by default from dot NET 9, so on a current runtime you are already running it, and the realistic experiment is turning it off ( DOTNET_GCDynamicAdaptationMode set to 0 ) if a throughput-sensitive service regressed on upgrade.
+The honest answer to the question as asked is: measure both, in your topology, with your traffic, and know that on dot NET 9+ "should I enable DATAS" is already answered for you.
+
+Cross-Q²: How do I verify which garbage collector mode my process is actually running?-- think --
+
+A: System.Runtime.GCSettings.IsServerGC returns true or false at runtime. Also GCSettings.LatencyMode tells you Interactive, Batch, LowLatency, et cetera
+For an external check: dotnet-counters monitor System.Runtime shows garbage collector stats; the heap size and Gen 2 collection cadence will look very different on Server versus Workstation.
+If you're suspicious of a misconfiguration (for example, runtimeconfig.json deployed wrong), IsServerGC is the first thing to log at startup.
+
+-- pause --
+Drill 17, garbage collector.Collect().
+
+Q: When should you call garbage collector.Collect() in production code?-- think --
+
+A: Almost never. The garbage collector is significantly smarter than any manual heuristic, it monitors allocation rate, segment fullness, and survival rates to decide when to collect. Forcing a collection wastes C P U and disrupts the garbage collector's tuning.
+garbage collector.Collect() in a hot path is a code smell that always loses on a benchmark.
+
+Cross-Q: Are there any legitimate cases?-- think --
+
+A: Two. (1) After a known one-time large allocation phase, for example, loading a 500 megabytes cache at app startup, then never allocating that much again.
+One garbage collector.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true) at the end of the load phase compacts the heap into a clean steady-state shape.
+(2) Benchmarking, bringing the heap to a known state between iterations of a micro-benchmark. Both cases are rare and explicit.
+
+Cross-Q²: What does garbage collector.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true) mean parameter-by-parameter?-- think --
+
+A: (a) 2, collect up to and including Gen 2 (so all generations + LOH). (b) GCCollectionMode.Forced, actually perform the collection now (alternatives: Default = let garbage collector decide if collection is warranted; Optimized = collect only if there's likely a benefit).
+(c) blocking: true, wait for the collection to complete before returning (versus background async). (d) compacting: true, include LOH compaction (normally LOH is non-compacting).
+Combined: "synchronously perform a full collection of all generations including LOH compaction, right now." Maximum disruption, maximum reclamation. Use only in the bootstrap scenarios.
+
+-- pause --
+Drill 18, BenchmarkDotNet [MemoryDiagnoser].
+
+Q: What does [MemoryDiagnoser] add to a BenchmarkDotNet report?-- think --
+
+A: Three columns: Allocated (bytes per call, the headline number), and Gen 0 / Gen 1 / Gen 2 (collection counts per 1000 ops). It runs each benchmark twice, once for time measurement, once with allocation tracking enabled (which adds overhead, so it's separated).
+The result is per-call attribution of how much garbage your method generates and which generations are affected.
+
+Cross-Q: I see Method A: 100 nanoseconds, 0 B; Method B: 80 nanoseconds, 24 B. Which is faster in production?-- think --
+
+A: Likely A, even though B has a lower per-call mean. The 24 B or op on the hot path becomes Gen 0 pressure: at 1M ops or sec, that's 24 megabytes per second of allocations, triggering Gen 0 every few hundred milliseconds.
+Each Gen 0 briefly pauses all threads; under load the pause amortizes into worse p99 or p999 latency even though average latency is fine. A's 0 B or op contributes zero to garbage collector.
+Senior rule: micro-benchmarks measure C P U; production performance is C P U + garbage collector + cache + tail-latency.
+Always include [MemoryDiagnoser] and weigh allocations alongside time.
+
+Cross-Q²: What are the two most common BenchmarkDotNet pitfalls?-- think --
+
+A: (1) Dead-code elimination, a benchmark that returns void and has no observable side effect gets optimized to nothing by the jit, reporting 0 nanoseconds. Fix: always return the computed value from the benchmark method; BDN consumes it to force evaluation.
+(2) Running in Debug mode or under a debugger, disables tier-2 jit optimizations, giving meaningless numbers. BDN warns about both at startup.
+Honorable mention: [Params] cardinality explosion, the run count is the product of every parameter's cardinality, every [Benchmark] method, and every job, so [Params(1, 10, 100, 1000)] across 4 benchmarks and 3 runtimes is 48 full measurement runs.
+Tune your parameter set deliberately; each run pays its own pilot, warmup and workload phases.
+
+-- pause --
+Drill 19, Closure allocations.
+
+Q: var n = 5; Func f = () goes to n * 2;, how many allocations?-- think --
+
+A: Two objects, so two allocations. The lambda captures the local n, so the compiler generates a display class ( <>c__DisplayClass. ), a heap object holding n as a field and a method returning n * 2. Then the Func itself is a delegate object whose target is that display-class instance.
+Say "one display class and one delegate" rather than quoting byte counts; the sizes follow from object layout and the delegate's field count, and the number of objects is what the interviewer is checking.
+Note also that the display class is per scope, not per lambda, every lambda in the same scope shares one, which is how a lambda that captures one int can end up keeping a large object alive.
+
+Cross-Q: How do I write a closure-free version?-- think --
+
+A: Three approaches, in the order you should try them. (1) Capture nothing, pass the value as a parameter instead: Func f = static n goes to n 2; then call f(5). Roslyn caches a non-capturing lambda's delegate in a static field, so it is allocated once for the life of the process.
+Marking it static (C sharp 9) makes accidental capture a compile error, which is the real value, it survives the next person editing the body. (2) Method group, static int Double(int n) goes to n 2; Func f = Double;. (3) Use a state-passing overload where the A P I offers one.
+These exist precisely to let you avoid the capture, but you have to check that the specific A P I has one, link's Enumerable methods largely do not, so list.FirstOrDefault(x goes to x.Id == criteria.Id) genuinely does capture.
+Ones that do: ConcurrentDictionary.GetOrAdd(key, Func, TArg), string.Create(length, state, SpanAction), ThreadPool.QueueUserWorkItem(Action, TState, bool), CancellationToken.Register(Action, object?).
+
+Cross-Q²: How do I detect closure allocations in production code?-- think --
+
+A: Three tools. (1) Roslyn analyzer HAA0301-302 (Heap Allocation Analyzer), flags lambdas that capture variables and warns about closure allocation. (2) [MemoryDiagnoser] benchmarks, if a method that should be allocation-free reports 56+ bytes per call, there's likely a closure.
+(3) PerfView allocation trace, search for compiler-generated <>c__DisplayClass* types; each one is a closure. The most common offenders: link in hot paths ( .Where(x goes to x.Id == my Id) captures my Id ), event handlers that capture state, and lambda parameters to async methods.
+
+-- pause --
+Drill 20, ref returns.
+
+Q: What's a real-world use of ref returns?-- think --
+
+A: Dictionary in-place update via CollectionsMarshal.GetValueRefOrNullRef. The typical "find-or-add" pattern costs two dictionary lookups, TryGetValue, then [key] =., each of which hashes the key and probes a bucket chain.
+GetValueRefOrNullRef does one lookup and returns a ref TValue pointing at the entry, which you mutate in place.
+Two savings, and they scale differently: the second hash-and-probe is a fixed saving, while for a large TValue struct you also stop copying the value out and back in, which grows with sizeof(TValue).
+GetValueRefOrAddDefault(dict, key, out bool existed) (dot NET 6) covers the insert case in the same single lookup.
+
+Cross-Q: Show me the code.-- think --
+
+A:
+csharp.
+using System.Runtime.InteropServices;
+
+var counts = new Dictionary();
+ref int slot = ref CollectionsMarshal.GetValueRefOrNullRef(counts, "alice");
+if (Unsafe.IsNullRef(ref slot)).
+counts["alice"] = 1; // first time, add via normal path.
+else.
+slot++; // direct mutation, no second lookup.
+
+Unsafe.IsNullRef(ref slot) checks whether the dictionary returned a "not found" marker (a null ref). On hit, slot++ writes through the ref directly into the dictionary's internal bucket.
+
+Cross-Q²: Why is this only available in dot NET 6+? Wasn't ref return added in C sharp 7?-- think --
+
+A: C sharp 7 (2017) added ref returns and ref locals, the language feature. But the BCL didn't expose ref returns from Dictionary because of safety: a ref to a dictionary slot becomes invalid if the dictionary resizes (the backing array is reallocated).
+Exposing the ref via the normal A P I surface would let callers hold dangling refs.
+dot NET 6 (2021) added CollectionsMarshal.GetValueRefOrNullRef in the System.Runtime.InteropServices namespace, explicitly opt-in, the name signals "you're crossing into unsafe territory, you take responsibility for not resizing the dictionary while holding the ref".
+Similar gating exists for CollectionsMarshal.AsSpan(List), span over the list's backing array, invalidated by Add.
+
+-- pause --
+Drill 21, Do value types live on the stack?.
+
+Q: Value types live on the stack and reference types live on the heap. True?-- think --
+
+A: No, that's a statement about types, and the real rule is about storage locations. A value type's bytes live wherever its storage lives.
+As a method local it may be in a register or the stack frame; as a field of a class it lives inside that heap object; as an array element it lives inside the array on the heap; captured by a lambda it lives in the display class on the heap;
+alive across an await it ends up in the state-machine object once the method suspends; boxed, it lives in a heap object of its own.
+And the converse fails too, since dot NET 9 or 10, escape analysis lets the jit satisfy a reference-type new on the stack when it can prove the object doesn't escape. The formulation that holds up: the stack is an implementation detail.
+What the language guarantees is copy semantics (assignment copies the value) and lifetime (reclaimed with whatever contains it), not placement.
+
+Cross-Q: Then why does the distinction matter at all for performance?-- think --
+
+A: Because of what it implies about layout and indirection, not about which region the bytes are in.
+A struct field inside a class or an array pays no object header, no method-table pointer and no per-element dereference, on x64 that's 16 bytes of overhead avoided per element, against a 24-byte minimum object size, plus the difference between a sequential scan and a pointer chase.
+It also means no write barrier on stores, and no array covariance check. Those are the reasons Point[] beats Point_asClass[] in a loop, and none of them is "the stack is faster than the heap".
+
+Cross-Q²: I have a recursive parser that works in tests and kills the process in production. Where do I look?-- think --
+
+A: At the stack the code is actually running on, which is different in the two environments.
+A thread's stack is a fixed reservation made at creation: on Windows it comes from the reservation in the executable's PE header (1 megabyte by default); on Linux the main thread's comes from ulimit -s, commonly 8 megabytes, and CoreCLR uses a smaller fixed default on Alpine or musl.
+Tests typically run on a main or test-host thread; an A S P dot NET Core request runs on a thread-pool thread whose stack size you cannot configure, with the middleware pipeline already some hundreds of frames deep. So the same input has far less headroom in production.
+DOTNET_DefaultStackSize (hex) raises the default for runtime-created threads and new Thread(work, maxStackSize) sets it for one you own, but neither is the right fix:
+a stack overflow is not a catchable exception, so the fix is a depth limit that returns a 400, plus moving any large buffers out of stackalloc and into the pool.
+
+-- pause --
+Drill 22, Diagnose a managed memory leak.
+
+Q: A service's memory climbs steadily over a week and the pod is restarted to fix it. How do you find the cause?-- think --
+
+A: First separate the two failures, because they need different tools. If GCMemoryInfo.HeapSizeBytes (or dotnet gc last collection heap size ) is climbing, it's managed retention and everything applies.
+If the managed heap is flat while the working set climbs, it's native memory and none of it will help. Assuming managed: dotnet-gcdump collect -p twice, spaced apart under comparable load, and diff the two in Visual Studio or PerfView.
+The diff, not a single dump, is what identifies the growing type, because a healthy heap also contains millions of objects. Then take one instance of that type into dotnet-dump analyze and run gcroot, which prints the reference path back to a root. That path is the answer.
+
+Cross-Q: What are the roots it could end at, and which one is it usually?-- think --
+
+A: The root set is: live locals on any thread's stack (or in registers), static fields and [ThreadStatic] slots, garbage collector handles ( Normal, Pinned, and the weak variants), objects in the finalization queue awaiting their finalizer, and runtime-internal structures.
+In application code it is nearly always a static: a cache with no eviction, or, the one that hides best, an event. publisher.Changed += handler puts a strong reference to the subscriber into the publisher's invocation list, so a singleton publisher roots every scoped subscriber that ever attached.
+Runners-up: a Timer or CancellationToken.Register callback holding a closure, and an ArrayPool of reference type returned with clear Array: false, where the pool itself becomes the root.
+
+Cross-Q²: The gcroot path ends at a static ConcurrentDictionary. Is that a leak?-- think --
+
+A: Probably not, and saying so is the point. In a managed process there is no leak in the C sense; there is unintended retention, and a static cache is retention working exactly as written.
+The diagnostic question is "if the load stops, does memory come back down?" If yes, it's live working set, not a leak.
+If no, the cache is unbounded and the fix is a policy, not a missing Remove: MemoryCache with a size limit and SetSize on entries, an LRU, or a WeakReference / ConditionalWeakTable if the value should die with something else.
+A genuine leak, a reference nobody intended to keep, is fixed by dropping the reference; unbounded retention is fixed by deciding what you're willing to keep. Getting the classification right is what stops a team from "fixing" a cache by deleting it.
+
+-- pause --
+Drill 23, Throughput falls as you add threads.
+
+Q: A parallel aggregation scales from one thread to two, stops improving at four, and gets slower at eight. There is no lock and no shared mutable state except a long[] of per-worker counters. What's happening?-- think --
+
+A: False sharing. Cache coherency operates on cache lines, not variables, 64 bytes on x64, and CoreLib's PaddingHelpers.CACHE_LINE_SIZE is 128 on ARM64. Eight long s is 64 bytes, so all eight counters sit within one or two lines.
+Every worker's write invalidates the line in every other core's cache, and the line ping-pongs between cores. The threads share no data; they share a line. It reads as a scaling ceiling rather than contention because there is nothing to show up in a lock-contention profile.
+
+Cross-Q: How do you fix it?-- think --
+
+A: Two options, and prefer the first. (1) Stop sharing the line: each worker accumulates into a plain local and does one Interlocked.Add (or one write under its own lock) at the end of its batch.
+This removes both the false sharing and the atomic operation from the hot loop, and it needs no knowledge of cache-line size.
+(2) Pad, if the shared write genuinely cannot be batched, which is what ConcurrentQueue does internally: PaddedHeadAndTail is [StructLayout(LayoutKind.Explicit, Size = 3 * CACHE_LINE_SIZE)] with Head and Tail at separate line offsets, padded before, between and after.
+Note where the BCL chose to spend that memory: on the two hottest concurrently-written fields of a lock-free queue, and essentially nowhere else. That's the calibration to carry, padding is a last resort, not a habit.
+
+Cross-Q²: Same aggregation, but now the slow part is a single-threaded pass over a million records and it allocates nothing. Where does the time go?-- think --
+
+A: Memory latency, most likely, and the shape of the data is the reason.
+If the records are a List where Record is a class, the list holds a million 8-byte references, each pointing at a separate heap object of at least 24 bytes, at whatever address the allocator produced, so the loop is a pointer chase the prefetcher cannot predict,
+and each element access is a potential cache miss.
+The same data as a Record[] of readonly record struct is one contiguous block: sequential access, no per-object headers, no indirection, and no write barrier on stores.
+Before converting, check the struct conditions, small, immutable, value-like, not used polymorphically, because if the type is passed through layers instead of computed over, you trade cache misses for the copies described in the defensive-copy section.
+The honest closing line is that this is a hypothesis you confirm with a profiler that reports cache misses, not with a stopwatch.
+
+-- pause --
+Section 2. Self-test.
+
+Span holds a managed pointer ( byref ) into memory that may be on the stack, heap, or native, it's a ref struct to enforce stack-only lifetime. A class field would let the span outlive its backing memory (for example, stackalloc after the frame returns), the compiler refuses to prevent this.
+For async methods, the compiler lowers them into a state machine class and hoists into fields every local that is live across a suspension point; a Span held across the await would become such a field, which is CS4007.
+Since C sharp 13 the declaration of a Span local in an async method is legal, only crossing the await is not, while a ref struct parameter remains an outright error (CS4012).
+Workaround: store Memory (heap-storable) on the field or parameter, and inside synchronous regions call .Span to do the actual work.
+
+(1) Interpolated string $"{a}-{b}": lowers to DefaultInterpolatedStringHandler, whose scratch buffer is rented from ArrayPool.Shared, so the result string is the only lasting allocation, and no boxing, because AppendFormatted is generic.
+(2) string.Create: string.Create(a.Length + b.Length + 1, (a, b), (span, state) goes to.), single allocation, no intermediate object[].
+(3) Utf8.TryWrite(destination, $"{a}-{b}") into a pooled or stack byte span if downstream is binary, zero allocations, because the handler writes straight into your buffer and no string is created.
+The classic string.Format boxes each value-type argument and runs format-string parsing every call, the modern alternatives skip both costs.
+What it does not do is allocate an object[]: the two-argument call binds to the non- params Format(string, object, object) overload, and beyond three arguments the compiler picks the params ReadOnlySpan overload and stack-allocates the span. Quote the boxes, not the array.
+(Full measured ledger in Type System, Boxing and unboxing.) One thing not to say: that interpolation is free when the result is discarded. That only holds for A P Is with an interpolated-string-handler parameter, and ILogger is not one of them.
+
+stackalloc is unbeatable for small ( at most ~1 kilobyte), known-size, single-frame buffers, zero allocation, zero garbage collector, automatic reclaim on return.
+Loses when (a) size is large or unknown, stack exhaustion is not a catchable StackOverflowException in modern dot NET, it is immediate process termination with no finally, no log flush and no dump; (b) the buffer must outlive the method;
+(c) it is used in a loop, the lifetime is the enclosing method, so each iteration adds to the frame and nothing is reclaimed until the method returns ( CA2014 flags this).
+ArrayPool.Rent(size) handles arbitrary sizes and survives across async boundaries, but pays rent or return overhead, requires the exact array back, and quietly loses its benefit if a Return is missed.
+Rule: at most ~1 kilobyte and bounded by a constant on the stack; anything derived from input, or anything crossing an await, goes to the pool.
+
+Likely A, even though B is faster per call. The 24 B or op on the hot path becomes Gen 0 pressure: at 1M ops or sec, that's 24 megabytes per second of allocations, triggering Gen 0 collections every few hundred milliseconds.
+Each collection pauses all threads briefly; under load, the pause amortizes into worse p99 or p999 even if avg latency improves. The 0 B or op method has no garbage collector contribution.
+Senior rule: micro-benchmarks measure C P U; production performance is C P U + garbage collector + cache + tail-latency.
+Always include [MemoryDiagnoser] and weigh allocations.
+
+Stack overflow waiting to happen. stackalloc doesn't bounds-check against the remaining stack, a malicious or buggy size of 10 megabytes blows the thread stack, killing the process (no OutOfMemoryException, just immediate termination).
+Two fixes: (1) clamp the stackalloc size and fall back to pooled array: Span buffer = size .Shared.Rent(size);, note the rented array must be returned in finally. (2) Always use ArrayPool for sizes derived from input. The pattern size <= threshold?
+stackalloc: pool.Rent is the dot NET BCL standard idiom, see Utf8JsonReader source.
+
+(1) As a field of a class, class Node { Point P; } puts P 's eight bytes inside Node 's heap object; there is no separate stack copy. (2) As an array element, Point[] pts is one contiguous heap block of Point s, no headers and no indirection per element.
+(3) Captured by a lambda, the local is hoisted into a compiler-generated display class on the heap and stops being a stack slot at all; the same happens to any local that lives across an await, which ends up in the state-machine object once the method suspends.
+And boxing makes a fourth: object o = p copies the bytes into a heap object with a header. The formulation to give an interviewer: a value type lives wherever its storage location lives; the language guarantees copy semantics and lifetime, not placement. "The stack is an implementation detail."
+
+First classify: if GCMemoryInfo.HeapSizeBytes / dotnet gc last collection heap size is growing it is managed retention; if the managed heap is flat while the working set climbs, it is native memory and none of the managed tooling applies.
+For managed: dotnet-gcdump collect -p twice, spaced under comparable load, and diff them, the delta names the type that grew, where a single dump cannot. Then dotnet-dump analyze on a full dump and gcroot on one instance of that type, which prints the path back to a root.
+Roots are: live locals on any thread, statics and [ThreadStatic], garbage collector handles, the finalization queue, runtime internals.
+In application code the answer is usually a static, and the sneakiest static is an event, because += stores a strong reference to the subscriber inside the publisher.
+Last step: classify again. If load stopping brings memory down, it was working set; if not and the root is an unbounded cache, the fix is an eviction policy, not a missing Remove.
+
+Ask three questions before accepting it. (1) Which thread? [MemoryDiagnoser] measures with garbage collector.GetAllocatedBytesForCurrentThread, so anything the method offloads to the thread pool is invisible; a method whose body is Task.Run(.) can report 0 B while allocating more than before.
+(2) Which memory?
+It counts managed allocation only, stackalloc, NativeMemory.Alloc, buffers held by a native library, and anything served from a warm ArrayPool all read as zero.
+0 B means "asked the garbage collector for nothing", which is exactly the claim a pooled implementation makes, and it is compatible with a leaked rental.
+(3) Which size? Allocation that scales with input is invisible in a single- N benchmark; parameterise on size, and include one 85,000 bytes if buffers are involved, because that is where the answer changes character.
+Then the follow-up that decides whether any of it matters: what fraction of a request does this method account for?

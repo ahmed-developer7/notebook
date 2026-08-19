@@ -1,0 +1,356 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Abstract class versus interface.
+
+Q: When would you choose an abstract class over an interface?-- think --
+
+A: When the contract needs to hold instance state (fields, mutable properties, captured dependencies) or share template-method skeleton logic across implementers that share a structural "is-a" relationship.
+
+Cross-Q: Since C sharp 11 added static abstract and C sharp 8 added default interface methods, can't interfaces do everything abstract classes can now?-- think --
+
+A: Almost. Interfaces still cannot hold instance state, only static fields via DIM. Abstract classes can hold instance fields and have constructors that initialize them.
+For state-carrying contracts (domain Entity with Id and domain-events list, framework-mandated bases like PageModel ), abstract class is still the right answer. Everything else is interface territory.
+
+Cross-Q²: If two interfaces both define a default Log() method and a class implements both, which one runs?-- think --
+
+A: It depends on whether they are the same member, and the trap is to answer "CS8705" reflexively.
+If IReader and IWriter are unrelated and each declares its own Log(), there are two distinct members, each with exactly one implementation, it compiles fine, and the caller picks by which interface reference it holds: ((IReader)x).Log() versus ((IWriter)x).Log().
+x.Log() on the class doesn't compile at all, because default members are never on the class's surface. CS8705 requires a real diamond: one member declared on a shared base interface, overridden by two derived interfaces, neither of which is more specific than the other.
+Then you must supply the most specific implementation yourself, and a class implementation always wins over an interface one.
+
+-- pause --
+Drill 2, Constructor execution order.
+
+Q: In new Dog("Rex") where Dog: Animal: object, what's the exact execution order?-- think --
+
+A: Memory allocation to Dog 's field initializers to Animal 's field initializers to object 's ctor body to Animal 's ctor body to Dog 's ctor body.
+
+Cross-Q: If Animal 's ctor calls a virtual method Render() that Dog overrides, and Dog 's Render() reads a field that Dog 's ctor body would initialize, what happens?-- think --
+
+A: Dog.Render() runs (the vtable was wired up at allocation), but the field is at its default value because Dog 's ctor body hasn't run yet. This is the "no virtual call from constructor" anti-pattern, flagged by CA2214.
+The standard fix: don't call virtuals from ctors; initialize in a protected virtual OnInitialized() that callers invoke after construction.
+
+Cross-Q²: What if Animal has a static constructor that throws?-- think --
+
+A: First access to Animal triggers the static ctor; the throw becomes TypeInitializationException. Worse: the type is marked broken for the rest of the AppDomain, every subsequent attempt to use it (including subclassing Dog ) throws immediately.
+Static-ctor exceptions are unrecoverable, which is why static-ctor logic must be bulletproof (no I O, no config access, no allocation that could OOM).
+
+-- pause --
+Drill 3, Virtual dispatch.
+
+Q: Walk me through Animal a = new Dog(); a.Speak(); where Animal.Speak is virtual and Dog overrides it.-- think --
+
+A: The I L emits callvirt Animal:Speak. At runtime, the jit looks up the Speak slot in the runtime type's vtable, which for Dog points to Dog.Speak. So Dog.Speak() runs, even through an Animal reference. That's polymorphism.
+
+Cross-Q: What changes if Dog uses new void Speak() instead of override ?-- think --
+
+A: new introduces a separate slot in Dog 's vtable, not replacing the inherited slot. Calling a.Speak() (through Animal reference) dispatches via Animal 's slot to Animal.Speak. Calling ((Dog)a).Speak() dispatches via Dog 's separate slot to Dog.Speak.
+This is why new causes "which one runs?" ambiguity, the answer depends on the variable's static type, not the object's runtime type.
+
+Cross-Q²: If I sealed override Speak() in Dog, what does the jit do?-- think --
+
+A: The jit knows no further class can override Speak(), so it can devirtualize the call, replace callvirt with a direct call Dog:Speak.
+The dispatch saving is the smaller half; the larger half is that a direct call to a known target becomes a candidate for inlining, after which constant propagation and dead-code elimination can work across what used to be a call boundary.
+That's why the payoff is impossible to state as a fixed number: it depends entirely on whether the body inlines and what the optimizer can then prove. Same trick applies to sealed class Dog, every virtual call through a Dog -typed reference can be devirtualized.
+
+-- pause --
+Drill 4, Boxing on value types.
+
+Q: Does this code box? Money m = new Money(); IComparable c = m; c.CompareTo(.).-- think --
+
+A: Yes. The assignment IComparable c = m boxes m, copies the struct to a new heap object wrapped in an object header. Subsequent c.CompareTo is a virtual interface call on the boxed object.
+
+Cross-Q: How would you call CompareTo on a value type without boxing?-- think --
+
+A: Two ways. (1) Call it through the struct type directly: m.CompareTo(other), direct call, no box.
+(2) Pass through a generic method with an interface constraint: static int Cmp(T a, T b) where T: IComparable goes to a.CompareTo(b);, the jit specializes per concrete T, so for T = Money it generates a Money-specific method with no box.
+
+Cross-Q²: Why does List.Sort() not box, but ArrayList.Sort() does?-- think --
+
+A: List is List specialized for int. Its Sort() uses Comparer.Default, which in turn uses IComparable.CompareTo(int), non-boxing generic interface call. ArrayList stores object references, so every element is already boxed when added.
+Its Sort() uses the non-generic IComparable.CompareTo(object), which works on the boxed values. List is one of the strongest reasons to never use ArrayList in modern dot NET.
+
+-- pause --
+Drill 5, Equality.
+
+Q: When should you override Equals on a class?-- think --
+
+A: When the class represents a "value", equal-by-content rather than equal-by-identity. Examples: money, dates, value objects, immutable DTOs.
+For "entity" classes (Person with Id), reference equality is usually correct because two Person(Id set to 42) instances should be considered the same entity but you want to know if they're the same object reference.
+
+Cross-Q: What's the GetHashCode contract?-- think --
+
+A: Equal objects MUST have equal hash codes. Unequal objects SHOULD have different hash codes (not required, but improves dictionary perf). Hash code MUST NOT change while the object is in a hash-based collection (mutating a key after Add corrupts the dictionary, entry becomes "lost").
+Implement GetHashCode from the same fields as Equals.
+
+Cross-Q²: I Add a mutable object as a Dictionary key, then mutate a field that participates in GetHashCode. What happens to the entry?-- think --
+
+A: It's still in the dictionary (count is unchanged) but TryGetValue with the same reference now returns false, the entry is in the bucket for the old hash code, but the lookup goes to the new bucket.
+The entry is leaked (memory held, never findable, never collected as long as the dictionary lives). Rule: dictionary keys must be immutable. Records and readonly record struct make this trivially safe.
+
+-- pause --
+Drill 6, Liskov Substitution.
+
+Q: What's a Liskov violation in Square: Rectangle ?-- think --
+
+A: Rectangle 's contract allows width and height to vary independently. Square strengthens the precondition by forcing them to move together. Code that worked on every Rectangle (for example, r.Width = 5; r.Height = 10; assert(r.Area == 50) ) fails when given a Square.
+
+Cross-Q: How would you fix it?-- think --
+
+A: Don't model Square as a subtype of Rectangle. They share an abstraction ( IShape with Area ), but they're siblings, not parent-and-child. Mathematically a square is a rectangle, but mathematically immutable squares; in code, mutable squares break the rectangle contract.
+The taxonomy of the real world doesn't always map to the type hierarchy that works in code.
+
+Cross-Q²: Why does C sharp even let you compile Square: Rectangle with the broken behavior?-- think --
+
+A: The compiler enforces type compatibility (every Square IS a Rectangle -shaped reference), not semantic correctness. Liskov violations are semantic, about the contract intent, not the type signature. No compiler can catch them in general (would require full theorem proving).
+The defense is design review + integration tests that exercise base-class contracts on derived instances.
+
+-- pause --
+Drill 7, Reflection instantiation.
+
+Q: Can Activator.CreateInstance(typeof(IRepository)) create an instance?-- think --
+
+A: No, it throws MissingMethodException. Interfaces have no implementation, so there's nothing to allocate. Same for Activator.CreateInstance(typeof(AbstractEntity)), abstract classes can't be instantiated either.
+
+Cross-Q: How does A S P dot NET Core's D I container then resolve IRepository ?-- think --
+
+A: The container is told which concrete type to use: services.AddScoped().
+When something asks for IRepository, the container looks up the registered concrete type, reflects on its constructors, picks the one with the most resolvable parameters, recursively resolves each parameter, and calls the chosen ctor.
+
+Cross-Q²: I have a class with a private ctor used by a static factory Create(). Can D I resolve it?-- think --
+
+A: Not by default, D I's reflection-based resolution requires a public ctor. You either (a) make the ctor public, (b) register a factory: services.AddScoped(_ goes to Locked.Create());, or (c) use ActivatorUtilities.CreateInstance which can be configured to honor non-public ctors via BindingFlags.
+The factory approach is most idiomatic and keeps the ctor private.
+
+-- pause --
+Drill 8, Generic variance.
+
+Q: Why is IEnumerable assignable to IEnumerable but List isn't to List ?-- think --
+
+A: IEnumerable is covariant, T only appears in output positions (the Current property). Returning Dog where Animal is expected is safe (every Dog is an Animal). List is invariant, T also appears in input positions ( Add(T) ).
+If List were assignable to List, you could Add(new Cat()) through the Animal -typed reference. Type safety breaks. Compiler refuses.
+
+Cross-Q: When would you use in T (contravariance)?-- think --
+
+A: For interfaces that consume T only: IComparer, Action, predicates. An IComparer can compare any two Animals, including Dogs. So IComparer is assignable to IComparer (contravariance: more general accepted where more specific is expected). The opposite of out /covariance.
+
+Cross-Q²: Arrays in C sharp are covariant, Dog[] is assignable to Animal[]. Is that safe?-- think --
+
+A: No, and it's the classic dot NET design wart. Animal[] a = new Dog[10]; a[0] = new Cat(); compiles but throws ArrayTypeMismatchException at runtime. Java has the same issue.
+Modern dot NET added generics specifically to avoid it, generic collections ( List, IList ) are invariant, which is why List to List is correctly rejected at compile time.
+
+-- pause --
+Drill 9, sealed.
+
+Q: What does sealed override mean?-- think --
+
+A: It overrides a virtual method and locks it, no further class in the chain can override it again. The class itself can still be subclassed; only that one method is final.
+
+Cross-Q: Why would the jit care about that keyword?-- think --
+
+A: Because once the jit knows no override is possible, it can devirtualize, replace the callvirt with a direct call, and potentially inline the method body. Without sealed, the jit must assume any subclass could override and use vtable lookup.
+
+Cross-Q²: How would you quantify the win in a hot loop calling a virtual method a hundred million times?-- think --
+
+A: By measuring it with BenchmarkDotNet on the actual workload, and saying that is the correct answer, not a dodge, because the honest components don't compose into a number.
+One indirect call is removed (cheap on its own, and well branch-predicted when the site is monomorphic), plus whatever the optimizer gains once the target is known and the body inlines, which can be large, or exactly zero for a method the jit declines to inline.
+Anyone quoting a fixed multiplier is quoting a microbenchmark of a method body that isn't yours. Dynamic PGO (on by default since dot NET 8) already does much of this speculatively without sealed; explicit sealed makes it unconditional and free.
+The one claim you can make without measuring is that it never makes things slower.
+
+-- pause --
+Drill 10, Static constructors.
+
+Q: When does the static constructor for Dog run, given Dog: Animal ?-- think --
+
+A: Lazily, the first time Dog is touched: instance creation, static-field access, or static-method call. The runtime guarantees it runs exactly once per AppDomain and is thread-safe.
+
+Cross-Q: Does Animal 's static ctor run before Dog 's when I write new Dog() ?-- think --
+
+A: Generally yes, Animal 's static ctor runs the first time anything triggers loading Animal 's type info, which happens when constructing Dog (the runtime needs the base type's metadata).
+The exact order depends on the beforefieldinit attribute: types without an explicit static ctor get optimized lazy initialization (might run later); types with an explicit static ctor run before any access.
+
+Cross-Q²: A static ctor throws. What's recoverable?-- think --
+
+A: Nothing. The exception is wrapped in TypeInitializationException and the type is permanently broken for the rest of the AppDomain, every subsequent attempt to use it ( new, static access, even reflection on its members) re-throws the same TypeInitializationException.
+There is no A P I to "retry" the static ctor. This is why static ctors must be bulletproof, no I O, no config access, no allocation paths that could OOM.
+
+-- pause --
+Drill 11, Default interface methods conflict.
+
+Q: If IReader and IBackup both have a default method void Save() goes to.; and class Repo: IReader, IBackup doesn't override it, what happens?-- think --
+
+A: It compiles. This is the trap in the question, two unrelated interfaces declaring Save() are two distinct members, each with exactly one implementation, so there is nothing to disambiguate. ((IReader)r).Save() runs IReader 's default and ((IBackup)r).Save() runs IBackup 's.
+The only thing that doesn't work is r.Save(), because default members never appear on the implementing class's surface.
+
+Cross-Q: Then what actually produces CS8705?-- think --
+
+A: A genuine diamond, one member, inherited from a shared base interface, with two competing overrides:
+csharp.
+public interface IStore { void Save() goes to Console.WriteLine("base"); }.
+public interface ILocal: IStore { void IStore.Save() goes to Console.WriteLine("local"); }.
+public interface IRemote: IStore { void IStore.Save() goes to Console.WriteLine("remote"); }.
+public class Hybrid: ILocal, IRemote { } // CS8705, no most specific implementation.
+
+The rule is "every virtual interface member needs a unique most specific implementation", where one implementation is more specific if its declaring type has the other's declaring type among its interfaces. ILocal and IRemote are siblings, so neither wins.
+The fix: implement it on Hybrid itself, a class implementation always beats an interface one.
+
+Cross-Q²: Why didn't C sharp inherit C plus plus's "use the leftmost ancestor" rule?-- think --
+
+A: C sharp was designed (1999-2001) explicitly to avoid C plus plus's implicit-resolution pitfalls. The diamond problem in C plus plus is one of the most-cited reasons to avoid multiple inheritance.
+C sharp instead defines a partial order (most-specific-implementation) and errors when it isn't a total order for a given member, forcing the author to pick.
+The trade-off is a small amount of friction in DIM scenarios for a large amount of clarity, and note that it's the consumer who pays that friction, which is the design argument for re-abstracting rather than overriding in derived interfaces.
+
+-- pause --
+Drill 12, Records.
+
+Q: What does record change about equality?-- think --
+
+A: Records auto-generate Equals, GetHashCode, and == for value semantics, two records with the same property values are equal, regardless of reference.
+For record class it's still a reference type with these auto-generated overrides; for record struct it's a value type with the same auto-generated semantics.
+
+Cross-Q: How does the with expression work?-- think --
+
+A: var b = a with { Amount = 20 }; clones a and applies the property changes to the clone. Mechanically: the compiler generates a protected $() method that does a memberwise copy via a synthesized copy ctor, then assigns the listed properties. The original a is unchanged (non-destructive mutation).
+
+Cross-Q²: What's the difference between record class and record struct ?-- think --
+
+A: record class is a reference type with value-semantic equality (heap-allocated, but == compares contents). record struct is a value type with value-semantic equality (stack-friendly, but copied on assignment).
+Use record class for general DTOs and value objects; use record struct (especially readonly record struct ) for small high-frequency values used as dictionary keys or in hot loops.
+Tie-breaker: if you're passing it around a lot through interfaces (boxing), prefer record class; if you're putting it in arrays or lists by value, prefer record struct.
+
+-- pause --
+Drill 13, The vtable.
+
+Q: What's a vtable?-- think --
+
+A: A method table, an array of function pointers, that the runtime uses to resolve virtual method calls. Each class has one; derived classes inherit slots from the base and add their own.
+
+Cross-Q: Where does the runtime store the vtable pointer?-- think --
+
+A: In every object's header (the few bytes preceding the object's fields on the heap). On a 64-bit runtime, each object has ~16 bytes of header: 8 bytes sync block + 8 bytes method table pointer (which points to the vtable + type metadata).
+That's why every reference type allocation has a minimum ~24-byte footprint even for empty classes, header + a pointer + alignment.
+
+Cross-Q²: How does new void Foo() (hiding) affect the vtable?-- think --
+
+A: It adds a separate slot to the derived class's vtable for the hidden method, leaving the inherited slot untouched. The base's Foo is still at slot N (inherited); the derived's Foo lands at slot N+M (new).
+Dispatch through the base reference uses slot N to base method; dispatch through the derived reference uses slot N+M to derived method. This is why new causes "which one runs?" to depend on the static type of the variable.
+
+-- pause --
+Drill 14, Composition versus inheritance.
+
+Q: When would you refactor an inheritance hierarchy to composition?-- think --
+
+A: When you find yourself wanting "two parents," when the hierarchy is more than 2 levels deep, when you need runtime-swappable behavior, or when a subclass uses only a fraction of the base's contract. Symptoms: cast-tests, NotImplementedException overrides, "is-a" relationships that feel forced.
+
+Cross-Q: Show me a 3-level inheritance refactored to composition.-- think --
+
+A: Logger to Decorator or Strategy. class LoggerBase { abstract WriteRaw(); Info() goes to WriteRaw(.); } to class ConsoleLogger: LoggerBase, FileLogger: LoggerBase. Composition version: interface IWriter { Write(); } + class Logger(IWriter w) + CompositeWriter to multiplex.
+Result: you can log to both console AND file simultaneously, which the inheritance version couldn't express.
+
+Cross-Q²: When is inheritance still the right call?-- think --
+
+A: Three places: (1) framework-mandated bases (Razor Pages PageModel, E F Core DbContext ), (2) genuine state-carrying "is-a" relationships (domain Entity with Id and equality), and (3) closed hierarchies sealed at the leaves (D D D value objects). Everything else: prefer composition.
+
+-- pause --
+Drill 15, Modern C sharp changes.
+
+Q: How do records, primary constructors, and static abstract change OOP interview answers from 2018?-- think --
+
+A: Records reduce the need to manually write Equals / GetHashCode / == for value-shaped types, fewer custom equality bugs. Primary constructors collapse boilerplate D I registration into one-liners.
+static abstract allows interfaces to require static members (operators, factories), which historically forced an abstract base class. Combined: fewer reasons to reach for abstract classes; "interface for capability, abstract class only for shared instance state" is now the default guidance.
+
+Cross-Q: With record class, record struct, primary constructors, init setters, and required members, when would you still write a plain class with explicit ctors?-- think --
+
+A: When the type has meaningful behavior (methods beyond data carriers), when it manages mutable state intentionally, when equality should be reference-based (entities with identity), or when you need fine-grained ctor logic (validation, normalization, side effects in the ctor).
+Pure data carriers, records. Mutable state with logic, class. Identity-based entities, class with Id -based Equals.
+
+Cross-Q²: Does using records prevent the need for IEquatable ?-- think --
+
+A: No, records implement IEquatable for you. The generated Equals(T) IS the IEquatable implementation. That's part of why records are the right choice in 2026 for value-typed reference equality: you get the strongly-typed non-boxing path automatically.
+
+-- pause --
+Drill 16, Interface dispatch mechanism.
+
+Q: An interface call and a virtual call through an abstract base, which is faster, and why?-- think --
+
+A: Wrong framing, and saying so is the answer. A virtual call is a fixed vtable slot: one dependent load, then an indirect call.
+An interface call in CoreCLR uses Virtual Stub Dispatch, the call site is patched with a dispatch stub that caches one MethodTable and its target, so when a single concrete type dominates the site it is a compare and a jump.
+The cost is a property of the call site, not the keyword: monomorphic sites are cheap either way, megamorphic sites are unpredictable either way.
+
+Cross-Q: Why can't interfaces just use vtable slots like classes do?-- think --
+
+A: Because slot numbering can't be made consistent. A class vtable works because every derived type lays its base's slots out at the same indices.
+A type implements several unrelated interfaces, each numbering its own members from zero, and no single linear layout gives every interface a fixed index in every implementing type. VSD sidesteps the layout problem by resolving pairs at runtime and caching the answer at the call site.
+
+Cross-Q²: What happens to a call site that sees fifty different concrete types?-- think --
+
+A: The dispatch stub's cached type keeps missing.
+Per the CoreCLR design doc, "when a dispatch stub fails frequently enough, the call site is deemed to be polymorphic and the resolve stub will back patch the call site to point directly to the resolve stub", so it stops trying the inline cache and goes straight to the global resolve cache.
+It isn't permanent: "at sync points (currently the end of a garbage collector), polymorphic sites will be randomly promoted back to monomorphic call sites", so the runtime periodically re-tests its own assumption.
+Practically: a megamorphic site never inlines and dynamic PGO can't help it, so the fix is to split it into several sites that each see few types.
+
+-- pause --
+Drill 17, Interface mapping versus hiding.
+
+Q: class Base: IWork { public void Do() {} } and class Derived: Base { public new void Do() {} }. What does ((IWork)new Derived()).Do() call?-- think --
+
+A: Base.Do. The interface mapping was established when Base declared IWork, and it maps IWork.Do onto the non-virtual Base.Do.
+The spec is explicit: "without explicitly re-implementing an interface, a derived class cannot in any way alter the interface mappings it inherits from its base classes." new changes what class-typed references see and nothing else.
+
+Cross-Q: Give me two ways to make Derived.Do the one the interface calls.-- think --
+
+A: (1) Make Base.Do virtual and override it in Derived, "when an interface method is mapped onto a virtual method in a class, it is possible for derived classes to override the virtual method and alter the implementation of the interface." (2) Re-implement the interface: write class Derived:
+Base, IWork, which rebuilds the mapping from scratch for Derived using its own members.
+Option 1 is what you want in almost every case; option 2 is the escape hatch when you don't own Base.
+
+Cross-Q²: Where does this bite in production?-- think --
+
+A: Anywhere a framework holds you by the interface rather than the class, D I container disposal ( IDisposable / IAsyncDisposable ), serializers, comparers, the A S P dot NET Core middleware pipeline.
+Your tests hold the concrete type and pass; production holds the interface and silently runs the base implementation. new on a method that participates in an interface mapping should read as a defect on sight.
+
+-- pause --
+Drill 18, Covariant returns.
+
+Q: Can an override return a more derived type than the method it overrides?-- think --
+
+A: Yes, since C sharp 9, for methods and for read-only properties. public override Invoice Clone() overriding public virtual Document Clone() compiles, and callers statically receive Invoice with no cast.
+
+Cross-Q: What are the gates, and are they the same gate?-- think --
+
+A: No, two different gates, which is the point of the question. The language gate is C sharp 9.
+The runtime gate is dot NET 5, because the type loader had to learn to unify a MethodImpl slot whose signature no longer matches the base member;
+the compiler marks such overrides with PreserveBaseOverridesAttribute so that "any virtual call to the method, whether it uses the base signature or derived signature, executes the most derived override".
+Targeting an older runtime with C sharp 9 gives CS8830, a runtime support error, not a language-version error.
+
+Cross-Q²: Does it work on interfaces?-- think --
+
+A: No. The feature is restricted to virtual methods and read-only properties on reference types, the runtime design doc says it "will only be applicable to methods on reference types.
+Methods on interfaces and value types will not be supported." So a fluent A P I whose surface is an interface still needs the old self-referencing-generic workaround ( interface IBuilder where TSelf: IBuilder ).
+It also doesn't apply to set / init accessors, and shouldn't: a setter is an input position, so covariance there would be unsound.
+
+-- pause --
+Section 2. Self-test.
+
+Choose abstract class when you need: (a) shared state, fields, constructors, finalizers; interfaces still cannot hold instance state; (b) one canonical lifecycle ( protected virtual void OnInitialize ); (c) constructor coordination ( base(.) chaining).
+Default interface methods provide behavior sharing for evolution but require an interface-typed reference to invoke. Abstract classes also still beat interfaces for protected visibility, interfaces only have public members.
+Trade-off: a class can extend exactly one abstract base, but implement many interfaces.
+
+Primary-constructor parameters in classes (C sharp 12) are captured into a hidden compiler-generated field only when used by an instance member. They're not properties, not auto-fields with public or protected access, they're locals scoped to the type body.
+They're invisible across partial-class files unless you explicitly project them: public IDb Db { get; } = db;. The compiler emits a backing field with an unspeakable name that callers cannot reach.
+For D I services where you want explicit visibility, declare an explicit private readonly IDb _db = db; field.
+
+When the operation logically belongs to the type not an instance, parsers ( T.Parse(string) ), constants ( T.Zero, T.One ), factories. Without static abstract, generic code couldn't say "any T that knows how to parse itself." With it, where T: IParseable lets you write T.Parse(s) in generic code.
+Trade-off: you lose polymorphism, there's no "vtable" for static methods, so each generic instantiation dispatches at compile time, growing I L. Use sparingly: mostly numeric types and parser libraries.
+
+Prints A. B.M is declared new, not override, it hides A.M rather than overriding it. The vtable slot for M still points at A.M for any instance whose declared type is A. Calling through an A reference uses the vtable; calling through a B reference uses the hidden B.M directly.
+This is exactly the "fragile base class" problem new was designed to mitigate at the language level, and it's almost always a bug. Senior code review rule: every new modifier on a method needs justification.
+
+(1) Abstract base, one inheritance slot consumed; great for plugins that share lifecycle or state; rigid (can't compose). (2) Interface, composable (multiple plugins can wear multiple "hats"); no shared state; ideal for capability-style plugins.
+(3) Generic with static abstract, type-level dispatch, zero runtime overhead, but each plugin variant generates its own jit'd code (I L bloat) and can't be discovered at runtime by reflection alone.
+Choose: interfaces by default; abstract base when sharing skeleton; static abstract for generic-math or parser-style plugins where the operation belongs to the type itself.

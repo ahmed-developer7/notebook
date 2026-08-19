@@ -1,0 +1,331 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Multicast exception behavior.
+
+Q: A handler in the middle of a multicast Action chain throws. What happens to the remaining handlers?-- think --
+
+A: They don't run. The exception propagates out of the multicast invocation at the point of the failing handler, the chain halts mid-walk, every handler after the failure is skipped, and the caller sees the exception as if invoking the chain were a single call.
+
+Cross-Q: For events, that means one bad subscriber breaks the entire broadcast. How do you defend against it?-- think --
+
+A: Manually walk delegate.GetInvocationList() and wrap each handler invocation in a try or catch. Collect exceptions into a List and either log them, swallow per-handler, or throw an AggregateException at the end. This isolates each subscriber: one buggy handler can't block the rest.
+
+Cross-Q²: Why doesn't dot NET do this by default for event invocation?-- think --
+
+A: Because "swallow handler exceptions silently" would be the wrong default, it would hide bugs. Stopping the chain on first throw is the conservative choice: the publisher sees the failure, has to decide whether to recover.
+The trade-off is that subscribers can DoS each other, which is why the defensive walk pattern exists. For domain event buses (MediatR), the convention is each handler runs in isolation and exceptions surface to the dispatcher, which decides.
+
+-- pause --
+Drill 2, Event versus delegate field.
+
+Q: A junior writes public Action OnReady; instead of public event Action OnReady;. Why is it wrong?-- think --
+
+A: With a plain delegate field, any caller can do instance.OnReady = null (wiping every other subscriber), instance.OnReady = MyHandler (replacing the chain instead of appending), or instance.OnReady.Invoke() (forging a fake event from outside).
+The event modifier locks these out at compile time, consumers can only += and -=.
+
+Cross-Q: But the field is still there underneath, right? Can the declaring class still misuse it?-- think --
+
+A: Yes, the declaring class has full access to the backing field and can invoke or assign it freely. The encapsulation is enforced only against external consumers.
+The contract is "outside code may subscribe / unsubscribe; only I decide when this fires." Internal misuse is a code-review issue, not a language one.
+
+Cross-Q²: Show me when you'd use explicit add / remove accessors instead of a field-like event.-- think --
+
+A: Three real cases: (1) you want to log or telemetry-count subscriber adds or removes; (2) you want lazy backing storage (don't allocate the underlying delegate field until first subscriber); (3) you want a weak-reference store to avoid the classic event memory leak.
+The accessors give you a hook to insert custom logic between += and the underlying combine.
+
+-- pause --
+Drill 3, for loop closure capture.
+
+Q: for (int i = 0; i Console.Write(i));. Then foreach (var a in actions) a();. What prints, and why?-- think --
+
+A: 333. The for loop has one slot for i; every lambda captures the same variable. By the time the lambdas run, the loop has finished and i holds its terminal value 3.
+
+Cross-Q: foreach (int i in Enumerable.Range(0, 3)) actions.Add(() goes to Console.Write(i));. Same trap?-- think --
+
+A: No, C sharp 5 changed foreach semantics so each iteration introduces a fresh loop variable. Each lambda captures its own i, so the output is 012.
+The for loop was deliberately not changed because i is a programmer-declared variable with an explicit for scope, while foreach introduces the variable as part of its statement.
+
+Cross-Q²: I can't avoid for, give me the one-line fix.-- think --
+
+A: Declare a fresh local inside the loop body and capture that: for (int i = 0; i Console.Write(captured)); }. Each iteration creates a new captured slot, so each closure binds to its own.
+Modern alternative, Enumerable.Range(0, 3).Select(i goes to (Action)(() goes to Console.Write(i))).ToList(), also works because each link projection produces a fresh scope.
+
+-- pause --
+Drill 4, Func versus Func versus Action.
+
+Q: Walk me through Func, Func, and Action. When does each apply?-- think --
+
+A: Func is "no args, returns int" (for example, () goes to 42 ). Func is "takes int, returns int" (for example, x goes to x * 2 ). Action is "no args, returns void". The convention: in Func the last type parameter is the return type, the rest are arguments (up to 16). Action always returns void.
+
+Cross-Q: Why does Func mean int to int and not (int, int) to void ?-- think --
+
+A: Because Action exists for void returns, separating "has-return" and "no-return" into two delegate families. Func<> always has at least one type parameter (the return); arity-zero void is Action.
+This separation also enables variance: Func lets the return co-vary and the parameter contra-vary, but a hypothetical Func that overloaded "two-arg void" with "one-arg int to int" would muddle the variance story.
+
+Cross-Q²: When would you ever declare a custom delegate int Reducer(int acc, int item); instead of using Func ?-- think --
+
+A: Three cases: (1) parameter names matter for documentation and IntelliSense, Func is anonymous; Reducer(int acc, int item) self-explains;
+(2) you need ref / out / in or params in the signature, Func<> / Action<> cannot express ref-kinds ( delegate bool TryParse(string s, out T v) is the canonical example); (3) the delegate becomes a domain concept used across many A P Is and you want a single named type.
+Otherwise, stick with the BCL trio.
+
+-- pause --
+Drill 5, Expression> versus Func.
+
+Q: When does link care about the difference between Func and Expression> ?-- think --
+
+A: IEnumerable.Where takes Func, it just invokes the delegate per element. IQueryable.Where takes Expression>, a tree representing the code.
+E F Core, MongoDB, and other providers walk the tree to translate it (to sequel, BSON, et cetera), they need structural access to p.Age > 18, not an opaque function pointer.
+
+Cross-Q: I assign a Func predicate and pass it to db.People.Where(.). What happens?-- think --
+
+A: EF never sees it at all, and this is the part most candidates get wrong. DbSet implements IQueryable and IEnumerable. A Func doesn't match Queryable.Where (which needs Expression> ), so overload resolution binds to Enumerable.Where and the result isn't even an IQueryable any more.
+The whole table is streamed to the client and filtered in memory, with no exception and no warning. E F Core 3's "client evaluation now throws" change is about fragments inside a tree EF can see; it doesn't apply here, because there is no tree.
+The fix is to write the predicate inline as a lambda, the compiler then infers Expression> from the Queryable.Where overload, or to type the parameter as Expression> from the start.
+
+Cross-Q²: How do I combine two Expression> predicates with and and ?-- think --
+
+A: Not with and and directly, that's a delegate-level operator, not an expression-tree operation.
+You build a new BinaryExpression with Expression.AndAlso(left.Body, right.Body), but only after rebinding the parameter: each lambda declares its own ParameterExpression instance, and a body referencing a parameter its lambda doesn't declare throws when compiled or translated.
+The mechanism for the rebind is ExpressionVisitor, subclass it, override VisitParameter to swap the right-hand parameter for the left's, Visit(right.Body), then Expression.Lambda>(Expression.AndAlso(left.Body, rewritten), left.Parameters[0]).
+That is exactly what LinqKit's PredicateBuilder.And/.Or and every specification-pattern library do internally.
+
+-- pause --
+Drill 6, async lambda becoming async void.
+
+Q: I write button.Click += async (s, e) goes to await SaveAsync();. What's the risk?-- think --
+
+A: EventHandler returns void, so the lambda becomes async void. If SaveAsync() throws, the exception doesn't surface as a faulted Task, it propagates to the SynchronizationContext (or ThreadPool in A S P dot NET Core), crashing the request / U I thread.
+The caller can't await it and can't try or catch it from outside the lambda.
+
+Cross-Q: What if I wrap the body in try or catch ?-- think --
+
+A: Then exceptions are contained, but the lambda is still async void, meaning the caller still doesn't know when it's done.
+For an event handler this is usually fine (events are fire-and-forget by nature), but you need to handle ALL exceptions inside the lambda, anything you forget escapes to the SynchronizationContext.
+The pattern is: subscribe an async void lambda only with a paranoid try or catch (Exception ex) { _logger.LogError(ex, "."); } around the entire body.
+
+Cross-Q²: How would you redesign the event to support async handlers safely?-- think --
+
+A: Change the event type from EventHandler to Func. Now subscribers return Task; the publisher's raise method does foreach (var h in handlers.GetInvocationList()) await ((Func)h)(this, e); (sequential) or await Task.WhenAll(.) (parallel).
+Exceptions surface as faulted Task s the publisher can observe. Most modern frameworks (MediatR notifications, Channel-based pub or sub) take this shape instead of C L R events.
+
+-- pause --
+Drill 7, Removing a lambda from an event.
+
+Q: I do pub.OnX += (s, e) goes to Log(); and later pub.OnX -= (s, e) goes to Log();. The handler still fires. Why?-- think --
+
+A: Each lambda expression compiles to a separate delegate instance, even if the bodies are identical.
+The += added delegate A to the chain; the -= searches for a delegate equal to delegate B; delegate equality compares (Target, Method); the methods are different compiler-generated methods; no match; no removal.
+
+Cross-Q: Fix it.-- think --
+
+A: Three options. (1) Use a method group, pub.OnX += MyHandler; pub.OnX -= MyHandler;, C sharp 11 caches the method-group delegate, so both are the same instance. (2) Store the lambda once: EventHandler h = (s, e) goes to Log(); pub.OnX += h; pub.OnX -= h;.
+(3) Use the IDisposable subscription pattern, wrap the subscribe and unsubscribe in an object whose Dispose does the -=.
+
+Cross-Q²: For options 1 and 2, what's the difference in stack traces during exceptions?-- think --
+
+A: Method group to the stack frame shows MyHandler directly. Lambda to the frame shows a compiler-generated name like <>c__DisplayClass3_0.b__0. The lambda also makes "find references" in the IDE find the call site, not the body, small but real ergonomic loss.
+For long-lived production handlers, prefer named methods.
+
+-- pause --
+Drill 8, delegate* (function pointers, C sharp 9) versus delegates.
+
+Q: C sharp 9 added delegate*. How does it differ from a regular delegate ?-- think --
+
+A: A delegate* is a true function pointer, a value type holding just the code address. No heap allocation, no multicast, no closures, no variance.
+A regular delegate is a reference type holding a target and a method pointer (plus, once it's multicast, an object[] invocation list and a live count) and supports all those features.
+delegate* exists for native interop and for dispatch loops where the delegate object, its allocation and the reference it keeps alive, is the cost you're removing.
+
+Cross-Q: When would I actually reach for delegate* ?-- think --
+
+A: Three cases: (1) you're calling into native code with a specific calling convention, delegate* unmanaged[Cdecl] lets the runtime emit the right ABI without marshalling; (2) you're handing a callback to native code, where delegate* plus [UnmanagedCallersOnly] replaces pinning a managed delegate;
+(3) a dispatch loop hot enough that the delegate object itself, its allocation, the reference it keeps alive, the garbage collector tracing it costs, is what you're removing.
+Note what case 3 is not: it isn't "delegate calls are slow." It's that you've measured and the object, not the indirection, is the problem. Outside those, Func / Action is the right choice.
+
+Cross-Q²: Can I use a delegate* in a closure?-- think --
+
+A: No. A delegate* has no target (no this, no captured locals), it's just a code address. You can put one in a closure variable (capture a delegate* value into a lambda), but you can't have the function pointer itself capture state, that's what regular delegates are for.
+The pointer can only target static methods (or instance methods via explicit conversion that loses the target).
+
+-- pause --
+Drill 9, Delegate variance.
+
+Q: Is Func assignable to Func? Why or why not?-- think --
+
+A: No. Func is covariant on the return type, meaning you can go from a more derived return to a less derived one, Func to Func works, not the reverse. A Func could legitimately return any Animal, including a Cat; treating it as Func would mean "callers expect a Dog and might get a Cat ", unsafe.
+
+Cross-Q: What about Action to Action ?-- think --
+
+A: Also no. Action is contravariant on the parameter type, you can go from a less derived input to a more derived one, Action to Action works (a method that handles any Animal certainly handles a Dog), not the reverse.
+An Action doesn't know how to handle a Cat, so accepting it as Action would let Cat slip in unsafely.
+
+Cross-Q²: Why don't value-type generic arguments participate in variance?-- think --
+
+A: Because variance is a runtime type-identity operation, the C L R treats IEnumerable and IEnumerable as reference-compatible, so the same object reference works as either with no conversion code anywhere.
+For value types that would be false: int and object have different representations, and bridging them requires a box per element, which variance has no place to insert. So IEnumerable is NOT assignable to IEnumerable despite int: object.
+
+Don't reach for List to List as the parallel, though, that's a different rule. Variance is only available on interfaces and delegates; classes are always invariant, so List isn't assignable to List either, even though both are reference types.
+List fails on "it's a class", IEnumerable fails on "T is a value type", and an interviewer probing this will ask which one applies.
+
+-- pause --
+Drill 10, [ThreadStatic] versus AsyncLocal across await.
+
+Q: I store a correlation ID in a [ThreadStatic] field, set it before await SomeAsync(), then read it after. What might I see?-- think --
+
+A: You might see 0 (the default), the ID was set on the original operating system thread, but after await, the continuation may run on a different ThreadPool thread that has its own [ThreadStatic] slot with no value set.
+[ThreadStatic] is per-operating system-thread storage and does not flow across await.
+
+Cross-Q: What's the right tool for "value that travels with the request, across await "?-- think --
+
+A: AsyncLocal. Its value is stored in ExecutionContext, which the runtime flows across every await. A S P dot NET Core's HttpContext and E F Core's DbContext propagation rely on this.
+The cost is small, ExecutionContext is captured and restored on every await, but the values are reference-shared, not copied.
+
+Cross-Q²: A lambda captures a local int x = 42; and is invoked after await. Does the captured value survive?-- think --
+
+A: Yes. Captured locals live in a heap-allocated closure object, that object survives across await because the async state machine holds a reference to it. The closure is just a regular dot NET object; it's threadsafe-by-isolation if the lambda is only called from one logical flow at a time.
+So capturing a local works across await; [ThreadStatic] does not. The distinction: closures capture variables (heap, flow with the lambda), [ThreadStatic] is per-operating system-thread (does not flow).
+
+-- pause --
+Drill 11, Method group versus lambda.
+
+Q: button.Click += Handler; versus button.Click += (s, e) goes to Handler(s, e);. Functionally identical?-- think --
+
+A: Visually identical, semantically different in three ways: (1) the lambda is a fresh delegate instance with a synthetic method body; the method group binds to Handler directly (and as of C sharp 11 is cached, so repeated subscriptions reuse the same delegate); (2) -= matching:
+method group can unsubscribe by pub.Click -= Handler symmetrically, lambda cannot (each lambda expression is a separate instance); (3) the lambda allocates a small closure if it captures anything from its enclosing scope;
+the method group does not unless the underlying method is an instance method (then Target == this ).
+
+Cross-Q: Why did C sharp 11 add method-group caching?-- think --
+
+A: Purely to remove an allocation. Before C sharp 11, every execution of a method-group conversion built a new delegate object; in a loop or a per-request subscription path that was avoidable garbage collector pressure. C sharp 11 lets the compiler cache and reuse it.
+Two caveats worth volunteering, because they're where the follow-up goes:
+the cache is a static field, so it only helps static method groups, an instance method group still allocates per conversion, since the delegate has to carry the receiver ( ReferenceEquals on two conversions of p.Handler is false ).
+And it changed nothing about -=: Delegate.Remove has always matched on value equality of (Target, Method), so pub.Click -= Handler worked identically in C sharp 1.0. Lambdas fail to unsubscribe not for want of a cache but because two lambda expressions are two different compiler-generated methods.
+
+Cross-Q²: If I have Action a = SomeMethod; and Action b = SomeMethod;, is a == b ?-- think --
+
+A: Yes (assuming SomeMethod is the same static method, or the same instance method on the same target). Delegate equality compares (Target, Method).
+If SomeMethod is static, C sharp 11+ caching means a and b are likely the same instance as well; if it's an instance method, they're two distinct objects that are nonetheless Equals -true. One more condition that's easy to forget: equality also requires the same delegate type.
+Action a = SomeMethod; and MyOwnVoidDelegate b = SomeMethod; are never equal, whatever the target and method, because Equals compares delegate types before anything else.
+
+-- pause --
+Drill 12, Lambda capturing this.
+
+Q: When does a lambda capture this, and when is that a leak risk?-- think --
+
+A: Any lambda that references an instance field or instance method captures this, even if the lambda only touches a single field. The closure object stores a reference to the entire enclosing instance.
+It becomes a leak when (a) the lambda is stored somewhere long-lived (static dictionary cache, singleton's event subscription), and (b) the enclosing instance was supposed to be garbage collector-collectible. The lambda roots this, so the instance can't be collected.
+
+Cross-Q: Show me how to keep the lambda but NOT capture this.-- think --
+
+A: Pull the field into a local before the lambda: var name = _name; return () goes to name;, the closure captures the local name, not this.
+For zero-allocation in hot paths, use a static lambda with explicit state: static (state) goes to state.Process(.), passing this as a parameter at the call site.
+The static modifier (C sharp 9) enforces "no implicit capture" at compile time.
+
+Cross-Q²: Profiler shows a leaked OrderViewModel. The path is MarketData (static) to Delegate to <>c__DisplayClass to this. What's the fix?-- think --
+
+A: The OrderViewModel subscribed to a static MarketData.PriceChanged event with a lambda that touched its own fields; the lambda captured this; the static event keeps the chain alive forever; the viewmodel is rooted.
+Three fixes (best to worst): (1) implement IDisposable on the viewmodel and unsubscribe in Dispose, called when the view closes; (2) use a WeakReference inside the lambda so the garbage collector can collect the viewmodel even with the subscription alive;
+(3) replace the static event with a weak event source ( WeakEventManager in WPF, or hand-roll a ConditionalWeakTable -based pub or sub).
+The IDisposable fix is the simplest and what every framework documents.
+
+-- pause --
+Drill 13, Closure capture mechanics.
+
+Q: int x = 10; Func f = () goes to x; x = 20;. What does f() return?-- think --
+
+A: 20. The lambda captures the variable x, not the value at the moment of capture. The compiler hoists x into a field on a generated closure class; both the lambda body and the subsequent x = 20 assignment go through that field. The lambda reads the current value at invocation time.
+
+Cross-Q: Show me what Roslyn emits.-- think --
+
+A: A compiler-generated <>c__DisplayClass0_0 class with a public int x field and a method whose body is the lambda's body, both referencing the same field.
+The original method allocates one instance of the class, assigns x = 10, creates the delegate pointing at the closure's method, then sets x = 20 through the same closure field. The lambda's () goes to x becomes () goes to closure.x, reading the field at call time.
+
+Cross-Q²: What if two lambdas in the same method capture the same local? How many closure instances?-- think --
+
+A: One. Both lambdas land as methods on the same generated closure class, sharing the same field. This is how Action inc = () goes to counter++; Func read = () goes to counter; work together, they both read or write closure.counter.
+The compiler picks one closure scope per "set of variables jointly captured by the same chain of lambdas." Disjoint capture sets get separate closures.
+
+-- pause --
+Drill 14, Action returning void, can it await ?.
+
+Q: Action a = async x goes to await Task.Delay(x);. Does this compile? What's it doing?-- think --
+
+A: It compiles. The lambda is marked async; the target is Action, whose return is void; the lambda becomes async void.
+Awaiting inside is fine, the await machinery still runs, but the caller can't await the returned task (there isn't one), can't observe completion or exceptions, and unhandled exceptions inside the lambda crash the process via the SynchronizationContext or ThreadPool.
+
+Cross-Q: If I want awaitability, what's the fix?-- think --
+
+A: Change the delegate type. Func a = async x goes to await Task.Delay(x); returns Task, so the caller can await a(100);. Exceptions become faulted Tasks the caller can observe.
+This is the same fix as for events: anywhere you have an async body, the delegate type's return should be Task (or ValueTask ), never void.
+
+Cross-Q²: Can ValueTask substitute for Task ?-- think --
+
+A: Yes, Func works the same way and avoids the small allocation per Task. Use ValueTask when (a) you have a fast-path that often completes synchronously (cache hit, no I O needed), or (b) you're allocating millions of these per second.
+For typical "always async" handlers, Task is simpler and the marginal allocation cost is negligible. Either way, anything except void makes the result observable.
+
+-- pause --
+Drill 15, Building expression trees manually.
+
+Q: I have a string "Age" at runtime and need Expression> equivalent to p goes to p.Age > 18. How?-- think --
+
+A: Build the tree node by node. var p = Expression.Parameter(typeof(Person), "p"); then var prop = Expression.Property(p, "Age"); then var c = Expression.Constant(18); then var gt = Expression.GreaterThan(prop, c); then var lambda = Expression.Lambda>(gt, p);.
+The result is a tree E F Core can translate to WHERE Age > 18.
+
+Cross-Q: What's the runtime cost of lambda.Compile() ?-- think --
+
+A: A different order of work from invoking it, describe the mechanism rather than quoting a multiplier. Compile() walks the tree, emits I L into a DynamicMethod, and the jit compiles that on first call; invoking the result is then an ordinary delegate call.
+Cache the compiled Func in a ConcurrentDictionary keyed by whatever varies (property name, type pair), otherwise you pay code generation per request, and that cost is invisible in any test that exercises a single key.
+Also know the A O T answer: there is no runtime I L generation under NativeAOT, so System.Linq.Expressions falls back to its interpreter, which is what Compile(prefer Interpretation: true) selects explicitly, and the A O T-friendly designs move the same work to a source generator instead.
+
+Cross-Q²: How would AutoMapper, Dapper, or E F Core build a property accessor?-- think --
+
+A: Same pattern, scaled up. Build a ParameterExpression for the source type, an Expression.Property or Field for each member, optionally an Expression.Convert for box or unbox, wrap in a lambda, compile once at startup or first use, cache by (SourceType, DestinationType) or (Type, PropertyName).
+AutoMapper builds one projection expression per map; E F Core composes user predicates with its own.
+Dapper is the instructive exception, it doesn't use expression trees for materialisers at all, it emits I L directly with DynamicMethod and ILGenerator, cached per query identity including column schema.
+That's the spectrum worth naming: reflection per call (slowest, simplest), expression trees compiled once (readable, safe), raw ILGenerator (fastest to emit, hardest to maintain), source generators (no runtime codegen at all, and the only one that works under NativeAOT).
+The shared trick in the middle two: generate once, reuse via a cached delegate, rather than a multiplier, the point is that reflection re-does per call the work these do once.
+
+Cheaper alternative worth knowing: if all you need is "call this method as a delegate", you don't need a tree. MethodInfo.CreateDelegate turns a MethodInfo straight into a delegate, and for an instance method it produces an open delegate whose receiver becomes the first parameter:
+
+csharp.
+var get Name = (Func)typeof(Person).GetProperty("Name")!.GetMethod!
+.CreateDelegate(typeof(Func));
+get Name.Target; // null, nothing captured.
+get Name(new Person { Name = "Alice" }); // "Alice".
+
+One cached Func replaces every PropertyInfo.GetValue call, with no I L emission, no Compile(), and no A O T problem. Delegate.CreateDelegate(type, first Argument, method) gives you the closed form instead, binding a specific instance.
+
+-- pause --
+Section 2. Self-test.
+
+The lambda captures threshold, so the compiler generates a closure class ( <>c__DisplayClass0_0 ) with a threshold field; one instance is allocated per entry into the enclosing scope, plus a delegate pointing at the closure's method, plus Where 's iterator and the List that ToList builds.
+
+Now the part that's usually stated wrongly: adding static changes nothing here, and removing the capture is what matters.
+list.Where(static x goes to x > 5) allocates no closure and no delegate after the first call, but neither does list.Where(x goes to x > 5), because Roslyn caches every non-capturing lambda in a <>c singleton regardless of the keyword.
+static is a compile-time assertion that no capture exists; it does not remove one and it does not remove an allocation that would otherwise happen.
+Its real value is that it fails the build if someone later edits the body to read threshold, which is exactly how a hot path silently regrows a per-call closure.
+
+The for variable i is one slot mutated across iterations, every closure captures the same slot, sees the final value 10. Fix by copying into a fresh local inside the loop: for (int i = 0; i Console.Write(captured)); }. Each iteration creates a new captured slot, so each closure binds to its own.
+The foreach form has the same fix baked in by the C sharp 5 spec change. Modern alternative: Enumerable.Range(0, 10).Select(i goes to (Action)(() goes to Console.Write(i))), each link iteration produces a fresh closure scope.
+
+Expression> when the consumer needs to inspect the predicate, for example, E F Core's IQueryable.Where walks the tree to translate to sequel; FluentValidation visits expression bodies to extract property names; specification patterns reify rules.
+Cost: building an expression allocates more (tree nodes), and invoking requires .Compile() (expensive, cache the result). Func when you just need to call the predicate, much faster, simpler, no compilation step. Rule: in-memory filtering to Func; database or analyzed predicates to Expression.
+
+EventHandler is synchronous-shaped, its return is void. Subscribing an async handler makes it async void: exceptions can't be caught by the publisher's try or catch and may crash the process.
+Func (or a custom AsyncEventHandler ) returns Task, so the publisher can await each handler in turn or run them with Task.WhenAll, observe exceptions, and apply backpressure.
+The dot NET-idiomatic answer for true async fan-out: Channel or IObservable (Rx), events are sync-shaped legacy; modern async pub or sub uses streams.
+
+Method is the underlying MethodInfo invoked; Target is the this that Method is called against, and it is null only for a genuinely static target. For a method group like obj.SomeMethod, Target = obj.
+For a lambda capturing locals, Target is the compiler-generated <>c__DisplayClass instance and Method is its emitted method.
+
+The trap in this question is the static lambda. Target is not null for one. Roslyn emits non-capturing lambdas, with or without the static keyword, as instance methods on a singleton <>c class, so Target is that <>c singleton and Method.IsStatic is false.
+Check it in a scratch project, note the lambda has to be given a delegate type first, since a bare lambda expression has no members to dot into:
+
+The static modifier constrains what you may write; it does not change how the lambda is emitted.
+
+Two delegates are equal when Method, Target, and the delegate type all match, which is why double- += of the same method group on the same instance creates a duplicate subscription, and why re-wrapping a handler in a different delegate type before -= never matches.

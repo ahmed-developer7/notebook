@@ -1,0 +1,367 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, checked versus unchecked overflow.
+
+Q: What does int.MaxValue + 1 return in C sharp?-- think --
+
+A: int.MinValue, -2147483648. C sharp integer arithmetic is silently wrapping by default (no exception). The I L opcode is add, not add.ovf.
+
+Cross-Q: How do you make it throw instead of wrap?-- think --
+
+A: Three scopes. (1) Expression: checked(int.MaxValue + 1). (2) Block: checked {. }. (3) Project-wide via true in the .csproj. The first two emit add.ovf I L; the third flips the default for the whole assembly.
+
+Cross-Q²: What's the runtime cost of checked arithmetic, and when would you unchecked inside a checked project?-- think --
+
+A: add.ovf adds a check of the C P U's overflow flag plus a branch to a throw helper, and because the operation can now throw, the jit loses some freedom to reorder and vectorise the surrounding code.
+That is noise in business logic and real in a numeric kernel, quote the mechanism, not a multiplier, and say you'd measure the specific loop with BenchmarkDotNet. Inside a checked project, you'd unchecked {.
+} around CRCs, hash mixing, ring-buffer counters, and pseudo-random number generators, code that intentionally wraps as part of the algorithm. The checked default catches accidents; explicit unchecked documents the intent of the rare correct overflow.
+
+-- pause --
+Drill 2, ref versus out versus in I L semantics.
+
+Q: What's the difference between ref, out, and in parameters?-- think --
+
+A: At the I L level they emit the same byref opcode ( and T ). The difference is purely the contract the C sharp compiler enforces. out requires the callee to assign before returning and exempts the caller from pre-assignment.
+ref requires the caller to pre-assign and lets the callee freely read or write.
+in is a readonly byref, caller pre-assigns, callee can read but not mutate.
+
+Cross-Q: What's the "defensive copy" trap with in ?-- think --
+
+A: If you pass a mutable struct via in, and call a non- readonly method on it, the compiler silently emits a defensive copy of the struct on the stack, because the method might mutate, but the in contract forbids that. The "avoid the copy" perf benefit of in is destroyed.
+Fix: mark the method readonly on the struct, or make the entire struct a readonly struct.
+
+Cross-Q²: What's ref readonly return and when would you use it?-- think --
+
+A: A method that returns a reference into a backing store, but the caller can't mutate through it. Example: public ref readonly Item GetSlot(int i) goes to ref _items[i];. The caller gets a zero-copy alias for read-only access, no defensive copy, no heap allocation, no chance of accidental mutation.
+Span.this[int] returns ref readonly T for ReadOnlySpan. Use when you want span-like ergonomics for one element of a backing collection.
+
+-- pause --
+Drill 3, String interning and reference equality.
+
+Q: string a = "hello"; string b = "hello"; ReferenceEquals(a, b), true or false?-- think --
+
+A: True. String literals are automatically interned by the runtime, both a and b point at the single pooled instance for "hello". The C L R exploits string immutability to share literals across the entire process.
+
+Cross-Q: What about string c = new string('h', 1) + "ello"; ReferenceEquals(a, c) ?-- think --
+
+A: False. Strings built at runtime (via new, +, string.Format, StringBuilder.ToString, Substring, IO, et cetera) bypass the intern pool. c is a distinct heap allocation. a == c is still true because string.== compares content; ReferenceEquals exposes the identity divergence.
+
+Cross-Q²: Should I string.Intern runtime-built strings as an optimization?-- think --
+
+A: Almost never. The intern pool is never garbage-collected for the lifetime of the process, manually interning random strings is a slow memory leak. The pool exists to share literal strings, not arbitrary runtime values.
+The right answer for high-frequency string keys is usually Dictionary with a normalization step, or a custom IEqualityComparer keyed off a hash.
+
+-- pause --
+Drill 4, decimal versus double for money.
+
+Q: Why is decimal the right type for money and double the wrong one?-- think --
+
+A: double is base-2 floating point, most "nice" decimal fractions ( 0.1, 0.2, 0.3 ) can't be represented exactly in binary. 0.1 + 0.2 == 0.3 is false in double.
+decimal stores a 96-bit integer with a base-10 scale factor (0, 28), so it represents every base-10 fraction inside 28-29 significant digits exactly.
+The decisive argument isn't the size of the error, it's that binary rounding isn't reproducible across different orders of operation, two systems can each round correctly and still disagree, and no amount of rounding at the end reconciles them.
+For values an accountant tracks, decimal is non-negotiable. (Note what decimal does not buy you: 1 or 3.0m * 3 is still 0.9999999999999999999999999999. Exact representation, not exact arithmetic.)
+
+Cross-Q: What's the perf cost of choosing decimal ?-- think --
+
+A: Give the mechanism, not a multiplier.
+double add or multiply are single C P U instructions that vectorise across a SIMD register; decimal arithmetic is a software routine that must align two scale factors before operating on 96-bit integers, and the type is 16 bytes against 8, so it costs cache and memory bandwidth too.
+That's a large gap in a numeric inner loop (Monte Carlo, simulation) and invisible next to a single database round-trip in a business app.
+If the interviewer wants a number, the correct answer is "I'd measure it with BenchmarkDotNet for that loop", quoting a remembered multiplier is how people get caught.
+
+Cross-Q²: When would you use float over double ?-- think --
+
+A: Almost never in business code. float (~7 digits of precision) is rarely "enough", double has the same speed on modern hardware and 15-17 digits.
+float makes sense only for (1) huge arrays where the 2 times memory difference enables SIMD wider lanes (graphics shaders, ML tensors); (2) sensor / hardware interop where the wire format is 32-bit (audio samples, GPU vertex buffers);
+(3) legacy game engines that committed to 32-bit precision a decade ago.
+Default for "a real number" is double; default for "a monetary value" is decimal; float requires justification.
+
+-- pause --
+Drill 5, params allocation cost.
+
+Q: Does void Log(string fmt, params object[] args) allocate on every call?-- think --
+
+A: Yes, even Log("ok") with zero args allocates an empty object[] (or reuses Array.Empty() since dot NET Core 2.0). Calls with value-type args (like Log("count: {0}", 5) ) also box each value into the object[] slot.
+For a logger called millions of times, that's millions of array allocations plus boxing pressure.
+
+Cross-Q: How do modern logging libraries avoid this?-- think --
+
+A: Source generators and strongly-typed delegates. LoggerMessage.Define(.) and the [LoggerMessage] source generator produce typed wrappers that never allocate an object[] and never box, and they check ILogger.IsEnabled before formatting anything.
+Be careful with the common wrong answer here:
+the ILogger extension methods do not have interpolated-string-handler overloads (the A P I proposal to add them, dotnet or runtime #111283, was closed as not planned), so logger.LogInformation($"User {id} logged in") formats the string eagerly and destroys the structured-logging template.
+Debug.Assert is the A P I that genuinely does use one ( AssertInterpolatedStringHandler, added in dot NET 6), which only evaluates the interpolation when the assert fails.
+
+Cross-Q²: What about params ReadOnlySpan from C sharp 13?-- think --
+
+A: The compiler stack-allocates the array for params ReadOnlySpan parameters, zero heap allocation, zero boxing for value types. So Sum(1, 2, 3) where Sum(params ReadOnlySpan) is allocation-free.
+This is the closest the language gets to "have your variadic cake and eat your perf budget too." It's why dot NET 9+'s string.Format overloads added params ReadOnlySpan variants.
+
+-- pause --
+Drill 6, nameof versus string literal.
+
+Q: Why use nameof(name) instead of just "name" in throw new ArgumentNullException(nameof(name)) ?-- think --
+
+A: Refactor safety. nameof(name) is a compile-time operator that produces the string "name", but if I rename the parameter to username in the IDE, the compiler updates the nameof to nameof(username) automatically.
+A hard-coded "name" string survives the rename and silently reports the wrong parameter name to the caller forever.
+
+Cross-Q: What does nameof(System.Collections.Generic.List) return?-- think --
+
+A: "List", just the last segment. nameof returns the simple name, not the fully-qualified name and not the generic-arity-decorated form. For the full name, use typeof(List).FullName. For just the type name, typeof(List).Name returns "List\ 1".
+
+Cross-Q²: Is nameof(SomeClass.Method()) legal?-- think --
+
+A: No, compile error. nameof accepts a symbol reference, not an invocation. nameof(SomeClass.Method) is legal (returns "Method" ); nameof(SomeClass.Method()) makes no sense, there's no name to extract from "the result of calling Method".
+Similarly nameof(x + y) is illegal because x + y isn't a name.
+
+-- pause --
+Drill 7, Boxing of integer constants in object.
+
+Q: object o = 5; object p = 5;, does ReferenceEquals(o, p) return true?-- think --
+
+A: False. Each assignment boxes the int 5 into a fresh heap object, two distinct boxes containing the same value. There is no automatic interning of value-type boxes (unlike string literals).
+
+Cross-Q: What about Java's Integer.value Of caching?-- think --
+
+A: Java caches Integer instances for -128.127 (the so-called integer cache). C sharp does NOT, every box is a fresh allocation.
+The reasoning: in C sharp, int and Int32 are the same type with a value-type identity, and boxing is supposed to be the "escape hatch" you avoid via generics; making it implicitly cached would mask the cost. So (object)5 != (object)5 by reference in C sharp.
+
+Cross-Q²: How would you make two int -as-objects compare equal by reference?-- think --
+
+A: You wouldn't, that's the wrong tool. Use Equals or == to compare values: o.Equals(p) returns true. If you need a single shared instance for some optimization, manually intern via a Dictionary.
+But the correct answer for "I want to compare two boxed ints" is almost always "don't box in the first place", use a generic method or IEquatable.
+
+-- pause --
+Drill 8, Default values of fields versus locals.
+
+Q: Why does int x; Console.WriteLine(x); fail to compile, but class C { int x; void M() goes to Console.WriteLine(x); } works fine?-- think --
+
+A: Definite assignment rule for locals. The C sharp compiler requires local variables to be assigned before they're read, this is a compile-time check (CS0165).
+Fields, on the other hand, are auto-initialized to their default value ( 0 for int, null for reference types, default(T) for structs) when the containing object is allocated.
+
+Cross-Q: Why does the language treat them differently?-- think --
+
+A: Fields' lifetime is bound to their containing object, and the runtime guarantees zero-init on heap allocations (the C L R clears memory), so a field always has a defined value the moment the object exists.
+A local has no such moment, its storage is a stack slot reused across calls, so the language demands proof that a write precedes every read. Be precise about the mechanism: C sharp does emit the .locals init flag by default, so the stack frame is zeroed too.
+Definite assignment isn't there to substitute for zeroing; it's a correctness rule that catches "you forgot to set this" at compile time. What it enables is the next answer.
+
+Cross-Q²: What's SkipLocalsInitAttribute ?-- think --
+
+A: An attribute (C sharp 9 / dot NET 5) that removes the .locals init I L flag, so the stack frame is no longer zeroed on method entry. [module: SkipLocalsInit] applies it to a whole assembly.
+It's safe for ordinary locals precisely because definite assignment already proves every read follows a write, the language rule is what makes the optimisation legal.
+It is not safe for stackalloc, which then hands you whatever was on the stack: with SkipLocalsInit on, a stackalloc buffer contains garbage rather than zeros, so anything reading before writing leaks previous stack contents.
+That's the whole trade: the win is real for parsers and IO paths that stackalloc large buffers and fill them completely; the hazard is code that assumed zeros.
+
+-- pause --
+Drill 9, var versus explicit type.
+
+Q: Is var x = 5; the same as int x = 5; ?-- think --
+
+A: Identically, var is implicit static typing, not dynamic. The compiler infers the type at compile time and locks it in. The resulting I L is byte-identical to the explicit-type version.
+
+Cross-Q: When does the choice matter?-- think --
+
+A: Readability and consistency. (1) When the type is obvious from the right-hand side ( var users = new List() ), var reduces noise. (2) When the type is not obvious ( var result = SomeMethod(); ), explicit types document intent, reviewers shouldn't need to hover to know the return type.
+(3) For literals, var x = 0 locks in int, if you wanted long or double, you'd write 0L or 0.0, or use the explicit type. Style guides vary; the StyleCop rule is var only when the RHS is a new expression or a cast.
+
+Cross-Q²: What's the difference between var, dynamic, and object ?-- think --
+
+A: var = compile-time type inference; full static typing, full IntelliSense, zero runtime cost, the emitted I L is identical to writing the type.
+dynamic = the static type is object plus an instruction to defer binding: every member access becomes a DLR call site that resolves the member at run time, allocates and caches a binder, and can throw RuntimeBinderException.
+Describe that cost as "a cached call-site lookup and a delegate invocation instead of a direct call" rather than a multiplier; the exact factor depends on whether the call site's cache hits. object = a static type that needs explicit casts to do anything useful.
+Default to var where the right-hand side makes the type obvious; reach for dynamic only for COM interop, ExpandoObject, or traversing genuinely unknown Jason shapes.
+
+-- pause --
+Drill 10, Top-level statements and Program.cs.
+
+Q: What does Console.WriteLine("hi"); at the top of Program.cs compile to?-- think --
+
+A: The compiler synthesizes a hidden Program class with a Main method around your top-level code. Roughly: internal class Program { static async Task Main(string[] args) {. your code. } }.
+The args parameter is implicitly in scope, the return type is inferred ( int if you return n;, void otherwise), and the method is async if you await.
+
+Cross-Q: Why is there exactly one allowed top-level-statement file per project?-- think --
+
+A: Because only one Main method is allowed per executable, and top-level statements are the Main. The compiler errors out if two files contain top-level statements.
+You also can't declare another Program class in the project (unless it's partial with the synthesized one), the compiler reserves the name.
+
+Cross-Q²: Can I unit-test code in a top-level-statement Program.cs?-- think --
+
+A: Yes, but you have to opt in. Add so the synthesized internal Program class is visible to your test project, then write public partial class Program { } in your main project to make the access modifier explicit.
+Alternative: extract the logic into a separate library project and reduce Program.cs to thin wiring, the more common pattern.
+
+-- pause --
+Drill 11, using static and when it helps.
+
+Q: What does using static System.Math; do?-- think --
+
+A: Brings the static members of System.Math into scope, so you can write Sqrt(2) instead of Math.Sqrt(2), PI instead of Math.PI. Compile-time only, no runtime cost, no I L changes.
+
+Cross-Q: When is it readable, and when is it noise?-- think --
+
+A: Readable when (a) the type is universally-known math or conversion utilities ( Math, MathF, BitOperations ); (b) the file is doing heavy use of those members (a graphics shader translation, a physics sim).
+Noise when (a) the imported type is a domain-specific helper readers won't recognize; (b) the file uses just one or two static calls, the cost of one extra qualifier is less than the cost of "where did Foo come from?".
+
+Cross-Q²: What's the interaction with extension methods?-- think --
+
+A: using static MyStaticClass does NOT bring its extension methods into scope as extension methods, it brings them in as static calls. To use extension methods as obj.Foo() syntax, you need a regular using Namespace;.
+Senior code review tells: a file that has both forms ( using N; AND using static N.SomeClass ) usually has a confused author who doesn't know what each does.
+
+-- pause --
+Drill 12, Console.WriteLine(null), what prints?.
+
+Q: What does Console.WriteLine(null); print?-- think --
+
+A: Trick question, it doesn't compile. Console.WriteLine has many overloads, and null converts to several of them.
+The exact compiler error is CS0121: The call is ambiguous between the following methods or properties: 'Console.WriteLine(char[]?)' and 'Console.WriteLine(string?)', note that it is char[] versus string, not object:
+object loses to both, because string and char[] are each more specific, and neither of those two converts to the other, so no winner exists between them.
+You must cast: Console.WriteLine((string)null) prints a blank line; Console.WriteLine((object)null) also prints a blank line.
+
+Cross-Q: Why doesn't Console.WriteLine((string?)null) print "null" like Python or JavaScript?-- think --
+
+A: Because dot NET's Console.WriteLine(string value) calls Out.WriteLine(value), which calls TextWriter.WriteLine(string), which writes the string followed by a newline. If the string is null, the implementation short-circuits and writes only the newline.
+The "null" literal in output is a JS or Python convention, not a C sharp one. If you want it, use Console.WriteLine(value ?? "null") or $"{value ?? "null"}".
+
+Cross-Q²: What about Console.WriteLine($"{x}") when x is null?-- think --
+
+A: Prints an empty string and a newline. The interpolated string handler calls AppendFormatted(x), which for a null reference just appends nothing. Same with string.Format("{0}", null), formats as empty. If you want to surface "null" explicitly, use x?.ToString() ??
+"(null)" in the interpolation: $"{x?.ToString() ?? "(null)"}".
+
+-- pause --
+Drill 13, Statement versus expression semantics.
+
+Q: When does C sharp require a statement versus an expression?-- think --
+
+A: Loosely: a statement does, an expression computes. The right-hand side of =, the inside of (.), the body of a switch arm, all expression positions. The body of an if, the body of a method (when not expression-bodied), the body of a loop, statement positions.
+C sharp 6+ added expression-bodied sugar ( goes to ) so a single-statement method body can be written as one expression: int Add(int a, int b) goes to a + b;.
+
+Cross-Q: What's the difference between switch statement and switch expression?-- think --
+
+A: switch statement is a control-flow construct, each case ends with break / return / throw / goto, no value is produced, no exhaustiveness check.
+switch expression (C sharp 8+) is an expression, each arm has the form pattern goes to result, the whole expression evaluates to one value, and the compiler warns if the patterns aren't exhaustive.
+Modern code prefers the expression form; statement form remains for cases where you genuinely need side-effecting branches.
+
+Cross-Q²: Is throw an expression or a statement?-- think --
+
+A: Both, since C sharp 7. throw new Exception(); is a statement. x ?? throw new ArgumentNullException(nameof(x)) uses throw as an expression, the throw "produces a value" of any type (it diverges, so the type-checker assigns it the bottom type and accepts it anywhere a value is expected).
+Same for the right side of expr? a: throw. or in switch-expression arms.
+
+-- pause --
+Drill 14, Definite assignment edge cases.
+
+Q: Does int x; if (cond) x = 1; Console.WriteLine(x); compile?-- think --
+
+A: No, definite-assignment analysis sees a path where cond is false and x is never assigned. Compile error CS0165. The compiler doesn't try to reason about whether cond is always true at runtime; the static analysis is conservative.
+
+Cross-Q: What about int x; if (cond) x = 1; else x = 2; Console.WriteLine(x); ?-- think --
+
+A: Compiles fine. Every path through the if / else assigns x, so the compiler proves x is definitely assigned before the read. The analysis is flow-sensitive at the level of basic blocks.
+
+Cross-Q²: How does out var interact with definite assignment?-- think --
+
+A: int.TryParse("5", out var x); Console.WriteLine(x); is legal, the out parameter contract guarantees TryParse assigns x before returning, regardless of the bool return value (this is out 's defining contract).
+The compiler treats out var x as "assignment via a method that promises to write to x," which satisfies definite assignment. This is why TryParse patterns work fluently in C sharp.
+
+-- pause --
+Drill 15, Modern C sharp string handling.
+
+Q: What's the difference between @"." and """.""" strings?-- think --
+
+A: @"." is a verbatim string, backslashes are literal, line breaks are part of the string, and "" is the escape for a literal ". """.""" is a raw string (C sharp 11), everything between the opening and closing """ is literal, including any " (up to N-1 quotes where N is the count of opening quotes).
+Raw strings also strip common leading whitespace based on the closing """ indent.
+
+Cross-Q: When does each beat the other?-- think --
+
+A: Verbatim wins for short Windows paths ( @"C:\temp" ) and regexes that have many \. Raw strings win for embedded Jason, sequel, X M L, or anything with ", no escaping is needed at all.
+For new code in 2026, raw strings are the default for multi-line embedded content; verbatim is mostly used for paths and short single-line content.
+
+Cross-Q²: What's $$""".""" ?-- think --
+
+A: A raw interpolated string where the interpolation hole is {{.}} instead of {.}. The $$ prefix tells the compiler "the interpolation requires two braces to start." This lets you embed Jason (which uses single { } braces) without escaping: $$"""{ "name": "{{name}}" }""".
+With a single $, the literal { in the Jason would need to be {{ to escape. The count of $ matches the count of braces needed for an interpolation hole.
+
+-- pause --
+Drill 16, Implicit conversions and rounding.
+
+Q: int i = 16_777_217; float f = i;, does this compile, and is i == (int)f ?-- think --
+
+A: It compiles with no cast, because int to float is an implicit conversion. And i == (int)f is False, f is 16,777,216.
+Implicit in C sharp means "no loss of magnitude", not "no loss of information": Microsoft Learn states that int / uint / long / ulong / nint / nuint to float and long / ulong / nint / nuint to double can lose precision.
+float has 24 bits of significand, so consecutive integers stop being representable past 2²⁴.
+
+Cross-Q: byte a = 200, b = 100;, why does byte c = a + b; fail to compile while a += b; succeeds, and what is a afterwards?-- think --
+
+A: byte, sbyte, short, ushort and char define only ++ and --; every other arithmetic operator promotes its operands to int, so a + b is an int with the value 300 and cannot implicitly narrow back to byte (CS0266).
+Compound assignment is defined differently: x op= y means x = (T)(x op y), with an explicit conversion inserted for you. So a += b compiles and a becomes 44, 300 truncated into a byte. In a checked context the same line throws OverflowException instead.
+
+Cross-Q²: (int)2.5, Convert.ToInt32(2.5), Math.Round(2.5), three answers, which are they and why?-- think --
+
+A: 2, 2, 2, but for two different reasons, which is the point. The cast truncates toward zero (so (int)3.5 is 3 and (int)(-2.7) is -2 ).
+Convert.ToInt32 and Math.Round round half to even, Learn's wording is "if value is halfway between two whole numbers, the even number is returned; that is, 4.5 is converted to 4, and 5.5 is converted to 6", so Convert.ToInt32(3.5) is 4.
+Banker's rounding is unbiased over many values and is what most accounting rules want, and it is not what a reader assumes. Pass MidpointRounding explicitly on anything financial.
+For a boundary that must never throw or wrap, dot NET 7+ generic math gives you the policy by name: CreateChecked (throw), CreateSaturating (clamp), CreateTruncating (keep low bits).
+
+-- pause --
+Drill 17, Closures and the captured loop variable.
+
+Q: for (int i = 0; i i);, what do the three delegates return?-- think --
+
+A: 3, 3, 3. The for variable is declared once, so the compiler hoists it into a single display-class field that all three lambdas share, and by the time they run the loop has finished and the field holds 3.
+Change it to foreach (var i in new[]{0,1,2}) and you get 0, 1, 2, because the foreach iteration variable is a fresh variable per iteration, a deliberate change in C sharp 5 made precisely because the old shared behaviour was a permanent source of bugs.
+
+Cross-Q: What actually happens to a captured local at the I L level?-- think --
+
+A: The compiler generates a display class and rewrites the method: the captured local becomes a field on a heap-allocated instance of that class, and every reference to it, inside the lambda and in the original method body, is rewritten to touch that field.
+That is why the lambda and the enclosing method see the same storage, and why the variable's lifetime is now the delegate's lifetime rather than the block's. One allocation per capturing scope, not per captured variable.
+
+Cross-Q²: A singleton holds a Func registered by a scoped service. What's the leak, and how does the language help you prevent it?-- think --
+
+A: If the lambda touches any instance member, it captures this, so the display class roots the whole scoped object, and anything it holds, typically a DbContext, for as long as the singleton lives.
+The usual symptom isn't OutOfMemoryException, it's ObjectDisposedException from a captured, already-disposed context, which sends people looking in the wrong place.
+The language-level prevention is static lambdas (C sharp 9) and static local functions (C sharp 8): they cannot reference enclosing locals, parameters or this, so an accidental capture becomes a compile error. Resolve what you need inside the callback from an IServiceScopeFactory instead.
+
+-- pause --
+Drill 18, Parsing, culture, and the invariant boundary.
+
+Q: On a server whose CurrentCulture is de-DE, what does double.Parse("1.5") return?-- think --
+
+A: 15. No exception, no warning. '.' is the group separator in de-DE, the default NumberStyles for Parse includes AllowThousands, so "1.5" reads as "one thousand five with a stray separator". A parse with no explicit IFormatProvider is a call whose behaviour is decided by an environment variable.
+
+Cross-Q: What's the rule you'd put in a code-review checklist?-- think --
+
+A: Machines talk to machines in InvariantCulture; humans see CurrentCulture; identifiers and protocol tokens aren't a culture question at all and use StringComparison.Ordinal.
+Concretely: InvariantCulture for config, CSV, H T T P payloads, database strings and cross-service Jason; CurrentCulture (or the user's stored preference) only at the rendering edge.
+Enforce it mechanically with CA1305 (specify IFormatProvider ) and CA1307 / CA1309 (specify / prefer ordinal StringComparison ) rather than by asking reviewers to remember.
+
+Cross-Q²: Give an example where a culture-sensitive comparison is a security bug.-- think --
+
+A: The Turkish-I problem, documented by Microsoft Learn. tr-TR has a dotted capital İ and a dotless lowercase ı, so i does not uppercase to I.
+A guard written as path.StartsWith("FILE:", ignore Case: true, culture) returns true on an English system and false on a Turkish one, and Learn spells out the consequence, on Turkish systems someone could get past a block on FILE: URIs.
+Any case-insensitive check on a scheme, header, extension, role or flag must be OrdinalIgnoreCase.
+Related: dot NET 5 switched Windows globalization from NLS to ICU, and the documented example "Hello\r\nworld!".IndexOf("\n") returned 6 on dot NET Core 3.1, -1 on dot NET 5, and 6 again on dot NET 6+, three answers for one line across three runtimes, all avoided by passing StringComparison.Ordinal.
+
+-- pause --
+Section 2. Self-test.
+
+var x = 0; is implicit static typing, the compiler infers int and locks it at compile time; x = "hello" is a compile error and IntelliSense works fully.
+dynamic x = 0; defers all type-checking to the DLR (Dynamic Language Runtime); x = "hello"; x.NotARealMethod(); compiles and only fails at runtime with RuntimeBinderException. var has zero runtime cost, identical I L to the explicit type.
+dynamic turns each member access into a call site that must bind at run time, allocating and caching a binder and dispatching through a delegate rather than a direct call.
+
+Strings are immutable; s += "x" allocates a new string and copies the old contents every iteration, O(n²) total.
+Alternatives: (1) StringBuilder for unknown-length builds (amortized O(n)); (2) string.Create(length, state, span goes to.) for known-length hot paths (single allocation, no intermediate char[] );
+(3) interpolated string handlers (C sharp 10+) which ILogger and Debug.Assert use, the formatter only allocates if the message is actually consumed.
+
+in passes a struct by readonly reference, avoids the copy of a value type, but the parameter is immutable inside the method. To mutate without copying, change to ref.
+To keep readonly intent but compute a derived value, return it: LargeStruct Compute(in LargeStruct s) goes to s with { Field = new Value };. The performance benefit of in (no copy) is preserved; mutation requires explicit ref or returning a new struct (cheap if it's small or you use with ).
+
+In classic C sharp ( at most 9), the interpolation always allocates: string.Format is called, which boxes any value-type args into object[] and allocates the result string.
+From C sharp 10, the compiler instead lowers an interpolated string to DefaultInterpolatedStringHandler, a ref struct that appends each component into a pooled buffer and produces one string at the end, avoiding the object[] and much of the boxing.
+An A P I can go further by declaring its own handler parameter ( [InterpolatedStringHandlerArgument] ) and refusing to build the string at all: Debug.Assert does exactly this with AssertInterpolatedStringHandler (dot NET 6+), so a passing assert formats nothing.
+Two important negatives: Console.WriteLine has no such handler, and neither does ILogger, interpolating into LogInformation formats eagerly and loses the message template that structured logging depends on. Use [LoggerMessage] there.
+
+Choose decimal for any value humans count in base-10, money, percentages, tax rates, because double is base-2 and can't represent 0.1 exactly, leading to drift like 0.1 + 0.2 == 0.30000000000000004 and, worse, to totals that depend on the order of summation.
+Cost, stated as mechanism: decimal is 128 bits (a 96-bit integer plus sign and a base-10 scale) against 64, so it costs cache and bandwidth; its arithmetic is software routines that must align scales rather than single vectorisable FPU instructions.
+Large in a numeric inner loop, invisible next to a database round-trip, measure the specific loop rather than quoting a factor. For scientific or graphics or ML where rounding errors are part of the model and throughput matters, stick with double. Never use float / double for currency, ever.
