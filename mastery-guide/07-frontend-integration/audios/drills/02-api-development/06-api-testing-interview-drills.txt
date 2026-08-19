@@ -1,0 +1,325 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, A P I test pyramid proportions.
+
+Q: What's the rough proportion of unit, integration, and E2E tests for an A P I service?-- think --
+
+A: For a typical service, roughly 70% unit, 25% integration, 5% E2E by test count. Unit tests are fast and many, every branch in business logic. Integration tests cover wiring (H T T P route to middleware to controller to service to DB), typically one happy path + 2-3 error paths per endpoint.
+E2E (full-stack smoke tests against staging) cover only critical user journeys, checkout flow, login flow.
+
+Cross-Q: A team has 10,000 unit tests and 50 integration tests. CI runs in 8 minutes. They have constant production bugs in H T T P wiring. What's the diagnosis?-- think --
+
+A: Coverage shape is wrong. The unit tests are exercising business logic deeply but never validating the wiring layer (request binding, middleware order, serialization edge cases, route conflicts). Many "passing unit tests, failing prod" stories come from this gap.
+Diagnosis: shift the ratio, fewer unit tests for trivial code, more integration tests covering each endpoint's actual H T T P contract. Aim for at least one integration test per endpoint that validates status code, response shape, and authentication behavior.
+
+Cross-Q²: E2E tests are flaky and slow. The team disables them. What's the compromise?-- think --
+
+A: Replace large E2E suites with a tiny smoke suite (5-10 tests) that runs against staging post-deploy: login, create one resource, read it, delete it, logout. If the smoke suite breaks, deployment is rolled back.
+Flakiness comes from full E2E suites with hundreds of tests covering many U I paths; trimming to "is the system alive end-to-end?" gives you the safety net without the maintenance overhead. Pair with contract tests for cross-service coverage, those are deterministic where E2E is fragile.
+
+-- pause --
+Drill 2, Contract testing (Pact).
+
+Q: What does Pact solve that integration tests don't?-- think --
+
+A: Cross-team breaking-change detection without coordinated deploys. Integration tests verify your service against your dependencies.
+Pact verifies that consumer team A and provider team B agree on the contract, consumer writes expectations ("I'll send GET /orders or 42; I expect status 200 with {id, total} "), provider's CI replays those expectations against the real provider and fails if the response no longer matches.
+The provider learns about a breaking change before deploy, not after the consumer's request errors flood.
+
+Cross-Q: When is Pact overhead rather than win?-- think --
+
+A: When (a) one team owns both consumer and provider, internal integration tests already cover the same ground; (b) the A P I is consumed by a single hand-rolled client where regression risk is low;
+(c) the team isn't disciplined about running provider verification in CI, Pact files drift from reality and give false confidence.
+The win requires the ownership boundary, separate teams, separate release cycles. Without that, the ceremony costs more than the safety.
+
+Cross-Q²: Pact-broker, Pact-flow, and OpenAPI-based contract tests, when do you use each?-- think --
+
+A: Pact-broker (free, self-hosted), coordinate contracts across teams in a single org, modest scale. Pact-flow (paid, hosted), same but with secrets management, audit trails, integrations with deployment pipelines for "can I deploy?" gates.
+OpenAPI-snapshot-diff (for example, oasdiff ), when you own both sides or the provider doesn't want to run consumer-driven contracts;
+cheaper, but it only catches breaking shape changes, not "this header was always required and the spec didn't say so" gaps that Pact catches by actually replaying requests.
+
+-- pause --
+Drill 3, WebApplicationFactory.
+
+Q: What does WebApplicationFactory bootstrap?-- think --
+
+A: It hosts your entire A S P dot NET Core app in-process, same Program.cs, same D I container, same middleware pipeline, same routing, but it replaces Kestrel with TestServer, an in-memory IServer.
+The HttpClient it hands you writes straight into that server, so there is no port, no socket and no H T T P wire parsing.
+Tests exercise the request pipeline (model binding, validation, controller dispatch, response serialization) but not the parts Kestrel owns, T L S, H T T P or 2 and H T T P or 3, request-size and header limits, real client IPs.
+
+Cross-Q: ConfigureServices in WithWebHostBuilder runs after Program.cs 's registrations. How do you override a registration like the real DB connection?-- think --
+
+A: services.RemoveAll>();, plus, on E F Core 9+, IDbContextOptionsConfiguration and the AppDbContext registration itself, since removing the options alone leaves the original configuration in place, then services.AddDbContext(.) with the test config.
+The order matters: Program.cs registers the production database; your test override removes that registration and re-adds the test one.
+Put the override in ConfigureTestServices ( Microsoft.AspNetCore.TestHost ) rather than plain ConfigureServices, it's the hook meant for test overrides, so using it states that intent at the call site.
+Some teams encapsulate this in a custom WebApplicationFactory subclass per test scenario to avoid repeating the override in every test.
+
+Cross-Q²: Async background services (for example, a BackgroundService that polls a queue) start running when the host starts. How do you handle them in tests?-- think --
+
+A: Three options. (1) Skip them, replace the registration in the test config: services.RemoveAll();. Useful when the test isn't about the background work. (2) Run them deterministically, replace the real queue with a fake that the test controls; trigger work and assert outcomes synchronously.
+(3) Embrace the asynchrony, let them run but drive the clock: have the service take TimeProvider (BCL, dot NET 8+) and register FakeTimeProvider ( Microsoft.Extensions.TimeProvider.Testing ) in the test, then advance time to fire its delays.
+(Rx's TestScheduler was the pre- TimeProvider workaround.) Option 1 is most common; option 3 is necessary when the test is about the background work.
+
+-- pause --
+Drill 4, Test isolation and shared state.
+
+Q: A test passes alone and fails when the full suite runs. Diagnose.-- think --
+
+A: Shared state leak. Suspects: static fields, singleton services (especially DbContext), file-system fixtures not cleaned up, environment variables modified by one test that survive into another, database state from one test visible to another (no transaction wrap), test ordering assumptions.
+
+Cross-Q: A team uses IClassFixture> for integration tests. Two tests in the same class hit /orders, first creates an order, second asserts the list is empty. Second test fails. Why?-- think --
+
+A: IClassFixture shares the factory (and the test database it is wired to) across all tests in the class. Test 1's seeded order is still in the DB when Test 2 runs.
+Two fixes: (a) reset state between tests, IAsyncLifetime.InitializeAsync clears the DB before each test; (b) wrap each test in a transaction that rolls back, using var scope = factory.Services.CreateScope(); var tx = scope.ServiceProvider.GetService().Database.BeginTransaction();
+test runs inside, rollback on dispose.
+(c) Switch to IClassFixture per-class but seed in InitializeAsync so state is deterministic.
+
+Cross-Q²: Parallel test execution, x Unit runs test classes in parallel by default. What pitfalls?-- think --
+
+A: (1) Shared external resources, same DB, same file path, same port. (2) Static fields touched concurrently. (3) Singleton services in the WebApplicationFactory (cache, in-memory store) collide if two test classes use the same factory instance.
+Mitigation: use [Collection] attribute to serialize tests sharing a resource, or use unique-per-test resources (random DB name, random file path). Testcontainers spins up a fresh container per test class by default, pricey but bulletproof.
+
+-- pause --
+Drill 5, Integration versus unit boundary.
+
+Q: Where do you draw the line, what's a unit test versus an integration test in the A P I world?-- think --
+
+A: Unit test: one class, dependencies mocked or faked, no external I O (no H T T P, no DB, no file system). Integration test: the real wiring is exercised, H T T P request enters the framework, traverses middleware, hits the controller, calls the service, persists to a test-container DB.
+The threshold is "is there any I O or framework participation?"
+
+Cross-Q: A test instantiates Controller, calls a method directly, and asserts the returned IActionResult. Is this unit or integration?-- think --
+
+A: Unit, and arguably a low-value one. You're testing the controller's logic without the framework's model binding, validation, content negotiation, authorization filter, action filter, or exception handling.
+The bugs you usually want to catch in a controller, wrong status code based on request shape, validation errors mapped wrong, response missing a header, all live in framework participation. Direct controller instantiation lets the framework's actual behavior surprise you in prod.
+Push these to integration via WebApplicationFactory unless the controller has substantial pure-logic methods.
+
+Cross-Q²: Where do you put validator tests, unit or integration?-- think --
+
+A: Unit. A FluentValidation validator is a pure function: input DTO to set of validation errors. No H T T P, no DB, no framework. Test it directly with validator.TestValidate(dto) and assert specific failures.
+Reserve integration tests for "does the controller actually invoke this validator and return 400 with the errors in the right shape?", usually one or two integration tests per controller cover that wiring; the deep validator coverage lives in fast unit tests.
+
+-- pause --
+Drill 6, Performance testing tools.
+
+Q: k6, NBomber, BenchmarkDotNet, when do you reach for each?-- think --
+
+A: BenchmarkDotNet, micro-benchmarks for code-level perf: "how long does this method take?", "what's the allocation count?". Used during optimization, runs in-process, sub-microsecond precision.
+k6, H T T P load testing, JS-scripted scenarios, great for CI integration, can simulate thousands of VUs from a single host. NBomber, dot NET-native load testing, useful when you want to share C sharp DTOs and validation logic between production code and load scripts.
+
+Cross-Q: A team writes BenchmarkDotNet tests for an A P I endpoint. What's wrong with that?-- think --
+
+A: BenchmarkDotNet measures in-process method performance, it won't accurately capture H T T P serialization overhead, network latency, connection pool dynamics, garbage collection pauses across requests, or thread pool starvation.
+For an A P I endpoint, the relevant measurement is throughput and tail latency under realistic concurrency, which means k6 or NBomber against the running service in a production-like environment.
+Use BenchmarkDotNet for the hot algorithm inside the service; use H T T P load testing for the endpoint as a whole.
+
+Cross-Q²: BenchmarkDotNet reports "Mean: 100ns, StdDev: 5ns". Is that useful?-- think --
+
+A: Only if you also look at allocation count, garbage collector stats, and tail percentiles. A 100ns mean with 0 allocations is qualitatively different from 100ns mean with 1 allocation per call, the latter cumulatively pressures gen0 garbage collector in a hot loop.
+BenchmarkDotNet reports Allocated per invocation and gen0 or gen1 or gen2 collection counts; read those alongside mean time.
+For real perf characterization, enable [MemoryDiagnoser]; if you want tail behaviour, add percentile columns yourself via a custom config ( StatisticColumn.P ninety-five ), the default output is mean, error and standard deviation, with no percentiles.
+
+-- pause --
+Drill 7, Soak test versus load test.
+
+Q: What's a soak test, and what does it catch that a load test doesn't?-- think --
+
+A: A load test runs at expected peak load for a short duration (10-60 minutes) to confirm SLAs hold.
+A soak test runs at moderate load for 24+ hours to surface time-dependent failures: memory leaks, connection-pool exhaustion, file-descriptor leaks, slow garbage collector degradation, log rotation failures, certificate expiry, scheduled-job interference.
+The "slow drip" failure modes that need time to accumulate.
+
+Cross-Q: A service passes a 30-min load test (1000 requests per second, p99 = 80 milliseconds, no errors). Two days into production, pods are OOM-killed every 6 hours. What likely class of bug?-- think --
+
+A: Memory leak, accumulating retained references over hours. The 30-min load test ran long enough for memory to climb modestly but not enough to trigger OOM.
+Common causes: singleton-scoped DbContext, unbounded in-memory cache, event handlers never unsubscribed, async state machines retaining context. Diagnosis: heap snapshot with dotnet-dump, look at top retainers, trace ownership graph. Fix the offending lifetime or cleanup.
+Prevention: nightly soak test (4 hours+) with heap-growth assertion.
+
+Cross-Q²: How do you assert heap stays bounded in an automated soak test?-- think --
+
+A: Three patterns. (1) Sidecar that polls /metrics (Prometheus) every minute for dotnet_total_memory_bytes or process_working_set_bytes; assert at end-of-test that growth from baseline is < threshold (for example, 50%).
+(2) Inside the load script (k6 has the BrowserMetrics extension; NBomber lets you embed assertions on custom counters), periodically probe a /diagnostics or memory endpoint and fail if working set exceeds a hard cap.
+(3) Post-test: trigger a heap dump, run dotnet-gcdump analysis, fail if any type's instance count grew unboundedly. The pattern that wins depends on infrastructure; the principle is "memory growth on a steady requests per second is a leak; flat is healthy."
+
+-- pause --
+Drill 8, Security testing in CI.
+
+Q: How do you integrate ZAP or Burp into CI?-- think --
+
+A: ZAP has a C L I mode and a GitHub Action, point it at your staging deployment URL, run a baseline scan (passive, fast) or a full scan (active, slow). Burp Suite Professional has a C I C D integration via the BurpSuite Enterprise Edition (paid).
+The typical flow: deploy to staging, run ZAP baseline as part of post-deploy verification, fail the build on critical findings (high-confidence XSS, SQLi). Save the report as a build artifact for review.
+
+Cross-Q: A team's ZAP baseline scan finds 50 "informational" findings on every run. They mute them all. What's the trap?-- think --
+
+A: The mute list grows until real findings hide in noise.
+The fix is tuning: review each informational finding once, most are CSP-related, header-related, or low-impact configuration issues; either fix them at the source (set the missing header, tighten CSP) or add them to ZAP's per-rule ignore list with a code comment explaining why each is suppressed.
+Periodically re-audit the ignore list. Distinguish "informational findings we've decided to accept" (documented) from "informational findings we haven't looked at" (a future hidden critical).
+
+Cross-Q²: Active ZAP scans against staging risk damaging test data. How do you isolate?-- think --
+
+A: Three patterns. (1) Dedicated security-test environment with synthetic data, refreshed nightly, no shared use. (2) Limit ZAP's scan scope: configure to skip destructive endpoints (DELETE), throttle requests per minute, set a budget on test duration.
+(3) Run active scans against a deployment of the current pull request in an ephemeral environment that's torn down after, no impact on other testers.
+The mistake is running active scans against shared staging during the day; everyone's tests start failing because ZAP submitted 10,000 form posts with malicious payloads.
+
+-- pause --
+Drill 9, Mocking external services.
+
+Q: WireMock.Net versus handcrafted fakes, when does each win?-- think --
+
+A: WireMock.Net for H T T P dependencies, payment gateway, third-party A P I, an external microservice. It's a real H T T P server (in-process) that responds based on configured request matchers, supports stateful behavior, recording or replay, latency simulation, fault injection.
+Handcrafted fakes ( class FakeOrderRepository: IOrderRepository ) for in-process dependencies, repository, message bus, time provider, where you don't need H T T P at all.
+
+Cross-Q: A team mocks an external H T T P A P I by injecting Mock instead of using WireMock. What goes wrong?-- think --
+
+A: HttpClient is hard to mock cleanly, it's not an interface; methods are virtual but the typical extension methods ( GetAsync, PostAsJsonAsync ) call into SendAsync which is awkward to stub.
+You miss real behaviors: H T T P-level headers, content negotiation, status code to exception mapping, retry logic in DelegatingHandler.
+WireMock at the network layer (loopback in-process) exercises the real HttpClient against a real H T T P endpoint, much closer to production behavior with less brittle test code.
+
+Cross-Q²: WireMock supports request matching, response stubbing, and stateful behavior. When do you need stateful tests versus stateless?-- think --
+
+A: Stateless ("always return this response for any GET /charge") works for most happy-path tests, exercise that your client handles the response correctly.
+Stateful is needed when the test asserts a sequence: "POST /order creates an order; subsequent GET /order/{id} must return what we just created with a server-generated ID." WireMock's WithCallback lets you compute responses dynamically from request state.
+Don't over-invest, stateful tests are slower and more brittle; reach for them when you genuinely need to verify request-response correlation.
+
+-- pause --
+Drill 10, Property-based testing.
+
+Q: When is property-based testing (FsCheck, FsCheck.Xunit) the right tool?-- think --
+
+A: When the system under test has a property that should hold for all inputs of some shape, not just example values.
+Classics: "for any string s, Jason.parse(Jason.stringify(s)) == s" (round-trip), "for any list of integers, sort(sort(list)) == sort(list)" (idempotence), "for any valid input to my parser, the result re-serializes to an equivalent input." FsCheck generates random inputs, finds counterexamples,
+shrinks them to a minimal failing case.
+
+Cross-Q: When is property-based testing overkill?-- think --
+
+A: When the behavior is fundamentally enumerable or the input domain is tiny, testing a state machine with 5 states by generating random inputs is silly; just enumerate.
+When the property is hard to express formally, "does the response look right?" doesn't translate to a property; example-based tests with hand-curated cases are better.
+When the function has many side effects that can't easily be undone in a property check, FsCheck assumes generated test cases are cheap to retry, which doesn't hold for tests that hit external services.
+
+Cross-Q²: A property-based test finds a counterexample after 5000 iterations and shrinks it to a 3-character string that breaks parsing. What do you do?-- think --
+
+A: (1) Reproduce: add the shrunk counterexample as a hard-coded example-based test so future runs always check it. (2) Diagnose: trace why the parser fails on that specific input, usually it reveals a missing edge case (Unicode normalization, empty-string handling, whitespace).
+(3) Fix and re-run the property test; the iteration count should increase before failure or the test should pass entirely. (4) Add similar test for related shapes, if "áb" (combining character) broke parsing, manually add other combining-character cases.
+Property-based tests find one bug each; treat them as guided fuzzing rather than complete coverage.
+
+-- pause --
+Drill 11, Testcontainers versus in-memory database.
+
+Q: Why is UseInMemoryDatabase controversial for integration tests?-- think --
+
+A: It ignores sequel provider behavior, no transactions, no concurrency tokens, no foreign-key constraints enforced at the DB level, no migrations, no provider-specific sequel features ( LIKE collation, Jason queries, RAISERROR ).
+Tests pass; production explodes on the first concurrent update or on a query that translated fine for sequel Server but Postgres rejects. Testcontainers runs the actual target database in Docker, slower (10-30 seconds setup per test class) but the behavior matches production.
+
+Cross-Q: A team's CI takes 25 minutes because Testcontainers spins up Postgres per test class. How do you optimize?-- think --
+
+A: Three patterns. (1) Share one container across the entire test run via x Unit collection fixtures, IClassFixture doesn't work cross-class; use ICollectionFixture and [Collection("postgres")] on test classes.
+(2) Migrations once at startup; reset state per test via transaction rollback or TRUNCATE. (3) Run integration tests in parallel where possible, multiple test classes can hit the same container if they use unique schema or database names.
+The combination cuts CI time substantially without losing the real-DB fidelity.
+
+Cross-Q²: A team uses Testcontainers locally but UseInMemoryDatabase in CI "for speed." When is that defensible?-- think --
+
+A: Almost never. The pathology: tests pass in CI (in-memory), fail locally (real DB), or worse, vice-versa. Developers stop trusting either result. The right axis is local-versus-CI consistency, not local-versus-CI optimization.
+Either both use Testcontainers and accept the time cost, or both use a shared dev-DB fixture. The single exception: pure controller-shape tests that genuinely don't touch the DB layer can use in-memory and the rest run against the real DB. Two test categories, not two test environments.
+
+-- pause --
+Drill 12, Authentication in tests.
+
+Q: How do you handle authentication in integration tests, bypass or real flow?-- think --
+
+A: Both, depending on what's tested. For tests of business logic that requires auth, bypass: register a test authentication handler that always returns a known ClaimsPrincipal with configurable claims.
+For tests of the auth flow itself, login, token refresh, role enforcement, exercise the real flow with a test user.
+
+Cross-Q: Concrete pattern for the bypass handler?-- think --
+
+A: Subclass AuthenticationHandler, override HandleAuthenticateAsync to return AuthenticateResult.Success(new AuthenticationTicket(.)) with the claims you want. Register the scheme in the test factory: services.AddAuthentication("Test").AddScheme("Test", _ goes to {}); and set as default.
+Tests then set claims via a per-test mechanism, often a header X-Test-User-Id that the handler reads and converts to claims. Real auth middleware is replaced; the rest of the auth pipeline (authorization handlers, policy evaluation) runs unchanged.
+
+Cross-Q²: A test asserts that an admin endpoint returns 403 for a non-admin user. The bypass handler is set to admin globally. How do you parameterize per-test?-- think --
+
+A: Three patterns. (1) Header-driven: X-Test-Role: User versus X-Test-Role: Admin; the handler reads the header per request. (2) Test-scoped service replacement: each test class registers its own IUserPrincipalProvider returning the role for that class.
+(3) Factory subclass per scenario: AdminTestFactory and UserTestFactory with different defaults. Header-driven is most flexible for tests that need to switch users mid-test; factory subclass is cleanest for tests that always run as one role.
+
+-- pause --
+Drill 13, Snapshot testing for A P I responses.
+
+Q: When is snapshot testing ( Verify, Snapshooter ) useful for A P I responses?-- think --
+
+A: When the response shape is large and stable, and you want regression protection against accidental shape changes. Example: a complex aggregation response with 30 fields.
+Hand-coding Assert.Equal for each field is tedious; snapshot test captures the response Jason to a .received file, compares to .verified file, fails on diff. Good for "I never want this output to change without me reviewing it."
+
+Cross-Q: When does snapshot testing become a maintenance burden?-- think --
+
+A: When the response includes volatile fields (timestamps, UUIDs, pagination cursors), every run differs, so every test fails until you scrub the volatile fields with a converter or ignore them.
+Also when the snapshot covers too much surface area, one harmless change ripples into 50 failed snapshots. Mitigations: configure snapshot converters to redact timestamps, use multiple smaller snapshots rather than one giant one, snapshot a subset (for example, schema only, not full data).
+
+Cross-Q²: A snapshot test fails. Junior dev runs the "accept all" command to update snapshots. What's the trap?-- think --
+
+A: They've just accepted a regression as the new baseline. The original snapshot existed to catch unintended changes; auto-accepting defeats the purpose.
+The discipline: snapshot updates require review (treat .verified file changes like code changes in pull request review), CI fails on any .received file present (forces author to explicitly accept changes locally before pushing).
+Tools like Verify support an "approval workflow" where the diff is presented to the developer in a diff tool before acceptance, friction is the feature.
+
+-- pause --
+Drill 14, Mutation testing.
+
+Q: What does Strykerdot NET catch that line coverage doesn't?-- think --
+
+A: Whether the tests would fail if the code changed in a subtle way. Stryker introduces "mutations", replace > with >=, swap true with false, change + to -, remove a method call, and runs the test suite.
+If tests still pass with the mutation, you have a coverage gap: the line was executed but no test actually asserted the value that the mutation changed. Line coverage says "this line ran"; mutation coverage says "this line ran and the tests would catch a change."
+
+Cross-Q: Stryker reports 65% mutation coverage on a service with 95% line coverage. What does that signal?-- think --
+
+A: 30% of the lines are exercised but not validated. Common causes: tests assert "result.IsSuccess" but not the specific value returned, tests assert one branch but not boundary conditions ( < mutated to <= survives), tests cover the happy path without checking error messages.
+Fix: review mutations that "survived", Stryker shows you each one, and add assertions that would catch them. Don't chase 100% (some mutations are equivalent to the original; some are economically not worth catching), but 65% to 85% closes the meaningful gaps.
+
+Cross-Q²: Stryker is slow, running the full test suite per mutation can take hours. Optimization?-- think --
+
+A: Three levers. (1) Scope: run on changed files only in CI (Stryker has incremental mode); full suite weekly. (2) Test selection: link mutations to tests via coverage data; only re-run tests that exercised the mutated line.
+(3) Parallelization: Stryker can run mutations in parallel processes; tune to CI host's C P U count. The right setup runs mutation testing on each pull request for changed files (~5-10 min) and full-codebase mutation on nightly cron (multi-hour). Report trend; investigate regressions.
+
+-- pause --
+Drill 15, A P I tests in CI duration.
+
+Q: How long is too long for the A P I test suite in CI?-- think --
+
+A: Heuristic: 5 minutes for pull request feedback, 30 minutes for merge-to-main, 4 hours for nightly. Beyond 5 min on pull request, developers context-switch and lose flow. Beyond 30 min on main, batching becomes complex.
+Beyond 4 hours overnight, the feedback loop on regressions stretches to "we'll see tomorrow."
+
+Cross-Q: A team's pull request pipeline takes 45 minutes. How do you trim?-- think --
+
+A: Tiered execution. (1) pull request pipeline runs fast tests, unit + lint + build + smoke integration (a couple endpoints), under 5 min. (2) Merge-to-main pipeline runs everything, full integration, contract verification, maybe a tiny load smoke, under 30 min.
+(3) Nightly runs soak, full security scan, mutation testing, larger load tests. The pull request is a "is this pull request sane?" gate; merge is "is this branch safe to deploy?"; nightly is "are the slow-burn issues still healthy?" Trying to run all three on every pull request is the failure mode.
+
+Cross-Q²: A test consistently takes 8 minutes alone. Worth keeping?-- think --
+
+A: Investigate the why. If it's a real integration test exercising 50 endpoints sequentially, parallelize. If it's a Testcontainer spinning up Postgres for one assertion, share the container across tests. If it's a await Task.Delay(60) polling loop, replace with deterministic state injection.
+If genuinely irreducible (for example, the test verifies a 5-minute cache eviction), move it from pull request to nightly and add a faster mock-based test that verifies the eviction logic without the real timer.
+"Slow but valuable" is rare; usually slowness signals an unidentified design problem in the test itself.
+
+-- pause --
+Section 2. Self-test.
+
+That asserts the repository's Save was called, testing the implementation, not the behavior. If you refactor to use a different repository method ( SaveAsync, Add + SaveChanges, et cetera) the test breaks even though behavior is identical.
+Better: assert observable outcomes, "after ProcessOrder, calling GetOrder(id) returns the persisted order with status Submitted." That uses an in-memory fake repository and verifies through the same surface real callers use.
+Mocks for verifying interactions are fine for side effects you can't observe directly (email sent, message published), not internal collaborator calls.
+
+UseInMemoryDatabase ignores sequel provider behavior, no transactions, no row-version concurrency, no foreign-key constraints, no migrations, no provider-specific sequel (for example, LIKE collation, Jason functions, RAISERROR ).
+Tests pass; production explodes on the first concurrent update or on a query that translated fine for sequel Server but blew up for Postgres.
+Use Testcontainers with the actual target database for any test that exercises the data layer; reserve InMemory for cases where you genuinely don't care about persistence semantics (rare).
+
+At 100 requests per second, p99 means roughly 1 request per second feels broken. Over a 5-minute session a typical user hits ~50 endpoints; statistical likelihood of seeing at least one 2-second pause is high.
+That's the difference between "this app feels fast" and "this app feels janky." Optimize for p99 first if customer-facing, tail latency dominates perceived performance once average is reasonable. Mean is a vanity metric.
+
+Use WireMock.Net to stand up a fake downstream that returns 500 on demand.
+Build the pipeline with Polly v8: new ResiliencePipelineBuilder().AddCircuitBreaker(new CircuitBreakerStrategyOptions { FailureRatio = 0.5, SamplingDuration = TimeSpan.FromSeconds(10), MinimumThroughput = 10, BreakDuration = TimeSpan.FromSeconds(30) }).Build().
+Test 1: send 20 requests, all 500, once the sampling window holds at least 10 actions at at least 50% failure, assert the next call throws BrokenCircuitException without reaching WireMock.
+Test 2: advance past the break duration, send one request into the half-open state, return 200, send another, assert the circuit closes.
+Drive time with FakeTimeProvider ( Microsoft.Extensions.TimeProvider.Testing ) set on the pipeline builder's TimeProvider instead of a real Task.Delay; read state via a CircuitBreakerStateProvider wired into the options ( StateProvider ).
+In A S P dot NET Core the integrated path is Microsoft.Extensions.Http.Resilience rather than a hand-registered policy.
+
+When (a) one team owns both sides, a contract test against yourself just duplicates integration coverage; (b) the A P I is consumed by a single hand-rolled client where the integration test already exercises the real shape;
+(c) the team isn't disciplined about running provider verification in CI, Pact files drift from reality and provide false confidence.
+The win is real cross-team independence: consumer ships expectations; producer's CI fails before deploy if it would break them. Without that ownership boundary, the ceremony costs more than the safety it adds.

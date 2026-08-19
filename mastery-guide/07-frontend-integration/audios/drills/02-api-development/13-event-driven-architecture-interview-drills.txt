@@ -1,0 +1,336 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Event versus command.
+
+Q: How do you tell whether a message should be modeled as an event or a command?-- think --
+
+A: Tense and intent. A command is imperative future tense ("PlaceOrder"), it asks one specific service to do something, may fail, may be rejected. An event is past tense ("OrderPlaced"), it states a fact that has already happened, has no single addressee, and consumers self-elect.
+Commands have one logical recipient; events have zero-to-many.
+
+Cross-Q: A "PaymentRequested" message goes to the payment service from the order service. Event or command?-- think --
+
+A: Command in event clothing, the name is past-tense but the semantic is "do this." Real signal: there's exactly one consumer (the payment service), and the order service expects an outcome ("did the payment go through?").
+Rename it ChargeCustomer (command), have the payment service publish PaymentSucceeded or PaymentFailed (events) when it's done. Other consumers (email, ledger) react to those events without coupling to the request.
+
+Cross-Q²: Why does this naming distinction actually matter at production scale?-- think --
+
+A: Two reasons. (1) Replay safety, events are facts, so re-processing them on a new consumer is safe (and required for new projections); commands are imperatives, so re-processing means re-executing side effects (double-charge).
+If you replay your topic without understanding which messages are which, you cause incidents. (2) Coupling boundaries, commands create direct producer-consumer coupling (the producer knows who handles it); events allow new consumers to be added without producer changes.
+A team that conflates them ends up with "events" that secretly require the original consumer to be online, which defeats the architecture.
+
+-- pause --
+Drill 2, Event sourcing trade-offs.
+
+Q: What does event sourcing actually buy you, and what does it cost?-- think --
+
+A: Buys: complete audit trail (every state change is a recorded event), time travel ("show the order as it was on day X"), natural fit for event-driven services (your write log IS the event stream), and free replay or rebuild of read models.
+Costs: schema evolution is hard (events are immutable, you can't rewrite history), querying requires building projections (current state is a fold, not a SELECT), snapshots needed for aggregates with thousands of events, G D P R right-to-erasure is awkward (deleting from an immutable log).
+
+Cross-Q: A team wants event sourcing on every aggregate "for auditing." Push back.-- think --
+
+A: Audit doesn't require event sourcing. You can get audit logs with a much cheaper pattern: append-only audit table with the diff of every change.
+Event sourcing's cost, projections, snapshots, schema versioning, command or query split, is justified only when the domain genuinely benefits from time-travel reads (financial ledgers, regulated industries with reconstruction requirements, complex workflow systems where past state matters).
+For most crud aggregates, "soft delete + audit log" gives you 90% of the audit benefit at 10% of the cost.
+
+Cross-Q²: How do you handle G D P R right-to-be-forgotten on an immutable event store?-- think --
+
+A: You don't actually delete events, that breaks the fold. Instead: (1) Encrypt PII in the event payload with a per-user key; on erasure request, throw away the user's key.
+The events still exist but the payload is unreadable cipher, "crypto-shredding." (2) Or store PII out-of-band: events reference a user ID, PII lives in a regular mutable table that you can delete from.
+Greg Young (event sourcing's main popularizer) recommends crypto-shredding for true event-sourced systems. The trade-off: encryption complicates replay and projection rebuilds; out-of-band complicates reconstruction. There's no free lunch with immutable logs + G D P R.
+
+-- pause --
+Drill 3, Choreography versus orchestration.
+
+Q: When choreography, when orchestration?-- think --
+
+A: Choreography for fan-out where each consumer reacts independently with no global workflow, notifications, projections, analytics. Orchestration for multi-step transactions with compensation requirements, a booking that must reserve inventory, charge card, schedule delivery, all-or-nothing.
+
+Cross-Q: Order placement involves stock check, payment, shipping schedule, email notification. What goes where?-- think --
+
+A: Hybrid. The transactional core (stock to payment to shipping schedule) is orchestrated, a Saga via Temporal or MassTransit or Durable Functions owns the workflow and compensation (if payment fails, release stock).
+The non-transactional fan-out (email, analytics, loyalty points, recommendation refresh) is choreographed, each service subscribes to OrderConfirmed independently and acts on its own.
+Trying to orchestrate the fan-out means every new "side effect" requires changing the orchestrator; trying to choreograph the transaction means no atomicity guarantee.
+
+Cross-Q²: A team's "choreographed" system has 8 services, and tracing a single order through them takes hours. Symptom of what?-- think --
+
+A: Choreography without observability. Implicit workflows that nobody documented; failures in step 5 cascade as silently dropped messages with no error path home.
+The fix isn't necessarily to add an orchestrator, it's to add: (1) Correlation IDs propagated through every event, (2) distributed tracing (OpenTelemetry) across the broker so you can see end-to-end spans,
+(3) a "workflow visualizer" service that subscribes to all events for one correlation ID and renders the actual flow, (4) explicit failure events with D L Q + alerting.
+Choreography is fine at scale; choreography-with-no-observability is a debugging hell.
+
+-- pause --
+Drill 4, Saga compensation.
+
+Q: Sketch the compensation logic for a 3-step Saga: reserve stock to charge payment to schedule shipping.-- think --
+
+A: Each forward step has a compensating action that "undoes" it. Reserve stock to compensate by ReleaseStock. Charge payment to compensate by RefundPayment. Schedule shipping to compensate by CancelShipping.
+If step 2 (charge) fails, the Saga runs step 1's compensation (release stock); if step 3 (shipping) fails, it runs step 2's compensation (refund) then step 1's (release). Saga state machine drives the forward + reverse path.
+
+Cross-Q: Compensations themselves can fail. How do you handle that?-- think --
+
+A: Two patterns. (1) Retry indefinitely with exponential backoff and D L Q to a human queue, RefundPayment is expected to eventually succeed; if it can't (account closed, gateway down), it goes to ops for manual handling.
+(2) Compensation must itself be idempotent, retried refund doesn't double-refund, and side-effecty compensations (sending an apology email) only fire once via the same idempotency-key pattern as the forward step.
+The harsh truth: distributed transactions don't have a perfect failure model; you design for "compensations almost always succeed, ops handles the few that don't."
+
+Cross-Q²: Why is "just use 2-phase commit instead" a bad answer in modern microservices?-- think --
+
+A: 2PC requires a coordinator that holds locks across all participant resources during the prepare phase. In a microservice world: (1) Participants are different databases (Postgres, Mongo, external SaaS A P Is); not all support XA transactions.
+(2) Coordinator failure during prepare leaves participants in "in-doubt" state, blocking resources until the coordinator recovers. (3) Locks held across network calls amplify latency tail and reduce throughput dramatically.
+Sagas relax atomicity (eventual consistency with compensation) but free participants from coordinator coupling, that's why Sagas, not 2PC, are the standard for microservice transactions.
+
+-- pause --
+Drill 5, Exactly-once delivery.
+
+Q: Why is exactly-once delivery generally impossible, and what do you do instead?-- think --
+
+A: Impossible because of the Two Generals problem: any single message ack can be lost, so the sender doesn't know if "no ack" means "consumer didn't receive" (resend) or "consumer received but ack lost" (don't resend). Both choices break exactly-once in one failure scenario.
+The industry solution: at-least-once delivery + idempotent consumers. Broker guarantees the message is delivered at least once; consumer tracks message IDs and skips duplicates. End-to-end behavior is "effectively exactly-once" but the mechanism is dedup, not single-delivery.
+
+Cross-Q: Kafka markets "exactly-once semantics", is that a lie?-- think --
+
+A: Marketing-aggressive but technically true within Kafka's boundary. Kafka EOS combines (a) idempotent producer (each message has a producer-ID + sequence-number, broker dedupes) and (b) transactional writes across Kafka topics (read message, process, write result, all in one Kafka transaction).
+End-to-end exactly-once works if your entire pipeline is Kafka-to-Kafka.
+The moment you cross to a non-Kafka system (external DB, Stripe A P I, S three), exactly-once is back to "at-least-once + idempotency at the boundary." Kafka EOS solves the streaming-within-Kafka case, not the general distributed-systems case.
+
+Cross-Q²: How do you make a Stripe charge call idempotent across consumer retries?-- think --
+
+A: Stripe's Idempotency-Key H T T P header. Generate one key per business operation (for example, the order ID), pass it on the charge request. Stripe servers store the response keyed by (account, idempotency_key) for 24 hours.
+Retries with the same key return the original response without re-charging.
+This is the pattern every payment processor and modern A P I offers, and the canonical example of "the consumer side bears the exactly-once burden, the protocol just delivers at-least-once."
+
+-- pause --
+Drill 6, Outbox pattern.
+
+Q: What dual-write problem does the outbox pattern solve?-- think --
+
+A: When a service must both persist a domain change (insert Order) and publish an event ( OrderPlaced to broker), without a distributed transaction across DB and broker, one can fail while the other succeeds. Order saved but event lost = downstream services never know.
+Event sent but order rollback'd = downstream services act on a non-existent order. Outbox: write the event row to an outbox table in the SAME DB transaction as the domain change; a background relay reads the outbox and publishes asynchronously.
+
+Cross-Q: The relay fetches an outbox row, publishes to the broker, then crashes before marking it published. What happens?-- think --
+
+A: On restart, the relay reads the un-marked row and publishes again, broker now has two copies. This is the at-least-once leak from the outbox. Consumers MUST be idempotent (de-dup table keyed by event ID).
+The outbox solves the producer-side dual-write but pushes duplicate handling onto consumers. Some libraries (MassTransit's Outbox) include a consumer-side inbox table to dedupe; the pattern is "outbox at producer, inbox at consumer" for symmetric reliability.
+
+Cross-Q²: Could you use Debezium / change data capture instead of a manual outbox table?-- think --
+
+A: Yes, and at scale it's preferred. Debezium tails the DB's transaction log (Postgres write-ahead log, MySQL binlog) and publishes change events downstream.
+The "outbox" is then a regular table that you INSERT into during the domain transaction; Debezium picks up the INSERT from the log and publishes.
+You skip the background relay.
+And it isn't Kafka-only any more:
+the connector form runs on Kafka Connect, but Debezium Server is a standalone runtime that sinks to Kinesis, Pub or Sub, Pulsar, Redis Streams, NATS, RabbitMQ or plain H T T P with no Kafka in the picture, and the embedded engine runs inside a host J V M application.
+The trade-offs:
+Debezium is another moving piece to run and monitor (whichever form), it ties your event publishing to DB infrastructure decisions (a PG upgrade impacts Debezium, and the replication slot becomes a production dependency), and event order across multiple tables is harder to reason about.
+The hand-rolled relay is simpler to operate at small-to-medium scale; change data capture wins for high-throughput systems.
+
+-- pause --
+Drill 7, Dual writes.
+
+Q: Show me a code example of the dual-write bug.-- think --
+
+A:
+csharp.
+await _db.SaveOrderAsync(order); // (1) DB commit.
+await _broker.PublishAsync(new OrderPlaced(Guid.NewGuid(), order.Id)); // (2) broker call.
+
+If (1) succeeds and (2) throws (network blip, broker down), the order is saved but no event fires. Consumers (inventory, payment) never act on it. Reversing the order doesn't fix it, (2) succeeds and (1) throws means consumers act on a non-existent order.
+
+Cross-Q: What if I wrap both in a try or catch and retry?-- think --
+
+A: Retrying (2) on failure helps if the broker comes back, but if the process itself crashes between (1) and (2), retry is lost. You'd need a durable retry queue, at which point you've reinvented the outbox.
+The fundamental issue: there's no transactional boundary spanning DB and broker, so any partial-failure window leaks. The outbox makes the only durable thing a SINGLE DB transaction; the broker publish becomes asynchronous and independent.
+
+Cross-Q²: What about XA transactions across DB and broker?-- think --
+
+A: Technically possible where both resources speak a distributed-transaction protocol, sequel Server plus MSMQ under MSDTC was the classic Windows pairing, but that stack is legacy and modern dot NET barely carries it:
+System.Transactions had no distributed-transaction support at all on dot NET Core, and dot NET 7 only restored it on Windows, via MSDTC.
+It's vanishingly rare in modern stacks. Kafka doesn't support XA. Cloud queues (SQS, Service Bus) don't. Even where it works, XA is operationally brittle (two-phase commit with locks held across network calls), and your DB and broker now have a coupling that breaks failover stories.
+The industry has decisively moved to "outbox + idempotent consumers" as the replacement for XA in distributed systems.
+
+-- pause --
+Drill 8, Event-carried state versus notification.
+
+Q: What's the difference, and when does each win?-- think --
+
+A: Notification event = minimal payload, just "X happened with ID Y; call back for details." Event-carried state transfer = full state in the payload, consumers don't need to call back. Notification wins for small events where most consumers ignore most of the data (efficient).
+State transfer wins for decoupling, consumers don't depend on the producer being online to enrich the event.
+
+Cross-Q: A team's OrderPlaced event has just { order Id }. Inventory service calls back to fetch details. Order service is sometimes down. What breaks?-- think --
+
+A: When order service is down, inventory can't enrich the notification, it must either retry (queue backs up) or fail. The decoupling that EDA promised is broken: inventory is now coupled to order's availability for processing.
+Switching to event-carried state (full order details in the event) means inventory processes from the payload alone; order service can be down for hours without inventory backing up.
+
+Cross-Q²: Event-carried state means events get big. Where's the line?-- think --
+
+A: Include the data 90% of consumers need; let the rare 10% call back for the rest.
+For an OrderPlaced event: include items + totals + customer ID + shipping address (almost everyone uses these); don't include full customer profile + payment history + browsing history (rarely needed, fetched on demand).
+The pragmatic answer: start with the minimum that decouples your main consumers, grow the event additively as new consumers need data, only fall back to call-back-for-details when payload size is genuinely problematic (>1MB events). Schema registry + additive evolution makes growing the event safe.
+
+-- pause --
+Drill 9, C Q R S + Event Sourcing.
+
+Q: When is C Q R S + event sourcing actually worth the complexity?-- think --
+
+A: When (a) the domain has a clear command or query asymmetry, writes are complex with business rules, reads are many different shapes and need fast tailored views, (b) audit and time-travel are core requirements (financial, healthcare),
+(c) the read side benefits from being denormalized + indexed differently from the write side.
+Internal crud apps with 1:1 read or write models gain nothing.
+
+Cross-Q: A team adds C Q R S for "read scalability." Push back.-- think --
+
+A: Read scalability rarely needs C Q R S, it needs read replicas (Postgres streaming replication, MySQL read replicas) or caching (Redis, output cache). Those are 10 times cheaper to operate and give you horizontal read scale without splitting your domain into command + query halves.
+C Q R S earns its complexity when you need DIFFERENT MODELS for read and write (denormalized read tables, search indexes, graph projections), not just more read capacity. Conflating "C Q R S" with "read replicas" leads to teams adopting a heavy pattern for a problem that doesn't justify it.
+
+Cross-Q²: With event sourcing, the read side rebuilds from events. What happens with 10 years of events?-- think --
+
+A: Two strategies. (1) Snapshots, every N events (often 100-1000), persist a snapshot of the current state; on rebuild, start from the most recent snapshot and apply events from there forward. Most event-sourced systems use snapshots routinely.
+(2) Projection rebuild from log, when a new projection is added, replay all events from the start to build it; depending on volume this is hours to days for old systems.
+For very large stores (financial systems with decades of history), tiered storage helps: recent events in hot Kafka or KurrentDB (formerly EventStoreDB), archived events in S three, with replay tooling that streams from both.
+
+-- pause --
+Drill 10, Event versioning.
+
+Q: You have OrderPlaced { id, customer Id, total } deployed. You need to add a currency field. How?-- think --
+
+A: Additive change, add currency with a default ("USD") for old events. Old consumers ignore the new field (forward compatible); new consumers see the default for old events (backward compatible). Both sides keep working without coordination.
+
+Cross-Q: Now you need to rename total to total Amount. How?-- think --
+
+A: Don't rename in place, that's a breaking change. Two patterns: (1) Publish a new event type ( OrderPlacedV2 ) with the new field name; consumers handle both V1 and V2 until V1 is retired.
+(2) Use an "upcaster", keep V1 in the wire format, but on read, transform V1 events to V2 shape (move total to total Amount ) in memory before passing to consumer logic. Upcasters are common in KurrentDB / Axon.
+Pure renames in event-sourced systems are rare; teams instead add the new field, deprecate the old, write a migration that publishes V2 events from the V1 stream, then eventually retire V1.
+
+Cross-Q²: How does a schema registry enforce this?-- think --
+
+A: Confluent Schema Registry + Avro (or Jason Schema, Protobuf) lets you register a compatibility policy per topic: BACKWARD (new schema can read old data), FORWARD (old schema can read new data), FULL (both), NONE.
+When a producer registers a new schema, the registry checks compatibility against the prior version and rejects breaking changes. Producers can't accidentally ship "rename total " without explicit override.
+This shifts schema discipline from "team norms" to "infrastructure enforcement", much higher reliability at scale.
+
+-- pause --
+Drill 11, Snapshots in event sourcing.
+
+Q: When does snapshotting in event sourcing pay off?-- think --
+
+A: When the aggregate has thousands of events and you load it frequently. Rebuilding state by folding all events on every read costs O(N) per load; with snapshots you cache the state at event N, and on load you read snapshot + events since N.
+The break-even depends on event count and folding cost; typically systems snapshot every 100-1000 events on aggregates that have >1000 lifetime events.
+
+Cross-Q: What goes wrong if you snapshot too often?-- think --
+
+A: Snapshot storage costs add up and the rebuild benefit plateaus. Snapshots themselves must be schema-versioned (if your aggregate state shape changes, old snapshots are invalid, fall back to full rebuild from events).
+Versioning bugs in snapshots silently corrupt state (read invalidates with wrong shape, apply new events, get garbage). Frequent snapshotting amplifies this risk.
+Production guidance: snapshot infrequently (every 1000+ events), version snapshots, and on schema mismatch always fall back to full event replay.
+
+Cross-Q²: An aggregate has 50K events, snapshotting was added 10K events ago, and the most recent snapshot has a schema bug. How do you recover?-- think --
+
+A: Delete the snapshots for that aggregate; the system falls back to full rebuild from event 1, slow but correct. Better systems mark a snapshot's schema-hash and refuse to load mismatching snapshots automatically.
+Even better: keep the last N snapshots so a roll-back to an older valid snapshot is possible. The architectural lesson: snapshots are an optimization, not a source of truth, events are the truth, and any system design should let you nuke snapshots and rebuild without data loss.
+
+-- pause --
+Drill 12, Event store choice.
+
+Q: KurrentDB versus Postgres-as-event-store versus Kafka, when each?-- think --
+
+A: KurrentDB (this is EventStoreDB renamed, Event Store Ltd rebranded to Kurrent in late 2024 and the licence changed with it, so check the terms rather than assuming it's still open source), purpose-built event store, native concepts of stream + projection + subscription;
+best fit when event sourcing is the central pattern.
+Postgres-as-event-store, an events table with (stream_id, sequence_number, event_data, event_type); on dot NET you rarely hand-roll that, because Marten already gives you exactly that shape over Postgres, plus inline and async projections and stream-version optimistic concurrency.
+Great for teams already on Postgres who want event sourcing without a new datastore. Kafka, append-only log with replay; works for event sourcing but lacks per-aggregate stream operations and projection model out of the box.
+
+Cross-Q: Why not just always use Kafka?-- think --
+
+A: Two reasons. (1) Kafka's unit of organization is the partition, not the aggregate, you can't easily say "load all events for order X." You either use the aggregate ID as the partition key (works but scales partition count to aggregate count, which is wrong) or scan and filter (slow).
+KurrentDB has streams (one per aggregate) as a first-class concept. (2) Kafka doesn't support optimistic concurrency on writes, "write this event only if the stream is at version N", which is critical for aggregate consistency.
+KurrentDB and Postgres-as-event-store (Marten included) both do this naturally.
+
+Cross-Q²: Postgres as event store, what's the scaling ceiling?-- think --
+
+A: Single-instance Postgres handles 10K-50K event writes or sec depending on hardware and indexing; reads are even higher with proper indexes. Beyond that you hit standard Postgres scaling (read replicas for projection reads, partitioning by stream_id for write throughput).
+The real ceiling is operational: as the events table grows to terabytes+ scale, VACUUM and index maintenance get painful, partitioning becomes mandatory, and you lose some single-table guarantees.
+Teams typically migrate to KurrentDB or Kafka when they hit this, but most never do, because most domains don't generate that event volume.
+
+-- pause --
+Drill 13, Idempotent consumer.
+
+Q: Patterns for making an event consumer idempotent?-- think --
+
+A: Three common patterns. (1) Dedup table, INSERT (event_id, processed_at) with unique constraint; on duplicate, skip. (2) Idempotent operation, design the side effect itself to be repeat-safe ( SET balance = 100 rather than UPDATE balance = balance + 50 ).
+(3) Outbox-inbox, consumer writes "I processed X" to its inbox table in the same transaction as the side effect; on replay, check inbox first.
+
+Cross-Q: Dedup table grows unboundedly. How do you prune it?-- think --
+
+A: T T L based on the maximum "in-flight" window of the message. If your broker retains messages for 7 days and your max retry window is 24 hours, keep dedup entries for 7-14 days. Older entries can be safely deleted because no replay would re-deliver an older message.
+Use a background job that DELETEs WHERE processed_at < NOW() - INTERVAL '14 days'. Some teams partition the dedup table by date for fast bulk pruning. The key constraint: never delete dedup entries newer than the broker's retention window.
+
+Cross-Q²: Two consumer instances process the same event simultaneously. Race condition?-- think --
+
+A: Yes if you don't use a unique constraint. The classic bug: consumer A reads "not in dedup table," consumer B reads "not in dedup table," both execute the side effect, both then write to dedup table, one succeeds, one fails the unique constraint, but the side effect ran twice.
+Fix: INSERT-then-execute. Try to INSERT the dedup row first (with unique constraint); if it succeeds, execute; if it fails (duplicate key), skip, another instance is or has handled it.
+This serializes via the DB's unique-index conflict resolution and is the idempotency pattern at the heart of every reliable EDA system.
+
+-- pause --
+Drill 14, Eventual consistency.
+
+Q: How do you expose eventual consistency to A P I consumers without breaking them?-- think --
+
+A: Three techniques. (1) Optimistic U I, after a write, immediately show the expected result; if the eventual state contradicts, reconcile. (2) Read-your-writes via session affinity, pin the user's reads to the primary node for X seconds after a write, so they see their own write immediately.
+(3) Polling with version, return the new entity's version on write; client polls until the version is visible in the read model.
+
+Cross-Q: Mobile client places an order, then immediately calls "GET my orders", but the projection hasn't caught up. What does the A P I return?-- think --
+
+A: Options. (1) Optimistic: server includes the just-placed order in the response synthetically (read-after-write via local cache or write-through). (2) 202 + status URL: the POST returns "accepted, check back" with a tracking ID; the GET reflects the order once the projection has caught up.
+(3) Versioned read: client knows the order's expected version; if version_in_db < expected_version, server returns "still processing." All three are valid; the right choice depends on U X requirements and how often the lag is user-visible.
+
+Cross-Q²: A bank U I must show the account balance immediately after a transfer. Eventual consistency seems unacceptable. How?-- think --
+
+A: Don't make the balance read eventually consistent.
+Either (a) keep the balance in the same aggregate as the transfer command, both writes happen atomically in the source-of-truth service (read-after-write trivially consistent),
+or (b) use synchronous write-through to the read model, the command handler writes to both event store and read model in one transaction.
+The pattern: identify reads that MUST be strongly consistent (financial balances, regulatory state), keep those synchronous; everything else (notifications, analytics, recommendations) is eventually consistent. Don't impose eventual consistency on reads that genuinely require strong consistency.
+
+-- pause --
+Drill 15, Schema evolution.
+
+Q: Avro versus Protobuf versus Jason for event payloads. Pick one.-- think --
+
+A: Depends on context. Avro is the Kafka default, strong schema, compact binary, schema embedded in messages OR registry-referenced. Protobuf is the polyglot favorite, strong schema, very compact, code-generated clients for every language.
+Jason is human-readable but verbose (3-5 times larger), no native schema enforcement (need Jason Schema layered on top), and schema evolution is informal. For high-volume EDA: Avro (in Kafka ecosystems) or Protobuf. For low-volume cross-team systems: Jason + Jason Schema if readability matters.
+
+Cross-Q: Why does Jason cause schema drift bugs more than Avro or Protobuf?-- think --
+
+A: Jason has no enforced contract on either side. Producer adds a field, consumers that didn't anticipate it silently ignore it (mostly fine, but they miss new data). Producer removes a field, consumers that depended on it fail at runtime ("expected total, got null").
+Producer renames a field, silent failure on the consumer. Avro or Protobuf with schema registry enforce compatibility at publish time: you literally cannot publish a breaking schema unless you bypass the registry. The drift bugs are caught at deploy time, not at production runtime.
+
+Cross-Q²: A team uses Jason and has a schema registry (Confluent's Jason Schema support). Is that as good as Avro?-- think --
+
+A: Nearly. You get compatibility checking on publish, and consumers can validate incoming events. You still pay 3-5 times bytes on the wire versus Avro or Protobuf, and Jason parsing is slower per message. For low-to-medium throughput (< 10K messages per second), the difference is negligible.
+For high-throughput streaming (100K+ messages per second), Avro or Protobuf pay back the schema discipline cost.
+The honest answer: Jason + schema registry is "good enough for most teams"; Avro or Protobuf are "what you grow into when you scale." The schema discipline matters more than the wire format.
+
+-- pause --
+Section 2. Self-test.
+
+It's R P C dressed as EDA. The caller blocks while the broker delivers the command, the consumer processes, emits a result event, the broker delivers it back to the caller, every hop adds latency and failure modes that synchronous R P C doesn't have.
+If the consumer is down, the caller hangs; if the result event is lost, the caller hangs forever. Either go fully async (return 202 Accepted with a status URL the client polls or subscribes to via S S E or WebSocket), or just use rest or G R P C for that path. Mixing models gives the worst of both.
+
+If the change is purely additive, old consumers ignore the new field, new consumers default to "USD" for v1 events, no consumer changes are required. This is why event-carried state is "evolve via additive changes" the same way graph Q L is.
+Schema Registry (Confluent + Avro, Apicurio + Jason Schema) enforces this at publish time: the producer must register a backward-compatible schema or the publish is rejected.
+Breaking changes (rename, field removal, type change) to publish a new event type ( OrderPlacedV2 ), let consumers migrate, retire OrderPlaced after usage drops.
+
+Choreography: notification fan-out. OrderShipped event triggers email service, SMS service, mobile push service, and analytics service, each cares independently, no central coordinator needed, adding a new "send Slack notification" service is just a new subscriber.
+Orchestration: a multi-step booking workflow where each step has compensating actions, reserve inventory, charge card, schedule delivery; if the charge fails, you must release the inventory in reverse.
+A Temporal or Durable Functions orchestrator owns the workflow state and explicit compensation paths. Choreography for "everyone reacts independently"; orchestration for "this transaction must complete or roll back atomically."
+
+Kafka, but only if someone configured the retention for it six months ago.
+Kafka topics are append-only logs with configurable retention, and the default is 7 days ( log retention hours set to 168 ); a 6-month backfill only works if the topic was already set to a longer retention, or to -1 for infinite, before those events aged out.
+Tiered storage (KIP-405, production-ready since Kafka 3.9) is not itself a retention setting, it makes keeping that much retention affordable, but you still have to have set it.
+Given that, the new service connects with a fresh consumer group, sets auto offset reset set to earliest, and replays history at high throughput. RabbitMQ's classic and quorum queues are queue-semantics: once a message is acked, it's gone.
+The exception is RabbitMQ Streams (RabbitMQ 3.9+, first-class alongside quorum queues in 4.x), an append-only log with non-destructive, offset-based reads and its own retention policy, which replays the same way.
+So the honest answer is that the choice isn't Kafka-versus-RabbitMQ, it's "was this stream modelled as a retained log, and retained long enough"; if your messaging system can't replay, you're locked out of patterns like "rebuild a projection from scratch" and "retroactive analytics."
+
+Two compatible strategies. (1) Tolerate via state machine, the consumer treats events as state transitions, persists them in any order, and reconstructs the final state once all are present.
+PaymentReceived arriving early just sets payment_status set to Received in a local table; when OrderPlaced arrives, the order row is created with the already-stored payment status.
+(2) Single-partition ordering, Kafka guarantees order within a partition; partition by order_id so all events for one order land on one partition consumed serially. The cost is reduced parallelism per order.
+Real systems combine: partition by aggregate ID for natural ordering, plus tolerant consumers for cross-aggregate event flows.

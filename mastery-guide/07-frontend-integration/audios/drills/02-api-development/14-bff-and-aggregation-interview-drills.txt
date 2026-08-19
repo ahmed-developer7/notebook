@@ -1,0 +1,331 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, What problem does B F F solve over a single A P I?.
+
+Q: Why introduce a B F F instead of a single well-designed rest A P I?-- think --
+
+A: A single A P I forces a compromise across client types, web SPA needs rich payloads with hyperlinks, mobile needs minimal payloads to save bandwidth, smart-TV needs different field projections entirely.
+One A P I serving all of them either bloats every response or grows divergent /v1 or mobile/* paths that the A P I team must maintain. B F F moves the client-specific shaping into a separate service owned by the client team, who can change their own B F F without coordinating with the A P I team.
+
+Cross-Q: Couldn't field selection (sparse fieldsets, ?fields=. ) solve the bloat problem without a B F F?-- think --
+
+A: Partially. Sparse fieldsets handle "client wants fewer fields" but not "client wants a fundamentally different shape", for example, the mobile home screen wants { recent Orders, unread Count, recommendations } aggregated from three services into one response.
+A flat field selector can't compose multiple service responses. graph Q L can; but then graph Q L is itself a kind of B F F (one endpoint that aggregates and reshapes). The pattern is the same; the implementation differs.
+
+Cross-Q²: A team has one client (web SPA) and is considering B F F. Push back.-- think --
+
+A: Not worth it yet. The B F F earns its operational cost (extra service to deploy, monitor, secure, scale) when client diversity creates coordination overhead, multiple clients evolving on different timelines.
+With one client, the SPA team and A P I team can just communicate directly; introducing a B F F adds a network hop, more deployment surface, and a "what does the B F F own versus the A P I" debate without solving a real problem.
+Wait for the second client (mobile, partner integration) and introduce B F F then, when the friction is concrete.
+
+-- pause --
+Drill 2, B F F versus A P I gateway.
+
+Q: How is a B F F different from an A P I gateway?-- think --
+
+A: A P I gateway is a generic edge, auth, rate limit, routing, request transformation, typically not client-specific. One gateway serves all clients identically. B F F is client-specific, one B F F per client family, with custom aggregation and shaping for that client.
+Gateway is infrastructure; B F F is application code.
+
+Cross-Q: Can you have both?-- think --
+
+A: Yes, and it's a common production layout. Traffic flows: Client to A P I Gateway (T L S termination, rate limiting, basic auth, routing) to B F F (client-specific aggregation, shaping, business-flow logic) to Downstream services.
+The gateway is generic edge handling; the B F F is per-client orchestration.
+Examples: A W S A P I Gateway in front of Lambda BFFs; Azure APIM in front of A S P dot NET Core BFFs.
+
+Cross-Q²: A team uses YARP for both. Where's the boundary?-- think --
+
+A: YARP itself is generic, it's the reverse proxy mechanism. You can build either pattern with it. The boundary is in the code or config: a YARP-as-gateway setup has generic routes by path and applies cross-cutting policies (auth, rate limit).
+A YARP-as-B F F setup adds client-specific aggregation endpoints (controllers calling multiple downstreams) plus YARP routing for the proxy paths.
+Many real systems collapse both layers into one YARP-hosted service for operational simplicity, the line between "gateway" and "B F F" blurs and that's fine; the distinction matters more as a thinking tool than as a hard architectural rule.
+
+-- pause --
+Drill 3, Per-client B F F duplication.
+
+Q: You have three BFFs (web, iOS, Android) and 70% of the code is shared. What now?-- think --
+
+A: Extract the shared code into a NuGet library ( MyApp.Bff.Common ). Auth handling, downstream HttpClient setup, common DTOs, resilience pipeline configuration, telemetry, all common. Each B F F references the library and adds only its client-specific shaping or aggregation.
+The BFFs stay separate (independent deployments, per-team ownership) but the substrate is shared.
+
+Cross-Q: Why not just merge the BFFs back into one?-- think --
+
+A: Merging recreates the original problem, one A P I serving multiple clients, which forces compromises in shaping and release cadence. The 30% that's different IS the reason you have separate BFFs. Sharing the 70% via library extracts the duplication without losing the per-client optimization.
+The architectural distinction: shared substrate (library, code) is fine; shared deployment unit (one B F F service for all clients) is not.
+
+Cross-Q²: A library shared across BFFs needs a breaking change. Who coordinates?-- think --
+
+A: Same as any library shared across services, semantic versioning + parallel-major releases. Publish v2.0 with the breaking change; BFFs migrate at their own pace; eventually retire v1. NuGet's package-versioning model handles this.
+If migration creates too much coordination pain, the library was probably too coupled to begin with, split it into smaller libraries (one for auth, one for H T T P, one for DTOs) so each can evolve independently.
+
+-- pause --
+Drill 4, Cookie-on-server versus token-in-browser.
+
+Q: Why is cookie-on-server preferred over token-in-browser for SPAs in 2026?-- think --
+
+A: Tokens in browser storage (local Storage, session Storage, in-memory) are accessible to any JS on the page, XSS, third-party scripts, compromised C D N libraries all can exfiltrate. HttpOnly cookies are unreadable from JS by browser policy.
+Cookie-on-server moves the entire O auth token lifecycle to the server; the browser only sees an opaque session ID.
+
+Cross-Q: PKCE protects the token exchange, why isn't that enough?-- think --
+
+A: PKCE protects the AUTHORIZATION CODE EXCHANGE, the bit where the SPA proves to the IdP it's the legitimate caller. PKCE doesn't protect the access token after it's issued.
+Once the SPA has the token, it must store it somewhere; local Storage is XSS-readable, in-memory is lost on refresh (forcing re-login flows), and http Only cookies require server cooperation (which IS the B F F pattern).
+PKCE + token-in-browser is "secure exchange + insecure storage"; B F F + cookie-on-server is "secure exchange + secure storage."
+
+Cross-Q²: A determined attacker XSSes the SPA. Can they still make requests to the A P I even without seeing the token?-- think --
+
+A: Yes, they can call fetch('/api or orders', {credentials: 'include'}) from the SPA's origin, and the browser will attach the session cookie. The attacker can ACT AS the user via the SPA's same origin.
+But they cannot exfiltrate the token (it never enters browser memory) or use it from a different origin or after the session expires.
+Defense in depth: a strict CSP to mitigate XSS, nonce-based with strict-dynamic, not script-src 'self', which a single self-hosted upload or JSONP endpoint defeats, anti-forgery tokens for state-changing requests, short session TTLs, anomaly detection on usage patterns.
+Cookie-on-server reduces blast radius dramatically but doesn't eliminate XSS impact entirely, XSS is still an incident, just a much smaller one.
+
+-- pause --
+Drill 5, Duende B F F security pattern.
+
+Q: What does Duende B F F actually provide that you can't easily roll yourself?-- think --
+
+A: A coherent implementation of cookie-on-server auth: OIDC login at the B F F, server-side token storage (in-memory or Redis), session cookie with secure defaults, token refresh, anti-forgery, logout, and management endpoints ( /bff or login, /bff or user, /bff or logout ).
+The pieces individually exist in A S P dot NET Core ( AddOpenIdConnect, AddCookie, IDistributedCache ); Duende wires them together correctly with the right defaults and CSRF protection.
+
+Cross-Q: It's commercial, when is paying for it worth it?-- think --
+
+A: When you're shipping a production SPA with auth and your security or compliance posture matters.
+It's a paid annual per-company subscription in the thousands of dollars, not the hundreds, still cheap compared to one auth bug, and there's a free Community Edition for companies a stated annual-revenue threshold, so check whether you qualify before assuming you have to pay at all.
+Rolling your own (combining AddOpenIdConnect + AddCookie + manual proxying via YARP or IHttpClientFactory ) is doable for OSS-mandated projects, but you're maintaining auth infrastructure forever and the corner cases (PKCE state validation, refresh token rotation, anti-forgery,
+multi-tab logout) are nontrivial.
+Duende is "buy not build" for non-toy SPAs.
+
+Cross-Q²: What's the closest free alternative?-- think --
+
+A: IdentityServer 4 was Apache-licensed; Duende IdentityServer (the successor) and Duende B F F moved to a commercial license circa 2020.
+The first honest answer is Duende itself: the Community Edition is free a stated annual-revenue threshold, so a small company may be entitled to the real thing for nothing.
+Beyond that: OpenIddict (truly free and open source) for the IdP side, plus hand-rolled B F F code combining cookie auth + OIDC + a YARP proxy with auth-header injection. This works but requires you to handle the integration carefully (CSRF, refresh, logout).
+Duende publish open-source B F F samples, and the dotnet or e Shop reference app, the dot NET Aspire successor to eShopOnContainers, shows the surrounding wiring; production-grade systems usually buy Duende for the maintenance offload.
+
+-- pause --
+Drill 6, YARP versus hand-rolled HttpClient aggregation.
+
+Q: When YARP over hand-rolled HttpClient aggregation?-- think --
+
+A: YARP shines when the B F F is mostly a routing or proxy concern, path-based or host-based forwarding to back-end services with auth and transformation. Config-driven, less code to maintain.
+Hand-rolled HttpClient aggregation (A S P dot NET Core controllers calling multiple services and composing responses) shines when the B F F does real aggregation logic, calling 3-5 services in parallel, composing a new DTO shape, applying business rules.
+YARP is for "forward and reshape headers"; controllers are for "fetch and compose payloads."
+
+Cross-Q: Can you mix them in one service?-- think --
+
+A: Yes, common pattern. YARP handles /api or orders/* as a passthrough proxy (with auth header injection); controllers handle /api or dashboard as a custom aggregation endpoint that calls multiple downstream services. Same A S P dot NET Core host.
+YARP's MapReverseProxy() registers proxy routes; MapControllers() registers custom endpoints. They coexist on different paths.
+
+Cross-Q²: What does YARP NOT give you that you'd need for a real B F F?-- think --
+
+A: (1) Multi-service aggregation in one response, YARP is one-request-to-one-downstream. (2) Complex response composition with business rules, YARP transforms are limited to headers or path or query, not body composition. (3) Streaming aggregation patterns (S S E chunks from multiple downstreams).
+For these you write controller code with IHttpClientFactory + Task.WhenAll. YARP is the proxy layer; your controllers are the B F F layer; they're complementary, not competing.
+
+-- pause --
+Drill 7, Aggregation patterns.
+
+Q: Sequential, parallel, streaming aggregation, when each?-- think --
+
+A: Sequential when later calls depend on earlier results ( get order to get customer using order.customer Id ). Parallel when calls are independent ( Task.WhenAll(orders Task, notifications Task, recs Task) for a dashboard).
+Streaming when total latency would feel slow but partial results are useful (S S E chunks delivered as each service responds). Sequential cost = sum(latencies); parallel = max(latencies); streaming = first-byte time.
+
+Cross-Q: All your dashboard calls are parallel. One service is hung. What happens to the request?-- think --
+
+A: Task.WhenAll waits for ALL, including the hung one. Without timeouts, the B F F thread is held until the hung downstream eventually times out (HttpClient default is 100 seconds) or you cancel. At scale, hung threads exhaust the pool and healthy requests start failing too.
+Fix: a per-call timeout strategy with a tight budget (2-5 seconds), AddStandardResilienceHandler() from Microsoft.Extensions.Http.Resilience gives you one per attempt plus a total-request timeout, or Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5)) (dot NET 6+).
+On timeout, return partial data ("orders unavailable, retry in 30 seconds") rather than failing the whole dashboard.
+
+Cross-Q²: For a 6-service dashboard with p95 latencies of 50 milliseconds each, what's the realistic p95 of the aggregated response under parallel calls?-- think --
+
+A: NOT 50 milliseconds, it's max over 6 tail distributions, which is higher than any single p95. If each service is 50 milliseconds at p95 (and 200 milliseconds at p99), the parallel-aggregated p95 might be 80-100 milliseconds because the slowest of 6 is more often near the tail.
+This is the "tail latency amplification" problem.
+Mitigations: hedged requests (start a request, if not back in 30 milliseconds start a duplicate, take whichever wins), caching aggressively at the B F F, and accepting that aggregated tail will be higher than per-service tail.
+Real BFFs typically budget 2-3 times single-service p95 for aggregated p95.
+
+-- pause --
+Drill 8, graph Q L as B F F alternative.
+
+Q: When does graph Q L win over B F F, and when does B F F win over graph Q L?-- think --
+
+A: graph Q L wins when (a) many client variations with different field needs, (b) clients iterate rapidly on what they want, (c) one schema can describe the entire domain.
+B F F wins when (a) heavy aggregation or business logic per client, (b) auth patterns that fit poorly with graph Q L middleware, (c) different client families need fundamentally different A P Is (not just different field selections).
+
+Cross-Q: A team uses graph Q L, they have N plus one queries crushing the database. Symptom of what?-- think --
+
+A: Resolvers calling per-field downstream services without batching. The classic case: a list of 100 orders, each with .customer resolver that calls the customer service, 100 calls. Fix: DataLoader pattern.
+HotChocolate's IDataLoader collects all .customer requests in a batch and issues one bulk lookup ( GetCustomersByIds([1, 2, 3,.]) ) per request. Without DataLoader, graph Q L is an N plus one amplifier; with it, you're back to efficient batched fetches.
+
+Cross-Q²: A team uses both B F F and graph Q L. What's the typical split?-- think --
+
+A: graph Q L for client-flexible reads (mobile dashboard, web profile page, different field needs), B F F for orchestrated writes and business flows (multi-step checkout, payment workflow).
+graph Q L excels at "give me what I ask for"; B F F excels at "run this complex multi-service workflow and tell me the outcome." Many production systems run both, graph Q L as the read A P I, rest or B F F for commands. They coexist; "use one or the other" is a false dichotomy at scale.
+
+-- pause --
+Drill 9, B F F caching.
+
+Q: B F F caching, per-user versus global?-- think --
+
+A: Depends on the response. Public data (catalog product list, public configuration) cache globally, high hit ratio, lots of savings. Per-user data (user's order history, dashboard) cache per-user with the user ID in the key, lower hit ratio but still saves backend calls.
+NEVER cache per-user data with a global key (security bug: user A sees user B's data).
+
+Cross-Q: Backed cache (Redis), output cache, in-memory cache, when each?-- think --
+
+A: In-memory IMemoryCache for small, frequently-accessed data within one B F F instance (for example, configuration). Redis-backed IDistributedCache for per-user data across multiple B F F instances (without it, each B F F instance has its own cache and hit ratio is fractional).
+OutputCache (dot NET 7+) for full H T T P response caching with key generation + tag-based invalidation, sits in front of the controller.
+HybridCache ( Microsoft.Extensions.Caching.Hybrid ), shipped in the dot NET 9 wave, often collapses the first two into one choice:
+it puts an in-process L1 in front of a distributed L2, and adds stampede protection, concurrent misses on the same key collapse into one downstream call instead of a thundering herd, though that de-duplication is per instance and not coordinated across replicas, plus tag-based invalidation.
+Reach for raw IMemoryCache / IDistributedCache when you need something HybridCache doesn't model. OutputCache still has its own place on the public-data endpoints.
+
+Cross-Q²: How do you invalidate per-user cache when the user's data changes?-- think --
+
+A: Two patterns. (1) Event-driven invalidation, subscribe to domain events (for example, OrderPlaced ); on receipt, evict the relevant cache keys ( cache:user:{customer Id}:dashboard ). Requires the B F F to be an event consumer; tight reactive coupling but no stale data.
+(2) T T L with stale-while-revalidate, cache for 30 seconds with stale-while-revalidate of 60 seconds; users may see slightly old data but next request triggers async refresh. Simpler operationally.
+Pick T T L for most BFFs; reach for event-driven invalidation only when staleness causes user-visible incorrectness (payment status, security state changes).
+
+-- pause --
+Drill 10, Auth forwarding B F F to backend.
+
+Q: B F F gets a session cookie; backend wants a bearer token. How does the B F F authenticate to the backend?-- think --
+
+A: Two patterns. (1) Token exchange, B F F holds the user's OIDC access token server-side (from cookie-on-server); on each backend call, attach Authorization: Bearer. Backend validates the token in the user's name.
+(2) Service-to-service token, B F F authenticates itself to the IdP (client_credentials flow), gets a service token, attaches as Authorization: Bearer AND propagates the user identity via a separate claim ( X-User-Id: ). Backend trusts the service token and reads user identity from the header.
+
+Cross-Q: Which is more secure?-- think --
+
+A: Token exchange (#1) preserves user identity at the backend natively, audit logs, authorization checks, row-level security all work as if the user called directly.
+Service-token + user-header (#2) requires the backend to trust the B F F's user assertion, which means the backend can't operate independently.
+#1 is the right default; #2 is for cases where the user token doesn't have the right audience or scopes for the backend (for example, partner A P I that needs a different O auth client).
+
+Cross-Q²: User's access token expires while the B F F is mid-aggregation. What happens?-- think --
+
+A: First downstream call returns 401. The B F F needs to either: (1) Use the refresh token (stored server-side) to mint a new access token, then retry, transparent to the user. (2) Return 401 to the SPA, SPA hits /bff or login to redo OIDC, returns to the page.
+Duende B F F handles refresh automatically.
+Hand-rolled BFFs usually layer a DelegatingHandler on the HttpClient that catches 401, refreshes the token, retries once. Failing this, every token expiry mid-request is a user-visible error, bad U X.
+
+-- pause --
+Drill 11, B F F + microservices topology.
+
+Q: Sketch a typical B F F + microservices production topology.-- think --
+
+A: Client to C D N (static assets) to A P I gateway (T L S, rate limit) to B F F (auth, aggregation) to Domain services (each with its own DB) to Event broker (Kafka or Service Bus) for inter-service communication. The B F F is north-south traffic; the broker is east-west.
+B F F stateless, scales horizontally; services own their data; broker decouples writes.
+
+Cross-Q: Where do you do cross-service queries (for example, "all orders for customers in this region")?-- think --
+
+A: Not in the B F F, that creates an N plus one anti-pattern. Two patterns: (1) Read-model service, a service that subscribes to events from order and customer services, builds a denormalized read model (Elasticsearch, Postgres materialized view), and exposes a query endpoint.
+B F F calls this read model.
+(2) Federated graph Q L gateway, a composed supergraph across services (Hot Chocolate Fusion / Apollo Federation, not legacy schema stitching) for cross-service reads. The B F F shouldn't be doing cross-service joins; either build dedicated read models or use a query-layer pattern.
+
+Cross-Q²: Where does observability fit?-- think --
+
+A: Trace context propagated from client to A P I gateway to B F F to services to broker. OpenTelemetry with W3C Trace Context headers ( traceparent, tracestate ), every hop logs the same trace ID. Metrics: per-endpoint latency at the B F F, per-downstream-call latency, error rates, cache hit ratios.
+Logs: structured with correlation IDs. Distributed traces in Jaeger or Tempo or App Insights let you see "this slow dashboard request spent 3 seconds waiting on the recommendations service." Without distributed tracing across the B F F + services, debugging aggregation latency is impossible.
+
+-- pause --
+Drill 12, B F F size.
+
+Q: How big can a B F F get before it's another monolith?-- think --
+
+A: Watch for warning signs. (1) B F F deployments require coordination with multiple downstream teams. (2) B F F has its own database for non-cache state. (3) B F F contains domain logic (not just shaping). (4) B F F deployment is a multi-hour event because so much depends on it.
+Roughly: if your B F F has more than a few thousand lines of business logic or owns persistent state, it's drifted into being a service in its own right, not just an aggregator.
+
+Cross-Q: A B F F has grown to 50K LOC over 3 years. What do you do?-- think --
+
+A: Diagnose what's in those 50K lines. If most is shaping or aggregation for one client family, that's just a normal B F F growing with the product (probably fine, watch for duplication).
+If chunks are business logic (calculating order totals, applying pricing rules), extract them into domain services where they belong.
+If chunks are per-feature aggregation, consider splitting the B F F along feature boundaries (for example, /api or orders/ and /api or catalog/ become two separate BFFs).
+50K LOC isn't automatically bad; 50K LOC of business logic mixed with aggregation IS bad.
+
+Cross-Q²: Splitting a B F F means another deployment unit. Cost?-- think --
+
+A: Real cost: more services to deploy, monitor, secure, scale; more network hops per request; more auth integration points. Benefit: clearer ownership boundaries, independent release cadences, smaller blast radius per change. The threshold depends on team size and ops maturity.
+Small teams (<10 people): one big B F F is usually fine. Larger teams: split when ownership becomes contentious or when one B F F's deployment cadence is bottlenecking another team. The pattern: one B F F per client family (web, mobile, partner), not per feature.
+
+-- pause --
+Drill 13, Error aggregation.
+
+Q: B F F calls 5 services in parallel for a dashboard. Two return errors. What does the response look like?-- think --
+
+A: Depends on the design choice. (1) All-or-nothing, return 500 if any downstream fails; the user sees nothing. Simple but poor U X.
+(2) Partial response with errors per section, return the successful sections, embed error placeholders for failed ones ( { orders: [.], notifications: {error: "unavailable"} } ). (3) Graceful degradation with fallbacks, failed sections return cached or static fallback content.
+The best is usually (2) for explicit visibility plus (3) for sections that have meaningful fallbacks.
+
+Cross-Q: A circuit breaker is OPEN on the recommendations service. How does the B F F behave?-- think --
+
+A: An open circuit fails fast, Polly throws BrokenCircuitException without making the actual call. The B F F catches this and either omits the recommendations section, returns a cached "popular items" list, or returns a static "personalized recommendations temporarily unavailable" message.
+Crucially, the circuit breaker prevents the B F F from piling up requests against the unhealthy service, fast-fail saves the thread pool and gives the downstream time to recover.
+
+Cross-Q²: A team's B F F returns 200 with embedded errors. The client doesn't check them. Bug class?-- think --
+
+A: Partial-failure leak, clients think the response is good because H T T P is 200, but some sections are error markers. The client renders an empty or broken U I silently.
+Fix: (1) Either return a non-200 status when any section fails (treats partial as failure, strict but unambiguous), or (2) require the client to handle the error markers explicitly (document the schema, code-gen client types from OpenAPI so the error fields are typed).
+The bug is when the B F F and client disagree on what 200 means; align them via contract.
+
+-- pause --
+Drill 14, B F F for mobile versus web.
+
+Q: Mobile B F F and web B F F, what's actually different?-- think --
+
+A: (1) Auth: web uses cookies (cookie-on-server pattern); mobile uses tokens (the device is trusted enough to hold them). (2) Payload size: mobile minimizes for bandwidth or battery; web tolerates larger responses.
+(3) Caching: mobile relies more on client-side caching (offline support); web can use server cache more aggressively. (4) Lifecycle: mobile has app launches with cold-cache state; web has refresh with browser cache.
+The B F F shapes responses accordingly: mobile gets pre-paginated lists with image URLs sized for mobile, web gets richer hyperlinked structures.
+
+Cross-Q: iOS and Android, same B F F or separate?-- think --
+
+A: Usually same. Their auth patterns (O auth + token), payload needs, and lifecycle are 90% identical. Separate them only when platform-specific features create real divergence (Apple-specific in-app purchases, Android-specific Play services integration that needs platform-aware shaping).
+Default: one mobile B F F for both iOS and Android; per-platform shaping happens in a few feature-specific endpoints, not as a structural split.
+
+Cross-Q²: Mobile users have intermittent connectivity. How does the B F F help?-- think --
+
+A: Three things. (1) Pre-paginated, pre-sized responses, mobile can render quickly without further requests. (2) ETag / If-None-Match for conditional GETs, when the client refreshes, B F F returns 304 if nothing changed, saving bytes and battery.
+(3) Push notifications that include enough data for the app to update its state without an extra GET, B F F emits push payloads with embedded relevant fields.
+The B F F is the place to optimize the device experience; pushing all this into the domain services bloats them with mobile concerns they shouldn't own.
+
+-- pause --
+Drill 15, B F F operational cost versus DX win.
+
+Q: B F F adds an extra service to operate. When is the DX win worth it?-- think --
+
+A: When client coordination cost is materially higher than running one more service.
+Concrete signals: front-end team waits days or weeks for A P I changes; multiple clients with different evolving needs; complex aggregations that would otherwise live in clients (slow, repeated, error-prone); auth-as-cookie-on-server requirement for SPAs (which is its own forcing function).
+For these cases, the B F F more than pays back its ops cost.
+
+Cross-Q: Quantify "operational cost" of a B F F.-- think --
+
+A: At minimum: another deployment pipeline, another set of metrics or logs or traces to monitor, another security boundary to patch, another scaling group to right-size, another auth integration.
+Realistically: 0.5-1 engineer-month per year per B F F for ongoing maintenance, plus incident-response load.
+For a team that ships fast, this is overhead; for a team blocked weekly on A P I changes, it's a massive net win. The math depends on which way you're losing time.
+
+Cross-Q²: A team's B F F is so successful that everyone wants to add features to it. How do you prevent it from becoming the new bottleneck?-- think --
+
+A: Strict scope: B F F owns shaping, aggregation, caching, auth. Business logic goes back to domain services. New "let's add X to the B F F" requests get pushed back: "is this client-specific shaping or domain logic?" If it's the latter, it belongs in a service, not the B F F.
+Front-end team owns the B F F and resists adding cross-cutting business rules, those drift across BFFs and become impossible to maintain. The B F F stays a thin layer; the domain stays in the services. This discipline is the difference between B F F as architectural win and B F F as new monolith.
+
+-- pause --
+Section 2. Self-test.
+
+That's domain logic creeping into the aggregation layer. Once the calc lives in the B F F, every B F F (web, mobile, TV) needs the same logic, duplicated, drifting, untested in the same way.
+Worse, future consumers of the orders service get a different total because the rule lives outside the service that owns the data. Keep BFFs to shaping, aggregation, caching, auth, never domain rules.
+If the orders service total endpoint is too slow, fix the orders service or cache its response at the B F F; don't bypass it.
+
+Task.WhenAll waits for the slowest task, the request hangs as long as the hung downstream takes to fail. Without timeouts, the B F F thread pool fills with hung requests, eventually exhausting it; healthy requests start failing too.
+Fix: every HttpClient registered via IHttpClientFactory gets a Timeout set explicitly (default is 100 seconds, way too long for aggregation), or add a timeout strategy to the client's resilience pipeline ( AddStandardResilienceHandler() from Microsoft.Extensions.Http.Resilience ),
+or use Task.WhenAll(tasks).WaitAsync(timeout) (dot NET 6+).
+Also: a circuit breaker on the unhealthy service stops sending traffic to it for a while, an open circuit fails fast with BrokenCircuitException instead of making the call, and the B F F catches that and degrades the affected section rather than hanging on it.
+
+Extract shared logic into a NuGet library ( Mobile.Bff.Common ) consumed by both. Auth handling, request transformation, downstream client setup, common DTOs, all library code. Each B F F retains its client-specific shaping.
+Don't merge back into one mobile B F F unless the platforms have actually converged on a single shape (rare); merging recreates the original "one A P I can't serve multiple clients" problem. The shared library + per-client B F F is the canonical compromise, common substrate, divergent assembly.
+
+RFC 9700 (BCP 240, O auth 2.0 Security Best Current Practice, January 2025) requires the authorization-code flow to be protected against code injection, PKCE, or the OIDC nonce for OIDC clients, and that's the thing to cite rather than O auth 2.1, which is still a draft.
+But that protects the code exchange, not token storage.
+Once the SPA has the access token, it must store it somewhere, local Storage (XSS-readable), session Storage (same), in-memory (lost on refresh, requires re-login), or http Only cookie (browser-policy-protected from JS but requires server cooperation, which is the B F F).
+The XSS attack surface for SPAs grew over the decade, third-party scripts, supply-chain attacks, browser extensions all execute in the same origin as the app.
+Cookie-on-server moves the entire token lifecycle to the server where the browser can't see it; the SPA gets a session cookie that's useless if exfiltrated to a different origin ( SameSite set to Strict ).
+
+(1) Run independent calls in parallel with Task.WhenAll, total latency = max(latencies) instead of sum. (2) Cache aggregated dashboards at the B F F with OutputCache keyed by user, T T L 30 seconds, most refreshes hit the cache and skip downstream entirely.
+(3) Streaming aggregation via S S E, return the dashboard skeleton with partial data immediately, push fields as their downstream calls complete; perceived p95 is dominated by first-byte time, not last byte.
+Plus: a per-call timeout strategy ( AddStandardResilienceHandler() from Microsoft.Extensions.Http.Resilience ) so that when one service is slow the dashboard returns degraded data ("orders unavailable, retry in 30 seconds") rather than failing entirely.

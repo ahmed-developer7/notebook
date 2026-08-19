@@ -1,0 +1,304 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, PUT versus PATCH versus POST.
+
+Q: I have an "update user email" endpoint. PUT, PATCH, or POST?-- think --
+
+A: PATCH is the right answer when you're changing a subset of fields on an existing resource. PUT requires the client to send the entire resource representation (full replacement). POST is for creating new resources or operations that don't fit any other verb.
+
+Cross-Q: A junior wrote PUT /users or 42 that accepts {email: "new"} and only updates that field. What's wrong?-- think --
+
+A: That's PATCH semantics smuggled into a PUT verb.
+The PUT contract says "this is the new resource; replace what's there." If a client sends PUT /users or 42 {email:
+"new"} expecting full-replace, every other field becomes null, or the server silently preserves them and now PUT is non-idempotent in a subtle way (different requests produce different states depending on what was there before).
+Either honor PUT's replace contract or rename it to PATCH.
+
+Cross-Q²: When would POST ever be correct for an update?-- think --
+
+A: When the operation isn't a resource update but a business action with side effects, POST /orders or 42 or cancel, POST /users or 42 or disable, POST /invoices or 42 or send-reminder. These trigger workflows (refunds, emails, ledger entries) that don't fit "field-level update" semantics.
+The sub-action POST pattern is the pragmatic escape hatch, rest purists hate it, but production A P Is use it everywhere because PATCH lies about what's happening.
+
+-- pause --
+Drill 2, Idempotency.
+
+Q: List the idempotent H T T P methods and define idempotent.-- think --
+
+A: GET, HEAD, OPTIONS, PUT, DELETE are idempotent. PATCH depends on body semantics. POST is not. Idempotent = N identical requests produce the same server state as one, no extra side effects from retries.
+
+Cross-Q: DELETE is idempotent, but the first call returns 204 and the second returns 404. Doesn't that contradict idempotency?-- think --
+
+A: No, idempotency is about server state, not response equivalence. After the first DELETE, the resource is gone; after the second, it's still gone. State is identical.
+The 404 on the second call is informational ("there's nothing here"); some A P Is return 204 on subsequent calls to be friendlier to retries, both are RFC-compliant.
+
+Cross-Q²: PATCH with Jason Merge Patch (RFC 7396), idempotent or not?-- think --
+
+A: Idempotent. PATCH {status: "shipped"} applied twice yields the same state. Jason Patch (RFC 6902) is the non-idempotent variant: [{op: "add", path: "/items/-", value: x}] appends x twice when retried. The verb alone doesn't tell you, the body format does.
+This is why "is PATCH idempotent?" is a gotcha, the correct answer is "it depends on the patch document format."
+
+-- pause --
+Drill 3, Status code choice.
+
+Q: POST creates a resource successfully. 200 or 201?-- think --
+
+A: 201 Created, with a Location header pointing at the new resource URL. 200 is for successful operations that don't create a resource (read, update). Returning 200 on create breaks every "subscribe to creation events" integration that filters by status code.
+
+Cross-Q: Duplicate-key insert, 409 or 422?-- think --
+
+A: 409 Conflict is the textbook answer, the request conflicts with the current state of the resource.
+422 Unprocessable Content (RFC 9110's name for what RFC 4918 called "Unprocessable Entity") is for semantically-invalid bodies that don't conflict with state (for example, "you can't add a 51st item to a 50-item cart").
+The distinction: 409 = "your input is fine but the world changed"; 422 = "your input was always going to be rejected by business rules."
+
+Cross-Q²: 400 versus 422, when does each apply?-- think --
+
+A: 400 is for syntactic failures, malformed Jason, missing required field, wrong content-type. The request couldn't be parsed at all. 422 is for semantic failures, Jason parsed, schema validated, but business rules reject it (negative price, invalid date range, item out of stock).
+The pragmatic test: if a Postman user fixes their request body without changing the meaning of what they're doing, the original was 400; if they have to change what they want to do, it was 422.
+
+-- pause --
+Drill 4, HATEOAS.
+
+Q: What does Richardson Level 3 promise?-- think --
+
+A: HATEOAS, Hypermedia as the Engine of Application State. Responses include links to next legal actions, so clients navigate the A P I by following links rather than constructing URIs from documentation. Theoretically, the A P I can evolve URIs without breaking clients.
+
+Cross-Q: Do production A P Is actually do this?-- think --
+
+A: Almost never. The cost is real (payload bloat, server-side LinkGenerator plumbing) and the benefit theoretical, every consumer is still a human-written client that hard-coded URLs from your OpenAPI spec.
+The handful of true Level 3 A P Is are public hypermedia products with truly evolving URIs (PayPal's rest A P I returns links arrays with rel / href / method; HAL or Jason:A P I ship as standards). For internal or B F F-shaped A P Is, Level 2 (verbs + status codes) is the pragmatic ceiling.
+
+Cross-Q²: If your client doesn't follow links, why does HATEOAS exist as a concept?-- think --
+
+A: Roy Fielding's PhD thesis defined rest as a hypermedia architecture, without HATEOAS, you have "H T T P with resource URIs," not rest. The discipline exists to keep the door open to generic clients (browsers, search engines, future agents) that could discover capability dynamically.
+It's the same gap as "JavaScript is a Lisp", true at the design level, irrelevant to most working code. Fielding himself has written angry blog posts that "rest A P I" is misused for what is really Level 2 H T T P.
+
+-- pause --
+Drill 5, Content negotiation.
+
+Q: Three ways a client can request Jason versus X M L.-- think --
+
+A: (1) Accept: application or json header, the RFC-correct way; the server picks the best format from its supported list. (2) URL extension, /orders or 42.json versus /orders or 42.xml, convenient but breaks rest (the resource is the same regardless of format).
+(3) Query parameter, /orders or 42?format set to json, works but pollutes the URI; caches see different keys for the same resource.
+
+Cross-Q: Which is "correct" rest and why?-- think --
+
+A: Accept header. The resource identifier ( /orders or 42 ) should be stable, it identifies what, not how it's serialized. Format is a representation concern, expressed via headers ( Accept from client, Content-Type from server).
+Extensions and query params conflate identification with representation.
+GitHub does this properly, its media types are all selected via Accept.
+
+Cross-Q²: How do caches handle the Accept header to avoid serving Jason to an X M L client?-- think --
+
+A: Via the Vary: Accept response header. The cache uses (URL, varied headers) as the cache key, so a Jason response and X M L response for the same URL get different keys. Without Vary: Accept, a cache would serve whichever it stored first to all clients regardless of their Accept.
+A S P dot NET Core's content negotiation does not auto-emit Vary: Accept, you have to set it explicitly when responses differ by format.
+
+-- pause --
+Drill 6, ETags.
+
+Q: Strong versus weak ETag, when each?-- think --
+
+A: Strong ( "abc" ) means byte-identical, every bit of the response body matches. Weak ( W/"abc" ) means semantically equivalent, same content, but bytes may differ (whitespace, Jason property ordering, gzip versus raw).
+Use strong for static or precisely-versioned resources; weak for dynamic Jason where you care about equality-by-meaning not equality-by-bytes.
+
+Cross-Q: Walk me through a conditional GET with ETag.-- think --
+
+A: First request: client sends GET /orders or 42; server returns 200 OK with ETag: "v17" and the body. Client caches both. Second request: client sends GET /orders or 42 with If-None-Match: "v17".
+Server compares: if current ETag still matches, returns 304 Not Modified with empty body (bandwidth saved); if changed, returns 200 OK with new ETag and new body.
+
+Cross-Q²: Same client, conditional write, what does the flow look like?-- think --
+
+A: Client reads GET /orders or 42 getting ETag: "v17" and the body. User edits. Client sends PUT /orders or 42 with If-Match: "v17" and the updated body.
+Server checks current ETag: if still "v17", processes the update and returns 200 OK with new ETag; if changed (someone else updated in between), returns 412 Precondition Failed. Client must re-fetch and merge.
+This is H T T P-level optimistic concurrency, mapping cleanly to E F Core's [ConcurrencyCheck] / RowVersion at the data layer.
+
+-- pause --
+Drill 7, cores preflight.
+
+Q: When does a browser send a cores preflight, and why?-- think --
+
+A: For "non-simple" cross-origin requests, anything beyond a GET or POST or HEAD with simple headers and application or x-www-form-urlencoded / multipart or form-data / text or plain content type.
+The browser sends an OPTIONS request with Access-Control-Request-Method and Access-Control-Request-Headers, and the server must respond with allowed methods or headers or origin before the browser sends the real request. It's the browser asking permission upfront.
+
+Cross-Q: Which requests bypass the preflight entirely?-- think --
+
+A: "Simple" requests: GET, POST, or HEAD with no custom headers (only Accept, Accept-Language, Content-Language, Content-Type is allowed and only with application or x-www-form-urlencoded, multipart or form-data, or text or plain ).
+A POST with Content-Type: application or json is not simple, it preflights.
+This is why Jason A P Is always preflight even for what looks like a plain POST.
+
+Cross-Q²: How do you reduce preflight overhead in production?-- think --
+
+A: Set Access-Control-Max-Age on the preflight response (for example, 86400 ), browsers cache the preflight result for that many seconds, so subsequent requests skip the OPTIONS round-trip. Chrome caps it at 7200 seconds (2 hours); Firefox at 86400 (24 hours).
+Combined with a C D N that handles OPTIONS at the edge, preflight cost drops to near-zero for repeat clients.
+The anti-pattern to avoid: caching a cores response without Vary: Origin, a shared cache stores the copy carrying Access-Control-Allow-Origin for one origin and replays it to a different origin, whose browser then blocks it. Vary: Origin is the fix, not the mistake.
+
+-- pause --
+Drill 8, rest versus R P C.
+
+Q: Is G R P C rest?-- think --
+
+A: No. G R P C is R P C over H T T P or 2 with Protobuf, it tunnels strongly-typed method calls ( UserService.GetUser(id) ) through H T T P, ignoring rest's resource or verb or status-code discipline. Every G R P C call is a POST to a method-named URL with a binary body.
+The H T T P layer is transport; the semantics are R P C.
+
+Cross-Q: G R P C uses URLs and H T T P. What makes it not rest?-- think --
+
+A: rest is about uniform interface constraints, resource URIs, semantic verbs, hypermedia, statelessness, cacheability, layered system.
+G R P C violates most of them: URLs are method names not resources, every call is POST regardless of intent, status codes are G R P C-specific (0, 1, 2,.) not H T T P semantics, no cache discipline (everything is uncached POST), no hypermedia.
+It uses H T T P as a pipe, not as the architectural style.
+
+Cross-Q²: When do you pick G R P C over rest?-- think --
+
+A: Internal service-to-service, high-volume, latency-sensitive, both sides controlled by you. Protobuf payloads are smaller than Jason, and the gap narrows again once both are gzip- or brotli-compressed, which every production Jason A P I does.
+H T T P or 2 multiplexing removes application-layer head-of-line blocking across streams (a lost TCP segment still stalls every stream on the connection, that limit is TCP's, not H T T P or 2's).
+Generated client stubs (G R P C-Go, G R P C-Java, G R P C-dot NET) make calls feel like local method invocations.
+Pick rest when: public A P Is, browser clients (G R P C-Web exists but is awkward), heavy intermediary caching needed, schema flexibility matters. Modern stacks: rest at the edge (browser-facing), G R P C internally.
+
+-- pause --
+Drill 9, RESTful URL design.
+
+Q: /orders or /order ?-- think --
+
+A: /orders, plural. The URL identifies a collection; the collection contains zero, one, or many orders. GET /orders returns a list; GET /orders or 42 returns one.
+/order or 42 would imply a singular noun, which is grammatically weird and inconsistent ("the orders endpoint", never "the order endpoint").
+
+Cross-Q: What about verbs in URLs, /get Orders or /orders ?-- think --
+
+A: Always nouns. The verb is the H T T P method (GET, POST, PUT, DELETE). /get Orders, /create Order, /cancelOrderById are R P C-style, they tunnel intent through the path. RESTful: GET /orders, POST /orders, DELETE /orders or 42.
+The exception: state-transition sub-actions ( POST /orders or 42 or cancel ) where the action is the operation, not a field update.
+
+Cross-Q²: A team has /customer-addresses and /customer Addresses mixed in their A P I. What's the convention?-- think --
+
+A: Lowercase with hyphens ( /customer-addresses ). Underscores are syntactically legal but visually similar to spaces; camel Case fights URL case-insensitivity rules (H T T P says hostnames are case-insensitive, paths are case-sensitive but conventions vary).
+Hyphens are the dominant convention in modern A P I design, GitHub uses kebab-case for most paths ( /check-runs, /code-scanning ). The actual rule: pick one and enforce via linting; inconsistency is worse than any specific choice.
+
+-- pause --
+Drill 10, Long-running operations.
+
+Q: A "process video" operation takes 10 minutes. How do you model it in rest?-- think --
+
+A: 202 Accepted pattern. Client sends POST /videos {url:.}; server returns 202 Accepted with a header pointing at a status resource.
+Location: /jobs or abc is the common convention; Microsoft's rest A P I guidelines and Azure services use Operation-Location instead (ARM uses Azure-AsyncOperation ) so the header isn't confused with 201's "here is the resource you created".
+Client polls GET /jobs or abc periodically; the status resource returns {status: "processing"} to {status: "completed", result:.}. The server never blocks the H T T P connection for 10 minutes.
+
+Cross-Q: Polling is wasteful. What are the alternatives?-- think --
+
+A: (1) WebSocket, bidirectional persistent connection; server pushes "job complete" when done. Right when you have many concurrent jobs and need real-time.
+(2) Server-Sent Events (S S E), one-way server to client push over H T T P; simpler than WebSocket for "I just need to know when it's done." (3) Webhook callback, client provides a callback URL in the original request; server POSTs to it when done. Best for server-to-server integrations.
+(4) Hybrid: long-poll the status endpoint with Prefer: respond-async, wait set to 60 (RFC 7240), server holds the request open up to 60 seconds and returns immediately when state changes.
+
+Cross-Q²: For a public rest A P I, which would you actually ship?-- think --
+
+A: 202 + polling, because every H T T P client supports it without special handling. WebSocket or S S E require persistent connections that complicate load balancers, retries, and stateless scaling.
+Webhooks require the client to expose an inbound endpoint (impossible from a browser or mobile app behind NAT). Polling is "boring but works", Stripe, A W S S three, every major cloud A P I uses 202 + polling for long jobs.
+
+-- pause --
+Drill 11, Bulk operations.
+
+Q: How do you model "create 100 orders in one request" in rest?-- think --
+
+A: There's no clean canonical answer, rest is resource-oriented and bulk is procedural. Common patterns: (1) POST /orders accepting an array body, pragmatic, breaks single-resource convention. (2) POST /batches {operations: [.]}, explicit batch resource, returns a batch status.
+(3) POST /orders per item with H T T P or 2 multiplexing, rest-pure but expensive. (4) graph Q L or R P C, admit you're outside rest's sweet spot.
+
+Cross-Q: A junior wrote POST /orders accepting both {single object} and [array of objects]. What's wrong?-- think --
+
+A: Inconsistent response shape (single object versus array of results) confuses clients. Mixed status semantics: what's the status code if 90 succeed and 10 fail? 200 lies; 207 Multi-Status exists (from WebDAV) but is obscure; 400 lies.
+The senior pattern: separate endpoint POST /orders or batch that always returns a structured per-item result with overall status 200 OK (the batch succeeded; individual items may have errored).
+
+Cross-Q²: Stripe doesn't support batch, why?-- think --
+
+A: Their stance: idempotency keys + parallel POSTs are simpler, and clients should care about per-request status anyway.
+A 100-order batch with 3 failures forces the client to write reconciliation logic, easier to just send 100 parallel POSTs with idempotency keys and process responses independently. The trade-off: 100 round-trips versus 1, but H T T P or 2 multiplexing closes that gap.
+Bulk endpoints are tempting but typically end up reinventing transactions poorly; rest nudges you toward "one resource per request" for a reason.
+
+-- pause --
+Drill 12, Caching.
+
+Q: What does Cache-Control: public, max-age set to 60, s-maxage set to 3600 mean?-- think --
+
+A: public = any cache (browser, C D N, proxy) may store. max-age set to 60 = fresh for 60 seconds in the browser. s-maxage set to 3600 = fresh for 1 hour in shared caches (C D N), overrides max-age for shared caches only. So: browsers re-validate every minute; C D N serves cached for an hour.
+The standard pattern for content A P Is.
+
+Cross-Q: Why do I need Vary: Authorization ?-- think --
+
+A: Without it, a cache uses just the URL as key, two users with different bearer tokens hitting /me get whichever response the cache stored first (likely the other user's data).
+Vary: Authorization makes the cache include the Authorization header in the key, so each user gets their own cached response. Critical for any per-user endpoint that's marked public or sits behind a shared C D N.
+
+Cross-Q²: What's stale-while-revalidate set to 86400 for, and what's the failure mode?-- think --
+
+A: After max-age expires, the cache may serve the stale copy immediately while refreshing in the background, up to 86400 seconds (24 hours) past expiry. Huge tail-latency win: users see instant responses; only the background fetch waits on origin.
+Failure mode: if your data is fast-changing (stock prices, inventory), users see day-old data with no visual indicator. Pair with short max-age (60 seconds) and only on truly cacheable content. Don't apply to user profiles, balances, or anything where staleness has real cost.
+
+-- pause --
+Drill 13, Pagination.
+
+Q: Link header versus body envelope for next-page metadata?-- think --
+
+A: Link header (GitHub style): Link:; rel="next". The body is just the array of items; pagination metadata lives in headers. Body envelope (Stripe style): {data: [.], has_more: true, next_cursor: "xyz"}. Items wrapped in an envelope object.
+
+Cross-Q: Which does your team pick and why?-- think --
+
+A: Most modern A P Is lean envelope. Header-based is RFC-correct (RFC 8288, which obsoleted RFC 5988) and keeps the body purely "the resource collection," but headers are awkward to log, hard to parse in some clients, and easy to lose through proxies or CDNs that strip non-standard headers.
+Envelope is verbose but discoverable in any H T T P debugger and survives every layer. GitHub uses headers; Stripe and most fintech A P Is use envelopes.
+
+Cross-Q²: A junior puts total_count: 12_847_392 in the envelope of every paginated endpoint. What's wrong?-- think --
+
+A: Computing total_count requires a COUNT(*) query that scans (or estimates) the full filtered set, for cursor pagination on changing data, this is expensive and immediately stale. Stripe explicitly excludes total counts for this reason.
+Pattern: provide has_more: true or false (cheap, just check if there's a next page) and never total_count on hot paths. If business needs counts, separate endpoint ( GET /orders or count ) with aggressive caching and explicit "approximate" labeling.
+
+-- pause --
+Drill 14, Allow header.
+
+Q: A client gets 405 Method Not Allowed from POST /orders or 42. What header does the response have, and why?-- think --
+
+A: Allow: GET, PUT, DELETE (or whatever the resource supports). The Allow header tells the client which methods this resource accepts, enabling the client to recover ("oh, I should have used PUT").
+Without Allow, 405 is a dead end; with it, the client (or its developer) immediately knows the alternative.
+
+Cross-Q: What if the resource supports different methods for different users (for example, DELETE only for admins)?-- think --
+
+A: Tricky, Allow is per-resource, not per-user. RFC 9110 (which obsoleted RFC 7231) says it lists methods the resource supports, not what the current user is authorized for. A non-admin still gets Allow: GET, PUT, DELETE even though their DELETE would 403.
+The fix: separate concerns, Allow reflects resource capability; authorization is a separate check that returns 403 if attempted. Don't try to make Allow user-specific; it confuses caching and breaks the spec.
+
+Cross-Q²: How does this relate to OPTIONS responses?-- think --
+
+A: OPTIONS /orders or 42 should return Allow: GET, PUT, DELETE as a discoverability mechanism, same header, used proactively. cores preflight relies on a related header ( Access-Control-Allow-Methods ) that serves the same role for cross-origin requests.
+Pattern: implement OPTIONS to return the union of supported methods, and let your 405 handler emit the same Allow header. A S P dot NET Core's routing gives you half of that for free: when the path matches a route but the method doesn't, it returns 405 with an Allow header automatically.
+It does not answer OPTIONS with a 200 + Allow, an unmapped OPTIONS lands on the same 405 path unless you map OPTIONS yourself or the cores middleware short-circuits the preflight.
+
+-- pause --
+Drill 15, rest versus H T T P A P I.
+
+Q: What makes an A P I "RESTful" versus just an "H T T P A P I"?-- think --
+
+A: An H T T P A P I uses H T T P as transport, any endpoint reachable over H T T P.
+A RESTful A P I additionally honors rest's constraints: resource URIs (nouns), semantic verbs (GET or POST or PUT or DELETE matching intent), correct status codes (201, 204, 404, 409, 422.), statelessness (each request self-contained), cacheability, and ideally hypermedia (HATEOAS).
+Most "rest A P Is" in production are Richardson Level 2 H T T P A P Is, resource URIs + verbs + status codes, no hypermedia.
+
+Cross-Q: Is POST /api or getOrdersByCustomer {customer Id: 7} rest?-- think --
+
+A: No, verb in path ( getOrdersByCustomer ), wrong H T T P method (POST for a read), no resource modeling. It's an H T T P A P I (it works over H T T P). It's R P C dressed in H T T P clothing.
+RESTful version: GET /customers or 7 or orders or GET /orders?customer Id set to 7, noun URLs, correct verb, no business logic in the path.
+
+Cross-Q²: Roy Fielding himself has said "most rest A P Is aren't rest." What's his complaint?-- think --
+
+A: His thesis defined rest as hypermedia-driven, clients discover next actions from response links (HATEOAS), not from out-of-band documentation. Almost no A P I does this. Fielding's view: if your client reads OpenAPI docs to construct URLs, your A P I is "H T T P-with-resources," not rest.
+The community has effectively redefined "rest A P I" to mean Richardson Level 2 (which Fielding considers a downgrade), and Fielding has written blog posts venting about the term being co-opted. For interview purposes: know the distinction; in code, ship Level 2 and call it rest like everyone else.
+
+-- pause --
+Section 2. Self-test.
+
+Yes, RFC 7396 merge semantics are idempotent because the second application produces the same target state as the first. RFC 6902 Jason Patch (operation list with add / remove / test ) is generally NOT idempotent, { "op": "add", "path": "/items/-", "value": x } appends twice.
+The verb alone doesn't tell you; the patch format does.
+
+(a) H T T P retry middleware (Polly, browser fetch retry, service mesh) won't retry, it sees success. (b) H T T P caches store the error response and replay it to other clients. (c) Observability tools (APM dashboards, alerting) classify it as success and don't fire the error-rate alarm.
+The right code is 4xx (client fault) or 5xx (server fault) plus a Problem Details body.
+
+Most clients are written by humans against documentation, not by generic agents that follow links at runtime. The _links payload weight pays no dividend when the iOS team has already hard-coded POST /orders/{id}/cancel from the OpenAPI spec.
+HATEOAS only earns its cost on truly evolving public hypermedia A P Is (rare) where clients should be insulated from URI changes.
+
+The sub-action POST is more honest when cancellation triggers side effects (refund, email, inventory release), the URL names the business operation, the verb is correctly non-idempotent if you allow only one cancellation.
+PATCH is purer rest but lies about the operation: "I'm just changing a field" hides the workflow. Most A P Is use sub-actions for state transitions and reserve PATCH for true field updates.
+
+422 Unprocessable Content, the request was syntactically valid Jason, the schema validated, but a business rule was violated. 400 Bad Request implies the request itself was malformed (bad Jason, missing required field). 409 Conflict is reserved for state conflicts (concurrent edit, duplicate key).
+Returning the right code lets the client pick a recovery strategy: 422 to show user error; 409 to re-fetch and retry; 400 to developer bug to fix.

@@ -1,0 +1,313 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, HMAC signature verification.
+
+Q: A partner sends webhooks signed with HMAC-SHA256 over timestamp.body. Walk me through verification.-- think --
+
+A: Read the raw request body bytes (before model binding), extract the timestamp and signature from a header like X-Signature: t=.,v1=., compute HMACSHA256(secret, timestamp + "." + raw_body), hex-encode it, compare to the provided signature using CryptographicOperations.FixedTimeEquals.
+Reject the request if the comparison fails.
+
+Cross-Q: Why specifically FixedTimeEquals and not == ?-- think --
+
+A: == (or string.Equals ) short-circuits on the first byte that differs. An attacker measures response time across many guesses; the request that takes microseconds longer is the one that matched one more byte. Repeat byte-by-byte and the signature falls out.
+FixedTimeEquals compares all bytes regardless of mismatches, the runtime is identical whether you matched zero bytes or 31 of 32. Same reason J W T validation, password hash comparison, and T L S MAC checking all use constant-time compare.
+
+Cross-Q²: I verify against JsonSerializer.Deserialize(body) rather than the raw bytes. Why does this fail?-- think --
+
+A: Re-serializing the parsed object produces semantically-equivalent but byte-different Jason, different whitespace, key order, escape sequences, decimal precision, trailing newlines. The HMAC is over the exact bytes the publisher sent.
+Even a single space difference produces a totally different hash. Capture raw bytes via request.EnableBuffering() + StreamReader.ReadToEndAsync() before model binding, verify against those exact bytes, then deserialize the same string for application use.
+
+-- pause --
+Drill 2, Replay attacks.
+
+Q: HMAC signatures are valid forever, how does the timestamp + window prevent replay attacks?-- think --
+
+A: Reject any event whose timestamp differs from server time by more than ~5 minutes. A captured webhook (from log files, a compromised proxy, a leaked CI artifact) is cryptographically valid forever, but expiring it by time means the attacker has at most 5 minutes from capture to replay.
+Without the window, an attacker who captured a payment.succeeded webhook 2 years ago could replay it today and credit the same payment again.
+
+Cross-Q: Why is the timestamp part of the signed payload, not just a separate header?-- think --
+
+A: If the timestamp were unsigned, the attacker could rewrite it to be current and pass the freshness check while keeping the original body and signature, but the signature only covers the body, so the rewrite goes undetected.
+By signing timestamp.body, any tampering with timestamp invalidates the signature. The two checks (signature valid + timestamp fresh) only work together when the timestamp is inside the signed envelope.
+
+Cross-Q²: What if the publisher's clock and yours drift by 10 minutes?-- think --
+
+A: Every webhook fails the freshness check, even legitimate ones. NTP keeps server clocks within milliseconds in practice; if you're seeing 10-minute drift, something is broken (V M clock, container time, deliberate skew).
+The 5-minute window accommodates real-world drift up to ~2-3 minutes; widening to 30 minutes degrades security. The right fix is server clock discipline (NTP, chrony, A W S Time Sync), not loosening the window.
+
+-- pause --
+Drill 3, Retry strategy with exponential backoff.
+
+Q: What's the standard retry strategy for a webhook publisher when the consumer fails?-- think --
+
+A: Exponential backoff with jitter, capped at a max delay, capped at a max total attempts or duration.
+Stripe spreads its retries over ~3 days with exponentially growing gaps; Shopify does up to 8 attempts over ~4 hours, quote the shape, not the counts, because they drift (Shopify's own numbers changed in September 2024).
+Jitter prevents retry storms, without it, many simultaneous failures would all retry at the same instant on subsequent backoff cycles.
+
+Cross-Q: Why does the consumer's H T T P response code shape the retry behavior?-- think --
+
+A: Up to a point, and the point is publisher-specific. 2xx means delivered, stop. 5xx and timeouts are normally read as transient and retried.
+4xx is where publishers diverge, don't assume it's terminal without reading their docs; Stripe retries any non-2xx, so a 400 is retried on exactly the same schedule as a 500.
+So choose codes for what they mean, not for the retry behaviour you hope to trigger: 400 for a bad signature, 500 or 503 for "DB is down" (please retry), 429 for "I'm rate-limited" (back off, retry later).
+Returning 200 to mean "I crashed but I don't want spam" is still the worst case, silent data loss. And for an event you will genuinely never process, unknown type, tenant deleted, 2xx plus a durable record is the right answer, because no 4xx is guaranteed to stop the retries.
+
+Cross-Q²: Jitter is added, but where exactly in the formula?-- think --
+
+A: Two common patterns. Full jitter: delay = random_between(0, base 2attempt), high variance, best for thundering-herd avoidance. Decorrelated jitter (A W S): delay = random_between(base, previous_delay 3), capped at max, smoother, still avoids correlation.
+The trap is "equal jitter" base*2attempt or 2 + random(0, base*2attempt or 2) which adds variance but keeps the mean correlated. A W S's blog post on jitter is the canonical reference; the takeaway: any randomization is better than none, full jitter is good enough for most cases.
+
+-- pause --
+Drill 4, Idempotency keys.
+
+Q: A webhook is delivered at-least-once. How does the consumer dedup?-- think --
+
+A: Treat the publisher's event ID ( evt_123 for Stripe, the GitHub delivery UUID) as the dedup key. Maintain a store (Redis, table with a unique index) of processed event IDs with a T T L covering the publisher's retry window (7+ days).
+On receipt: check the store first, if seen return 200 immediately, else process and mark.
+
+Cross-Q: A redelivered event arrives during the original's processing, what happens?-- think --
+
+A: Race condition. The dedup check sees "not processed" for both, both start processing. Two fixes layered: (1) H T T P layer: optimistic mark, write to dedup store with INSERT ON CONFLICT DO NOTHING; the second one fails the insert and returns 200 without processing.
+(2) Application layer: the actual side-effect (for example, charging the customer) uses a DB unique constraint on processed_events(event_id) in the same transaction as the side effect. If two workers race past the H T T P check, the DB constraint serializes them, only one commit succeeds.
+H T T P layer is fast happy-path; DB constraint is the correctness safety net.
+
+Cross-Q²: How long should the dedup T T L be?-- think --
+
+A: Longer than the publisher's longest retry window. Stripe retries for up to three days, so 7 days is comfortable. Anything shorter risks dedup-store expiry between the original delivery and a late retry to reprocessing.
+Storage cost is trivial (one row per event, 4M events or day times 7 days = 28M rows = tiny in any modern DB). The legitimate reason to keep it tight (cost, table size) almost never outweighs the correctness risk of premature expiry.
+
+-- pause --
+Drill 5, Dead-letter handling.
+
+Q: After N retries the webhook still fails. What now?-- think --
+
+A: Move to a dead-letter queue (D L Q), a separate store for events that exhausted retries. Triggers an alert. A human investigates: is it a parser bug (fix code, replay from D L Q), schema drift (update model, replay), legitimately bad data (skip, document)?
+The D L Q is the bridge between "automatic retries" and "human attention", you never silently drop events.
+
+Cross-Q: Stripe and GitHub don't expose a D L Q to consumers. So where do you put unprocessable events?-- think --
+
+A: On the consumer side. Each event that fails N internal worker retries gets persisted to a failed_webhooks table or a Redis sorted-set keyed by retry-eligible-time, with the full original payload, signature, headers, and the last exception. Alerting + manual U I for inspection and replay.
+The publisher's retry budget is one dimension; your internal processing pipeline has its own D L Q for events that pass HMAC + idempotency but fail business logic.
+
+Cross-Q²: A payment.succeeded event lands in the D L Q because of a transient outage. Two weeks later you fix it and "replay" it, what could go wrong?-- think --
+
+A: (1) Stale state, the customer might have refunded, churned, or been deleted in the interim; replaying naïvely re-credits a closed account.
+(2) Idempotency keys expired, your dedup store cleared the original evt_id after 7 days, so replay processes it again, but the publisher might also have stopped retrying so this is the only delivery. (3) Downstream side effects, emails, inventory holds, fraud-system signals all replay too.
+The right pattern: D L Q replay is manual and audited, with idempotent business logic that re-checks current state before acting (don't ship an order that's already cancelled).
+
+-- pause --
+Drill 6, Webhook URL discovery.
+
+Q: How does the publisher know where to send the webhook?-- think --
+
+A: Two patterns. Registration A P I: consumer calls POST /v1 or webhook_endpoints with their URL + event types + (sometimes) a custom secret. Publisher stores it and starts firing. Dashboard U I: human goes to Stripe or GitHub or Shopify settings, pastes URL, picks events.
+Hardcoded URLs are rare, only seen in tight bilateral integrations where ops manages the URL out-of-band.
+
+Cross-Q: Why does the publisher return the signing secret only once, at creation?-- think --
+
+A: Treat it like an A P I key, show on creation, hash and discard on the publisher side, can't be retrieved later. If the consumer loses it, they must rotate (delete the endpoint, create a new one with a new secret).
+This matches modern secret-management practice (Stripe A P I keys, A W S access keys, GitHub PATs all work this way). The principle: secrets in the publisher's DB at rest is a breach risk; show once, store the hash for verification only.
+
+Cross-Q²: How do you rotate a webhook secret without dropping events?-- think --
+
+A: Stripe-style overlap window, the publisher supports multiple active secrets per endpoint for ~24 hours during rotation. Consumer accepts signatures from either old or new secret. Steps: (1) Publisher generates new secret, returns it.
+(2) Consumer adds new secret to its verifier list (still accepts both). (3) Publisher switches to signing with new only. (4) After overlap window, consumer drops old secret from list.
+Without the overlap, there's an inevitable seam where in-flight events signed with the old key get rejected by the new-only consumer.
+
+-- pause --
+Drill 7, Polling versus webhooks.
+
+Q: When is polling the right choice and when are webhooks?-- think --
+
+A: Webhooks when (1) events are rare and bursty (wasteful to poll constantly), (2) low-latency push matters (payment confirmation in polling overhead.
+
+Cross-Q: A hybrid pattern uses both. What does it look like?-- think --
+
+A: Webhook for the notification, polling for the data. The webhook says "something changed at order 42," it doesn't include the order data. The consumer fetches the current state from a rest A P I.
+This pattern (Stripe's "thin events", GitHub's webhook to rest workflow) avoids the dual-write or payload-staleness problem, if the consumer is slow processing webhooks, what matters is that they eventually fetch and process;
+the webhook payload itself can't be out of date because it doesn't carry state.
+
+Cross-Q²: Webhooks beat polling for low latency. But what's the failure mode polling avoids?-- think --
+
+A: Webhooks fail when the consumer endpoint is unreachable, even with retries, prolonged outages bottleneck the publisher's queue and eventually they suspend the integration.
+Polling fails by the consumer not running, but as soon as they start, they catch up by reading from the publisher's queue with a cursor. Polling has better failure semantics for long outages; webhooks have better steady-state latency.
+Public SaaS (Stripe, GitHub) use webhooks because most consumers are always-on; internal cross-system integration often uses polling because consumer uptime can't be guaranteed.
+
+-- pause --
+Drill 8, Webhook security checklist.
+
+Q: A new webhook endpoint goes to prod tomorrow. What security checks must be in place?-- think --
+
+A: (1) T L S only, HSTS, modern ciphers. (2) Signature verification on every request, HMAC-SHA256 + raw bytes + FixedTimeEquals. (3) Timestamp window, reject events older than 5 minutes. (4) Origin allowlist, accept only the publisher's documented IP ranges (firewall or middleware check).
+(5) Secrets in vault, not in source, not in env vars (Key Vault, Secrets Manager). (6) Rate limit at the edge, even legitimate publishers can have bursts that overwhelm you. (7) Logging without secrets, never log signature header values, never log full body if it contains PII.
+
+Cross-Q: Origin allowlist by IP, what's the risk and is it worth it?-- think --
+
+A: IP allowlists drift, Stripe, GitHub publish their IP ranges but they change. Keeping the allowlist current is operational work; missing an update silently drops legitimate events. Risk if not maintained: events lost during a publisher's IP migration.
+Worth it as defense in depth, not as primary auth, the HMAC signature is the auth, the IP allowlist filters obvious garbage at the edge so your endpoint isn't hammered by drive-by scanners. Don't treat it as your only line of defense.
+
+Cross-Q²: A webhook is replayed within the 5-minute window, signature is valid. What stops it?-- think --
+
+A: Idempotency. Signature + freshness can't tell a "first delivery" from a "replay 4 minutes later", both look identical (same body, same valid signature, both timestamps within window). The dedup store keyed by evt_id is the only defense for in-window replay.
+This is why the three checks compose: (signature) prevents forgery, (timestamp) prevents long-window replay, (idempotency) prevents short-window replay. Removing any one leaves a gap.
+
+-- pause --
+Drill 9, Local webhook testing.
+
+Q: A developer's webhook handler runs on localhost:5000. How do they receive webhooks in development?-- think --
+
+A: Expose localhost via a tunnel, ngrok ( ngrok http 5000 gives a public URL forwarding to local, the old *.ngrok.io free subdomains are gone), cloudflared tunnel, Stripe C L I ( stripe listen --forward-to localhost:5000 or webhooks or stripe signs and forwards Stripe events to local),
+smee.io (a free relay from the Probot community project, not a GitHub product, point your GitHub webhook at smee.io, smee.io forwards to a local client), versus Dev Tunnels in IDE.
+
+Cross-Q: What's the security risk of leaving an ngrok tunnel open?-- think --
+
+A: Anyone with the URL can POST to your local handler, random scanners, port-scrapers, sometimes someone who recognizes the URL pattern.
+Mitigations: (1) Verify the signature in dev exactly as you do in prod, so unsigned drive-by traffic is rejected anyway, (2) Use the Stripe C L I, which only forwards Stripe-signed events, (3) Tear down the tunnel when you're done, most devs leave them running indefinitely.
+
+Cross-Q²: Stripe C L I versus ngrok, when each?-- think --
+
+A: Stripe C L I when you only test Stripe, it bypasses ngrok entirely, uses a long-poll connection to Stripe's A P I, signs events locally with your test webhook secret, and forwards them to localhost. Much simpler, no public URL, no random traffic.
+ngrok when you test multiple publishers or want a real public URL (testing O auth callback URLs, sharing a dev site with a designer). For Stripe-only dev work, C L I is strictly better; for everything else, ngrok.
+
+-- pause --
+Drill 10, WebSub (hub model).
+
+Q: How does WebSub extend the simple webhook pattern?-- think --
+
+A: WebSub (formerly PubSubHubbub) adds a hub between publisher and subscriber. Publisher pings the hub "I updated"; the hub fans out to all subscribers. Subscribers register with the hub once (with discovery via HTML tag). Used in podcast feeds, blog feeds, ActivityPub.
+Solves: one publisher to many subscribers, where the publisher doesn't want to maintain N webhook configs and N retry loops.
+
+Cross-Q: How is WebSub different from server-side pub or sub (Kafka, Redis pub or sub)?-- think --
+
+A: WebSub is over H T T P, pull-based discovery, push-based delivery, internet-scale. It's designed for cross-organization fan-out (RSS at scale) where subscribers come and go and the publisher doesn't control the infrastructure.
+Kafka or Redis are internal infra, single-org, controlled cluster, lower latency, ordering guarantees, much higher throughput. WebSub trades performance for federation; Kafka trades federation for performance.
+
+Cross-Q²: Why is WebSub mostly absent from modern SaaS (Stripe, GitHub use direct webhooks, not WebSub)?-- think --
+
+A: SaaS publishers want control, over signing keys, retry policy, observability ("which customer's endpoint is failing?"), rate limiting per-subscriber. WebSub abstracts this away through the hub, losing per-subscriber telemetry and policy.
+Direct webhooks let Stripe know exactly when customer X's endpoint started returning 500 seconds and surface that to the customer's dashboard.
+WebSub thrives in federated ecosystems (Fediverse, RSS) where no single org owns the publishers; SaaS thrives on direct delivery where the publisher is the platform.
+
+-- pause --
+Drill 11, Backpressure when consumer can't keep up.
+
+Q: A consumer's endpoint is healthy but slow, webhooks pile up faster than they process. What happens?-- think --
+
+A: The publisher's queue for that consumer grows. If the consumer returns 200 seconds slowly, the publisher's per-customer concurrency limit fills, new events queue, eventually queue depth alerts fire on the publisher side and they may rate-limit or suspend delivery.
+
+Cross-Q: What's the consumer-side fix?-- think --
+
+A: Decouple acceptance from processing. The webhook handler must do almost nothing, verify signature, dedup-check, enqueue to internal Kafka or RabbitMQ or SQS, return 200 in under 100 milliseconds. Internal workers process at their own pace, scale horizontally, retry independently.
+The publisher only sees "delivered" instantly; backpressure happens inside your own infra where you control it. The walkthrough in this chapter is this exact pattern.
+
+Cross-Q²: What if internal queue fills up faster than workers can drain?-- think --
+
+A: Now you're back to backpressure, just one layer in. Solutions in order: (1) Scale workers horizontally, typically the right answer. (2) Process in batches, workers pull 100 events, process in one bulk operation.
+(3) Shed load at the edge, if queue depth > N, return 503 to publisher (Stripe will retry with backoff). (4) Drop low-priority event types if business permits. Avoid: synchronous processing in the webhook handler (you'll cascade-fail), and unbounded queues (you'll OOM the worker pool).
+
+-- pause --
+Drill 12, Versioning webhook payloads.
+
+Q: How do you version webhook payloads as the schema evolves?-- think --
+
+A: Multiple strategies. (1) Version in the event type: payment.succeeded.v2 versus payment.succeeded. Consumers register for the version they understand. (2) Version in the payload: a top-level version field; consumers branch on it.
+(3) Per-endpoint version pinning (Stripe's classic model): the consumer pins their endpoint to a specific dated A P I version; Stripe sends every event in that version's schema until the consumer migrates.
+Pinning is the most consumer-friendly because it doesn't require simultaneous consumer or publisher upgrades.
+
+Cross-Q: How is webhook versioning different from rest A P I versioning?-- think --
+
+A: rest consumers pull on their schedule and pick versions per call. Webhooks push, the consumer's processing window starts the moment the event is sent. If the publisher silently changes the schema, the consumer's parser breaks at runtime with no warning.
+So webhooks need additive-only evolution between minor versions (new optional fields fine, removing fields or changing types breaking) and explicit versioned event types for breaking changes.
+
+Cross-Q²: A consumer ignores the version field and parses with old code. New optional field appears in v2 payloads. What breaks?-- think --
+
+A: Nothing immediately, if the consumer uses lenient Jason parsing ( System.Text.Json defaults to ignoring unknown properties). It breaks when v3 adds a required field, or when v2 adds a new value to an enum the consumer treats as exhaustive (a switch without a default case to ArgumentException ).
+Defenses: (1) always-ignore-unknown-properties on the Jason deserializer, (2) treat enums as open sets ( switch always has a default that logs and falls through to a safe behavior, never throws), (3) integration tests against fixtures of every documented event type.
+
+-- pause --
+Drill 13, At-least-once delivery.
+
+Q: Publishers offer at-least-once delivery. What's the consumer contract this implies?-- think --
+
+A: Every event handler must be idempotent. Re-processing the same event must not produce different observable behavior. This propagates from the webhook handler to every downstream side effect, DB writes, emails, third-party calls.
+The consumer can't push back ("please only deliver once"), the network and publisher infrastructure make exactly-once delivery undecidable in general (Stripe might receive your 200 ack but your DB rollback was after; was the event "delivered"?).
+
+Cross-Q: What about "exactly-once" semantics, when is that actually achievable?-- think --
+
+A: Exactly-once delivery is impossible in distributed systems (two generals problem). Exactly-once processing is achievable if the side effects are transactional with the dedup state.
+Pattern: in one DB transaction, INSERT into processed_events(event_id) with a unique constraint AND apply the side effect. If the constraint violates, transaction rolls back, no side effect, return 200, the dedup of the first try is intact.
+The trick is making the side effect itself transactional with the dedup write; if it spans systems (email + DB), use the outbox pattern.
+
+Cross-Q²: Exactly-once processing requires the dedup state and side effect in the same transaction, what if the side effect is sending an email?-- think --
+
+A: Use the outbox pattern: the transaction writes both the dedup row and an outbox row ( { "type": "send_email", "payload":. } ). A separate worker reads outbox rows and dispatches them, marking each one sent. Email itself isn't transactional, but its intent is now durable.
+If the worker fails mid-send, on restart it sees the outbox row, retries (the email provider must handle dup, often via the worker's own idempotency key).
+Three steps to atomicity: webhook handler writes dedup + outbox in one tx to returns 200 to outbox processor handles the side effect with its own dedup.
+
+-- pause --
+Drill 14, Dual-write problem.
+
+Q: My webhook handler does db.Save(order); publish Webhook(order);. Why is this a problem?-- think --
+
+A: The save and publish aren't atomic. If the process crashes between them, the DB is updated but no webhook fires, your downstream consumers (your own services or third parties subscribed to your webhooks) miss the event permanently.
+Conversely, if the webhook fires before commit and the commit fails, you've notified about an event that didn't happen. This is the dual-write problem, coordinating two systems that don't share a transaction.
+
+Cross-Q: What's the right pattern?-- think --
+
+A: Transactional outbox. The transaction that writes the order also writes an outbox row in the same DB. A background relay reads the outbox and publishes to webhook subscribers (or Kafka, or wherever). The DB transaction is atomic, both rows or neither.
+The publish is best-effort with retries; consumers get at-least-once delivery. This decouples the application's write from the network publish, eliminates the lost-update window, and gives you a retry buffer.
+
+Cross-Q²: Can change-data-capture (change data capture) tools like Debezium replace the outbox?-- think --
+
+A: Yes, for many cases. Debezium reads the DB's transaction log (Postgres write-ahead log, MySQL binlog) and emits Kafka events for every row change. No application code change, the DB itself is the source of truth, and the events are derived from committed transactions.
+Trade-offs: (1) you lose control over event shape, you get raw row changes, not domain events. (2) Schema changes leak (column rename to consumer breaks). (3) Operational overhead of running Debezium. Outbox gives you domain events, change data capture gives you data events.
+Many production setups use Debezium for the transport layer, with the outbox table as the source (so domain events live there, Debezium reads them), best of both.
+
+-- pause --
+Drill 15, Receiver scale (10K events or sec).
+
+Q: Architect a webhook receiver that handles 10K events or second.-- think --
+
+A: (1) Edge tier (stateless): A S P dot NET handlers behind a load balancer. Their only job is verify signature + dedup-check + enqueue + return 200. Each handler should complete in <50 milliseconds.
+Scale horizontally, 10K rps over 50 milliseconds is 500 concurrent operations, comfortably under what one pod handles.
+(2) Internal broker: Kafka or SQS with partitioning by event type or customer ID. (3) Workers: consumer group on the broker, scale horizontally based on lag. Use bulk processing where business logic allows.
+(4) Dedup store: Redis (in-memory, sub-millisecond) for the hot dedup check, with a T T L of 7 days. Promoted to a persistent DB unique-index for the durability-critical dedup at processing time.
+
+Cross-Q: What's the bottleneck first to hit, and how do you know?-- think --
+
+A: Usually the dedup store. At 10K rps the hot Redis takes the brunt, every event hits it. Track p99 latency on the dedup lookup; if it climbs 5 milliseconds, Redis is the limit. Scale: Redis cluster, sharding by evt_id hash.
+If the dedup store is fine, next bottleneck is typically the verifier's HMAC compute (10K HMACs or sec times ~1KB body is real C P U, but one core handles much more, so it's rarely first). After that, the internal broker's ingestion rate, then worker scaling.
+
+Cross-Q²: 10K events or sec for 7 days = 6 billion dedup keys. How do you size storage?-- think --
+
+A: With T T L, the steady-state working set is ~6 billion keys. Redis stores each key + tiny value at ~100 bytes, so ~600GB, too much for a single Redis instance. Solutions: (1) Shard Redis across N instances by evt_id hash.
+(2) Tiered: hot cache in Redis for recent keys (last hour, ~3.6M keys), cold check in a partitioned table in Postgres or DynamoDB for older keys.
+(3) Bloom filter as a fast-no-false-negative pre-check, Bloom says "definitely not seen" to skip the deeper lookup (rare), Bloom says "maybe seen" to check the real store. A 10-billion-key Bloom filter at 1% FP rate is ~12GB, fits in memory.
+The Bloom filter cuts ~99% of dedup lookups before they hit storage.
+
+-- pause --
+Section 2. Self-test.
+
+The signature is HMAC over the exact bytes the publisher sent. Any re-serialization, JsonSerializer.Serialize(JsonSerializer.Deserialize(body)), changes whitespace, key ordering, escape sequences, and trailing newlines. Even semantically-identical Jason produces a different hash.
+In A S P dot NET Core, capture the raw bytes via request.EnableBuffering() + StreamReader.ReadToEndAsync() before model binding, hash that exact string, then deserialize the same string for application use. Order matters: verify, then deserialize.
+
+Good, 5xx tells the publisher "transient; please retry," exactly the semantics you want. The publisher has its own retry schedule (typically exponential over hours) which buys you time to recover.
+The opposite mistake is returning 200 because "I didn't crash", the publisher considers the event delivered and never retries. Reserve 4xx for requests you refuse outright (bad signature, malformed body).
+Don't expect the 4xx to end the retries, though: Stripe retries any non-2xx, so an event you can never process (unknown type, tenant deleted) should get a 2xx and a durable log instead.
+
+The timestamp + signature combination prevents tampering, but a captured webhook (for example, from a misconfigured proxy log or compromised endpoint earlier) is still cryptographically valid forever, the signature doesn't expire.
+Rejecting old timestamps prevents replay attacks where an attacker collects valid webhooks and floods your endpoint hours or days later. 5 minutes is the standard window: long enough to tolerate clock drift between Stripe and your server, short enough that capture-and-replay isn't useful.
+
+It conflates acceptance with completion. Real processing, DB writes, email, downstream A P I calls, can take seconds or fail transiently.
+If you wait, the publisher times out (GitHub records a failure once you take longer than 10 seconds; Stripe doesn't publish a figure, but it is seconds, not minutes) and retries, often before your processing finishes, now you have concurrent processing of the same event.
+The right separation: webhook handler accepts, persists the event, returns 200; an internal worker does the actual work with its own retry or error handling. Event acceptance and event processing have different reliability requirements; coupling them creates the worst of both.
+
+Two layers: (a) H T T P layer, idempotency store keyed by evt.Id returning the original response on dup; (b) Application layer, when the worker processes, it uses a INSERT. WHERE NOT EXISTS (or INSERT.
+ON CONFLICT DO NOTHING ) on a processed_events(event_id) unique index in the same transaction as the charge.
+If two workers race past the H T T P dedup (for example, across instances), the DB constraint serializes them, only one INSERT succeeds; the other gets a unique-constraint violation and short-circuits without charging.
+The H T T P layer is fast common-path; the DB constraint is the safety net that makes correctness independent of distributed-cache freshness.

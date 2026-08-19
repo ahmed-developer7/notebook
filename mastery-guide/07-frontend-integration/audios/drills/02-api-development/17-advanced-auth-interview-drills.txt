@@ -1,0 +1,323 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, DPoP versus bearer.
+
+Q: What specific attack does DPoP prevent that plain bearer tokens don't?-- think --
+
+A: Token replay by an attacker who exfiltrated the access token. A bearer token is "whoever has it can use it", steal it from local Storage, network capture, leaked log line, the attacker can call A P Is as the victim.
+DPoP binds the token to a key the client holds; every request must include a J W T proof signed by that key. Stolen token alone is useless without the key.
+
+Cross-Q: Where does the DPoP private key live, and can the attacker steal it too?-- think --
+
+A: In a browser: in IndexedDB via the WebCrypto A P I as a non-extractable key (the JS code can sign with it but can't read the raw key bytes). On mobile: in the secure enclave (iOS Keychain, Android Keystore) backed by hardware.
+If the attacker has the key, DPoP is defeated, but exfiltrating a non-extractable WebCrypto key requires either compromising the browser process itself (much harder than reading local Storage) or compromising the operating system (where they already have everything).
+The attack surface shrinks dramatically.
+
+Cross-Q²: An attacker has full XSS on your page, they can call your DPoP-protected endpoints by signing proofs in the victim's browser. Does DPoP help in that case?-- think --
+
+A: Only partially. With full XSS the attacker can call endpoints as long as the victim's browser is open, the JS runs and signs DPoP proofs.
+But DPoP still prevents offline / replay-from-elsewhere abuse: the attacker can't take the captured tokens and use them from their own machine in another country, can't replay them tomorrow, can't sell them on dark markets.
+The "active attack while page is open" scenario is bounded; the "exfiltrate once, abuse for hours" scenario is killed. Combined with short token lifetimes (5 min), the live window shrinks further. DPoP is a depth layer, not a silver bullet, also fix the XSS.
+
+-- pause --
+Drill 2, O auth 2.1 versus 2.0.
+
+Q: What's been removed in O auth 2.1 versus 2.0?-- think --
+
+A: (1) Implicit flow, tokens in URL fragment leak via history, referrer, and screen recording; no PKCE possible. (2) Resource Owner Password Credentials (ROPC), client collects password, defeating the entire point of federated auth. Both removed.
+
+Cross-Q: What's been added or required?-- think --
+
+A: (1) PKCE mandatory for all clients including confidential, defense-in-depth against leaked secrets. (2) Bearer tokens in URL query parameters forbidden, body or header only. (3) Refresh tokens for public clients must be sender-constrained OR rotated, leak resistance.
+(4) Security BCP guidance folded in, the Security BCP (published as RFC 9700 / BCP 240 in January 2025) is folded into the 2.1 draft rather than left as separate advice.
+Be precise here: 2.1 is still a draft, so RFC 9700 is the published document to cite, and it is the Security BCP specifically, other O auth BCPs remain separate documents.
+
+Cross-Q²: Your legacy app uses ROPC to integrate with a partner that requires it. What's the realistic migration?-- think --
+
+A: Two paths. (1) Replace with auth-code flow + custom U X, if the partner controls the user, route them through their standard login. (2) Replace with client credentials flow, if the partner is a service (not a user), use M2M tokens; no user password ever travels.
+The reality: many enterprises still have ROPC in flight in 2026 because partners haven't modernized. Mitigations: rate-limit and monitor ROPC endpoints aggressively, require MFA via a side-channel, and put a hard sunset date in writing.
+ROPC is the O auth equivalent of plaintext FTP, works, but treat as legacy on borrowed time.
+
+-- pause --
+Drill 3, FAPI.
+
+Q: What is FAPI and when is it required?-- think --
+
+A: FAPI (Financial-grade A P I) is an OpenID Foundation profile of O auth or OIDC for high-value or regulated A P Is. Required when: integrating with banks (UK Open Banking PSD2, Brazil Open Banking, Australia CDR), or building systems where regulators specify FAPI compliance.
+FAPI 2.0 is the current version, aligned with O auth 2.1.
+
+Cross-Q: What does FAPI 2.0 mandate over plain O auth 2.1?-- think --
+
+A: (1) Sender-constrained tokens, DPoP or mutual T L S required, not optional. (2) PAR (Pushed Authorization Requests), auth requests pushed server-to-server, not built in browser URL. (3) private_key_jwt or mutual T L S client auth, client_secret_basic forbidden.
+(4) Restricted signing algorithms, no HS256, no RS256; PS256 and ES256 are the usual choices. (5) Strict redirect URI matching, no wildcards.
+Worth saying out loud what 2.0 dropped: signed request objects (JAR) were mandatory in FAPI 1.0 Advanced, but the FAPI 2.0 Security Profile doesn't require them, they moved to the optional Message Signing profile, which exists for non-repudiation.
+
+Cross-Q²: You're building a non-banking app but partners ask "are you FAPI compliant?" Should you adopt FAPI?-- think --
+
+A: Selectively. FAPI is expensive, DPoP keypair management per client, PAR server, mutual T L S infrastructure. If you don't need the full profile, don't adopt it whole, pick the relevant pieces: DPoP for stolen-token defense, PAR for auth-request integrity.
+Tell partners: "We implement DPoP-bound tokens, PAR-protected auth, and private_key_jwt client auth, a FAPI 2.0 subset." That's honest and gives them the security guarantees they care about without paying for the full bank-compliance overhead.
+Don't claim FAPI compliance without doing the full profile, auditors check.
+
+-- pause --
+Drill 4, Introspection versus J W T validation.
+
+Q: When do you choose token introspection (RFC 7662) over local J W T validation?-- think --
+
+A: When real-time revocation matters more than per-request latency.
+Introspection POSTs the token to the AS on every call (or with caching), the AS is the source of truth for "is this token still active?" J W T validation is sub-milliseconds local crypto but can't see revocation until the token expires.
+
+Cross-Q: Concrete scenarios where introspection's network cost pays off?-- think --
+
+A: (1) Employee termination at a bank, when HR fires someone, their tokens must die immediately, not in 5-15 minutes.
+(2) HIPAA-regulated healthcare, compliance often requires "immediate access termination on incident." (3) B2B partner that gets banned, a partner whose contract is voided shouldn't have a usable token for the next hour.
+(4) Opaque tokens, random-string tokens have no payload to J W T-validate; introspection is the only path.
+
+Cross-Q²: Introspection adds a network round-trip per call. How do you reduce the load on the AS without losing revocation freshness?-- think --
+
+A: Short-T T L cache on the resource server. Cache the introspection response keyed by the token hash for 1-5 seconds. Common path: the cache hits and you skip the network call. After the T T L, you re-introspect, so revocations propagate within the T T L.
+The trade is "5-second window where a revoked token might still work", far better than 15-minute J W T expiry, but with massively less AS load. Many large deployments use 5-second cache TTLs. For ultra-sensitive ops, skip the cache and introspect every call.
+
+-- pause --
+Drill 5, Refresh-token rotation with reuse detection.
+
+Q: A refresh token gets stolen. The legitimate client and the attacker both try to refresh. What does reuse detection catch?-- think --
+
+A: When the AS sees R1 used after R2 was issued (R1 should have been invalidated when R2 was minted), it knows one of two parties is an attacker. Both legitimate clients and attackers only see their latest token; whoever uses the old one is replaying.
+The AS response: invalidate the entire token family, R2, R3, all descendants. Both parties lose access; the legitimate user must re-authenticate.
+
+Cross-Q: Couldn't an attacker race the legitimate client and refresh first, taking over the family?-- think --
+
+A: They could win the refresh, but then they hold R2 and the legitimate client holds R1. The next time the legitimate client refreshes (which they will, since their access token expired), they present R1, the AS detects reuse and kills the family.
+So the attacker's win is short-lived; they can't sustainably use the family without re-stealing each new token. Combined with short access-token lifetimes (5-15 min), the attack window shrinks to one refresh cycle.
+
+Cross-Q²: Reuse detection works when the AS sees both attempts. What if the attacker uses only the old token and never lets the legitimate client refresh?-- think --
+
+A: The attacker controls the refresh cadence, they refresh every 5 minutes, keep getting new access tokens, the legitimate client never gets a chance to present R1.
+Mitigations: (1) the legitimate user notices ("I'm logged out", they re-login and the security team gets alerted to potential compromise); (2) anomaly detection, same refresh token used from new IP or UA or geography triggers a step-up challenge or kills the family proactively;
+(3) device-bound refresh tokens, tie the token to a device fingerprint, alert on mismatch.
+Reuse detection alone isn't sufficient; it's one of multiple layers.
+
+-- pause --
+Drill 6, mutual T L S for service-to-service.
+
+Q: When do you use mutual T L S over J W T for service-to-service?-- think --
+
+A: When (a) you need transport-level identity (the cert proves the caller is service X without any application logic), (b) regulatory requirements demand mutual T L S, (c) the consumer is a long-lived service (cert rotation cycles work fine),
+and (d) you want defense-in-depth with J W T plus connection-level cert.
+
+Cross-Q: mutual T L S has cert provisioning and rotation overhead. J W T has signing-key rotation overhead. Aren't they equivalent?-- think --
+
+A: Different threat models. mutual T L S authenticates the T L S connection itself, the cert is presented during handshake before any H T T P traffic. J W T authenticates application-level requests, anyone who can connect can send any J W T.
+mutual T L S gives you "this connection is from service X"; J W T gives you "this request claims identity Y." mutual T L S is harder to forge (requires the private key during connection establishment) and harder to log accidentally (cert thumbprints, not bearer secrets).
+For high-trust service mesh, mutual T L S at the connection + J W T at the request layer is the senior pattern.
+
+Cross-Q²: Service mesh (Istio, Linkerd) does mutual T L S automatically between services. Why would you also do J W T?-- think --
+
+A: Different identity layers. mutual T L S proves "this connection is from service A", service identity. J W T carries the user identity that originally initiated the request chain.
+Service A calling Service B with a J W T containing sub:
+alice says "service A, acting on behalf of user alice, is calling B." Without the J W T, B knows "A called me" but not "for whom." For auditing, authorization (B may grant different permissions per user), and impersonation tracking, you need both.
+Standard pattern: mesh handles connection-level mutual T L S; app code propagates the user J W T.
+
+-- pause --
+Drill 7, Step-up authentication.
+
+Q: A user logged in with password 2 hours ago and now wants to wire $50K. What happens?-- think --
+
+A: The wire endpoint checks the access token's acr claim and finds the value its AS uses for password-only authentication ( pwd here). It requires the stronger value ( mfa here).
+The endpoint returns 401 Unauthorized with WWW-Authenticate: Bearer error="insufficient_user_authentication", acr_values="mfa". The client redirects the user to /authorize?. and acr_values set to mfa. The AS forces MFA / biometric / hardware key. New tokens come back with updated acr.
+Client retries the wire.
+Say out loud that these strings are deployment-defined, there is no standard ACR ladder to quote, so name whichever values your AS actually publishes.
+
+Cross-Q: How does the AS know which methods satisfy mfa ?-- think --
+
+A: The AS has policy mapping each ACR value it publishes to a set of authentication methods, here, pwd = password only, mfa = password plus a phishing-resistant second factor (WebAuthn or FIDO2).
+The mapping is internal to the AS; the resource server only specifies the value it requires and trusts the AS to honor it. The amr claim then lists the actual methods used: ["pwd", "fido"], useful for auditing.
+
+Cross-Q²: A user keeps getting prompted for step-up on every $50K wire, annoying. How do you balance security and U X?-- think --
+
+A: Time-bound the elevation. After step-up, issue a token with acr: mfa valid for the next 10 minutes (or for the next N operations). Subsequent wires within that window don't re-prompt. After expiry, the next high-value op triggers step-up again.
+Configure the window based on operation value and customer risk profile, small wires (under $10K) might get a longer window than wire-to-new-recipient. This is standard banking U X: enter MFA once at the start of a "session" of high-value ops, not on every click.
+
+-- pause --
+Drill 8, J W T signature stripping ( alg: none ).
+
+Q: An attacker forges a J W T with header {"alg":"none"} and no signature. How does a vulnerable validator accept it?-- think --
+
+A: Some libraries (especially older ones) accept alg: none as a valid algorithm, the spec defines it for unsecured JWTs. If the validator's "verify" function trusts the header's alg without explicit allow-listing, it accepts any token with alg: none as authenticated.
+The attacker forges a token with any claims, signs it as "none," and the validator accepts.
+
+Cross-Q: What's the defense?-- think --
+
+A: Allow-list the algorithm explicitly. Never trust the header's alg. In dot NET: ValidAlgorithms = new[] { "RS256", "PS256", "ES256" } on TokenValidationParameters. The library validates the token's alg is in the allow-list before verifying signature.
+alg: none is never in any production allow-list.
+Same for accepting HS256 when the issuer should use RS256, that's the "algorithm confusion" attack (use the public key as HMAC secret).
+
+Cross-Q²: A second class of attack: an attacker submits a token with alg: HS256 and kid pointing to a signing key. The validator uses the RSA public key as the HMAC secret. What's the attack?-- think --
+
+A: Algorithm confusion. The public RSA key is public, attacker has it. They forge a token with alg: HS256, sign it using the public key as the HMAC secret.
+A naïve validator does "look up key by kid to use that key with the alg specified in the token", so it uses the public key as an HMAC key and verifies the signature. Forged token accepted.
+Defense: allow-list alg: RS256 (or whatever the issuer signs with), and validate that the key in the JWKS is keyed to the right algorithm. Modern libraries handle this; older ones (especially pre-2017 PHP or Node libraries) didn't.
+
+-- pause --
+Drill 9, PKCE.
+
+Q: What attack does PKCE prevent?-- think --
+
+A: Authorization code interception. In the auth-code flow, the AS sends a code via redirect to the client. On mobile (custom URL schemes) or in any compromised network path, an attacker could intercept the code and redeem it for tokens.
+PKCE binds the code to a secret (code_verifier) the legitimate client knows; the attacker has the code but not the verifier.
+
+Cross-Q: Why is PKCE mandatory for confidential clients too in O auth 2.1, given they have a client_secret?-- think --
+
+A: Defense-in-depth. Client secrets leak, env-var dumps, git accidents, C I C D pipeline exfiltration, log captures, container metadata SSRF. Without PKCE, an intercepted authorization code + the leaked client secret = full token issuance.
+PKCE adds a per-request secret known only to the legitimate client process at exchange time. Cost: one SHA-256 hash. Benefit: a leaked long-lived secret no longer maps to live token issuance.
+
+Cross-Q²: What's code_challenge_method set to plain and why is it bad?-- think --
+
+A: plain means code_challenge = code_verifier (no hashing). If the auth URL leaks (browser history, referrer), the verifier is in the URL, defeats the entire purpose. The AS can implement PKCE in plain mode for backward compat, but every modern client should use S256 (SHA-256 hash).
+O auth 2.1 explicitly recommends S256; many ASes now reject plain entirely.
+
+-- pause --
+Drill 10, J W T in cookie versus Authorization header.
+
+Q: For a browser SPA, do you put the J W T in a cookie or send via Authorization: Bearer ?-- think --
+
+A: Modern best practice: neither in the SPA itself, use the B F F pattern. SPA gets a session cookie (http Only, Secure, SameSite set to Lax); the B F F backend holds the actual tokens and forwards calls to A P Is with the right token.
+If you must store tokens in the browser: http Only + Secure cookies if your CSRF protection is solid; never local Storage (XSS reads it).
+
+Cross-Q: HttpOnly cookies protect against XSS reading the token, but introduce CSRF. How do you defend?-- think --
+
+A: (1) SameSite set to Lax (or Strict), modern browsers won't send the cookie on cross-site POST. (2) Anti-CSRF tokens, server includes a per-request token in HTML, JS includes it in X-CSRF header; server validates.
+(3) Custom request headers, many CSRF attacks can't set custom headers ( X-Requested-With: XMLHttpRequest ) without cores preflight. Layered.
+The B F F pattern subsumes all of this, tokens never leave the server, so the only attack surface is session hijack of the cookie, defended by http Only + SameSite.
+
+Cross-Q²: A team puts J W T in local Storage "for simplicity." What's the realistic threat model?-- think --
+
+A: Any XSS, even a third-party script loaded by a teammate, a compromised npm dependency, an XSS in a single forgotten input, reads the token. The attacker uses the token from their server for as long as it's valid. Token expiry of 5-15 min is the only mitigation; reuse detection on refresh helps.
+But the attacker can also exfiltrate the refresh token if it's also in local Storage. The whole class of vulnerability (one XSS = full account compromise) is structural to local Storage tokens.
+HttpOnly cookies move you to "session compromise requires either stealing the cookie session, which requires more than XSS, or compromising the browser process itself." Massively better posture.
+
+-- pause --
+Drill 11, OpenID Connect Discovery.
+
+Q: What's /.well-known or openid-configuration and why does it matter?-- think --
+
+A: The OIDC discovery endpoint. The AS publishes a Jason document at describing its capabilities: authorization_endpoint, token_endpoint, jwks_uri, issuer, scopes_supported, response_types_supported, grant_types_supported, et cetera
+Clients use this to bootstrap: fetch once at startup, then know where to send auth, where to redeem tokens, where to fetch keys.
+
+Cross-Q: What's the security implication of trusting the discovery doc?-- think --
+
+A: Critical. The discovery doc tells your client what jwks_uri to fetch signing keys from, if an attacker MITMs the discovery fetch, they can redirect to attacker-controlled JWKS, then mint tokens with their own keys that validate.
+Defense: pin the issuer URL (H T T P S, verify cert chain) and verify the issuer field in the doc matches what you expected. A S P dot NET Core's Microsoft.Identity.Web does this automatically; if you're rolling your own, ensure pinning.
+
+Cross-Q²: How often does the client refetch the discovery doc?-- think --
+
+A: Default: cache it for the application lifetime, or refresh on a slow interval (24 hours). The discovery doc rarely changes. JWKS (signing keys) refreshes more aggressively, typically every 1 hour, or on demand when a token presents a kid not in the current cache.
+The pattern: long cache for discovery, shorter cache for keys, refresh-on-demand for unknown keys. Microsoft.Identity.Web and Duende handle this.
+
+-- pause --
+Drill 12, JWKS endpoint and key rotation.
+
+Q: How does an IdP rotate J W T signing keys without breaking issued tokens?-- think --
+
+A: Both old and new keys are published in JWKS during a transition window. New tokens are signed with the new key (header kid references it); old tokens (issued before rotation) still validate against the old key in JWKS. After the longest token lifetime expires, the old key is removed from JWKS.
+Resource servers fetching JWKS during the window see both keys; everything just works.
+
+Cross-Q: How long should the transition window be?-- think --
+
+A: At minimum, the maximum token lifetime, typically 1 hour for access tokens or 24+ hours for ID tokens. Common pattern: rotate keys monthly, leave the old key in JWKS for 7 days after rotation.
+This way any token issued before rotation has a comfortable validation window even if some clients have long-lived tokens. Don't quote a fixed cadence for Microsoft Entra ID, the old "every 6 weeks" figure is stale guidance.
+Current Microsoft guidance is that signing keys can roll at any time without announcement, so clients must be able to refresh JWKS on demand (cache the keys, but refresh when a kid you don't recognise turns up). Many private IdPs rotate quarterly.
+
+Cross-Q²: An attacker compromises a signing key. How do you respond?-- think --
+
+A: Three actions. (1) Generate new key, publish in JWKS, switch issuer to it, new tokens go out with the new key. (2) Remove compromised key from JWKS immediately, every existing token signed with it is now invalid (forces re-login for active users).
+(3) Roll the long-lived tokens, invalidate any refresh tokens that may have been issued during the compromise window (token reuse detection helps here). The user impact is severe (everyone re-logs in) but the security imperative is clear.
+Many IdPs don't make key revocation easy, that's why HSM-backed keys (where the private key never leaves hardware) are preferred for production.
+
+-- pause --
+Drill 13, Audience validation.
+
+Q: What does the aud claim represent and what should validation check?-- think --
+
+A: aud (audience) identifies the intended recipient(s) of the token, typically the A P I or resource server. Validation: this token was issued for me (matching my expected audience identifier). Format: a string or array of strings.
+Standard practice: every resource server has a stable audience identifier (for example, api://orders-api ), and validates aud == "api://orders-api" (or includes it for multi-audience tokens).
+
+Cross-Q: Without audience validation, what's the attack?-- think --
+
+A: Cross-audience token replay. An attacker obtains a legitimate token for a low-trust A P I (for example, api://comments ), perhaps by signing up themselves and getting a token. They present that token to a high-trust A P I ( api://payments ).
+If payments doesn't validate audience, it sees a valid signature from a trusted IdP and accepts. The attacker has elevated from "can post comments" to "can move money" using nothing but a low-trust token. Always validate audience.
+
+Cross-Q²: What if the token has aud: ["api://payments", "api://orders"], is that OK?-- think --
+
+A: It means "this token is intended for both." The payments A P I and the orders A P I are both valid recipients. The danger: an attacker who gets such a multi-audience token from the orders A P I context can present it to payments.
+Validation must check "my audience is one of the audiences in the array", and accept it. Multi-audience tokens are a design choice: if you have services that genuinely share trust (a tightly-bound family of microservices), multi-aud is convenient.
+For cross-trust-boundary, separate-audience tokens are safer (one per A P I), limits blast radius.
+
+-- pause --
+Drill 14, Scope versus role in O auth.
+
+Q: When do you use scope versus role in an O auth token?-- think --
+
+A: Scope = what the client (application) is allowed to do, represents the delegated permissions. The user consented to "this app can read orders" to token has scope: orders.read. Role = what the user is allowed to do, represents the user's authorization within the system.
+The user is an admin to token has roles: ["admin"]. Resource servers check both: "does this token's scope allow this operation AND does this user's role allow it?"
+
+Cross-Q: An admin user opens a third-party app that requested only orders.read scope. They want to delete an order. Should the app be allowed?-- think --
+
+A: No. The user is an admin (role permits delete), but the app was only granted orders.read scope.
+The user delegated read-only access to this app; they didn't say "act with my admin powers." The resource server enforces scope-first: "does this token's scope permit delete?" If no, reject, regardless of the user's role.
+Scope is the upper bound of what the app can do; role narrows further within that bound. This separation is why scope-and-role both matter.
+
+Cross-Q²: A common mistake: putting roles in the scope claim ( scope: orders.admin ). What goes wrong?-- think --
+
+A: You conflate two orthogonal things. Now you can't have "an admin user using a read-only app", the role bleeds into the scope. You also lose the ability to consent meaningfully ("Grant this app orders.admin " sounds like a permission upgrade, not delegation).
+Worse: roles change (someone gets promoted); now their old tokens have stale role-in-scope, and you can't easily re-grant. Keep scope = app perms, role = user perms, in separate claims. Validate both at the resource server.
+
+-- pause --
+Drill 15, Federation with multiple IdPs.
+
+Q: Your app needs to support sign-in via Entra ID, Google, and your corporate IdP. How do you architect?-- think --
+
+A: Federated IdP via a single internal AS (for example, Duende IdentityServer). The internal AS is your sole token issuer; it federates to external IdPs as identity providers.
+Users pick "Sign in with Google" to redirect to Google to Google returns identity to internal AS issues its own token to your app.
+Your app only ever trusts the internal AS, single audience, single issuer, single signing key. The external IdP is a detail of how the user authenticated, surfaced via idp claim.
+
+Cross-Q: Why not let your app trust multiple IdPs directly (Entra ID, Google) and skip the internal AS?-- think --
+
+A: Cost spirals. Now your app validates tokens from N IdPs, N JWKS to fetch, N audiences to match, N issuers to allow-list, N sets of claims to normalize. When a new partner shows up with another IdP, you change code.
+Worse: each IdP has its own quirks (Google's email_verified claim semantics versus Microsoft's, et cetera). The internal AS centralizes: it knows the quirks of each external IdP, normalizes claims (always emit email, sub, name ), and your app only validates one issuer.
+The pattern scales linearly with apps, not with IdPs times apps.
+
+Cross-Q²: A corporate customer demands their employees authenticate via their corporate IdP only, not via Google or Entra ID. How do you support tenant-specific IdPs?-- think --
+
+A: Tenant configuration in the internal AS. Each tenant has a "home IdP" configured; when a user from acme.com signs in, the AS detects the tenant (from email domain or subdomain) and redirects them straight to Acme's IdP, Google and Entra ID aren't shown for Acme users.
+Generic users (no specific tenant binding) see all IdP options. This is multi-tenant federation with tenant-scoped IdP discovery, Auth0, Okta, Entra ID External Identities, and Duende all support this pattern.
+
+-- pause --
+Section 2. Self-test.
+
+Defense-in-depth. Client secrets leak, env-var dumps, git accidents, log captures, container metadata SSRF, C I C D pipeline exfiltration. Without PKCE, an intercepted authorization code + the leaked client secret = full token issuance.
+With PKCE, the attacker also needs the per-request code_verifier known only to the legitimate client process at exchange time. The cost is one SHA-256 hash; the benefit is that a leaked long-lived secret no longer maps to live tokens.
+O auth 2.1 made it universal because the cost-benefit is overwhelmingly in favor.
+
+When real-time revocation matters more than throughput. Banking: a fired employee's tokens must die immediately; introspection sees the revoke instantly while J W T-with-short-expiry leaves a 5-15 minute attack window.
+Healthcare: HIPAA compliance often requires "immediate access termination on incident." High-value B2B integrations: token compromise must be containable in seconds, not minutes.
+The hybrid pattern is common: J W T-validate the common path; introspect on sensitive endpoints, on session changes, or with a short-T T L Redis cache of the introspection response (1-5 seconds) to amortize the auth-server load.
+
+Without reuse detection, an attacker who steals refresh token R1 can race the legitimate client. Whoever calls /token first wins R2; the loser is locked out and the attacker happily continues refreshing.
+Reuse detection flips this: when the auth server sees R1 used after R2 was issued, it knows one of the two parties is an attacker (legitimate clients only see their newest token). The conservative response is to invalidate the entire token family, kill R2, R3, all descendants.
+The legitimate user is forced to re-authenticate (annoying), but the attacker is also locked out. Reuse detection turns the win condition from "race the user" to "you can't win without locking yourself out."
+
+Classic O auth puts every auth-request parameter in the user's browser URL: scope, redirect_uri, code_challenge, state, response_type. That URL ends up in browser history, referrer headers (some browsers send Referer even on cross-origin redirect), proxy logs, screen recordings.
+Worse, a malicious browser extension or in-page script can read and tamper with parameters before submission. PAR sends the parameters server-to-server (with client authentication), gets back an opaque request_uri, then the browser only ever sees GET /authorize?request_uri set to urn:.:abc123.
+The actual parameters never touch the browser, so they can't be read, tampered with, or logged at intermediaries. Mandatory in FAPI 2.0; recommended for any high-value authorization in O auth 2.1.
+
+Client calls POST /transfers with the access token. Resource server inspects the token's acr claim, finds pwd (password only). The transfer endpoint requires mfa (multi-factor). Those two strings are this deployment's own ACR labels; there is no standard ladder.
+Resource server returns 401 Unauthorized with WWW-Authenticate: Bearer error="insufficient_user_authentication", acr_values="mfa". The client's O auth library catches the 401, redirects the user to /authorize?. and acr_values set to mfa.
+The auth server forces a fresh authentication step, biometric, hardware key, push-notification approval. New tokens come back with updated acr set to mfa. Client retries the original POST /transfers; resource server now sees sufficient acr and processes.
+The user only sees friction on the high-value action, not on every login, that's the design goal.

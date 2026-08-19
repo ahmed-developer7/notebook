@@ -1,0 +1,307 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, The N plus one problem.
+
+Q: What is the N plus one problem in graph Q L and how does DataLoader fix it?-- think --
+
+A: A root resolver returns N parents (for example, 50 orders), and each parent has a nested resolver ( customer { name } ) that issues its own DB query to 1 + N queries.
+DataLoader collects all LoadAsync(id) calls within an execution tick, fires one batched query ( WHERE Id IN (.) ), and dispatches results back to each waiting resolver. 51 queries collapse to 2.
+
+Cross-Q: What's the difference between DataLoader and HotChocolate's [UseProjection] ?-- think --
+
+A: DataLoader is data-source agnostic, works for EF, rest A P Is, G R P C, Redis. It batches by key. [UseProjection] is EF-only: it inspects the graph Q L selection and folds it into one sequel query with the right Include / Select.
+Projection is more efficient when the whole subtree is EF-backed; DataLoader is needed when you cross sources. They compose, project the EF subtree, DataLoader the cross-source fields.
+
+Cross-Q²: A DataLoader is used but N plus one still happens. What's the most common cause?-- think --
+
+A: Per-request scope is wrong. DataLoader must be scoped to one graph Q L execution, if registered as a singleton, every concurrent request shares cached keys (correctness bug) and batching windows collide.
+If registered as transient, each resolver call gets a fresh DataLoader and batching never happens (perf bug). HotChocolate scopes DataLoaders to the execution automatically, declare the DataLoader as a resolver parameter and the framework hands you the per-request instance.
+Manual new CustomerByIdDataLoader(.) in a resolver defeats the framework's batching.
+
+-- pause --
+Drill 2, Query versus Mutation versus Subscription.
+
+Q: What's the semantic difference between the three operation types, and how does the runtime enforce it?-- think --
+
+A: Query = read-only, idempotent, runs resolvers in parallel. Mutation = write, runs roots serially (spec-mandated) so clients can chain side effects. Subscription = long-lived stream (one operation, many emissions) typically over WebSocket.
+
+Cross-Q: Why are mutations serial but queries parallel?-- think --
+
+A: Queries have no observable order dependency, reading order A and order B in parallel produces the same result either way. Mutations are state changes; clients depend on ordering ( create User to update Profile to send Invite ).
+If the spec allowed parallel mutations, identical client code would produce different outcomes depending on resolver timing. Serial mutations make the contract deterministic across implementations.
+
+Cross-Q²: Can I cheat and do writes inside a query resolver?-- think --
+
+A: The engine won't stop you, but you've broken the contract clients rely on. Caches (Apollo Cache, H T T P-level persisted-query C D N) treat queries as safe-to-replay; writes inside queries get double-executed. Idempotent reads can be GET-cached and prefetched.
+Anything mutating belongs in Mutation, even if it makes the A P I "feel" worse, the contract integrity is worth more than the elegance.
+
+-- pause --
+Drill 3, Schema federation versus schema stitching.
+
+Q: Apollo Federation versus schema stitching, what's the difference?-- think --
+
+A: Stitching (older), a gateway pulls multiple schemas and merges them, with manual conflict resolution and link-field hooks.
+Federation (newer), each subgraph declares ownership via directives ( @key, @external, @requires, @provides ); a federated gateway plans queries across subgraphs automatically. Federation is the production pattern in 2026.
+
+Cross-Q: In Federation, what does @key(fields: "id") actually do?-- think --
+
+A: It marks id as the entity's primary identifier for cross-subgraph resolution. When subgraph A returns an Order and subgraph B extends Order with a payment field, the gateway issues a follow-up call to subgraph B with _entities(representations: [{ __typename: "Order", id: "42" }]).
+B's __resolveReference then loads its Order slice using just the key. Without @key, the gateway has no way to ask "give me this entity by ID across boundaries."
+
+Cross-Q²: Why does Federation suffer from the N plus one problem at the gateway, and how is it fixed?-- think --
+
+A: For each parent entity returned by subgraph A, the gateway calls B's _entities. Naive implementation = one call per entity.
+Federation v2 uses representation arrays, the gateway batches all keys into a single _entities call: representations: [{__typename:"Order", id:"1"}, {__typename:"Order", id:"2"},.]. B's __resolveReference receives the batch and must DataLoader-batch internally too.
+Both layers (gateway-to-subgraph and subgraph-to-DB) need batching; missing either reintroduces N plus one.
+
+-- pause --
+Drill 4, Persisted queries.
+
+Q: What problem do persisted queries solve?-- think --
+
+A: Two at once:
+performance (clients send a short hash instead of a full query body, smaller payloads, GET-cacheable URLs, C D N-friendly) and security (server rejects any query whose hash isn't in the registry, eliminates arbitrary-query DoS and limits the attack surface to known-vetted operations).
+
+Cross-Q: How does APQ (Automatic Persisted Queries) differ from manually registered persisted queries?-- think --
+
+A: APQ is opportunistic, the client sends a hash first; on a miss the server replies "PersistedQueryNotFound," the client re-sends with the full query body, server caches it under the hash. Good for dev velocity, but the cache is best-effort and arbitrary queries still execute.
+Registered persisted queries are part of the build, the client bundle ships with a hash manifest, the server has a fixed allowlist, anything outside it is rejected. Registered is the security control; APQ is the convenience optimization.
+
+Cross-Q²: Persisted queries are deployed but a C D N still caches nothing. Why?-- think --
+
+A: The client is still sending POST /graphql with the hash in the body, and CDNs don't cache POSTs by default. The fix is to flip to GET requests with the hash + variables in the query string ( GET /graphql?id set to abc123 and variables={.} ). Now the URL is the cache key; the C D N happily caches.
+Trade-off: variables in the URL leak into logs, so don't put PII there. Combine with Cache-Control: max-age=. from the resolver layer.
+
+-- pause --
+Drill 5, Query depth and complexity limiting.
+
+Q: Why is query depth or complexity limiting non-optional in production?-- think --
+
+A: graph Q L exposes the full graph through one endpoint; a single request can express enormous server work. { user { posts { author { posts { author { posts {. } } } } } } } recursively explodes, without limits, one malicious or buggy client takes down the DB.
+
+Cross-Q: Depth-limiting alone isn't enough. Why?-- think --
+
+A: Depth is one dimension. A shallow query { orders(limit: 10000) { id customer { id } } } is depth 3 but issues 10001 DB queries (without DataLoader) or fetches 10k rows times 2 fields.
+Complexity scoring assigns cost per field with list multipliers, orders(limit: 10000) costs field_cost times 10000.
+The threshold is a single budget that captures both depth and breadth.
+
+Cross-Q²: How do you decide the complexity threshold?-- think --
+
+A: Empirically. Capture the cost score for every production query over a week (HotChocolate's cost analysis computes a field cost and a type cost per operation), plot the distribution.
+Pick a threshold at p99 or p99.9 of legitimate traffic, high enough to never reject real users, low enough to block obvious abuse, and set it via ModifyCostOptions(o goes to o.MaxFieldCost =.).
+Combine with rate-limit-by-cost: instead of "1000 requests or min," do "1000 cost-units or min", a single expensive query consumes more budget than a cheap one.
+
+-- pause --
+Drill 6, rest versus graph Q L.
+
+Q: When do you pick graph Q L over rest in 2026?-- think --
+
+A: graph Q L wins when (1) clients have diverse shape requirements (mobile + web + watch all want different fields), (2) one operation needs to aggregate across services (B F F pattern), (3) over-fetching meaningfully hurts (mobile bandwidth, payload size).
+rest wins for simple crud, service-to-service, public A P Is where H T T P caching matters, or teams without the tooling to manage schema evolution.
+
+Cross-Q: A team migrates a rest A P I to graph Q L and immediately misses H T T P caching. What changed?-- think --
+
+A: rest URLs ( /orders or 42 ) are stable cache keys; every layer of the H T T P stack (browser, C D N, reverse proxy) caches them for free. graph Q L is POST /graphql with query in body, every distinct query is a different "resource," and POSTs aren't cached.
+Workarounds: persisted queries flipped to GET, Apollo Cache client-side, response cache at the resolver layer. The loss is real and is the strongest reason rest still wins for high-cache-ratio public A P Is.
+
+Cross-Q²: A rest team writes a graph Q L gateway that just wraps existing rest endpoints. Smell or pattern?-- think --
+
+A: Smell, if the gateway just translates one-to-one, you've added graph Q L complexity without solving over-fetching (the gateway still over-fetches from rest, then trims).
+Pattern, if the gateway aggregates multiple rest calls behind one resolver tree (B F F), or DataLoader-batches them so the client gets one round-trip for what was 5 sequential rest calls. The litmus: would the client be making fewer H T T P round-trips or fetching less data?
+If no, you've added a layer for nothing.
+
+-- pause --
+Drill 7, Pagination, Relay cursor connections.
+
+Q: How does Relay-style cursor pagination work and why is it preferred over offset?-- think --
+
+A: Each list field returns a Connection type with edges { node, cursor } and page Info { hasNextPage, end Cursor }. The client passes first: N, after: $cursor to fetch the next page. Cursors are opaque (typically base64-encoded (timestamp, id) tuples).
+Preferred over offset because (1) it's stable under concurrent inserts (offset 100 changes meaning as rows are added), (2) it scales to billion-row datasets (offset 100000 forces the DB to scan and skip), (3) it matches keyset pagination at the sequel layer.
+
+Cross-Q: Why are cursors opaque rather than just exposing id directly?-- think --
+
+A: Opacity preserves the server's freedom to change the sort. If you expose id as the cursor, clients hardcode "next page = id > 42" and your sort is permanently ORDER BY id.
+Opaque cursors let the server encode (score, created_at, id) for relevance sorting today and switch to (rank, id) tomorrow without breaking clients. Same reason JWTs are opaque to non-issuers, implementation detail, not contract.
+
+Cross-Q²: A client jumps to page 50, how would you support that with cursors?-- think --
+
+A: You don't, directly, cursors are sequential.
+The honest answer is "Relay pagination doesn't support deep random access; use search or filter to narrow the set, not deep pagination." If product demands it, expose offset pagination as a separate field (for example, ordersByPage(page: 50, size:
+20) ) with a documented performance cliff, or build a precomputed index of cursor-checkpoints every Nth row.
+The right product fix is usually "remove the page numbers from the U I", Twitter, GitHub, Stripe all did this.
+
+-- pause --
+Drill 8, H T T P-level batching with @batched.
+
+Q: A page renders 10 widgets, each firing its own graph Q L query. How do you batch them into one H T T P request?-- think --
+
+A: Use H T T P-layer batching, Apollo Client's BatchHttpLink collects queries fired within a tick (~10 milliseconds) into a single POST /graphql whose body is a Jason array of operations. The server splits the array, runs each operation, returns an array of responses in order.
+One TCP round-trip, ten resolver trees executed.
+
+Cross-Q: How is H T T P batching different from DataLoader batching?-- think --
+
+A: H T T P batching collapses client requests into one network round-trip, purely a transport optimization, no DB savings. DataLoader collapses resolver-level fetches within one operation into one DB call.
+They're orthogonal: H T T P batching saves round-trips when one page fires many queries; DataLoader saves DB load when one query fans out to many parents. Use both, H T T P batch the 10 widget queries, then each query DataLoader-batches its nested resolvers.
+
+Cross-Q²: What's the failure-isolation risk of H T T P batching?-- think --
+
+A: One slow operation in the batch stalls the whole H T T P response, all 10 widgets wait on the slowest. The server has to wait for every operation to complete before returning the array.
+Mitigation: cap the batch size, set a per-operation timeout that doesn't block the array, or use @defer / @stream directives that let the server start streaming partial results (multipart response) so fast queries don't pay the slow query's tax.
+
+-- pause --
+Drill 9, Error model (partial success).
+
+Q: A query selects order and recommendations, order succeeds, recommendations resolver throws. What does the response look like?-- think --
+
+A: H T T P 200 with both data and errors. data.order populated, data.recommendations is null, and errors is an array describing what failed and where ( path: ["recommendations"] ). The client gets a usable partial result and knows which fields failed.
+This is graph Q L's "partial success" model, a single response can mix success and failure per field.
+
+Cross-Q: How does nullability interact with errors?-- think --
+
+A: If the failed field is nullable, the null bubbles up to that field only and the rest of the response is intact. If it's non-null ( recommendations: [Recommendation!]! ), the null can't legally fill the slot, the error bubbles up to the nearest nullable ancestor and nullifies it.
+Worst case: every field on the path is non-null up to the root to the entire data becomes null. This is why field-by-field nullability is a critical schema design decision, making everything! for cleanliness causes one failed leaf to nuke the whole response.
+
+Cross-Q²: H T T P middleware retries on non-2xx. How does that interact with graph Q L's 200-on-error model?-- think --
+
+A: Badly, if the middleware is rest-shaped. A graph Q L response with errors is H T T P 200, retry middleware sees "success" and doesn't retry, even if the failure is transient.
+Conversely, replaying a 200 partial-success response replays the success side too, potentially double-billing for mutations.
+Fix: graph Q L-aware retry logic that inspects body.errors[].extensions.code to decide. Apollo Client's error link does this; raw fetch() callers must do it manually.
+
+-- pause --
+Drill 10, Why caching graph Q L is hard.
+
+Q: H T T P caching is mature and free. Why is it hard to apply to graph Q L?-- think --
+
+A: H T T P caches key on URL + method. graph Q L is POST /graphql with the query in the body, every distinct query is the same URL but different content. H T T P caches don't read POST bodies. Even if they did, hashing a query body changes with every whitespace tweak.
+So out-of-the-box H T T P caching does nothing for graph Q L.
+
+Cross-Q: What can't H T T P caching do that resolver-layer or client-layer caching can?-- think --
+
+A: H T T P caches treat responses as opaque blobs; they can't invalidate by entity. If a Customer is updated, you must invalidate every cached response that mentioned that customer, impossible by URL alone. Resolver-layer cache (Redis keyed by resolver args) can invalidate by entity ID.
+Client-layer cache (Apollo, Relay) normalizes responses by __typename:id, so a single Customer:42 update propagates to every screen showing that customer. H T T P caching can do "this URL is fresh for N seconds"; only entity-aware caches can do "this customer changed, invalidate everywhere."
+
+Cross-Q²: A team wants a C D N to cache graph Q L responses anyway. What's the path?-- think --
+
+A: (1) Persisted queries flipped to GET, URL becomes the hash + variables, C D N caches it. (2) @cache Control(max Age: N) directives on fields, with HotChocolate's response cache plugin emitting Cache-Control headers, but only for queries where every selected field has a max Age.
+(3) Vary the cache key by auth header so private data doesn't leak across users. The whole flow only works for public, infrequently-changing data, personalized responses or post-mutation data fall through to origin every time. C D N caching works in narrow slices, not broadly.
+
+-- pause --
+Drill 11, HotChocolate versus graph Q Ldot NET.
+
+Q: When would you pick HotChocolate over graph Q Ldot NET (or vice versa)?-- think --
+
+A: HotChocolate is the dominant dot NET graph Q L server in 2026, code-first with attribute-driven schemas, built-in DataLoader, [UseProjection] for EF integration, federation support, the Nitro IDE (renamed from Banana Cake Pop). Use it for new projects.
+graph Q Ldot NET is older, more schema-first oriented, still maintained but less feature-rich; the only reason to choose it is if you're maintaining an existing graph Q Ldot NET service or you need its specific schema-first ergonomics.
+
+Cross-Q: HotChocolate's [UseProjection] is impressive. Where does it stop working?-- think --
+
+A: Non-EF resolvers (rest-backed types, computed fields, G R P C sources), projection only works on IQueryable returned from EF. Custom resolvers that don't return IQueryable fall back to in-memory execution after the projection point.
+Also breaks with complex authorization that needs row-level filtering applied after EF translation, the projection runs at sequel level before C sharp auth filters can rule out rows. You then either pre-filter via Where, or accept that some authz happens post-projection.
+
+Cross-Q²: Nitro is shipped with HotChocolate. Should you expose it in production?-- think --
+
+A: No. Same logic as exposing Swagger U I in production, fingerprints the schema for attackers, surfaces internal types, makes DoS easier (point-and-click query crafting).
+Expose it in dev or staging behind auth, disable in prod via app.MapGraphQL().WithOptions(new GraphQLServerOptions { Tool = { Enable = !env.IsProduction() } }). The introspection endpoint should also be disabled or auth-gated in production unless the schema is intentionally public (GitHub, Shopify).
+
+-- pause --
+Drill 12, Subscription transports.
+
+Q: graph Q L subscriptions over WebSocket versus S S E, when each?-- think --
+
+A: WebSocket is the historical default, full duplex, low overhead post-handshake, multiple subscriptions multiplexed over one connection (over the graphql-transport-ws protocol, implemented by the graphql-ws library, or the legacy protocol from the subscriptions-transport-ws library).
+S S E is the rising alternative, simpler (just H T T P), works through restrictive proxies that block WS, browser-native auto-reconnect. WS for chat-like high-frequency scenarios; S S E for notifications, dashboard updates, L L M-style token streaming.
+
+Cross-Q: Why does the graph Q L spec not mandate a transport for subscriptions?-- think --
+
+A: The spec defines the operation semantics (one subscription = stream of payloads) but stays transport-agnostic, same way it doesn't mandate Jason or H T T P for queries.
+This lets the ecosystem pick the right transport for each context: WS in browsers with libraries, S S E for proxy-hostile networks, even M Q T T for IoT-grade.
+The downside is client or server transport handshake confusion, clients must agree with servers on the WebSocket subprotocol:
+graphql-transport-ws, the modern one, implemented by the graphql-ws library, versus the legacy subprotocol, which is itself named graphql-ws and is implemented by the subscriptions-transport-ws library.
+The names cross over, which is why mismatched libraries fail with cryptic errors.
+
+Cross-Q²: A subscription server hits 10K concurrent connections and C P U saturates. What's the bottleneck?-- think --
+
+A: Almost always per-subscriber serialization. Each emit on a topic with N subscribers serializes N times. Same fix as the WebSocket walkthrough: serialize once into a ReadOnlyMemory, fan out to each subscriber's bounded channel, each connection's write loop just sends the pre-serialized bytes.
+Backplane (Redis pub or sub for SignalR-style, NATS for graph-friendly) handles cross-pod fan-out so each pod only fans out to its locally-connected clients.
+
+-- pause --
+Drill 13, Schema-first versus code-first in HotChocolate.
+
+Q: HotChocolate supports both schema-first (SDL) and code-first (attributes). When each?-- think --
+
+A: Code-first is HotChocolate's default and recommended path in 2026, C sharp attributes ( [Query], [UsePaging], [UseFiltering] ) drive the schema; refactoring tools work; IDE autocomplete; impossible to drift from C sharp types.
+Schema-first is useful when (1) the schema is owned by a contracts team separate from the implementer (mirror of OpenAPI-first), (2) you're porting an existing SDL from another stack, (3) the schema is the source of truth for cross-language consumers.
+
+Cross-Q: What's the downside of code-first?-- think --
+
+A: Schema becomes a side-effect of implementation, easy to accidentally break consumers with a refactor. Mitigation: snapshot the generated SDL into version control ( schema.graphql ), diff it in CI, fail the build on breaking changes. HotChocolate has dotnet-graphql schema export for this.
+The schema-first equivalent (SDL in repo, codegen produces stubs) gets this for free at the cost of the codegen step.
+
+Cross-Q²: Can you mix the two, schema-first base with code-first extensions?-- think --
+
+A: Yes. HotChocolate allows merging, define base types in SDL, extend them with C sharp resolvers via descriptor.Extend(). Useful when the contract is fixed (for example, federated subgraph schemas mandated by gateway) but you want the resolver code to live in idiomatic C sharp.
+The risk is fragmentation, split definitions across SDL and C sharp make it harder to reason about which fields exist. Pick one as primary and use the other only at clear boundaries.
+
+-- pause --
+Drill 14, Authorization (resolver-level versus schema-level).
+
+Q: Where do you put authorization in a graph Q L server, resolvers or schema?-- think --
+
+A: Both layers, intentionally. Coarse-grained authz (this user can reach the orders mutation at all) at the schema level via [Authorize(Roles = ".")] attributes on type or field.
+Fine-grained authz (this user can only see their own orders, this admin can see all) inside resolvers using the ClaimsPrincipal and the query arguments. Schema-level rejects early at the gateway; resolver-level enforces row-level rules.
+
+Cross-Q: A resolver authz check is "user can read this Order if user.id == order.customer Id", where does the check go and why?-- think --
+
+A: Inside the resolver, after the data is loaded enough to know order.customer Id. Schema-level can't do it (doesn't have access to row data).
+DataLoader-batched loads complicate it, the DataLoader fetches all keys at once; you must check ownership for each returned row before exposing to the resolver. Pattern: DataLoader returns the row, resolver compares principal.UserId to row.CustomerId, returns the row or null or throws.
+This works but is easy to forget, consider an interceptor or middleware (HotChocolate's IRequestExecutorBuilder.UseField / Apollo's directives) that applies it automatically based on a @requires(field: "customer Id") directive.
+
+Cross-Q²: How does field-level authz interact with the nullability error model?-- think --
+
+A: If the field is nullable, "denied" returns null and errors[].extensions.code: "FORBIDDEN", the client sees a partial response. If non-null, the null bubbles to the nearest nullable ancestor (potentially the whole data becomes null).
+For authz-protected fields, lean toward making them nullable in the schema so the error stays scoped. The exception: fields that must exist for the response to mean anything, then non-null is correct and the whole query fails, which is the right outcome.
+
+-- pause --
+Drill 15, graph Q L versus OData.
+
+Q: graph Q L and OData both let clients query a typed schema. What's the actual difference?-- think --
+
+A: OData = rest-style URL syntax for querying entity sets ( /Orders?$filter set to Status eq 'Pending' and $expand set to Customer and $select set to Id,Total ). Standard from Microsoft, widely used in enterprise (Dynamics, SAP).
+graph Q L = single endpoint, Jason query language in the body, ecosystem-driven, type system designed for graph traversal. OData is more aligned with relational or crud; graph Q L is more aligned with arbitrary graph shapes (B F F aggregation, multi-source).
+
+Cross-Q: Which has better tooling for dot NET teams in 2026?-- think --
+
+A: OData has deeper Microsoft-stack tooling ( Microsoft.AspNetCore.OData package, automatic mapping from E F Core, $filter translated to link via expression trees, no need to write resolvers). graph Q L has broader ecosystem tooling (Apollo, HotChocolate, codegen for TS or Swift or Kotlin clients).
+For a dot NET-only A P I consumed by dot NET clients, OData often wins on cost. For an A P I consumed by web or mobile teams using JS or TS, graph Q L wins because the client tooling is dominant there.
+
+Cross-Q²: When would you genuinely combine both?-- think --
+
+A: Almost never in one service. The legitimate case is a gateway pattern: external A P I surface is graph Q L (consumer-friendly), internal services expose OData (admin or analytics-friendly, EF-friendly).
+The graph Q L gateway calls OData internally because OData's $filter / $expand translates straight to EF, saves writing resolvers for every internal entity. Don't expose both protocols on the same service; pick one for each layer and bridge between layers.
+
+-- pause --
+Section 2. Self-test.
+
+rest URLs /orders or 42 are stable cache keys; H T T P caches (browsers, CDNs, proxies) work out of the box. graph Q L uses POST /graphql with the query in the body, every distinct query body is a different "resource," and POSTs aren't cached at the H T T P layer at all.
+Workarounds: (a) persisted queries, server registers known queries by hash, client sends hash via GET, response becomes cacheable; (b) Apollo Cache / Relay client-side cache; (c) at the resolver layer, cache the data sources themselves.
+The H T T P-cache loss is real and a strong reason rest still wins for high-cache-ratio public A P Is.
+
+Queries are read-only and idempotent, running 5 query roots in parallel is safe and faster. Mutations cause state changes; the spec mandates serial execution because clients commonly depend on ordering ("create user, then update profile, then send invite").
+If they ran in parallel, the second mutation might race the first's writes. Serial mutations let clients chain side effects predictably without coordinating across endpoints.
+
+(a) Max depth, set in HotChocolate via AddMaxExecutionDepthRule(N); rejects queries deeper than N levels with 400. (b) Query complexity, assign cost weights per field (lists multiplied by limit), reject queries a threshold.
+(c) Persisted queries, only pre-registered query hashes accepted in production; arbitrary queries blocked. (d) Rate limit by query cost, instead of one limit per request, multiply by computed complexity. Without these, malicious or buggy clients trivially DoS the database.
+
+DataLoader works for any data source, E F Core, rest A P Is, G R P C, Redis, by batching key lookups within a tick. Use it when nested resolvers fan out to multiple sources or when the parent type isn't an EF entity.
+[UseProjection] only works for IQueryable (E F Core); it inspects the graph Q L selection and folds it into a single sequel query with the right Include and Select, so even nested traversal becomes one round-trip.
+Use projection when the entire subtree is EF-backed; DataLoader for cross-source aggregation. They compose: project the EF subtree, DataLoader the cross-cutting fields.
+
+The spec separates transport-level errors (H T T P 4xx or 5xx for parse failure, malformed Jason, transport faults) from execution errors (a resolver threw, a field couldn't be computed), the latter live in the errors array of the Jason body alongside data.
+A response can be "partial success": some fields resolved, others errored. H T T P 200 makes the response body authoritative, so middleware that retries on non-2xx doesn't double-charge for partial successes.
+Consumer impact: code that checks response.ok is wrong for graph Q L; you must inspect body.errors and decide per-error whether to retry, surface, or ignore.

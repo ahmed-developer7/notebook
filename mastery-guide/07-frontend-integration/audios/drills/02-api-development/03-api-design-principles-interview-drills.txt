@@ -1,0 +1,319 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Richardson Maturity Model.
+
+Q: Name the four levels of the Richardson Maturity Model.-- think --
+
+A: Level 0, single URI, single verb (soap-over-H T T P, R P C-style POST to one endpoint). Level 1, resource URIs ( /orders or 42, /customers or 7 ) but still one verb. Level 2, correct H T T P verbs (GET, POST, PUT, DELETE) + correct status codes.
+Level 3, hypermedia (HATEOAS): responses include links to next legal actions.
+
+Cross-Q: Where do most production A P Is sit on the model?-- think --
+
+A: Level 2. Resource URIs + correct verbs + correct status codes is the pragmatic ceiling. Level 3 (HATEOAS) is rare because clients are written by humans against documentation, not generic agents following links.
+The cost of _links payloads exceeds the benefit when every client has hard-coded the URLs anyway.
+
+Cross-Q²: Is "Level 2 only" still "rest" per Fielding's definition?-- think --
+
+A: No, strictly speaking. Fielding's PhD thesis defined rest as hypermedia-driven (HATEOAS is not optional in the original definition). The industry has redefined "rest A P I" to mean Level 2, and Fielding has written angry blog posts about the term being co-opted.
+For interview purposes: know the gap; in practice, "rest A P I" almost always means Level 2 H T T P A P I, and that's the pragmatic ceiling unless you're building a true evolving hypermedia A P I.
+
+-- pause --
+Drill 2, Pagination.
+
+Q: Offset versus cursor versus keyset pagination, when each?-- think --
+
+A: Offset ( ?offset set to 100 and limit set to 50 ): simple, works on small static sets; breaks under concurrent inserts (duplicates or skips), slow as offset grows (DB physically scans + skips).
+Cursor ( ?cursor set to abc and limit set to 50 ): stable under inserts, fast (uses index range scan via WHERE id < last Id ); can't jump to arbitrary page.
+Keyset (a variant of cursor using natural keys like WHERE (created_at, id) < (last_created, last_id) ): cursor-equivalent at the sequel layer, exposes the key explicitly rather than encoding it.
+
+Cross-Q: Why does offset get slow with large offsets?-- think --
+
+A: sequel OFFSET 1000000 LIMIT 50 requires the DB to generate the first 1,000,000 rows then discard them, there's no shortcut. As offset grows, query time grows linearly.
+Cursor pagination's WHERE id > last Id uses an index range scan: jump directly to position via B-tree, return next 50, done, constant time regardless of how deep into the result set.
+For any collection that might exceed 10,000 rows, cursor is the default; offset is fine only for small static lists where the user expects to see "page 5" U I.
+
+Cross-Q²: A junior wraps cursor pagination over an unstable sort ( ORDER BY updated_at DESC ). What goes wrong?-- think --
+
+A: Items can move between pages as their updated_at changes. User sees page 1, an item's updated_at updates and moves to the top, next page request misses it. The fix: cursor must encode a stable, total order, typically (updated_at, id) tuple so ties on updated_at are broken by id.
+The cursor encodes both: WHERE (updated_at, id) < (last_updated, last_id). The unstable-sort bug is the most common cursor pagination mistake; teams discover it when QA reports "items disappear when scrolling fast."
+
+-- pause --
+Drill 3, Idempotency keys.
+
+Q: A client sends Idempotency-Key: abc-123 twice. What happens server-side?-- think --
+
+A: First request: server checks its idempotency store, key not found, processes the request, stores {key: "abc-123", response:, ttl: 24 hours}, returns the response.
+Second request (retry): server checks store, finds the key, returns the original stored response without re-executing any side effects.
+The client gets the exact same response, same status code, same body, same headers (minus per-request things like timestamps).
+
+Cross-Q: What if two parallel requests with the same key hit at the same time?-- think --
+
+A: Race condition without locking. Two servers both check store, both find "not present," both process the request to duplicate side effects (the bug you were trying to prevent). The fix: insert-or-fail with a unique constraint on the key.
+First request inserts {key, status: "processing", response: null}; second tries to insert and hits unique violation, it waits (with timeout) for the first to complete, then reads the response.
+Or, simpler: first request locks the key in Redis with SET NX EX 60; second sees the lock and either waits or returns 409 Conflict for the client to retry after a short delay.
+
+Cross-Q²: How long do you keep idempotency records, and why?-- think --
+
+A: 24 hours is the industry default (Stripe's choice). Long enough to absorb realistic retry windows (network blips, mobile background tasks, client crashes), short enough to keep storage bounded. Some A P Is go 7 days for high-value writes (payments).
+Trade-off: longer T T L = more storage cost but more retry safety; shorter T T L = risk of "old" retries being re-processed as new requests. Don't go 1 hour, mobile devices reconnect after long offline windows and retry old requests.
+
+-- pause --
+Drill 4, RFC 9457 Problem Details.
+
+Q: What fields does Problem Details define?-- think --
+
+A: Five standard fields: type (URI identifying the error type), title (human-readable summary), status (H T T P status code, integer), detail (specific explanation for this occurrence), instance (URI of the specific failed request).
+Extensions allowed via additional members, trace Id, errors (for validation), code (for machine matching). Cite RFC 9457, not 7807: 9457 obsoleted 7807 in 2023, keeping the same five members and adding an IANA problem-type registry plus guidance on extension members.
+
+Cross-Q: Why have title AND detail ?-- think --
+
+A: title is the class of error, same for every occurrence ("Order not found"). detail is the specifics of this occurrence ("Order with ID 42 does not exist"). Clients group by title for monitoring or error catalogs; users see detail to understand what happened.
+Don't include user-specific info in title (it becomes high-cardinality and useless for grouping); don't omit detail (the user needs to know what went wrong).
+
+Cross-Q²: What about validation errors with multiple field failures?-- think --
+
+A: ValidationProblemDetails extends ProblemDetails with errors: {field: [messages]}. Example: {"errors": {"email": ["invalid format"], "age": ["must be positive", "must be < 150"]}, "title": "Validation failed", "status": 400}. A S P dot NET Core emits this automatically when model binding fails.
+The pattern: one ProblemDetails per response, validation errors aggregated in the errors member. Don't return 400 with {"error": "Email invalid"} separately from {"error": "Age invalid"}, clients can't display them together.
+
+-- pause --
+Drill 5, Request ID propagation.
+
+Q: A request fans out to 5 downstream services. How do you correlate logs across all 6 hops?-- think --
+
+A: W3C Trace Context, every request carries a traceparent header ( 00--- ). The original gateway generates the trace-id; each service propagates the trace-id, generates its own span-id for the work it does, and emits it on outgoing requests.
+Logs include trace Id + span Id; APM tools (App Insights, Datadog, Jaeger) assemble the full trace from log records.
+
+Cross-Q: What's the difference between traceparent, X-Correlation-ID, and X-Request-ID ?-- think --
+
+A: traceparent (W3C standard) is structured, includes trace-id, span-id, sampling flags, and supports distributed tracing tooling. X-Correlation-ID / X-Request-ID are conventional, unstructured single IDs, fine for a single team's log search but not built for distributed tracing.
+Modern dot NET: use W3C Trace Context (default in A S P dot NET Core via Activity / OpenTelemetry ). Custom headers like X-Correlation-ID are still common as a human-friendly synonym (logged alongside trace Id).
+
+Cross-Q²: A client makes a request with no traceparent header. What does the server do?-- think --
+
+A: Generate one. The traceparent should be present on every internal request; if missing (first hop, external caller), the entry point generates a fresh trace-id and span-id.
+A S P dot NET Core's Microsoft.AspNetCore.Hosting middleware auto-generates an Activity per request, if the incoming traceparent is absent, it creates one; if present, it continues the existing trace.
+You should never have to do this manually unless you're outside the request pipeline (background workers, message handlers).
+
+-- pause --
+Drill 6, Breaking versus non-breaking changes.
+
+Q: List five changes that are non-breaking and five that are breaking.-- think --
+
+A: Non-breaking: (1) Add an optional field to a response. (2) Add a new endpoint. (3) Add a new optional query parameter. (4) Add a new value to an enum (if clients tolerate unknown values, many don't). (5) Relax validation (accept more inputs than before).
+Breaking: (1) Remove or rename a response field. (2) Change a field's type ( string to int ). (3) Add a required request parameter. (4) Tighten validation (reject inputs previously accepted). (5) Change error response shape or status codes for existing error conditions.
+
+Cross-Q: Adding an enum value, non-breaking or breaking?-- think --
+
+A: Subtle. Strictly: it's breaking if clients have exhaustive switch statements (Java's default clause may throw, TypeScript's never type fails compile, C sharp's switch may not handle the new value). In practice: most clients log-and-continue on unknown enum values, treating it as additive.
+The robust stance: assume it's breaking unless you've explicitly documented "clients must tolerate unknown enum values." Add a major version when in doubt.
+
+Cross-Q²: How do you communicate a deprecation in headers?-- think --
+
+A: Two separate RFCs. Sunset is RFC 8594, an H T T P-date saying when the endpoint will be removed: Sunset: Sat, 31 Dec 2026 23:59:59 GMT.
+Deprecation is RFC 9745 (2025), a structured-field Date (RFC 9651) saying when it became, or becomes, deprecated, an @ followed by a Unix timestamp ( Deprecation: @ ). Note it is not Deprecation: true; that was a pre-RFC draft form still shown in most material online.
+RFC 9745 also registers the deprecation link relation, so pair it with Link:; rel="deprecation" pointing to migration docs. Clients can detect these programmatically and surface warnings.
+A S P dot NET Core: middleware adds these headers to v1 routes; observability tools alert when traffic on deprecated endpoints stays high near the sunset date.
+
+-- pause --
+Drill 7, Contract-first versus code-first.
+
+Q: Contract-first versus code-first A P I design, when each?-- think --
+
+A: Contract-first: write the OpenAPI spec first; generate server stubs and client SDKs from it. Forces design discipline; teams can build in parallel from a frozen contract. Use when multiple consumers / teams depend on the A P I.
+Code-first: write controllers in C sharp; auto-generate OpenAPI from attributes (Swagger). Faster to iterate; smaller teams; the code IS the contract. Use when one team owns both ends or for rapid prototyping.
+
+Cross-Q: Why is contract-first the recommendation for public A P Is?-- think --
+
+A: The contract is the product. If you ship code-first, every refactor risks accidentally changing the wire shape (renaming a DTO property to Jason key changes to all clients break).
+With contract-first, the spec is the source of truth; code is generated or validated against it; you can't accidentally change the contract because the generator regenerates from spec, not from code. CI fails when code diverges from spec.
+
+Cross-Q²: A team is on code-first and wants to "go contract-first", how do they migrate?-- think --
+
+A: Step 1: lock the current generated OpenAPI as the "v1 contract", commit it. Step 2: install contract-conformance tests in CI ( Spectral or openapi-diff ) that diff current generated spec against the locked spec, block pull requests that change the wire shape unintentionally.
+Step 3: for new endpoints, write the spec first, then implement against it (still in C sharp; just human-driven discipline instead of generation). Step 4 (optional): switch to true generation ( NSwag, Refit ) for new modules.
+The intermediate state is the most valuable, discipline without the tooling cost.
+
+-- pause --
+Drill 8, Nested versus flat resources.
+
+Q: /orders/{id}/items versus /items?order Id={id}, which and why?-- think --
+
+A: Both are valid. Nested ( /orders/{id}/items ) emphasizes the parent-child relationship; URL conveys ownership; good when items don't exist outside an order.
+Flat ( /items?order Id set to 42 ) keeps the resource a first-class top-level entity; better when items might be queried by multiple parents (customer's items, order's items, supplier's items).
+Convention: nest if the resource is naturally scoped to the parent and has no independent identity; flatten otherwise.
+
+Cross-Q: A team has /orders or 42 or items AND /items or 7. Is that fine?-- think --
+
+A: Yes, many A P Is expose both. /orders or 42 or items (list within parent context, parent-aware operations like "add to order"); /items or 7 (direct access by ID, regardless of parent). The same item is reachable via both URLs. The risk: ambiguity around what's canonical.
+Document one as the canonical reference (usually the direct path /items or 7 ); the nested form is a convenience. Stripe does this, /customers or cus_X or invoices and /invoices or in_X both work; /invoices or in_X is canonical.
+
+Cross-Q²: How deep should nesting go?-- think --
+
+A: Two levels is the practical limit. /orders/{id}/items/{item Id} is fine. /customers/{id}/orders/{order Id}/items/{item Id}/refunds/{refund Id} is hostile, long URLs, hard to remember, parent-child relationships need only one level for context. After 2 levels, switch to flat with query params.
+The reason: each nesting level requires the URL to encode information that's already implied (an item ID is unique globally; you don't need the order ID to find it). Beyond 2 levels, you're encoding the database join graph into the URL, which couples consumers to your schema.
+
+-- pause --
+Drill 9, Mobile A P I design.
+
+Q: What should you do differently when designing an A P I primarily for mobile?-- think --
+
+A: (1) Minimize payload size, sparse fieldsets ( ?fields set to id,title,price ), pagination, compression. Mobile bandwidth is metered and unreliable. (2) Reduce round-trips, fewer chatty endpoints; consider graph Q L or B F F for client-shaped composition.
+(3) Idempotency-Key on every write, mobile networks drop. (4) Aggressive caching with stale-while-revalidate, flaky connectivity benefits from "show stale, refresh in background." (5) Resumable uploads for large media. (6) Push notifications instead of polling.
+
+Cross-Q: A team measures mobile A P I perf and finds 80% of latency is "request setup" not "response payload." What's happening?-- think --
+
+A: T L S handshake + TCP connect + D N S lookup dominates over the actual response time.
+Mitigations: H T T P or 2 connection reuse (multiple requests over one connection), H T T P or 3 / QUIC (handshake-during-data, faster mobile recovery), connection keep-alive, edge POP closer to user (C D N or regional).
+The "chatty A P I" problem amplifies this, 10 requests with T L S setup each is way slower than 1 batch request. This is why mobile-first A P Is lean toward graph Q L or B F F: one round-trip to get all the data the screen needs.
+
+Cross-Q²: What's the trade-off of using graph Q L specifically for mobile?-- think --
+
+A: Pros: one round-trip per screen; client requests only fields it needs (less payload, less battery from parsing); evolution without versioning (deprecate fields with @deprecated annotation).
+Cons: harder to cache at H T T P layer (every query is a POST to the same endpoint with different body, H T T P caches can't distinguish); APM tools have less visibility (single endpoint hides per-operation metrics);
+easier for malicious clients to issue expensive queries (need query complexity limits).
+Pick graph Q L when client-shape flexibility outweighs caching loss; pick rest when caching matters more.
+
+-- pause --
+Drill 10, Filtering and sorting.
+
+Q: Convention for filtering and sorting in query strings?-- think --
+
+A: Filter: ?status set to active and customer_id set to 42 for exact match; ?created_after set to 2026-01-01 for ranges. Sort: ?sort set to created_at (ascending) or ?sort=-created_at (descending, leading minus). Multi-field sort: ?sort set to status,-created_at.
+Jason:A P I standardizes this; most A P Is follow similar conventions.
+
+Cross-Q: A junior implements ?filter={"status":"active","price":{"$gte":100}} (Mongo-style query in Jason). What's the trade-off?-- think --
+
+A: Expressive (supports operators, nested fields, OR or AND), but harder to learn, harder to validate, easy to abuse ( {"$where": "."} ), unfriendly to URL caching (query string is opaque to caches), unparseable in a browser address bar.
+Most public A P Is reject this in favor of flat key-value conventions: more verbose but more discoverable. The exception: search or analytics A P Is (Elasticsearch, Algolia) where expressive query is the product.
+
+Cross-Q²: How do you handle "filter by multiple values for the same field"?-- think --
+
+A: Two conventions: (1) Repeat the key: ?status set to active and status set to pending, most servers parse this as a list. (2) Comma-separated: ?status set to active,pending, friendlier to read, requires server-side split.
+A S P dot NET Core's model binding handles both ( [FromQuery] string[] status for repeats; manual parse for comma). Document which you support; clients break when they assume the other.
+
+-- pause --
+Drill 11, Sparse fieldsets.
+
+Q: Why support ?fields set to id,title,price ?-- think --
+
+A: Bandwidth, client requests only the fields it needs; smaller payloads for mobile, faster parse, less bandwidth cost. Especially valuable when the resource has many fields and clients use small subsets (mobile list view: id + title + thumbnail; desktop detail view: everything).
+
+Cross-Q: How do you implement this without leaking the underlying O R M?-- think --
+
+A: Parse fields into a whitelist; project at the DTO or serializer layer, not at the E F Core query. data.Select(x goes to new ResponseDto { Id = x.Id, Title = include("title")? x.Title: null }).
+Reason: pushing field selection to E F Core means the sequel changes per request, uncacheable, fragile, blocks index covering. Project after fetch from a stable query. The performance overhead of fetching unused fields is usually negligible versus the complexity of dynamic sequel.
+
+Cross-Q²: A junior implements sparse fields by literally trimming Jason in middleware after serialization. Why is that wasteful?-- think --
+
+A: The full DTO was already constructed, serialized, then trimmed, all the C P U work was done; only network bandwidth saved.
+Better: build the DTO conditionally, if (include("relations")) dto.Relations = await LoadRelations(), so you skip the expensive work (DB call for related entities, conversion logic).
+Sparse fields shines when you avoid the work that would have produced the omitted fields, not when you just hide them at the end.
+
+-- pause --
+Drill 12, Long polling versus S S E versus WebSocket.
+
+Q: Decision criteria for long polling, S S E, and WebSocket?-- think --
+
+A: Long polling: client opens connection; server holds it until data is available (or timeout); client reconnects. Use when you have rare events and want H T T P-only infrastructure (no upgrade negotiation).
+S S E (Server-Sent Events): one-way server to client stream over H T T P; auto-reconnect built into browsers; text-only. Use when only the server pushes (notifications, log streams, L L M tokens). WebSocket: bidirectional persistent connection; binary or text.
+Use when client also needs to push frequently (collaboration apps, chat, multiplayer games).
+
+Cross-Q: S S E seems simpler than WebSocket, why isn't it the default?-- think --
+
+A: One-way only (server to client). Anything client to server has to be a separate H T T P request, which adds latency for interactive flows.
+Also: S S E is H T T P, load balancers, CDNs, and proxies handle it natively, but each connection holds a server thread or socket (same as WebSocket; doesn't scale to millions without async-everywhere). For pure server-push (notifications, real-time dashboards), S S E wins on simplicity.
+For chat or games, WebSocket wins on bidirectionality.
+
+Cross-Q²: A team picks WebSocket "because it's modern" for one-way notifications. What's the cost?-- think --
+
+A: Lost H T T P affordances. WebSocket bypasses H T T P middleware (auth, rate limiting, cores, observability), each is re-implemented inside the WebSocket protocol or middleware. Reverse proxies sometimes mishandle the Upgrade negotiation.
+Bearer auth becomes tricky (header sent only on initial handshake; token expiry mid-connection requires custom handling). Reconnection logic is manual. S S E gets all of this for free because it's just an H T T P response with Content-Type: text or event-stream, every H T T P tool works.
+For one-way push, S S E is the senior pick.
+
+-- pause --
+Drill 13, Response envelope.
+
+Q: {data: [.], meta: {.}} versus just [.], when is each right?-- think --
+
+A: Bare array: simplest, rest-clean, body is the resource. Pagination metadata goes in headers ( Link, X-Total-Count ). Envelope: container with data, meta (pagination, totals), maybe links (HATEOAS).
+Easier to log or debug (all info in body), survives proxies that strip headers, but adds noise to every response.
+
+Cross-Q: Why do GitHub and Stripe disagree on this?-- think --
+
+A: GitHub uses Link header (bare array body); Stripe uses envelope ( {data: [.], has_more: true} ). GitHub's audience is developers using curl-friendly tools; envelope is overhead.
+Stripe's audience is enterprise integrations through middleboxes that might strip headers; envelope guarantees pagination info survives every hop. Both are correct for their use case.
+The pragmatic guideline: envelope if you need to evolve to include cursor metadata, errors, or warnings; bare if it's a stable read-only resource.
+
+Cross-Q²: A team uses envelope for collections but bare for single resources. Is that consistent?-- think --
+
+A: Common pattern, defensible. Single resources GET /orders or 42 return {id, status,.}, just the resource; no pagination needed. Collections GET /orders return {data: [.], next_cursor:.}, envelope for pagination metadata. Most A P Is do this.
+Strict consistency ( {data: } everywhere) is "purer" but means every single-resource client unwraps .data for no reason. Pick one per response category and stay consistent within that category.
+
+-- pause --
+Drill 14, Soft delete.
+
+Q: How do you expose soft-deleted records in your A P I?-- think --
+
+A: Default to hiding them, GET /orders or 42 returns 404 if soft-deleted. Allow opt-in retrieval via query param or header for admin use cases: GET /orders or 42?include_deleted set to true returns {id, deleted At: "2026-01-01",.}. Restore via explicit action: POST /orders or 42 or restore.
+Hard delete via DELETE with elevated permissions or after a retention period.
+
+Cross-Q: A junior implements soft delete by adding IsDeleted = true but doesn't filter queries. What goes wrong?-- think --
+
+A: Deleted records show up in every list endpoint, search, foreign-key navigation. Customers see "ghost" orders, statistics double-count, integrations fail because they expected deletion to be permanent.
+The fix: global query filter in E F Core ( HasQueryFilter(o goes to !o.IsDeleted) ) so every query auto-filters; explicit IgnoreQueryFilters() only on admin endpoints that need them.
+The defense: soft delete should be invisible to normal A P I consumers; it's a retention mechanism, not a U X feature.
+
+Cross-Q²: Unique constraints conflict with soft delete, user A is soft-deleted with email a@b.com; user B tries to register with the same email. What happens?-- think --
+
+A: Without thought: unique constraint rejects the insert because the soft-deleted row still has that email. Fix options: (1) Nullify or anonymize email on soft delete ( a@b.com to deleted-1234@example.invalid ) so the live email is free.
+(2) Filtered unique index ( UNIQUE WHERE NOT is_deleted ), supported in Postgres Q L, sequel Server, not MySQL. (3) Hard-delete after a grace period (real DELETE after 30 days) so soft-deleted is temporary.
+Most production systems use a combination: anonymize on soft-delete + hard-delete after retention period for G D P R compliance.
+
+-- pause --
+Drill 15, Rate limit headers.
+
+Q: What rate limit headers should an A P I return, and what's the convention?-- think --
+
+A: De-facto standard: X-RateLimit-Limit (allowance per window), X-RateLimit-Remaining (calls left), X-RateLimit-Reset (when allowance resets, Unix timestamp or seconds).
+On 429 (the status code itself comes from RFC 6585): Retry-After, number of seconds (or H T T P date) before retry is allowed, defined in RFC 9110 §10.2.3, not in 6585. Clients use Remaining + Reset to throttle proactively; Retry-After to back off on 429.
+
+Cross-Q: There's now a proposed RFC for rate-limit headers, what does it add?-- think --
+
+A: The IETF httpapi working group's RateLimit and RateLimit-Policy headers ("RateLimit Header Fields for H T T P").
+It replaces the ad-hoc X-RateLimit- with H T T P structured fields: RateLimit-Policy: "default";q set to 100;w set to 60 (quota 100 per 60-second window) and RateLimit: "default";r set to 42;t set to 30 (42 remaining, resets in 30 seconds).
+Treat the exact syntax as a moving target, earlier revisions used the flat limit set to 100, remaining set to 42, reset set to 60 form, so check the current revision before quoting it. Adoption: Cloudflare, GitHub (newer endpoints), some others.
+Modern dot NET: the built-in rate limiting middleware ( Microsoft.AspNetCore.RateLimiting, dot NET 7+) emits no rate-limit headers at all, neither X-RateLimit- nor the structured ones.
+You write them yourself in OnRejected, reading the rejected lease's MetadataName.RetryAfter ( context.Lease.TryGetMetadata(.), populated by the window and token-bucket limiters). And note RateLimiterOptions.RejectionStatusCode defaults to 503, not 429, you have to set that too.
+
+Cross-Q²: A client gets 429 Too Many Requests with Retry-After: 60. What should it do?-- think --
+
+A: Wait at least 60 seconds before retrying, and ideally use exponential backoff with jitter on subsequent 429 seconds (the client and server are negotiating). Naive retry-without-wait amplifies the overload, every client retrying immediately causes a thundering herd.
+The senior pattern: parse Retry-After, wait that long, then retry once; on subsequent 429 seconds, double the wait + add randomness (jitter) so clients don't synchronize.
+In dot NET you get this from Microsoft.Extensions.Http.Resilience, AddStandardResilienceHandler() on the typed client, whose Polly v8 HttpRetryStrategyOptions reads Retry-After and honors it automatically.
+Hand-rolling it means a Polly v8 ResiliencePipelineBuilder with a DelayGenerator that parses the header, the generic form, so the generator gets the response to read Retry-After from. Don't loop-retry without honoring Retry-After, you'll get IP-banned.
+
+-- pause --
+Section 2. Self-test.
+
+Offset ( ?page set to 2 and limit set to 50 ) re-runs the query each call and skips N rows from the current result set. If 10 new rows land between page 1 and page 2, those 10 push the previous page-2 rows down, you'll re-see 10 items from page 1 on page 2 (or skip 10, depending on sort direction).
+Cursor pagination encodes the last seen sort key ( WHERE id < last Id ORDER BY id DESC ) so new rows the cursor never affect the next page. Trade-off: you can't "jump to page 47."
+
+412 specifically means "your If-Match / If-Unmodified-Since precondition didn't match", it's a protocol-level signal tied to the conditional request feature.
+409 is broader: "your operation conflicts with current state" and covers cases without preconditions (duplicate key insert, illegal state transition, optimistic-lock failure detected at the DB layer).
+Convention: use 412 when the client explicitly sent a precondition header; use 409 when the conflict was discovered server-side without the client opting in.
+And the third case neither code covers: the client sent no If-Match at all, that's 428 Precondition Required (RFC 6585), refusing the blind write instead of letting it silently become last-write-wins.
+
+private instructs shared caches to skip storing, but only if your C D N respects it. Some configurations (especially aggressive "ignore origin headers" rules) cache private responses anyway.
+And without Vary: Authorization, two users hitting the same path with different bearer tokens may share a cache key. Always combine private with Vary: Authorization and verify the C D N's actual behavior with a test rig that issues two different tokens.
+
+In Merge Patch semantics, null means "remove this field", not "set to null." So PATCH { "tags": null } deletes the tags collection entirely. Teams expecting "set to null" reach for Jason Patch (RFC 6902) ops instead, or document that the A P I rejects null and accepts only [] to mean empty.
+Mixing the two semantics across endpoints is the chaos pattern; pick one per A P I and document it.
+
+[ResponseCache] only emits Cache-Control headers, it relies on the client or C D N to actually store. OutputCache runs server-side, so a single cache hit short-circuits the entire pipeline (no DB call).
+It also supports tag-based eviction ( EvictByTagAsync("orders") ), pluggable Redis backing for multi-instance deployments, and lock-free coordination so a single computation feeds all concurrent waiters. [ResponseCache] is a labeling tool; OutputCache is an actual cache.

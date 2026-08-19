@@ -1,0 +1,317 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, S S E versus WebSocket.
+
+Q: When would you pick S S E over WebSocket for a real-time feature?-- think --
+
+A: When traffic is one-way server to client, text-only, and you want to ride plain H T T P through proxies. S S E auto-reconnects, has Last-Event-ID resume, and works over H T T P or 2 multiplexing. WebSocket is the answer when you need bidirectional, binary frames, or sub-frame latency.
+
+Cross-Q: "But WebSocket can do server-to-client one-way, why introduce a second protocol?"-- think --
+
+A: Because the cost is real: WebSocket has no built-in reconnect, no resume-from-id, no native browser auto-reconnect, and many corporate proxies still block Upgrade: websocket headers. S S E rides Content-Type: text or event-stream through every middlebox that accepts H T T P.
+For L L M token streaming, notifications, build progress, S S E is 50 lines of IAsyncEnumerable, WebSocket is a framework with state to manage.
+
+Cross-Q²: A teammate says "We use WebSocket everywhere so we have one protocol." Convince them otherwise.-- think --
+
+A: The "one protocol" argument is a false economy. S S E is a thin H T T P idiom, anyone who knows H T T P knows S S E in 10 minutes. WebSocket forces every endpoint into stateful long-lived connections with manual reconnect, manual heartbeat, manual binary or text framing decisions.
+For unidirectional push, you trade simplicity for the optics of uniformity. Better axis: pick protocol by direction (one-way to S S E, two-way to WS) and stop pretending the choice is style.
+
+-- pause --
+Drill 2, S S E versus long-polling.
+
+Q: What does S S E buy you over long-polling?-- think --
+
+A: One open connection instead of N reconnects. No per-request T L S handshake, no per-request auth round-trip, no per-request H T T P headers tax.
+Server can flush immediately; client receives in real time instead of "wait until N seconds elapsed or event arrived." Also: built-in reconnect with Last-Event-ID for resume.
+
+Cross-Q: Long-polling is famously universal, works through every proxy that ever existed. Why give that up?-- think --
+
+A: You don't have to fully give it up, SignalR uses long-polling as the fallback transport. But for any modern environment (no legacy IE6, no exotic enterprise proxy from 2003), S S E works.
+The trade is: long-polling costs at minimum one TCP or T L S handshake + H T T P round-trip per event; S S E costs that once and amortizes over thousands of events. For high-throughput streams (L L M tokens at 30 or sec), long-polling melts your server with handshake overhead.
+
+Cross-Q²: When would you still pick long-polling in 2026?-- think --
+
+A: When you genuinely can't trust the network path, for example, you're behind a corporate proxy that buffers or strips streaming responses regardless of X-Accel-Buffering, or you must traverse infrastructure you don't control (third-party data center, regulated industrial network).
+Also when the event rate is very low (one event per few minutes), the handshake cost is amortized fine and you avoid the keep-alive complexity. Outside those edges, S S E wins.
+
+-- pause --
+Drill 3, dot NET 10 native S S E support.
+
+Q: How does dot NET 10 's Results.ServerSentEvents(IAsyncEnumerable) change S S E in A S P dot NET Core?-- think --
+
+A: It removes the boilerplate.
+The helper sets Content-Type: text or event-stream, Cache-Control: no-cache,no-store, Content-Encoding: identity, disables response buffering, serializes each yielded item to Jason, writes the event: / data: / \n\n framing, and honors the CancellationToken for client-disconnect detection.
+You write the source IAsyncEnumerable, the framework writes the S S E wire format.
+
+Cross-Q: What was the pre-dot NET 10 manual equivalent, and what's easy to get wrong?-- think --
+
+A: Manual: set headers yourself, then loop writing data: \n\n and call FlushAsync after each.
+Easy to miss: (1) forgetting FlushAsync so Kestrel buffers; (2) forgetting the blank line between events so the browser concatenates; (3) forgetting to honor CancellationToken so your producer keeps emitting into a closed socket; (4) forgetting X-Accel-Buffering:
+no so nginx batches in 30-second chunks.
+
+Cross-Q²: You need POST with a request body and S S E streaming response. Can you use Results.ServerSentEvents for that?-- think --
+
+A: Yes, the helper doesn't care about the request method. Map a POST route, bind your body via [FromBody], return Results.ServerSentEvents(my Enumerable). The catch is browser-side: EventSource is GET-only, so for POST+S S E you must use fetch with ReadableStream and parse the S S E frames yourself.
+That's the standard pattern for L L M chat, POST the prompt, stream tokens back. You lose EventSource 's auto-reconnect; you handle it manually.
+
+-- pause --
+Drill 4, Last-Event-ID and reconnection.
+
+Q: A client reconnects mid-stream and the browser sends Last-Event-ID: 42. What's the server's responsibility?-- think --
+
+A: Look at that header on the incoming request, parse it as the cursor, and replay every event with id > 42 before resuming the live stream. This requires server-side event persistence, a queryable log of events keyed by ID.
+
+Cross-Q: What if your events are ephemeral, generated live, never stored (for example, live C P U metrics from a sensor)?-- think --
+
+A: Then you can't replay. Set retry: 1000 (aggressive reconnect) and accept gap loss. Document it: "live-only stream, no replay guarantee on disconnect." For metrics dashboards this is fine, the next sample arrives in 5 seconds anyway.
+For ordered domain events (orders placed, payments received), you need persistence: append to a table with auto-increment id, use Redis Streams ( XADD + XREAD from cursor), or use Kafka with consumer-group offsets.
+
+Cross-Q²: A user kept their laptop closed for 4 hours, then reopens. The browser reconnects with Last-Event-ID: 42. Your replay buffer holds 10,000 events since then. Replaying all of them at full speed crushes the client. What do you do?-- think --
+
+A: Cap replay.
+Either (1) define a max replay window, "events older than N minutes are not replayed; client gets a: replay-truncated comment and a marker" so the client knows to refetch state via rest;
+or (2) compact, replay only the latest event per logical key (collapse 50 status updates for order-42 to the most recent one).
+For user-facing notifications you usually want option 1 + a U I badge "X notifications while away, view all." Don't blindly fire-hose 4-hour-old data at a freshly-woken client.
+
+-- pause --
+Drill 5, Reverse-proxy buffering.
+
+Q: S S E works in dev, arrives in 30-second batches in production behind nginx. What's the fix?-- think --
+
+A: nginx is buffering. Set proxy_buffering off; on the location, plus proxy_cache off; and a long proxy_read_timeout like 1 day. Pair with X-Accel-Buffering: no from the app side so the hint travels with the response.
+
+Cross-Q: Why does nginx buffer S S E by default, isn't that obviously wrong?-- think --
+
+A: Buffering exists for legitimate reasons: smoothing variable backend speed before delivery, reducing socket writes per response, computing Content-Length. For a typical request or response, buffering is correct.
+nginx can't tell S S E apart from a slow rest response just by the request, the cue is Content-Type: text or event-stream plus the streaming nature, which nginx doesn't introspect by default.
+The X-Accel-Buffering: no header is the explicit opt-out, and proxy_buffering off; is the location-level forcing.
+
+Cross-Q²: Same symptom on Azure Front Door / CloudFlare, X-Accel-Buffering doesn't fix it. What now?-- think --
+
+A: CDNs have their own buffering and compression. Front Door: confirm the route has streaming or compression-off mode and the WAF policy isn't body-buffering for inspection.
+CloudFlare: bypass cache for the route, disable Brotli or gzip on the path (compression often buffers full body to compute size), and use a CF Worker only if needed.
+The general principle: every layer between client and origin can buffer; test by curling from each layer outward (origin to regional gateway to edge) and find where streaming dies. The X-Accel header is the universal signal but proprietary edges may need product-specific config.
+
+-- pause --
+Drill 6, Browser 6-connection limit.
+
+Q: A dashboard opens 8 S S E feeds from the same origin. Some never connect. Why?-- think --
+
+A: Browsers limit concurrent H T T P or 1.1 connections per origin, typically 6. S S E holds one connection long-term, so 8 S S E feeds saturate the budget and the 7th or 8th wait indefinitely for one to close. Other H T T P requests to the same origin also queue.
+
+Cross-Q: How do you fix this without dropping features?-- think --
+
+A: Two options. (1) Move to H T T P or 2, it multiplexes many streams over one TCP connection, so the per-origin cap effectively goes away (you can have 100 concurrent S S E streams).
+Just enable H T T P or 2 termination at the load balancer / C D N; the connection from browser to edge becomes H T T P or 2.
+(2) Consolidate, merge multiple logical feeds into one S S E endpoint using the event: field to discriminate ( event: notifications, event: orders, event: metrics ). Browser uses addEventListener('notifications',.) to filter.
+
+Cross-Q²: H T T P or 2 from browser to C D N, but H T T P or 1.1 from C D N to origin. Does that still solve the limit?-- think --
+
+A: Yes for the browser-side limit, which is what matters. The 6-per-origin cap is a browser policy; it only inspects the browser to and from server connection.
+The C D N-to-origin link can be H T T P or 1.1 with one connection per stream and it doesn't matter, the browser sees H T T P or 2 with one multiplexed connection to the edge. This is the standard production setup: H T T P or 2 at the edge, H T T P or 1.1 inside.
+S S E survives fine over H T T P or 1.1 backhaul.
+
+-- pause --
+Drill 7, L L M token streaming.
+
+Q: Stream L L M tokens to a browser, S S E or WebSocket?-- think --
+
+A: S S E. The data flow is one-way server to client, text-only (tokens are strings), and naturally framed (one token = one event). Results.ServerSentEvents(chat Client.GetStreamingResponseAsync(.)) is essentially a one-liner in dot NET 10.
+WebSocket would work but adds bidirectional state you don't need.
+
+Cross-Q: OpenAI and Anthropic both use S S E for their streaming A P Is. Why is that the industry consensus and not WebSocket?-- think --
+
+A: Three reasons. (1) Simplicity for callers: client code is fetch + ReadableStream parse; no library required. WebSocket clients need framing, ping or pong, reconnect logic.
+(2) C D N compatibility: S S E rides H T T P, every C D N supports it; WebSocket Upgrade is sometimes blocked or rate-limited differently. (3) Stateless server side: S S E response is "stream IAsyncEnumerable until done or cancelled", that maps cleanly to async iterators on every backend platform.
+WebSocket forces a stateful connection lifecycle.
+
+Cross-Q²: But L L M chat is bidirectional, user sends prompts, model sends tokens. Doesn't that mean WebSocket?-- think --
+
+A: No, because the bidirectional pattern is request or response, not interleaved. User POSTs a prompt to server streams tokens via S S E to server sends event: done to connection closes. Next prompt is a new POST. Each turn is one-shot streaming, not concurrent in or out.
+If you had token-by-token user interruption ("stop"/"continue" mid-stream), then yes WebSocket, but the standard chat pattern is "complete one stream, start the next."
+
+-- pause --
+Drill 8, Authentication on EventSource.
+
+Q: Browser EventSource can't send Authorization: Bearer.. How do you auth an S S E endpoint?-- think --
+
+A: Three patterns. (1) Cookie-based, SPA already has a session cookie; S S E endpoint reads it via [Authorize]. Standard with the B F F pattern. (2) Query-string token, /events?access_token set to eyJ.; works but tokens may leak into logs and browser history.
+(3) Use fetch + ReadableStream instead of EventSource so you control headers, you lose built-in auto-reconnect and reimplement it.
+
+Cross-Q: Why won't the WHATWG fix this with a headers option on EventSource ?-- think --
+
+A: Long-standing browser-vendor stance: EventSource is intentionally minimal and works with cookies for auth. The argument is "auth headers belong to the app's fetch story, not a one-shot streaming primitive." There's a years-old proposal to allow custom headers, but it hasn't shipped.
+In practice modern apps that need headered auth use fetch with ReadableStream and parse S S E manually, about 30 lines of code.
+
+Cross-Q²: Query-string token is "easy" but considered bad practice. What specifically goes wrong?-- think --
+
+A: Three leak vectors. (1) Server logs, load balancers, reverse proxies, and access logs record full URLs including query strings; tokens end up in plaintext logs. (2) Browser history, URL is bookmarked, shared, screenshot.
+(3) Referrer header, if the S S E page links to a third-party resource, the browser may send Referer: Mitigations: use short-lived (60-second) tokens specifically scoped to "open S S E channel only", redact in logs, use Referrer-Policy: no-referrer.
+But the cookie path eliminates all three categories, so it's preferred.
+
+-- pause --
+Drill 9, Hosting and request timeouts.
+
+Q: S S E works for a while and then the connection drops. Where do you look?-- think --
+
+A: Request timeout. Every layer has one: IIS and the hosting platform have their own request timeouts, A S P dot NET Core applies whatever request-timeouts policy you registered, Azure App Service has idle-connection timeouts, load balancers have their own.
+Configure all of these to allow long-lived requests, and exempt the S S E endpoint in A S P dot NET Core with .DisableRequestTimeout() (or the [DisableRequestTimeout] attribute).
+
+Cross-Q: S S E is a long-lived response. Doesn't infinite request timeout open the door to slowloris?-- think --
+
+A: Yes, that's why "infinite for S S E only" is the rule, not "infinite for everything." Apply the long timeout to specific S S E routes via per-endpoint timeout policies, not globally. Other endpoints stay on tight timeouts.
+Pair with sane connection limits per IP and rate limiting so a single attacker can't open thousands of "fake S S E" connections and exhaust sockets and memory.
+
+Cross-Q²: Azure App Service has a hard idle timeout, roughly 230 seconds on a Windows app, that you can't change. What does that mean for S S E?-- think --
+
+A: Two things. (1) Send a keep-alive comment (: ping\n\n ) every 60-90 seconds so the connection isn't idle, the rule counts idle time, so bytes flowing keep the timer reset.
+(2) If you can't keep activity flowing (truly silent stream for hours), move to a hosting model that allows configurable timeout (A K S, Container Apps with longer settings). The keep-alive pattern is the standard S S E escape hatch from idle-timeout enforcement everywhere.
+
+-- pause --
+Drill 10, S S E versus H T T P or 2 server push.
+
+Q: H T T P or 2 has "server push." Isn't that the same as S S E?-- think --
+
+A: No, totally different mechanisms. H T T P or 2 server push lets the server preemptively send resources (CSS, JS, images) the client hasn't requested yet, anticipating they'll be needed. It's a transport-layer optimization for page load.
+S S E is an application-layer streaming protocol for ongoing events over an open response. H T T P or 2 push doesn't help with "send a live notification when something happens"; S S E doesn't help with "preload these assets faster."
+
+Cross-Q: H T T P or 2 server push has been deprecated by Chrome. Does that affect S S E?-- think --
+
+A: Not at all. S S E doesn't use the PUSH_PROMISE frame at all; it uses normal H T T P or 2 DATA frames on a regular response stream. Chrome's removal of server push was about the Link:; rel set to preload redirection pattern, which turned out not to deliver the promised perf gains.
+S S E rides H T T P or 2 multiplexing as a normal response and is healthier than ever.
+
+Cross-Q²: What about WebTransport / H T T P or 3, does that obsolete S S E?-- think --
+
+A: WebTransport is positioned for the bidirectional + binary + low-latency use cases that WebSocket served, gaming, live video, real-time collab. It doesn't replace S S E; the unidirectional text-streaming sweet spot stays with S S E because its simplicity is the point.
+In 5+ years S S E may quietly migrate to H T T P or 3 transport underneath but the A P I surface ( text or event-stream, EventSource ) stays. WebTransport competes with WebSocket; S S E competes with neither.
+
+-- pause --
+Drill 11, Heartbeat and detecting dead clients.
+
+Q: How does the server detect a client that "vanished", closed laptop, network died, without explicit disconnect?-- think --
+
+A: TCP doesn't help quickly, a closed laptop leaves the socket in established state until the operating system times out (minutes to hours). The pragmatic mechanism: send a heartbeat comment (: ping\n\n ) every 15-30 seconds and rely on the write to fail.
+When the operating system finally notices the socket is dead, WriteAsync throws or the CancellationToken fires, your IAsyncEnumerable exits naturally.
+
+Cross-Q: Why a comment (: ) rather than an event: ping ?-- think --
+
+A: Comments are protocol-level, the browser's EventSource discards lines starting with: without firing any event handler.
+Sending event: ping would deliver a "ping" event to client code; client has to either add addEventListener('ping', noop) to suppress it or every ping triggers a no-op event handler call. Comments give you the keep-alive bytes with zero client-side noise.
+The "heartbeat" pattern is therefore traditionally a comment line.
+
+Cross-Q²: A client behind a proxy keeps the TCP connection up but is no longer reading bytes, your buffer fills, your write blocks. How do you avoid OOM-ing your server with abandoned slow clients?-- think --
+
+A: Bounded write buffer + cancellation on slow consumer.
+Either (1) use Channel with a bounded capacity and BoundedChannelFullMode.DropOldest, your producer never blocks, the slow client just gets gaps; or (2) detect slow client via a timeout on the WriteAsync (for example, Task.WaitAsync(TimeSpan.FromSeconds(10)) ) and cancel the consumer on timeout.
+Either way: don't let one slow client back-pressure your producer. Many production S S E failures are "one client on a phone-tethered connection grinds the publisher pipeline to a halt." Bound the producer side.
+
+-- pause --
+Drill 12, Backpressure on S S E.
+
+Q: Your producer emits 1,000 events per second; the client's connection is only 100 kilobytes per second. What happens?-- think --
+
+A: Bytes pile up. First in Kestrel's output buffer (small, kilobytes), then in TCP's send buffer (tens of kilobytes), then your producer's await response.WriteAsync(.) blocks because the buffer is full. If the producer is awaiting on its own Channel, the channel fills up, and its writer blocks too.
+Cascade.
+
+Cross-Q: How do you stop this propagating back to upstream producers?-- think --
+
+A: Bounded channel with explicit drop policy. Channel.CreateBounded(new BoundedChannelOptions(capacity: 1000) { FullMode = BoundedChannelFullMode.DropOldest }).
+When the channel fills, oldest items are dropped silently, the upstream producer keeps producing, the slow consumer gets the latest N items (gaps in older). The semantics are "freshness over completeness," appropriate for stock tickers, dashboards, live metrics.
+For notifications you may want Wait (block producer) to never drop, but then a slow consumer can starve everyone.
+
+Cross-Q²: Notifications must not drop, but one slow client can't stall the producer. How do you reconcile?-- think --
+
+A: Per-consumer queue, not shared. Producer fan-outs into N per-client channels; each channel has its own bounded buffer with DropOldest or Wait per-client policy. A slow client's queue fills and drops their events, not anyone else's.
+This is the standard fan-out pattern at scale, and at very large scale, the per-client queues live in a broker (Redis Streams, Kafka with per-consumer offsets) rather than in-memory in the S S E server. The principle: never share back-pressure across consumers.
+
+-- pause --
+Drill 13, Scaling S S E.
+
+Q: Past 10K concurrent S S E connections per instance, what changes?-- think --
+
+A: You need pub or sub fan-out. Each S S E server can comfortably hold ~10K open connections (tunable; depends on heap, garbage collector, kernel limits). that, you scale horizontally, multiple S S E server pods, all subscribed to a shared backplane (Redis Pub or Sub, Redis Streams, NATS, Kafka).
+Producers publish to the backplane; S S E servers subscribe and fan-out to their connected clients.
+
+Cross-Q: Sticky sessions or not?-- think --
+
+A: For pure S S E pub or sub fan-out, no, any pod can serve any client because the backplane delivers events to all pods.
+Stickiness matters if you have per-client server-side state (subscription filters, throttling counters) that's expensive to migrate; even then, prefer to make the state shared (Redis) and skip stickiness, because sticky sessions complicate failover.
+The exception: when reconnecting with Last-Event-ID, you want the replay to come from the same backing store (which is centralized anyway), so stickiness doesn't help replay correctness.
+
+Cross-Q²: At 100K+ concurrent connections, where does the bottleneck shift?-- think --
+
+A: From S S E servers to the backplane. A single Redis instance pub or sub at 100K subscribers + high publish rate becomes the constraint.
+Two patterns: (1) Redis Cluster with sharded channels (subscribers per shard); (2) move to NATS or Kafka with partitioned topics, clients connect to the S S E server holding the partition for their user.
+At "Slack-scale" or "LinkedIn-feed-scale," this is custom infrastructure, your S S E servers become thin partition-aware routers and the broker is the heart. Most apps never see this.
+
+-- pause --
+Drill 14, Closing S S E cleanly.
+
+Q: How does the server cleanly end an S S E connection?-- think --
+
+A: Stop yielding from the IAsyncEnumerable (or break the manual loop), the response completes naturally. A S P dot NET Core flushes any pending bytes and closes the TCP connection. Optionally send a final event: done\ndata: {}\n\n so the client knows it was an intentional close, not a network blip.
+
+Cross-Q: How does the client cleanly end?-- think --
+
+A: Call event Source.close(). This stops auto-reconnect (without it, EventSource aggressively retries on any close, exactly what you don't want if the user is logging out).
+Server-side, the cancellation token fires when the TCP socket closes; your IAsyncEnumerable should propagate the token via [EnumeratorCancellation] so the producer stops generating into a dead pipe.
+
+Cross-Q²: User clicks "Log out." You revoke their session server-side, but the S S E connection is still open with their cookie. What happens next?-- think --
+
+A: Depends on your design. (a) Best: server-side, the S S E endpoint listens on a "session-revoked" channel and closes any matching streams immediately. (b) Acceptable: the next heartbeat write attempts a re-auth check (for example, re-validate cookie) and closes on failure.
+(c) Tolerable: short-lived cookies so the S S E connection naturally fails on the next renewal. The naive design (no revocation propagation) leaves the S S E channel as a "ghost session" that keeps streaming until the TCP times out, for high-value apps this is a security issue.
+For low-value notifications it's fine.
+
+-- pause --
+Drill 15, S S E wire format.
+
+Q: Draw the wire format of an S S E event with all four fields.-- think --
+
+A:
+
+event: token.
+id: 42.
+retry: 5000.
+data: {"text":"hello"}.
+
+Each field is name: value\n, the event terminates with a blank line ( \n\n ). event: is the event name (default message ). id: is the cursor for resume. retry: is the reconnect delay hint in milliseconds. data: is the payload (multiple data: lines are joined with \n ).
+
+Cross-Q: What does a: line do? Why is it useful?-- think --
+
+A: A line starting with: is a comment, EventSource discards it without firing any handler. It's used as a keep-alive (: ping\n\n ) to defeat NAT or middlebox idle timeouts without delivering a noise event to the client. It's also useful for in-stream debugging notes the client should ignore.
+
+Cross-Q²: A producer emits data: line1\ndata: line2\n\n. What does the client see in event.data ?-- think --
+
+A: "line1\nline2", multi-line data: is joined with \n per the spec. That only works because each line carries its own data: prefix: a raw newline inside a data: value ends the field.
+So if you hand-write data: {json}\n\n yourself and the payload contains newlines (pretty-printed Jason from a JsonSerializerOptions with WriteIndented = true, say), the payload is truncated to its first line and the rest is silently dropped.
+You don't get extra events, the continuation lines are read as unknown fields and discarded. Fix: serialize compact, or emit a data: prefix per line. Results.ServerSentEvents prefixes every line for you, so this hazard is specific to hand-rolled writers. The blank line ends the event.
+If you wanted two events, you'd write data: line1\n\ndata: line2\n\n, two events each with one data: line. The blank line is the event terminator; the field-line repetition is in-event continuation.
+
+-- pause --
+Section 2. Self-test.
+
+The browser's native EventSource A P I doesn't expose a headers option, by spec, it sends only the standard request headers plus Accept: text or event-stream and Last-Event-ID on reconnect.
+Workarounds: (1) Cookies, the S S E endpoint reads the session cookie on the upgrade request, ideal with the B F F cookie-on-server pattern. (2) Query string token, ?access_token=., but tokens leak into logs and history.
+(3) Use fetch with ReadableStream instead of EventSource and parse S S E manually, gives full headers control at the cost of losing built-in auto-reconnect. The cookie path is cleanest in production.
+
+(1) Reverse-proxy buffering, nginx, Azure Front Door, Cloudflare, IIS may buffer until the response is complete. Set X-Accel-Buffering: no and configure the proxy explicitly. (2) Response compression, gzip or Brotli middleware may buffer until full to compute the compressed size.
+Exclude S S E paths from compression. (3) Missing FlushAsync calls in code, Kestrel's default is to batch writes; without explicit await response.Body.FlushAsync() after each event, multiple events combine into one TCP segment.
+Diagnose by curling the App Service directly (bypass proxy), if it streams there, the issue is at the edge.
+
+The server must persist events with stable, ordered IDs.
+Options: (a) append to a sequel table with an autoincrement ID, query WHERE id > lastEventId ORDER BY id on reconnect; (b) use Redis Streams which give you both pub or sub and replay-from-cursor for free; (c) use Kafka with consumer groups, treating each browser session as a consumer.
+If events are ephemeral (computed on demand from external sources), you can't replay, set retry: 1000 and accept that reconnects miss the gap. This is one place S S E is more demanding than WebSockets, which often don't bother with replay at all.
+
+Browsers limit ~6 concurrent connections per origin in H T T P or 1.1. Each S S E stream occupies one connection long-term, open 6 S S E streams to one origin and the rest of the page can't load assets.
+H T T P or 2 multiplexes many streams over a single TCP connection, so 100 S S E streams to one origin all share one connection and don't starve other requests. This isn't optional at scale: a notifications dashboard with multiple S S E feeds plus normal AJAX traffic will jam without H T T P or 2.
+Termination at the load balancer or C D N is sufficient, S S E works fine over H T T P or 1.1 from LB to backend.
+
+S S E wins when (a) push is genuinely one-way, no client to server messages on the same channel; (b) clients are browsers only, no need for SignalR's multi-platform clients (Java, Python, mobile native); (c) you don't need transport fallback to long-poll for old corporate proxies;
+(d) simplicity matters more than features, S S E is 50 lines of IAsyncEnumerable, SignalR is a hub framework with conventions to learn.
+SignalR wins when you need bidirectional, group broadcast with server-managed groups, automatic transport fallback, or cross-language clients. For L L M token streaming and notification feeds in a modern browser-first SPA, S S E is leaner and uses less infrastructure.
