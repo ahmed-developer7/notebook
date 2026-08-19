@@ -1,0 +1,1004 @@
+-- pause --
+Section 1. Why It Matters.
+
+Dependency Injection (D I) is the spine of every modern dot NET application. A S P dot NET Core, Worker Services, MAUI, G R P C, SignalR, E F Core, OpenTelemetry, MediatR, all of them register and resolve through IServiceCollection / IServiceProvider.
+Understanding the internals of Microsoft.Extensions.DependencyInjection is the difference between a developer who copy-pastes AddScoped<> and one who can debug a captive-dependency leak in production at 2 AM.
+
+D I is also the single biggest source of subtle bugs in long-running dot NET apps. Inject a DbContext into a Singleton and your app will silently corrupt state across requests. Forget to wrap a BackgroundService in a scope and you'll exhaust the connection pool in hours.
+Mis-order two AddScoped calls and a decorator silently disappears. None of these throw at startup, they show up as flaky tests, memory leaks, or "works on my machine" tickets.
+
+This guide goes deep: how ServiceDescriptor actually works, why scoped to singleton is illegal, how IServiceScopeFactory rescues you, what keyed services (dot NET 8+) changed, how the container behaves under Native A O T, and what the runtime actually does between builder.Build() and app.Run().
+
+-- pause --
+Section 2. Table of Contents.
+
+Introduction, including I O C principle versus D I pattern versus Service Locator.
+Real-World Analogy: The Hotel Concierge Service Catalog.
+How D I Works Internally.
+ServiceDescriptor Internals.
+The IServiceProvider A P I Surface.
+Service Lifetimes.
+Lifetime Compatibility Matrix.
+The Captive Dependency Problem and Fix.
+Injection Styles: Constructor versus Property versus Method, including how the container picks a constructor.
+Keyed Services (dot NET 8+).
+Open Generic Registrations.
+Scoped Service Validation.
+IServiceScopeFactory in Non-H T T P Contexts.
+Disposal, Ownership, and Async Scopes.
+Service Replacement, TryAdd, and Decorators.
+Conditional and Factory Registration.
+When NOT to Use D I.
+Real-World D I Registration.
+Common Pitfalls.
+Best Practices.
+Real-World Scenarios.
+Interview-Ready Summary.
+Interview Cross-Questioning Drill.
+Cheat Sheet.
+Walkthrough.
+Self-Test.
+Cross-References.
+Sources.
+
+-- pause --
+Section 3. Introduction.
+
+-- pause --
+What is Dependency Injection?.
+
+Dependency Injection is a design pattern where an object's dependencies are handed to it rather than constructed by it.
+The dot NET runtime (via IServiceProvider ) acts as the "matchmaker", when something asks for IUserRepository, the container decides which implementation to give, how long it lives, and how to clean it up.
+
+Without D I: Each class news up its own dependencies. Tightly coupled, untestable, hard to swap implementations.
+With D I: Classes declare what they need; the container provides it. Loosely coupled, testable, swappable.
+
+-- pause --
+I O C Principle versus D I Pattern versus Service Locator.
+
+This is the standard opening question, and "D I means the framework injects things" is not a passing answer. Inversion of Control (I O C) is the principle: a component does not create or locate its own dependencies, something external supplies them. D I is one pattern that implements I O C.
+
+I O C principle, maps to, "Don't call us, we'll call you." A class declares needs; something external satisfies them.
+D I pattern, maps to, One I O C implementation: dependencies are passed in (constructor, property, or method).
+D I container, maps to, The runtime infrastructure ( IServiceProvider ) that automates D I at scale.
+Service Locator, maps to, A different I O C implementation: classes pull dependencies from a global registry. An anti-pattern in application code, it hides dependencies and breaks testability.
+
+The distinction interviewers probe: I O C is the principle, D I is the mechanism. new OrderService(new EfRepo(), new Logger()) in Main is still D I, manually wired. IServiceProvider just automates it.
+Microsoft's own D I guidance names the service locator pattern explicitly as something to avoid, and extends that to "injecting a factory that resolves dependencies at runtime" in application code.
+
+-- pause --
+Why D I Matters in dot NET.
+
+Testability: Replace real services with fakes or mocks at the boundary.
+Lifetime management: The container disposes scoped services automatically, no leaks.
+Configuration-driven composition: Different implementations per environment ( InMemoryCache in tests, RedisCache in prod).
+Cross-cutting concerns: Logging, metrics, tracing, caching can be added via decorators without touching the original class.
+Native A O T support: Microsoft.Extensions.DependencyInjection works under Native A O T, when the runtime reports that dynamic code cannot be compiled, the provider falls back to an interpreting engine instead of emitting I L (see The Two Engines).
+There is no official source-generated D I container in dot NET; that remains an open proposal (dotnet or runtime#82679, dotnet or aspnetcore#62104). Third-party compile-time containers (Jab and similar) exist, but they are not Microsoft.Extensions.DependencyInjection.
+
+-- pause --
+Section 4. Real-World Analogy: The Hotel Concierge Service Catalog.
+
+Think of the D I container as a hotel concierge desk with a service catalog binder.
+
+This analogy maps directly onto code:
+
+Concierge desk, maps to, IServiceProvider.
+Catalog binder, maps to, IServiceCollection (list of ServiceDescriptor ).
+Catalog entry, maps to, ServiceDescriptor.
+Guest stay folder, maps to, IServiceScope.
+Room key (one per stay), maps to, Scoped service.
+Taxi (new each call), maps to, Transient service.
+WiFi password (whole hotel), maps to, Singleton service.
+Painting WiFi on a key, maps to, Captive dependency.
+
+-- pause --
+Section 5. 4. Dependency Injection in dot NET 10.
+
+-- pause --
+The Two Engines.
+
+ServiceProvider picks its resolution engine automatically, and the switch is dynamic-code support, not the environment. From ServiceProvider.GetEngine() in dotnet or runtime:
+
+DynamicServiceProviderEngine, the default on any runtime that can compile dynamic code (normal jit-based apps, dev and prod). It resolves through the interpreting call-site resolver first and swaps in a compiled delegate for hot service types, so you get fast startup and fast steady state.
+It derives from CompiledServiceProviderEngine, which owns the compilation step (I L emit where available, expression trees otherwise).
+RuntimeServiceProviderEngine, used when RuntimeFeature.IsDynamicCodeCompiled is false, that is Native A O T and interpreter-only runtimes. It walks the call-site tree every time rather than compiling, because emitted I L would only be interpreted anyway.
+
+️ Common interview trap: CompiledServiceProviderEngine is not a "production engine" that a jit tier-up switches you to, it is DynamicServiceProviderEngine 's base class.
+And there is no UseSourceGenerator() -style A P I: an official source-generated container is still only a proposal (dotnet or runtime#82679).
+
+-- pause --
+Section 6. ServiceDescriptor Internals.
+
+-- pause --
+Three Ways to Register.
+
+Container ownership rule: if the container constructs an IDisposable, it disposes it. If you hand it a pre-built instance via AddSingleton(instance), you own disposal. See Disposal, Ownership, and Async Scopes.
+
+The three implementation properties are mutually exclusive, exactly one is set per descriptor:
+
+ImplementationType, shape 1; the container constructs it.
+ImplementationFactory, shape 2; the container invokes your delegate.
+ImplementationInstance, shape 3; the container hands back the object as-is.
+
+Instance registration is singleton-only, and the A P I enforces it: there is no AddScoped(instance). A pre-built object cannot have per-scope or per-call semantics, returning the same object every time is singleton behaviour.
+
+-- pause --
+Section 7. The IServiceProvider A P I Surface.
+
+IServiceProvider is the runtime resolver. In A S P dot NET Core you rarely call it directly, but you need its surface for tests, factories, and background services.
+
+️ Never call BuildServiceProvider() inside ConfigureServices (or inside a Program.cs registration block) just to resolve something during startup. It builds a second, separate container: every singleton in it is a different instance from the one the app actually runs on, and nothing disposes it.
+If you need a service at startup, build the host and then using var scope = app.Services.CreateScope();.
+
+IServiceScopeFactory is always registered as a singleton. The IServiceProvider you get injected, by contrast, varies with the lifetime of the class receiving it, resolve a service from a scope and the IServiceProvider it receives is that scope's provider.
+
+-- pause --
+Section 8. Service Lifetimes.
+
+-- pause --
+Transient, Properties Box.
+
+When to use:
+Stateless validators, mappers, formatters.
+Services with mutable state that callers shouldn't share.
+Lightweight strategy objects.
+
+When NOT to use:
+Anything implementing IDisposable and injected into a singleton (memory leak).
+Services with expensive constructors (H T T P clients, use IHttpClientFactory instead).
+Anything needing per-request consistency (use Scoped).
+
+-- pause --
+Section 9. Lifetime Compatibility Matrix.
+
+Read this one way only: rows are the service doing the injecting (the consumer); columns are the dependency it asks for. The single rule underneath the whole table is never let a longer-lived service hold a shorter-lived one.
+The reverse direction, short-lived depending on long-lived, is always fine.
+
+Transient, maps to, Takes on the identity of whichever scope resolved it.
+Scoped, maps to, Most permissive, a singleton dependency is always legal here.
+Singleton, maps to, = captive dependency; use IServiceScopeFactory to reach scoped services.
+
+Legend: safe, legal but wasteful (and leaks disposal), bug, ValidateScopes throws on it.
+
+-- pause --
+Section 10. The Captive Dependency Problem and Fix.
+
+-- pause --
+Detection.
+
+The generic host turns scope validation on only in the Development environment. From HostingHostBuilderExtensions in dotnet or runtime:
+
+Microsoft's D I overview states the same behaviour: when an app runs in the development environment and uses CreateApplicationBuilder, the default provider verifies that scoped services aren't resolved from the root provider and aren't injected into singletons.
+
+With validation on you get:
+
+In every other environment, including Production, both flags are off by default, so the bug ships silently. Best practice: turn them on explicitly for all environments:
+
+-- pause --
+Section 11. Injection Styles: Constructor versus Property versus Method.
+
+-- pause --
+How the Container Picks a Constructor.
+
+Microsoft's rule, stated in the D I overview: "The constructor with the most parameters where the types are D I-resolvable is selected." Three details that turn into cross-questions:
+
+Only public constructors are considered. Both IServiceProvider and ActivatorUtilities require a public constructor.
+Ambiguity throws. CallSiteFactory sorts constructors by descending parameter count and takes the first fully-resolvable one; if a second resolvable constructor is not a subset of that one, it throws InvalidOperationException naming both constructors.
+Docs example: a class with (ILogger) and (IOptions) constructors, both resolvable and neither a superset of the other, fails to resolve.
+Non-injected parameters must have default values. A constructor may take arguments D I can't supply, but only if they are optional.
+
+[ActivatorUtilitiesConstructor] marks the constructor "to be used when activating type using ActivatorUtilities ", that is the whole of its documented contract.
+The string ActivatorUtilitiesConstructor does not appear in CallSiteFactory, so the built-in ServiceProvider ignores it and applies the greedy rule regardless. Use it to disambiguate ActivatorUtilities.CreateInstance, never to steer the container.
+
+C sharp 12 primary constructors are idiomatic for D I services, with two gotchas: the synthesized backing fields are mutable (nothing stops repo = null; later in the class body, project to private readonly IRepo _repo = repo;
+if you want enforced immutability), and a parameter that is never used by an instance member gets no backing field at all.
+
+-- pause --
+Property Injection (Use Sparingly).
+
+Microsoft.Extensions.DependencyInjection does not support property injection out of the box, it's a deliberate design choice. If you need it, you wire it manually:
+
+Use property injection only for truly optional dependencies in legacy code that you can't refactor.
+
+-- pause --
+Method Injection (HttpContext-style).
+
+A S P dot NET Core minimal A P Is and controller action methods inject per-call dependencies via method parameters:
+
+This is method injection, the framework resolves parameters from D I as it invokes the method.
+
+-- pause --
+Section 12. Keyed Services (dot NET 8+).
+
+Before dot NET 8, registering multiple implementations of one interface required a custom factory pattern. dot NET 8 introduced keyed services as the native replacement, via AddKeyedSingleton / AddKeyedScoped / AddKeyedTransient and the [FromKeyedServices] attribute.
+
+-- pause --
+Properties Box.
+
+Keyed services and Native A O T. Keyed services shipped in dot NET 8 and are not gated on a later release.
+The one A P I in this area carrying an A O T annotation is the non-generic overload GetKeyedServices(this IServiceProvider, Type, object?), marked [RequiresDynamicCode("The native code for an IEnumerable might not be available at runtime.")].
+The generic GetKeyedServices(this IServiceProvider, object?) carries no such attribute. So: use the generic overload on an A O T target, and expect a warning if you reach for the Type -based one.
+
+-- pause --
+KeyedService.AnyKey, Two Different Jobs.
+
+KeyedService.AnyKey means different things on the registration side and the lookup side, and conflating them is a classic follow-up:
+
+️ Behaviour change in dot NET 10: calling the singular GetKeyedService() with KeyedService.AnyKey now throws InvalidOperationException, AnyKey was never meant to resolve a single service. Only the plural GetKeyedServices() accepts it.
+
+-- pause --
+Section 13. Open Generic Registrations.
+
+Register the open type once and let the container close it per T at resolution time. This is how ILogger works, and how you avoid registering IRepository, IRepository, IRepository. by hand.
+
+Why AddScoped, EfRepository<>>() doesn't compile: IRepository<> is an unbound generic type. C sharp doesn't allow it as a type argument to a generic method, the language requires a closed type there.
+typeof(IRepository<>) is legal because typeof can produce an open generic Type object, and the non-generic AddScoped(Type, Type) overload takes it. It's a language restriction, not a container limitation.
+
+Constraints are not validated at registration. The container stores the descriptor without inspecting where T: IEntity. Resolve IRepository against EfRepository where T: IEntity and the failure surfaces at resolution time from MakeGenericType, not at startup.
+Defence: an integration test that resolves each closed type you actually use, so violations fail in CI.
+
+-- pause --
+Section 14. Scoped Service Validation.
+
+Two startup flags govern container correctness. Both should be on in dev, and strongly considered in prod.
+
+ValidateOnBuild = true walks every descriptor at startup and tries to build a resolution chain for it. The cost is one-off and scales with the number of registrations and the depth of the graph, measure it on your own app rather than quoting a number.
+The benefit is that a missing or circular dependency crashes the app in CI, not at midnight on the first real request.
+
+Both flags default to on in Development only (see Detection for the host source), so set them explicitly if you want them in Production.
+
+-- pause --
+What ValidateOnBuild Does NOT Catch.
+
+Say this before the interviewer asks it, it is the most common follow-up:
+
+Factory-registered services. services.AddSingleton(sp goes to new Cache(sp.GetRequiredService())) registers a delegate. The validator never executes it, so a captive dependency created inside a lambda is invisible. Code review is the primary defence here.
+Open-generic registrations, skipped outright. ServiceProvider.ValidateService opens with if (descriptor.ServiceType.IsGenericType and and !descriptor.ServiceType.IsConstructedGenericType) return;, so a descriptor registered as typeof(IRepository<>) is never walked at build time.
+It is validated only when a closed IRepository is first resolved. Don't claim ValidateOnBuild covers open generics, it explicitly does not.
+Runtime-keyed lookups. GetRequiredKeyedService(keyFromConfig) is a runtime decision.
+Generic constraint violations that only appear for particular T.
+Conditional registration branches that weren't taken in this environment.
+
+In short: it validates the descriptor-level graph, not the dynamic resolution paths your code takes. Integration tests over the real container are the safety net for those.
+
+-- pause --
+Section 15. IServiceScopeFactory in Non-H T T P Contexts.
+
+IServiceScopeFactory is the rescue valve for any code that lives outside of a per-request scope: BackgroundService, hosted services, message-queue consumers, scheduled jobs, SignalR Hub handlers that fan out work.
+
+-- pause --
+Other Non-H T T P Hot Spots.
+
+SignalR Hubs: Hub instance is transient per invocation, but background fan-out via IHubContext<> lives outside a scope, wrap work in CreateScope().
+Quartz / Hangfire jobs: each job execution must run in its own scope; both libraries have built-in integration packages.
+G R P C streaming methods: a streaming call has one scope for its full duration, long calls can leak scoped resources; consider explicit sub-scopes.
+
+-- pause --
+Section 16. Disposal, Ownership, and Async Scopes.
+
+-- pause --
+The Ownership Rule.
+
+If the container constructed it, the container disposes it. If you handed the container a pre-built object, you own it.
+
+Microsoft states the same rule from the other direction: services resolved from the container should never be disposed by the developer, and for services.AddSingleton(new Service1()) "the framework doesn't dispose of the services automatically."
+
+-- pause --
+Ordering, and What Happens When Dispose Throws.
+
+Disposal is LIFO relative to resolution order, so a dependent is disposed before the dependency it was built from, OrderService before its DbContext.
+
+What happens when one Dispose throws is version-dependent, and both halves of this guide previously got it wrong:
+
+Through dot NET 10, ServiceProviderEngineScope.Dispose has no try / catch. It walks the tracked list in reverse calling Dispose(), and the first exception propagates immediately, the remaining services are never disposed. There is no AggregateException and nothing is logged by the container.
+On the main branch (dot NET 11 previews) the loop was changed to catch per-instance: exceptions are accumulated, then a single exception is rethrown with its original stack via ExceptionDispatchInfo.Throw(), or an AggregateException if more than one service threw.
+
+Practical takeaway is the same either way: never throw from Dispose. If cleanup can fail, log it internally and swallow. On the runtimes most teams are on today, one buggy Dispose really does abandon the rest of the scope's cleanup.
+
+-- pause --
+Sync Scope + IAsyncDisposable.
+
+Two distinct cases, and the difference matters:
+
+A service implementing both IDisposable and IAsyncDisposable, in a sync-disposed scope: Dispose() is called, DisposeAsync() is not. The async cleanup path is silently skipped.
+A service implementing only IAsyncDisposable, in a sync-disposed scope: it does not fail silently, Dispose throws InvalidOperationException (" '{0}' type only implements IAsyncDisposable. Use DisposeAsync to dispose the container. "). Loud, and easy to fix.
+
+So: any service with real async cleanup (closing a connection, flushing a buffer) belongs in a scope created with CreateAsyncScope() and disposed with await using.
+
+-- pause --
+Section 17. Service Replacement, TryAdd, and Decorators.
+
+-- pause --
+Add versus TryAdd versus Replace.
+
+TryAdd asks "is any descriptor for this service type present?" TryAddEnumerable asks "is a descriptor for this exact (service type, implementation type) pair present?", which is what you want when several implementations are meant to coexist but the same one must not be registered twice.
+
+-- pause --
+Extension-Method Module Registration.
+
+Group related registrations behind one Add{Module} extension method. This is the framework's own convention ( AddRazorComponents, AddDbContext,. ) and it keeps Program.cs readable while giving each module an owner:
+
+Use TryAdd* inside these methods, that is the polite library-author contract. If the consumer registered their own implementation first, yours steps aside instead of appending a second descriptor that would win GetRequiredService() by last-wins and silently override their explicit choice.
+Returning IServiceCollection keeps the calls chainable.
+
+-- pause --
+Multiple Registrations of One Interface.
+
+Resolving IRule (singular) returns the last one registered. Resolving IEnumerable returns all in registration order.
+
+Last-wins is deliberate: it is what lets app code override a library default simply by registering after it.
+The docs spell out both halves, a second AddSingleton() "overrides the previous one when resolved as IMyDependency and adds to the previous one when multiple services are resolved via IEnumerable ".
+
+Need an execution order different from registration order? Two options: put an int Order property on the interface and sort in the composite ( rules.OrderBy(r goes to r.Order) ), or use keyed registrations with an ordered key.
+The first is simpler and far more common; the second earns its keep when the order is configured externally.
+
+-- pause --
+Decorators via Scrutor.
+
+The built-in container has no native decorator support and no assembly scanning. Scrutor is the long-standing third-party package that adds both:
+
+Scrutor also provides Scan() for assembly-scanning registration:
+
+️ AsImplementedInterfaces() registers each matched type under every interface it implements, including IDisposable if the class implements it. After that, GetRequiredService() resolves whichever handler happened to be registered last. Narrow it: As(), or filter the interface list.
+
+Version note before you quote guidance about Scrutor in an interview.
+Keyed-service support arrived in Scrutor v7.0.0 (released 24 Nov 2025), together with support for exposing decorated services; guidance written against dot NET 8 or 9-era Scrutor that steers you away from combining Decorate with keyed registrations predates it.
+Check the release notes for the version you actually reference. Separately: assembly scanning is reflection over assemblies by design, so a trimmer or Native A O T publish cannot see those registrations statically, that is a property of scanning, not a defect in the package.
+
+-- pause --
+Section 18. Conditional and Factory Registration.
+
+-- pause --
+Factory Pattern.
+
+For most cases, prefer keyed services (above) over hand-rolled factories, the container manages the lifetimes, the dependency is declared at the injection site via [FromKeyedServices] instead of hidden behind an IServiceProvider, and there's less boilerplate.
+
+-- pause --
+Section 19. When NOT to Use D I.
+
+Registering everything is its own smell. The container earns its place only when a type has dependencies with lifetimes, or needs to be swappable.
+
+Pure functions, formatters, parsers, Math -style helpers, No state, no dependencies, pure input to output, static methods; no container needed.
+Static utility helpers, StringExtensions, DateTimeExtensions, No lifecycle; injecting them is noise, static class extension methods.
+Value objects / DTOs, Order, Address, Money, Data carriers, not services, Constructor or object initializer.
+Types created in hot loops, Resolution overhead and allocation churn for no benefit, new directly, or ObjectPool.
+Config-only singletons, It's a shared value, not a service, IOptions or direct IConfiguration binding.
+
+The tell: "I'm registering this so I can call new X() once." If a type has no dependencies and no lifecycle, it doesn't belong in the container.
+
+The test for when a former "pure function" legitimately earns D I: does it now hold a dependency with its own lifetime (a cache, a logger, an HttpClient, config that can change)? Does it need to be replaceable in tests?
+Yes to either to promote it from static class to a class with constructor-injected dependencies. No to both to leave it static.
+
+-- pause --
+Section 20. Common Pitfalls.
+
+-- pause --
+1. Captive Dependency (Scoped to Singleton).
+
+Already covered. Runs forever, leaks state, will not be caught unless ValidateScopes = true.
+
+-- pause --
+2. Resolving Scoped Services from Root Provider.
+
+The root provider has no scope. Either resolve from HttpContext.RequestServices, or create one explicitly:
+
+-- pause --
+4. Constructor That Throws Mid-Construction.
+
+Throwing in constructors of services that consume disposables is dangerous; the partially-constructed graph escapes disposal. Validate inputs before taking ownership of disposables.
+
+-- pause --
+6. Static IServiceProvider Anti-Pattern.
+
+This is the Service Locator anti-pattern. It hides dependencies, breaks tests, and re-introduces the coupling D I was supposed to eliminate. Use constructor injection instead.
+
+-- pause --
+7. HttpClient as a Singleton (Old Pattern).
+
+Use IHttpClientFactory ( AddHttpClient() ), typed clients, named clients, or pooled handlers.
+
+-- pause --
+8. Multi-Threading a Scoped Service.
+
+Scoped services are not automatically thread-safe. For parallel fan-out, create child scopes (one per task) or serialize the work.
+
+-- pause --
+9. Open-Generic Misregistration.
+
+For repositories, validators, and anything else that closes over T, use the typeof() overload. See Open Generic Registrations.
+
+-- pause --
+10. Registering the Same Interface 50 Times by Mistake.
+
+Calling AddScoped() from a re-entrant AddXXX() extension can register the same descriptor on every host reload, especially in tests. Use TryAdd in extension methods that may be called more than once.
+
+-- pause --
+11. Async Dispose Not Awaited.
+
+If the type implements both IDisposable and IAsyncDisposable, a sync-disposed scope quietly calls only Dispose(). If it implements only IAsyncDisposable, a sync-disposed scope throws InvalidOperationException instead. Details in Disposal, Ownership, and Async Scopes.
+
+-- pause --
+Section 21. Best Practices.
+
+Default to constructor injection. Use primary constructors (dot NET 8+) for terseness.
+Default to scoped lifetime for application services, scoped for DbContext, transient for stateless helpers, singleton for caches or clients or loggers.
+Turn on ValidateScopes and ValidateOnBuild, catch bugs at startup, not in production.
+*Library authors: use TryAdd ** so consumers can override your defaults.
+Never inject IServiceProvider unless you have a runtime-resolution need (factories, plugin systems). It hides dependencies.
+Use keyed services over factories for "pick one of N", built-in, A O T-safe, less code.
+Background services: always CreateScope() per unit of work, never share scopes across iterations.
+H T T P clients: always use IHttpClientFactory ( AddHttpClient() ), never raw HttpClient.
+DbContext is scoped, never singleton. Period.
+For decorators and assembly scanning, Scrutor is the usual answer, the built-in container has neither. Pin a version and read its release notes rather than repeating second-hand claims about what it does and doesn't support; keyed-service support landed in v7.0.0 (Nov 2025).
+Assembly scanning is inherently reflection-based, so don't reach for it on a trimmed or Native A O T target.
+Avoid >5 ctor parameters, split the class.
+Don't GetService() from a constructor, let the container do the work.
+In tests, build a real IServiceCollection via WebApplicationFactory rather than mocking the container.
+
+-- pause --
+Section 22. Real-World Scenarios.
+
+-- pause --
+Scenario 1: Multi-Tenant SaaS with Per-Tenant Configuration.
+
+Problem: Each request is for a tenant. Some services (DB connection string, feature flags, branding) must vary per tenant. How to wire?
+
+Solution:
+
+Decision: scoped + factory delegate, because the dependency on ITenantContext is per-request.
+
+-- pause --
+Scenario 2: Replacing a Production Service in Tests.
+
+Problem: Integration test must intercept emails, replace SendGridEmailSender with InMemoryEmailSender.
+
+Solution:
+
+Decision: RemoveAll + re-add, because the production wiring may have multiple registrations or decorators.
+
+-- pause --
+Scenario 3: Plugin Architecture for Workflow Steps.
+
+Problem: Customers ship dot NET assemblies with custom workflow step types. The host must discover, load, and resolve them.
+
+Solution:
+
+Decision: assembly-scanning via Scrutor + injecting IEnumerable; trivially extensible without recompiling host.
+
+-- pause --
+Scenario 4: Long-Running Worker with Per-Job Scope.
+
+Problem: A BackgroundService processes 100 jobs or second from a queue. Each job needs its own E F Core context but the worker itself is registered once.
+
+Solution: see IServiceScopeFactory in Non-H T T P Contexts, CreateScope() per iteration. Critical to dispose the scope between iterations to release the DbContext, change tracker, and DB connection.
+
+-- pause --
+Section 23. Interview-Ready Summary.
+
+I O C is the principle (a class doesn't create its own dependencies); D I is the pattern (they're handed in); IServiceProvider is the automated container. Service Locator is a different I O C pattern and an anti-pattern in application code.
+IServiceCollection is a List. Registration appends; Build() turns that list into resolution call sites.
+Three lifetimes: Transient (new every resolve), Scoped (one per scope approximately per request), Singleton (one per app). The only rule: never let a longer-lived service hold a shorter-lived one. Long-into-short is always safe.
+Captive dependency = scoped captured inside a singleton. Fix by injecting IServiceScopeFactory and creating a scope per unit of work.
+ValidateScopes is the runtime captive-dependency check; ValidateOnBuild is the startup graph check. Both default to on in Development only, turn them on everywhere, and know that neither sees inside factory lambdas.
+Constructor injection is the default. Public constructors only; the greedy rule picks the most parameters D I can satisfy; genuine ambiguity throws; [ActivatorUtilitiesConstructor] steers ActivatorUtilities, not the container.
+Keyed services (dot NET 8+) replace hand-rolled "pick one of N" factories. Keys are any object with correct Equals. KeyedService.AnyKey is a registration fallback and a query wildcard, and in dot NET 10 the singular GetKeyedService() throws if you pass it.
+IEnumerable returns every registration in registration order; resolving T returns the last one registered, which is what lets app code override library defaults.
+Open generics ( typeof(IRepo<>) ) let the container close over T at resolution and cache the closed result. Constraints are not checked at registration.
+The container disposes what it constructs, LIFO. Instance-registered singletons are yours to dispose. Async cleanup requires CreateAsyncScope() + await using.
+Engine choice is about dynamic-code support, not environment: DynamicServiceProviderEngine normally, RuntimeServiceProviderEngine under Native A O T. There is no official source-generated D I container.
+
+-- pause --
+Section 24. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Singleton versus Scoped versus Transient.
+
+Q: What goes wrong if you mismatch lifetimes, Scoped into Singleton?-- think --
+
+A: Captive dependency: the scoped service gets captured by the singleton on its first resolution and lives for the entire app lifetime. State leaks across requests, IDisposable instances never get disposed, connection pools exhaust, change trackers accumulate.
+The bug ships silently unless ValidateScopes = true is on.
+
+Cross-Q: What about Transient into Singleton, is that wrong too?-- think --
+
+A: Not strictly a bug, but a semantic waste.
+The transient is created once when the singleton is constructed and lives forever, exactly the opposite of "new instance every time." Worse: if the transient is IDisposable, the singleton owns it for the app's lifetime; nothing disposes it until shutdown.
+It's the same lifetime trap as scoped to singleton with a slightly less dramatic symptom. Fix: inject IServiceProvider or a factory if you genuinely need a new transient per call.
+
+Cross-Q²: How does ValidateScopes = true detect this at runtime?-- think --
+
+A: Setting ValidateScopes = true makes ServiceProvider construct a CallSiteValidator, which does two distinct jobs. (1) Call-site validation: when a call site is first built, the validator walks its tree and records whether the subtree contains anything Scoped.
+If a Singleton call site has a Scoped service anywhere beneath it, it throws InvalidOperationException: Cannot consume scoped service 'X' from singleton 'Y'.
+(2) Resolution validation: on each resolve, if the service needs a scope and the scope being resolved from is the root scope, it throws Cannot resolve scoped service 'X' from root provider. Both are runtime checks, nothing here is compile-time.
+Pair it with ValidateOnBuild = true and check (1) runs for every descriptor at builder.Build(), so the captive dependency crashes startup instead of waiting for the first request that happens to touch that graph.
+
+-- pause --
+Drill 2, Captive dependency detection.
+
+Q: What's a captive dependency and how do you detect it?-- think --
+
+A: A captive dependency is when a longer-lived service holds a reference to a shorter-lived one, most commonly Scoped held by Singleton. The shorter-lived service is "captured" by the longer one and outlives its intended scope.
+Detection: turn on ValidateScopes and ValidateOnBuild, which surface most cases at startup. For runtime-resolved services (factories, GetService<> ), you need code review.
+
+Cross-Q: My CI passes with ValidateOnBuild but I still have a captive dep in production. How?-- think --
+
+A: Factory-based registrations can hide them. services.AddSingleton(sp goes to new MyService(sp.GetRequiredService())), the validator can't statically analyze what your factory does with sp. The graph walker doesn't execute factories, only inspects descriptors.
+Fix: avoid resolving scoped services inside singleton factories; if you must, use IServiceScopeFactory and document the lifetime contract.
+
+Cross-Q²: I have a singleton EventBus that needs to publish to scoped handlers. How do I avoid capture?-- think --
+
+A: Inject IServiceScopeFactory into the EventBus, not the handlers. On Publish, create a fresh scope, resolve handlers from it, dispatch, then dispose the scope. Code skeleton:
+csharp.
+public class EventBus(IServiceScopeFactory factory) {.
+public async Task PublishAsync(T evt) {.
+using var scope = factory.CreateScope();
+var handlers = scope.ServiceProvider.GetServices>();
+foreach (var h in handlers) await h.HandleAsync(evt);
+}.
+}.
+
+The handlers are scoped to the publish call, not the EventBus's lifetime. Cleanup is automatic when the scope disposes.
+
+-- pause --
+Drill 3, IServiceScopeFactory from a Singleton.
+
+Q: When does a singleton genuinely need IServiceScopeFactory ?-- think --
+
+A: Any time a singleton must do work that involves scoped services, background workers, message-queue consumers, scheduled jobs, event handlers, SignalR hub fan-out, anything that runs outside an H T T P request.
+The pattern: inject the factory, create a scope per unit of work, resolve scoped services from that scope, dispose the scope when the work completes.
+
+Cross-Q: Why per unit of work and not just once per singleton?-- think --
+
+A: Because scoped services are designed to be short-lived, DbContexts accumulate change-tracker entries, repositories cache, validators may hold per-request state.
+Reusing one scope across thousands of iterations defeats the purpose: you'll see memory leaks, stale data, and pooled-resource exhaustion. One scope per logical operation (one queue message, one timer tick, one event) mirrors how H T T P requests scope: a clean slate for each unit of work.
+
+Cross-Q²: What's the perf cost of creating and disposing a scope?-- think --
+
+A: Small but non-zero, and structural rather than mysterious: creating a scope allocates a ServiceProviderEngineScope plus the dictionary that caches its resolved services, and disposing it walks the tracked-disposables list.
+That's a couple of allocations and a list walk, negligible next to the work the scope exists to do (a DB round trip, an H T T P call, a message handler). If you want a number, measure your own graph; don't quote one.
+What you must not do is reuse scopes to save that cost, you'd be trading a trivial allocation for stale state and leaked resources.
+
+-- pause --
+Drill 4, Keyed services versus named factories.
+
+Q: When would you use keyed services (dot NET 8+) over a factory pattern?-- think --
+
+A: Almost always, in modern dot NET. Keyed services give you compile-time discoverability via [FromKeyedServices("name")] parameter attributes, native A O T support, automatic lifetime management, and KeyedService.AnyKey for fan-out.
+Factory patterns require hand-rolling: maintaining a dictionary, casting from IServiceProvider, manually disposing, no A O T introspection.
+
+Cross-Q: What's a key, is it limited to strings?-- think --
+
+A: Any non-null object: strings, enums, ints, types, custom records.
+Enums are idiomatic for typed dispatch ( PaymentProvider.Stripe ); strings for config-driven scenarios (channel names from appsettings); types for "register this thing for that type." The key is compared via Equals, so use value-equality-friendly types, records and enums work great;
+mutable classes work poorly.
+
+Cross-Q²: When would keyed services be the wrong answer?-- think --
+
+A: Two solid cases. When you need all implementations rather than pick-one, that's IEnumerable with regular AddX<> registrations.
+And when the choice depends on runtime data the container can't see (user role, tenant, a feature flag read from a database), a strategy-resolver service that takes the runtime context and returns the implementation is more testable than pushing that state into a key.
+A third case you'll see repeated in older material, "don't combine keyed services with Scrutor decoration", is version-dependent: Scrutor added keyed-service support in v7.0.0 (Nov 2025). Say "check the version you're on" rather than asserting it either way.
+
+-- pause --
+Drill 5, Scrutor decoration order.
+
+Q: Does the order of Decorate calls matter?-- think --
+
+A: Yes, Scrutor wraps outside-in in registration order. Decorate() after Decorate() makes Outer wrap Inner wrap the original. The outermost decorator is the one resolved by callers; calls flow inward through each layer, then back out. The last Decorate registered is the first to execute.
+
+Cross-Q: I want logging on every call and retries only on outbound H T T P failures. Which order?-- think --
+
+A: Register Logging innermost, Retry outermost so retries happen outside logging, every retry attempt gets logged separately, giving you observability of the retry behavior. If you did it the other way (logging outermost), you'd see one log per logical call, with retries hidden inside. Code:
+csharp.
+services.AddScoped();
+services.Decorate(); // innermost wrapper.
+services.Decorate(); // outermost wrapper.
+// Resolution: RetryClient to LoggingClient to RealClient.
+
+Cross-Q²: How does Scrutor implement Decorate internally?-- think --
+
+A: It finds the existing ServiceDescriptor for the interface, wraps its factory in a new factory that resolves the original then constructs the decorator with it. It removes the old descriptor and adds the new one. So under the hood it's a Replace operation.
+This is why Decorate must come after the registration it decorates, there's nothing to wrap if the original isn't registered yet. And why if you services.Replace() after decorating, you lose the decorators (Replace destroys the wrapped factory).
+
+-- pause --
+Drill 6, AddScoped() versus AddScoped().
+
+Q: What's the practical difference between AddScoped() and AddScoped() ?-- think --
+
+A: The first registers IRepo as the public contract resolvable from IServiceProvider.GetService(). The second registers EfRepo as itself, only resolvable as the concrete type.
+Consumers of IRepo won't see EfRepo in case (2); you'd have to do services.AddScoped(sp goes to sp.GetRequiredService()) to bridge them.
+
+Cross-Q: When would you register both?-- think --
+
+A: Pattern: register the implementation as itself for decoration or test seam, then alias the interface to it. Example:
+csharp.
+services.AddScoped(); // concrete.
+services.AddScoped(sp goes to sp.GetRequiredService()); // alias.
+
+Now IRepo and EfRepo resolve to the same instance within a scope (scoped lifetime to cached per scope). Tests can resolve EfRepo directly to introspect. Decorators on IRepo wrap the same instance.
+
+Cross-Q²: What if I do AddScoped(); AddScoped();, same instance?-- think --
+
+A: No, different instances. Each registration creates its own factory that constructs a new EfRepo. Within one scope you'd have two EfRepo objects, each cached under its interface. For "same instance under multiple interfaces," bind to the concrete type once, then add factory aliases:
+csharp.
+services.AddScoped();
+services.AddScoped(sp goes to sp.GetRequiredService());
+services.AddScoped(sp goes to sp.GetRequiredService());
+
+Now all three resolutions yield the same scoped instance. The concrete type is the "anchor."
+
+-- pause --
+Drill 7, Replacing a registration in tests.
+
+Q: How do you replace a production service in an integration test?-- think --
+
+A: Use WebApplicationFactory.WithWebHostBuilder(b goes to b.ConfigureServices(s goes to {. })) to override registrations after the production Startup runs. Inside the callback, RemoveAll() then re-add with the test implementation. The test gets a fully-built host minus the swapped service.
+
+Cross-Q: Why RemoveAll instead of Replace ?-- think --
+
+A: Replace removes only the first matching descriptor and adds yours after. If production code registers IEmailSender multiple times (for example, one for SendGrid + a decorator for retry + a decorator for logging), Replace removes only one.
+RemoveAll clears all descriptors with the same service type, then re-add the test impl from a clean slate. Safer default for tests.
+
+Cross-Q²: I replaced IEmailSender but the test still uses the real one. Why?-- think --
+
+A: Three common causes. (1) Order: ConfigureServices in WithWebHostBuilder runs after production registration, but if production code registers in IHostedService.StartAsync or after Build(), your test override happens first.
+(2) The dependent service captured the original during construction, if it's a singleton, replacing the descriptor doesn't replace the already-constructed graph. (3) You're injecting IEnumerable and the test added an extra one instead of replacing, RemoveAll first, then add.
+Verify with services.Where(d goes to d.ServiceType == typeof(IEmailSender)).Count() after configuration.
+
+-- pause --
+Drill 8, ActivatorUtilities.CreateInstance.
+
+Q: When would you use ActivatorUtilities.CreateInstance instead of registering the type with D I?-- think --
+
+A: When the type takes a mix of D I-resolved and explicit arguments, D I normally requires all ctor params to be resolvable. ActivatorUtilities.CreateInstance(sp, runtimeArg1, runtimeArg2) resolves ctor params from the provider but uses the explicit args for any param that matches by type.
+Common in factories, scheduled job dispatchers, plugin systems.
+
+Cross-Q: How does it pick which constructor?-- think --
+
+A: Greedy: it picks the constructor with the most resolvable parameters (combining D I registrations + the explicit args you passed). Ambiguity throws. To disambiguate, add [ActivatorUtilitiesConstructor] to the constructor you want it to choose.
+This attribute is honored only by ActivatorUtilities, its documented purpose is to "mark the constructor to be used when activating type using ActivatorUtilities ", and the name doesn't appear anywhere in the container's CallSiteFactory.
+The regular D I container ignores it and applies the greedy rule regardless. Saying the attribute "overrides the container's constructor selection" is a common and checkable mistake.
+
+Cross-Q²: What's the perf cost versus registering with D I?-- think --
+
+A: ActivatorUtilities.CreateInstance does the constructor-selection work on every call, re-scanning constructors, picking one, building an argument array, invoking. Registered types pay that cost once, at call-site construction.
+Optimization: ActivatorUtilities.CreateFactory(type, argument Types) returns an ObjectFactory delegate you build once and cache, then call like a function.
+Reach for it whenever the same type is constructed many times with different runtime arguments, a job dispatcher, a plugin loader, a per-message handler factory.
+
+-- pause --
+Drill 9, Root-scope leaks.
+
+Q: Why does resolving disposable transients from the root provider leak memory?-- think --
+
+A: The container tracks disposable instances for cleanup on scope disposal. The root scope only disposes at app shutdown. Every disposable transient resolved from the root provider gets added to the root scope's disposal list and stays alive until the process exits.
+Over hours or days, this accumulates into multi-gigabytes leaks.
+
+Cross-Q: Why doesn't the container just not track disposable transients?-- think --
+
+A: Because then you'd lose automatic disposal entirely. The contract is: "the container disposes what it constructs." For singletons and scoped, that mapping is clear (app lifetime / scope lifetime).
+For transients, the container has no other lifetime hook, so it ties disposal to whichever scope did the resolution. Root resolutions = root scope = app lifetime. The "leak" is actually correct behavior under the contract, it's just that the contract surprises people.
+
+Cross-Q²: What's the workaround for legitimately needing a transient at root?-- think --
+
+A: Don't resolve at root, create an explicit scope. using var scope = app.Services.CreateScope(); var t = scope.ServiceProvider.GetRequiredService();, the transient is tracked by scope, disposed when scope disposes. For one-off operations at startup or shutdown, this is the right shape.
+If you control the type, mark it IAsyncDisposable so async disposal works too, and use await using with CreateAsyncScope().
+
+-- pause --
+Drill 10, Service provider validation.
+
+Q: What's the difference between ValidateOnBuild and ValidateScopes ?-- think --
+
+A: ValidateOnBuild = true walks every registered service at builder.Build() and tries to construct the resolution chain, catches missing dependencies, circular dependencies, and ambiguous or unresolvable constructors.
+It collects every failure and throws one AggregateException("Some services are not able to be constructed"). ValidateScopes = true is a runtime check that throws if a Scoped service is resolved from the root provider, or injected into a Singleton. They catch different failure modes.
+
+Cross-Q: What's the startup cost of ValidateOnBuild ?-- think --
+
+A: Proportional to the number of registrations and the depth of the graph, paid once at startup and never again.
+Don't quote a figure you haven't measured, the honest answer is "it scales with the descriptor count;
+on our app it was X milliseconds, and I'd measure yours." For scale, Microsoft notes that A S P dot NET Core template apps start with more than 250 framework-registered services before you add your own.
+The benefit: bugs that would otherwise surface as a runtime exception on the first request crash the app before traffic arrives. Both ValidateOnBuild and ValidateScopes are enabled by the generic host only in Development, turn them on in Production too.
+
+Cross-Q²: What does ValidateOnBuild NOT catch?-- think --
+
+A: Factory-registered services ( AddScoped<>(sp goes to.) ), it can't statically analyze what your factory will do.
+Open-generic registrations, which it skips by design: ValidateService returns immediately for any descriptor whose service type is an unconstructed generic, so typeof(IRepository<>) is never validated until a closed T is actually resolved.
+Conditional resolutions inside IServiceProvider.GetService<> calls in code. Runtime-determined keys for keyed services. Generic methods that resolve T based on input. It catches the descriptor-level graph, not the dynamic resolution paths your code takes.
+For dynamic resolutions, integration tests are the safety net.
+
+-- pause --
+Drill 11, Open generics in D I.
+
+Q: Why is services.AddScoped(typeof(IRepo<>), typeof(EfRepo<>)) legal but AddScoped, EfRepo<>>() isn't?-- think --
+
+A: Open generics aren't valid type arguments in C sharp generic methods, IRepo<> isn't a constructible type, so you can't pass it to AddScoped.
+The non-generic overload AddScoped(Type, Type) accepts open generic Type objects, which the container handles specially: when someone resolves IRepo, the container closes the open registration over User and constructs EfRepo.
+
+Cross-Q: How does the container know to close the generic?-- think --
+
+A: At resolution time, the container looks up descriptors by service type. For IRepo, no direct match exists, so it falls back to checking open-generic descriptors. It finds (typeof(IRepo<>), typeof(EfRepo<>)), constructs IRepo and EfRepo at runtime via MakeGenericType, and uses them to instantiate.
+The result is cached per closed type so subsequent resolutions don't pay the reflection cost.
+
+Cross-Q²: Can I have constrained open generics in D I?-- think --
+
+A: Sort of, the constraint is enforced at type construction (the runtime throws if you try EfRepo for class EfRepo where T: IEntity ), but the container doesn't validate at registration. The D I container itself has no constraint awareness.
+So you can register an open generic that won't actually be constructible for many T; you only find out at the first attempted resolution with a non-matching T. Use unit tests to validate the closed-type instantiations you care about.
+
+-- pause --
+Drill 12, Lifetime mismatch at runtime.
+
+Q: Captive deps and scoped-from-root are runtime checks (when validation is on). What's an example that's only detectable at runtime, not by ValidateOnBuild ?-- think --
+
+A: Anything resolved inside a factory: services.AddSingleton(sp goes to new EventBus(sp.GetRequiredService())). The validator can't see what's inside the lambda, it just registers the factory.
+The captive dep manifests only when the singleton is first constructed, which might be on first request, not at app start.
+
+Cross-Q: How would you defend against this in code review?-- think --
+
+A: Lint rule / convention: never resolve scoped services inside singleton factories. The legitimate need is rare; the bug shape is common. If you need a scoped service inside a singleton, inject IServiceScopeFactory and resolve inside CreateScope(), at use time, not construction time.
+Code review checklist item: "any AddSingleton(sp goes to.) where the factory body calls sp.GetRequiredService should be flagged."
+
+Cross-Q²: What if a third-party library registers a singleton that captures a scoped service?-- think --
+
+A: You don't see it until you turn on ValidateScopes in production, then the app fails to start. Workarounds: (1) Wrap the registration: Replace with your own factory that uses IServiceScopeFactory. (2) Avoid the singleton lifetime: re-register as scoped if the semantics permit.
+(3) File a bug, most well-maintained libraries fix these promptly. In hot loops, prevention beats remediation: turn on validation in CI integration tests so library updates fail-fast.
+
+-- pause --
+Drill 13, Disposable resolution semantics.
+
+Q: When is Dispose called on a scoped service?-- think --
+
+A: When the scope it was resolved in is disposed. A S P dot NET Core disposes the request scope when the request pipeline completes (success or failure). For manually-created scopes, it's when scope.Dispose() runs (typically using var scope =. ).
+The container walks its disposal list in reverse-resolution order (LIFO) so dependents are disposed before their dependencies, OrderService before its DbContext.
+
+Cross-Q: What if Dispose throws?-- think --
+
+A: Answer this one by version, because it changed. Through dot NET 10, ServiceProviderEngineScope.Dispose has no try / catch at all, it walks the tracked list in reverse calling Dispose(), and the first exception propagates straight out, so every service after it in the list is never disposed.
+Nothing is logged by the container and there is no AggregateException.
+On the main branch (dot NET 11 previews) this was changed: each disposal is wrapped, exceptions are collected, and at the end a single exception is rethrown with its original stack via ExceptionDispatchInfo.Throw(), or an AggregateException if more than one service threw.
+Practical takeaway, unchanged either way: never throw from Dispose. If cleanup might fail, log internally and swallow, on the runtimes most teams ship on today, one bad Dispose really does abandon the rest of the scope's cleanup.
+
+Cross-Q²: How does IAsyncDisposable interact with scope disposal?-- think --
+
+A: With CreateAsyncScope() + await using, the container calls DisposeAsync() on tracked instances that implement IAsyncDisposable.
+With plain CreateScope() + using, it takes the sync path, and there are two outcomes worth separating: a type implementing both interfaces gets only Dispose(), its async cleanup is silently skipped, which is the real trap;
+a type implementing only IAsyncDisposable doesn't fail silently at all, sync disposal throws InvalidOperationException ("only implements IAsyncDisposable.
+Use DisposeAsync to dispose the container"). Rule: await using var scope = factory.CreateAsyncScope() for anything with an async cleanup path.
+
+-- pause --
+Drill 14, IServiceProvider injected, anti-pattern?.
+
+Q: Is injecting IServiceProvider into a class an anti-pattern?-- think --
+
+A: Usually yes, it's the Service Locator pattern hiding behind D I. Constructor injection makes dependencies explicit; injecting IServiceProvider hides them, breaks testability (you have to set up a whole container), and lets callers pull arbitrary services without declaring need. Default: no.
+Use constructor params per dependency.
+
+Cross-Q: When is it acceptable?-- think --
+
+A: Three legitimate cases. (1) Factories that select at runtime: a NotifierFactory that returns one of N implementations based on input. (2) Plugin systems: when the set of dependencies isn't known at compile time.
+(3) Frameworks or infrastructure code: middleware, D I extensions, decorators, code that fundamentally operates on the container itself. For application services, almost never.
+
+Cross-Q²: I see a class with (IServiceProvider sp) and 5 constructor params, refactor or leave?-- think --
+
+A: Refactor, that's a code smell. The 5 explicit params + the sp suggests someone wanted to add a 6th dependency but didn't update the constructor. Pull the 6th dependency into a regular ctor param, remove the IServiceProvider.
+If a future runtime-chosen dependency emerges, introduce a typed factory or a strategy resolver, both more discoverable than IServiceProvider.GetService.
+
+-- pause --
+Drill 15, Manual GetService() versus constructor injection.
+
+Q: When should you call IServiceProvider.GetService() manually instead of constructor injection?-- think --
+
+A: Almost never in application code. Constructor injection is more discoverable, more testable, and avoids hiding dependencies. The legitimate cases are factory implementations, infrastructure code (middleware), and integration points (filters, attributes that need D I).
+Even in those, prefer narrowly-typed factory abstractions over raw IServiceProvider.
+
+Cross-Q: What's wrong with "just pull what I need when I need it"?-- think --
+
+A: Three problems. (1) Hidden dependencies: nothing in the class signature reveals what services it actually uses; readers must scan the body. (2) Testability: mocking a single ctor param is trivial; mocking IServiceProvider is painful.
+(3) Lifetime errors: GetService() from a singleton context can resolve a scoped service incorrectly if called from a non-scoped path. All three vanish with constructor injection.
+
+Cross-Q²: I have a controller that needs different services depending on a route parameter. Constructor inject all five, or IServiceProvider ?-- think --
+
+A: Inject all five, especially if they're scoped or transient. Constructors that look "fat" usually signal class-level over-responsibility, not D I misuse. If five really are needed, the cost is one allocation and five interface assignments, negligible.
+Better refactor: extract a strategy resolver, IServiceFactory.Create(route Param), which internally uses keyed services or IServiceProvider. Now the controller has one dependency, the factory is the only place that touches the container, and the dispatching logic is unit-testable in isolation.
+
+-- pause --
+Drill 16, I O C versus D I versus Service Locator.
+
+Q: What's the difference between I O C, D I, and Service Locator?-- think --
+
+A: I O C is a design principle: a component doesn't manage its own dependencies, something external does. D I is one pattern implementing it: dependencies are passed in by a caller, via constructor, property, or method.
+Service Locator is a different I O C pattern: the class pulls its dependencies out of a global registry at call time. D I is preferred because the dependencies are visible in the constructor signature; Service Locator hides them.
+
+Cross-Q: Why is Service Locator an anti-pattern in application code but acceptable inside a framework?-- think --
+
+A: In application code, hidden dependencies mean tests have to stand up a whole container or mock IServiceProvider, and a reader can't tell what a class actually needs.
+In framework and infrastructure code, middleware, the container itself, plugin hosts, the set of dependencies isn't known at compile time. The framework's job is to discover and resolve them dynamically; it cannot express that graph as constructor parameters because the graph is its input.
+
+Cross-Q²: Can you make Service Locator safer?-- think --
+
+A: Wrap it in a typed factory. Instead of IServiceProvider.GetService() scattered through the codebase, expose IOrderHandlerFactory.Create(OrderType) and do the dynamic resolution inside it.
+Callers now depend on a discoverable interface, tests mock the factory, and the container-touching code lives in one reviewable place. Keyed services give you essentially this, natively, from dot NET 8.
+
+-- pause --
+Drill 17, Lifetimes and the compatibility matrix.
+
+Q: Walk me through the three lifetimes and the rule about mixing them.-- think --
+
+A: Transient = a new instance on every resolution; Scoped = one per scope ( approximately per H T T P request); Singleton = one for the app's lifetime. The mixing rule: never inject a shorter-lived service into a longer-lived one.
+Scoped into Singleton is the classic captive dependency, the scoped instance lives forever and leaks state across requests. Transient into Singleton is semantic waste: it's created once and behaves like a singleton, and if it's IDisposable nothing disposes it until shutdown.
+
+Cross-Q: Singleton into Scoped, is that OK?-- think --
+
+A: Yes, always. A singleton's lifetime is longer than or equal to any scope's, so it can never be torn down while a scope still holds it. Only the short-into-long direction is dangerous; the reverse is unconditionally safe.
+If you've seen a lifetime matrix flag this cell as risky, the matrix is wrong, check which axis is the consumer and which is the dependency.
+
+Cross-Q²: I have a Scoped OrderService that needs a fresh Transient IEmailSender per email sent, not one captured at construction. How?-- think --
+
+A: Constructor-inject the current IServiceProvider (or, better, a typed IEmailSenderFactory ) and resolve per send. The transient is resolved from OrderService 's own scope, so it's tracked and disposed when that scope ends.
+If you want it disposed immediately after each send instead, resolve it inside using var scope = scope Factory.CreateScope(). Cleanest shape: register a Func or a small factory interface so the pattern is declared rather than improvised.
+
+-- pause --
+Drill 18, Registration shapes and who owns disposal.
+
+Q: What are the three ways to register a service, and how do they differ?-- think --
+
+A: By type, AddScoped(), the container constructs it, picking the greedy constructor and resolving parameters from D I. By factory, AddScoped(sp goes to new EfRepo(.)), you control construction and the container invokes your delegate.
+By instance, AddSingleton(existing Clock), you hand in a pre-built object; singleton only; the container does not dispose it.
+
+Cross-Q: Why can't you use instance registration with Scoped or Transient?-- think --
+
+A: Because the point of Scoped and Transient is that the container creates a new instance on some cadence. A pre-built object has already been constructed exactly once, handing it back per scope wouldn't give you per-scope instances, it would give you singleton semantics under a scoped label.
+The A P I simply doesn't offer the overload: there is no AddScoped(instance).
+
+Cross-Q²: I pass an IDisposable to AddSingleton(my Clock). When does Dispose get called?-- think --
+
+A: Never, not by the container. The container disposes what it constructs; instance registrations are treated as externally owned.
+Microsoft's docs are explicit that for services.AddSingleton(new Service1()) "the framework doesn't dispose of the services automatically" and "the developer is responsible for disposing of the services." Dispose it yourself, typically hooked to host shutdown.
+This surprises people who assume the container manages every IDisposable in the graph.
+
+-- pause --
+Drill 19, IEnumerable resolution and ordering.
+
+Q: I register three IRule implementations. What does GetRequiredService() return, versus GetServices() ?-- think --
+
+A: The singular resolution returns the last registered implementation. GetServices(), or injecting IEnumerable, returns all three, in registration order.
+The docs state both halves: a later registration "overrides the previous one when resolved as IMyDependency and adds to the previous one when multiple services are resolved via IEnumerable."
+
+Cross-Q: Why is last-wins the default rather than first-wins or an error?-- think --
+
+A: So that application code can override a library default just by registering after it. AddMyLibrary() runs first and registers ITimeProvider; your Program.cs registers its own afterwards and wins.
+The polite counterpart on the library side is TryAdd*, which steps aside if the consumer already registered one, and TryAddEnumerable when several implementations are legitimately expected but the same (service, implementation) pair must not be added twice.
+
+Cross-Q²: I need an execution order different from registration order. Options?-- think --
+
+A: Two. (1) Put an int Order property on the interface and sort in the composite: rules.OrderBy(r goes to r.Order). Simple, explicit, unit-testable.
+(2) Use keyed registrations with an ordered key (an enum with explicit values, or ints) and resolve in the order you want, useful when the order is configuration-driven rather than baked in.
+Do not rely on shuffling the registration calls in Program.cs; that couples behaviour to a file's line order and breaks the moment someone extracts a module extension method.
+
+-- pause --
+Drill 20, TryAdd versus TryAddEnumerable versus Replace versus RemoveAll.
+
+Q: When would you use TryAddSingleton instead of AddSingleton ?-- think --
+
+A: In library extension methods, to be a polite guest. If the consumer already registered their own ITimeProvider, TryAddSingleton() silently skips and their registration stands. AddSingleton would append a second descriptor which, by last-wins, would override the consumer's deliberate choice.
+
+Cross-Q: What's the difference between TryAdd and TryAddEnumerable ?-- think --
+
+A: TryAdd asks "is any descriptor for this service type already present?" and skips if so. TryAddEnumerable asks "is a descriptor for this exact (service type, implementation type) pair present?" and adds if not.
+The second lets multiple implementations coexist, event handlers, validators, rules, while still preventing the same implementation being registered twice by two AddX calls.
+
+Cross-Q²: In an integration test I need to swap a library's IEmailSender. Replace or RemoveAll + Add ?-- think --
+
+A: RemoveAll() then add your fake. Replace removes only the first matching descriptor, if the library registered a base implementation plus decorators, or registered more than once, Replace leaves the rest behind and you get a half-swapped graph. RemoveAll wipes the service type clean first.
+In tests, a clean slate is almost always what you want; verify with services.Count(d goes to d.ServiceType == typeof(IEmailSender)) if a swap mysteriously doesn't take.
+
+-- pause --
+Drill 21, When NOT to use D I.
+
+Q: Name three things that should not go in the container.-- think --
+
+A: (1) Pure functions and static utilities, formatters, parsers, string helpers. No state, no lifecycle, no dependencies; registering them adds a resolution and a dictionary entry to avoid typing a class name. (2) Value objects and DTOs, Order, Address, Money.
+They're data, not services; constructors and object initializers are the right creation mechanism. (3) Types constructed in tight hot loops, container resolution has real overhead relative to new, so new directly or ObjectPool is correct there.
+
+Cross-Q: A colleague wants to register StringExtensions as a singleton "so it's available everywhere". What's wrong with that?-- think --
+
+A: A static utility has no state and no lifecycle, so the registration buys nothing, you get a container entry, a resolution, and a dictionary slot purely to avoid writing StringExtensions.Truncate(s, 50).
+It also costs something real: readers reasonably assume container-registered types have meaningful lifetimes, so every future maintainer has to work out that this one doesn't. static class with extension methods is already "available everywhere".
+
+Cross-Q²: At what point does a formerly pure helper legitimately earn D I?-- think --
+
+A: When it acquires a dependency with its own lifetime, a cache, a logger, an HttpClient, a config value that can change at runtime, or when a test needs to replace it. At that point it isn't a pure function any more; it has state or external I O.
+Promote it from static class to a class with constructor-injected dependencies. The two-question test: does it have dependencies with lifetimes, and does it need to be swappable? Yes to either to D I. No to both to static.
+
+-- pause --
+Drill 22, Constructor selection mechanics.
+
+Q: A class has several constructors. How does the container decide which one to call?-- think --
+
+A: Greedy selection over public constructors: the one with the most parameters that D I can fully satisfy wins.
+Microsoft's wording is "the constructor with the most parameters where the types are D I-resolvable is selected." Under the hood CallSiteFactory sorts constructors by descending parameter count and takes the first fully-resolvable one.
+If a second resolvable constructor isn't a subset of that one, resolution throws InvalidOperationException naming both, the docs' example is a class with (ILogger) and (IOptions) constructors when both services are registered.
+
+Cross-Q: My class has a public 5-parameter constructor and a public parameterless one. Which gets used?-- think --
+
+A: The 5-parameter one if all five are registered. If even one isn't, that constructor is unresolvable, the container falls back down the list, and the parameterless constructor, which is always satisfiable, wins.
+That's the dangerous part: if the class is non-functional without those five dependencies, you get a silently broken instance and no exception. The fix is a design one: don't give a service a public parameterless constructor.
+(A constructor may take arguments D I can't supply, but only if they have default values.)
+
+Cross-Q²: Any D I gotchas with C sharp 12 primary constructors?-- think --
+
+A: Two. The parameters become compiler-synthesized private fields, not properties, and they're mutable, nothing stops repo = null; later in the class body. If you want compiler-enforced immutability, project them: private readonly IRepo _repo = repo;.
+Second, a parameter is only turned into a backing field if an instance member actually captures it; declare one and never use it and no field is generated at all, which is confusing when reading a partial class.
+Neither affects resolution, the container still applies the same greedy rule to the primary constructor.
+
+-- pause --
+Section 25. Cheat Sheet.
+
+I O C principle: a class doesn't create its own dependencies. D I is one I O C pattern; Service Locator is another (anti-pattern in app code).
+IServiceCollection: IList. AddX appends, TryAddX adds only if the service type is absent, TryAddEnumerable adds only if the (service, impl) pair is absent, Replace removes the first match then adds, RemoveAll clears the service type.
+Lifetimes: Transient (new each resolve), Scoped (one per scope), Singleton (one per app). Short-lived into long-lived = captive dependency. Long-lived into short-lived = always safe.
+Descriptor shapes: by type (container constructs), by factory ( Func ), by instance (pre-built, singleton only, container won't dispose it).
+Constructor injection: the default and the only style MEDI supports natively. Public constructors only; primary constructors (C sharp 12) are idiomatic; method injection comes from the framework (minimal A P Is, controller actions).
+Greedy selection: most parameters D I can satisfy wins; ambiguity throws; non-injected parameters need default values. [ActivatorUtilitiesConstructor] steers ActivatorUtilities only, never the container.
+Validation: ValidateScopes (runtime captive-dep check), ValidateOnBuild (startup graph walk). Both default to Development-only; neither sees inside factory lambdas.
+IServiceScopeFactory: the rescue valve for singletons that need scoped services. One scope per unit of work. Always registered as a singleton.
+Keyed services (dot NET 8+): AddKeyedSingleton("key") / GetRequiredKeyedService("key") / [FromKeyedServices("key")]. KeyedService.AnyKey = registration fallback and query wildcard; in dot NET 10 the singular GetKeyedService() throws if passed AnyKey.
+IEnumerable returns every registration in order; GetRequiredService() returns the last one.
+Open generics: AddScoped(typeof(IRepo<>), typeof(EfRepo<>)), closed at resolution via MakeGenericType, cached per closed type, constraints unchecked at registration.
+Disposal: container disposes what it constructs, LIFO. Async cleanup needs CreateAsyncScope() + await using. Through dot NET 10 a throwing Dispose aborts the rest of the scope's disposal.
+Engines: DynamicServiceProviderEngine when dynamic code can be compiled; RuntimeServiceProviderEngine under Native A O T. No official source-generated container.
+Scrutor: assembly scanning + decoration, the two things the built-in container lacks. Decoration order: last Decorate = outermost = first to execute.
+When NOT to D I: pure functions, static utilities, value objects, hot-loop allocations, config-only values.
+
+-- pause --
+Section 26. Walkthrough.
+
+A composite scenario assembled from the way this failure usually presents. The shape is what to rehearse, not the specific numbers.
+
+Symptom: a multi-tenant SaaS processes orders in a BackgroundService. A few hours after each deploy, processing starts reading stale data, orders already completed get re-queued. Memory climbs steadily. Eventually a connection-pool-exhaustion exception surfaces.
+
+Diagnosis chain:
+
+A memory profile shows AppDbContext instances holding tens of thousands of tracked entities. A healthy request-scoped context holds a handful.
+ValidateScopes is off in Production (the host default outside Development). Turning it on in a staging deploy throws immediately at startup:
+
+Git blame on the worker: three weeks earlier a "cleanup" refactor changed the constructor from IServiceScopeFactory to direct AppDbContext injection. Tests stayed green because the unit tests mocked AppDbContext; no test exercised the real container.
+
+Root cause: AppDbContext captured inside the singleton worker. Every iteration added entities to the same change tracker, hence the growing memory and the stale reads (EF returning tracked entities instead of querying). The single long-lived context held its connection, so the pool drained.
+
+Fix:
+
+Post-mortem actions: ValidateScopes and ValidateOnBuild set explicitly in every environment, not just Development; an integration test using WebApplicationFactory that resolves the full service graph, so the container itself is under test.
+
+What to say in an interview: "A captive dependency doesn't look wrong in code review, the constructor signature is perfectly ordinary.
+Scope validation is the safety net, and enabling it outside Development is a one-line change that turns a multi-hour production incident into a startup failure in CI."
+
+-- pause --
+Section 27. Self-Test.
+
+DbContext is not thread-safe. A singleton is shared across all concurrent requests, so multiple threads hit the same instance, producing InvalidOperationException: A second operation was started on this context instance.
+Worse over time: the change tracker accumulates every entity ever loaded for the app's lifetime, so memory grows without bound and per-query tracking work grows with it. AppDbContext belongs in Scoped, a fresh instance per request, disposed at request end.
+AddDbContext() registers it as scoped by default for exactly this reason.
+
+Two descriptors are appended. GetRequiredService() returns the last one registered; GetServices() returns two distinct EfRepo instances per scope, both tracked and both disposed at scope end.
+For a repository this is usually a bug: two instances mean two change trackers serving the same request, so a write through one is invisible to the other. Fix: use TryAddScoped inside extension methods, so the second call is skipped.
+
+Without keys, GetRequiredService() returns whichever was registered last, so you'd hand-roll a factory that takes a discriminator, resolves from IServiceProvider, and dispatches. That factory hides the dependency and is pure boilerplate.
+
+With keys: AddKeyedScoped(PaymentProvider.Stripe) and friends. Consumers declare exactly what they need via [FromKeyedServices], or resolve dynamically with GetRequiredKeyedService. Lifetimes stay the container's job.
+
+Where it gets nuanced: if you need decorators (logging, retry) wrapped around every gateway, non-keyed registrations plus IEnumerable are the simpler shape,
+and decorator support for keyed registrations depends on the version of the decoration package you're using, Scrutor added keyed-service support in v7.0.0 (Nov 2025).
+Check before you commit to a design on either side.
+
+This is Service Locator. The method depends on IClock, but nothing in its signature says so; tests must stand up a container or stub a static property; the model is no longer a POCO.
+Microsoft's D I guidance names both halves of this, avoid the service locator pattern, and avoid static or global object access as a substitute for D I.
+
+Refactor: pass IClock as a constructor or method parameter. If the model genuinely shouldn't carry dependencies, move the clock-dependent logic into a domain service or factory that is container-managed. The model stays a POCO; the service declares the dependency.
+
+Scan reflects over the specified assemblies to enumerate concrete, non-abstract types. AddClasses(c goes to c.AssignableTo()) filters to the ones implementing IHandler. AsImplementedInterfaces() then registers each matched type under every interface it implements, not only the one you filtered on.
+WithScopedLifetime() sets the lifetime.
+
+Risk: AsImplementedInterfaces() will happily register your handlers under IDisposable too, if they implement it. Now GetRequiredService() resolves an arbitrary handler, and anything injecting IDisposable gets a surprise.
+Narrow the registration, As(), or filter the interface set, and remember that reflection-based scanning is invisible to the trimmer, so it doesn't fit a Native A O T target.

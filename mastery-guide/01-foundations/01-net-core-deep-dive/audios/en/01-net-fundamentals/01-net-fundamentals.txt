@@ -1,0 +1,909 @@
+-- pause --
+Section 1. Why it matters.
+
+Every dot NET interview eventually touches the runtime. Questions about memory leaks, garbage collector pressure, startup cost, A O T deployment, or assembly versioning are all runtime questions in disguise.
+You can't reason about IDisposable, boxing, or Span without understanding the managed heap; you can't explain deployment choices without understanding jit versus A O T versus ReadyToRun.
+
+Senior questions go past "what is garbage collector" to "why did our Gen 2 collection spike in prod?", "when would you choose NativeAOT over tiered jit?",
+and "how would you turn on Server garbage collector in staging without rebuilding?" this session gives you the answers and the reasoning behind them.
+
+️ On version claims. Runtime defaults move every November. Where this session states a default (DATAS, background garbage collector, regions), the claim is sourced in Sources.
+Treat any number without a citation as illustrative, and verify against learn microsoft com before repeating it in an interview.
+
+-- pause --
+Section 2. 1. dot NET Fundamentals.
+
+-- pause --
+What is dot NET?.
+
+dot NET is a free, open-source developer platform for building many types of applications. It provides a runtime, libraries, and tools for building web, mobile, desktop, cloud, and IoT applications.
+
+-- pause --
+dot NET Framework versus dot NET Core versus dot NET 5+/10.
+
+AppDomain.CreateDomain, code access security, remoting, and the GAC are the dot NET Framework features with no modern equivalent, see AppDomain versus AssemblyLoadContext and Strong naming and assembly versioning.
+
+-- pause --
+The Evolution Timeline.
+
+One release ships each November. Even-numbered releases are L T S (three years of support); odd-numbered releases are STS with a shorter window. dot NET 10 (November 2025) is the current L T S and the right default for new work; dot NET 8's L T S window closes in November 2026.
+Check the dot NET support policy rather than trusting a date written into a document.
+
+-- pause --
+C L R (Common Language Runtime) Internals.
+
+The C L R is the virtual machine component of dot NET that manages the execution of dot NET programs. It has four major subsystems:
+
+Execution engine, loads types, invokes the jit, manages threads, handles exceptions.
+jit compiler, translates Intermediate Language (I L) to native machine code. In modern dot NET this is RyuJIT. I L is C P U-agnostic; the jit specializes it per platform and, with tiered compilation, re-specializes hot methods.
+Type system / verifier, enforces type identity and safety at load time and at runtime. The C L R checks that I L doesn't forge references, corrupt memory, or violate access modifiers (unless you opt out with unsafe ).
+Garbage collector, manages the managed heap, tracks live object graphs from garbage collector roots (stack variables, static fields, C P U registers, handles), reclaims unreachable objects.
+
+The C L R is a specification with several implementations: CoreCLR (the open-source runtime that ships with modern dot NET, used by most server and desktop workloads), Mono (used by MAUI and Unity), and NativeAOT, which has no jit at all, the whole compile happens at build time via ILC.
+They run the same I L and the same BCL A P Is with different runtime strategies and capability boundaries.
+
+The C L R is embedded through a hosting A P I, this is how the dotnet host, A S P dot NET Core, Azure Functions, and test runners each start and configure the runtime differently.
+
+-- pause --
+jit Compilation in Detail.
+
+Compilation strategies in modern dot NET.
+
+Standard jit, Compile each method on first call, Baseline behaviour.
+Tiered compilation, Quick Tier 0 compile, then re-jit hot methods at Tier 1, On by default since dot NET Core 3.0.
+ReadyToRun (R2R), Pre-compiled native code shipped inside the assembly, still re-jit-able, Opt-in: true plus a RID.
+NativeAOT, Whole app compiled ahead of time; no jit at runtime, Opt-in: true plus a RID.
+
+Standard jit, Slow (cold jit), High (tier 1 + PGO), Full, Yes.
+Tiered + PGO, Moderate, Highest in practice, Full, Yes.
+ReadyToRun, Fast, High, Full, Yes.
+NativeAOT, Instant, High (static-only opts), Limited, No.
+
+R2R is not a default. ReadyToRun requires PublishReadyToRun and a target RID. What is pre-compiled by default is the shared framework itself, "the dot NET runtime libraries have already been precompiled with ReadyToRun," which is why R2R buys little for tiny apps and a lot for large ones.
+Tiered compilation then replaces commonly used R2R methods with jit-generated ones.
+
+Tiered Compilation (default since dot NET Core 3.0):
+
+The jit compiles a hot method twice. Tier 0 is a quick, minimally optimized compile that gets the app running. Once the method has been called enough times, it is re-jit'd at Tier 1 with inlining, loop optimization, dead-code elimination, and register allocation.
+The exact call-count threshold is a runtime implementation detail, not a documented contract, don't quote a number in an interview, describe the mechanism.
+
+Dynamic PGO (on by default since dot NET 8) instruments Tier 0 code to collect real observations, which virtual targets dominate, which branch directions are taken, which concrete types flow through generics, and feeds them into the Tier 1 recompile.
+That is how a long-running server can beat an A O T build on peak throughput: the jit specializes to the profile the app actually has.
+
+-- pause --
+Managed versus unmanaged code and P or Invoke.
+
+Managed code runs under C L R control: the garbage collector tracks allocations, the type system enforces safety, exceptions are structured. All C sharp, F sharp, and VB code compiles to managed I L.
+
+Unmanaged code (native C or C plus plus libraries, operating system A P Is, COM objects) runs outside C L R control: manual memory, no garbage collector, pointer arithmetic, no verifier.
+
+P or Invoke (Platform Invoke) is the bridge: the runtime marshals managed types to native calling conventions, copies or pins memory as needed, then marshals results back.
+
+Marshaling rules that trip people up:
+
+string marshals to a null-terminated native string (UTF-16 with CharSet.Unicode ). The native side gets a pointer to a marshaller-owned buffer, not the managed string's own memory.
+A byte[] passed as a pointer must not move mid-call; the marshaller either copies it or pins it ( fixed / GCHandle.Alloc(., GCHandleType.Pinned) ).
+ref / out arguments marshal as pointers.
+Structs must be blittable, identical layout in managed and native memory, no reference fields, for zero-copy interop. Non-blittable types ( bool, char, string, structs containing references) are marshaled by copy and conversion, which costs time and allocations.
+
+unsafe and fixed are the other interop path: take a managed pointer directly, pin the object so the garbage collector can't move it during the operation, do the pointer work, release the pin.
+
+Modern alternative: [LibraryImport] (C sharp 11 / dot NET 7) is a source generator. It emits the marshaling code at compile time as ordinary C sharp instead of using the runtime's reflection-based marshaller.
+That makes it A O T-compatible, trimmer-analyzable, faster, and inspectable, the generated file lands in obj/. Prefer it over [DllImport] for new code.
+
+-- pause --
+AppDomain versus AssemblyLoadContext.
+
+AppDomain (dot NET Framework) was a heavyweight isolation unit: separate security policy, separate type identity, cross-domain calls marshaled through remoting proxies. It let independently deployed components share one process without sharing state.
+
+Modern dot NET removed multi-AppDomain support. The AppDomain type still exists and a process has exactly one of them ( AppDomain.CurrentDomain ), but AppDomain.CreateDomain throws PlatformNotSupportedException.
+Real isolation is now a process boundary, containers, worker processes, separate services.
+
+AssemblyLoadContext (ALC) inherited AppDomain's assembly-grouping role. Each ALC has its own resolver. Types loaded into different ALCs are different types even when the assembly name and version match, type identity is per-ALC.
+An ALC created with is Collectible: true can be unloaded: once every reference into it drops, the garbage collector reclaims it and all its types.
+
+Why ALCs fail to unload (the classic interview gotcha): any reference crossing from outside the ALC into it pins it alive.
+Usual culprits: event handlers subscribed on long-lived singletons, Type objects cached in a static dictionary in the default ALC, thread-static fields holding plugin instances, generic instantiations in the default ALC parameterized over plugin types.
+
+Diagnostic: dotnet-dump analyze then !gcroot on a type from the supposedly-unloaded ALC; use WeakReference to a sentinel object to confirm collection, since Unload() gives no synchronous confirmation.
+
+-- pause --
+Assembly, module, type metadata.
+
+A dot NET assembly is the deployment unit: a .dll or .exe containing I L plus metadata.
+
+Manifest, assembly name, version, culture, public key, list of referenced assemblies, embedded resources.
+Module(s), one or more PE modules, each with I L and a type-definition table.
+Type metadata, for every type: name, namespace, base type, interfaces, fields, methods, properties, events, custom attributes.
+
+Metadata is what makes reflection, the C L R loader, decompilers, IntelliSense, and analyzers possible. Without it, I L would be opaque bytecode.
+
+Performance note: MethodInfo.Invoke is orders of magnitude slower than a direct call, it walks argument arrays, boxes value-type arguments, and re-checks access every time. For a hot path, bind once to a typed delegate and cache it:
+
+Open versus closed instance delegates. Passing null as the target for an instance method does not mean "no receiver", it creates an open instance delegate, and the delegate type must then declare the hidden this as its first parameter ( Func ).
+Binding Func with a null target throws ArgumentException.
+Bind the target when you have one; use the open form deliberately when you want to reuse the delegate across receivers.
+
+Source generators (C sharp 9+) and JsonSerializerContext in System.Text.Json are the modern answer to reflection-heavy code: generate the equivalent code at compile time, with zero runtime reflection, full trimmer visibility, and A O T compatibility.
+
+-- pause --
+Strong naming and assembly versioning.
+
+A strong-named assembly carries a public key and a signature produced with the matching private key, plus a PublicKeyToken derived from the public key. Together with name, version, and culture, that token forms the assembly's identity.
+
+️ **What strong naming does not do.* Microsoft's guidance is explicit: "Do not rely on strong names for security. They provide a unique identity only." And for modern dot NET: "For dot NET Core and dot NET 5+, strong-named assemblies do not provide material benefits.
+The runtime never validates the strong-name signature, nor does it use the strong-name for assembly binding."* Any answer that describes strong naming as tamper detection, publisher proof, or a load-time signature check is wrong on modern dot NET, and it was already wrong on dot NET Framework,
+which since 3.5 SP1 has skipped signature validation for full-trust assemblies by default (the "strong-name bypass" feature, done purely for load performance).
+If you want tamper-evidence, that is Authenticode / code signing or container-image signing (for example Sigstore), not strong names.
+
+What strong naming is still for:
+
+Identity and compatibility with dot NET Framework consumers, a strong-named dot NET Framework assembly can only reference other strong-named assemblies, and InternalsVisibleTo between strong-named assemblies requires the public key.
+Side-by-side versioning and the GAC on dot NET Framework. The GAC does not exist in modern dot NET; binding there is path-based.
+
+Version numbers have two layers:
+
+AssemblyVersion, part of the C L R's binding identity on dot NET Framework. Changing it there breaks consumers unless they add a binding redirect.
+NuGet package version, semantic versioning for humans and tooling, independent of AssemblyVersion.
+
+Modern practice: pin AssemblyVersion to the major version ( 3.0.0.0 for every 3.x.y release) so dot NET Framework consumers never need a redirect on a patch bump, and let the NuGet version carry the real release history. Bump AssemblyVersion only for binary-incompatible changes.
+
+-- pause --
+dot NET Standard versus dot NET 5+ unified model.
+
+dot NET Standard was a specification, a set of A P Is that every conforming runtime (Framework, Core, Mono, Xamarin) promised to implement. It solved the "my library targets netcoreapp but also needs to run on net472 " problem by giving authors one TFM to target.
+
+The dot NET 5+ unified model replaced it: net5.0. net10.0 is the TFM. dot NET Framework 4.x still consumes netstandard2.0 libraries, but no new dot NET Standard versions are being produced.
+
+netstandard2.0, maps to, Library must run on dot NET Framework 4.6.1+ as well as modern dot NET.
+netstandard2.1, maps to, Library must run on dot NET Core 3.0+ and Mono or Xamarin but not Framework.
+net10.0, maps to, Library only needs modern dot NET, the default choice for new work.
+Multi-target ( netstandard2.0;net10.0 ), maps to, Both worlds, with #if NET8_0_OR_GREATER -style guards for the modern paths.
+
+Targeting netstandard2.0 costs you a 2017-era A P I surface: no Span in the public A P I, no IAsyncEnumerable, none of the modern BCL. Take that hit only when a Framework consumer forces it.
+
+-- pause --
+Runtime Identifier (RID).
+
+A Runtime Identifier is a string describing an operating system + architecture target: win-x64, linux-x64, linux-arm64, osx-arm64.
+
+RIDs matter when:
+
+Publishing self-contained or NativeAOT or ReadyToRun, all three need -r because the output contains native code.
+A NuGet package ships native assets under runtimes//native/, restore picks the right one.
+The host resolves native shims and interop libraries at startup.
+
+RID graph, RIDs form a fallback hierarchy ( linux-arm64 to linux to unix to any ). NuGet walks from most specific to most general until it finds an asset. That is why a package that only ships a generic linux asset still installs on linux-x64.
+
+-- pause --
+S D K, runtime, and shared frameworks.
+
+An S D K is what you need to build dot NET code: Roslyn, MSBuild, templates, the dotnet C L I. A runtime is what you need to run compiled code: the C L R plus the framework libraries. dotnet --list-sdks shows what you can build with; dotnet --list-runtimes shows what compiled apps can bind to.
+
+There are three shared frameworks, layered so apps don't redistribute what the machine already has:
+
+Microsoft.NETCore.App, C L R + base libraries, Everything.
+Microsoft.AspNetCore.App, Kestrel, M V C, SignalR, hosting or D I extensions, Web apps.
+Microsoft.WindowsDesktop.App, WPF + WinForms, Windows desktop apps.
+
+Roll-forward. The host reads the app's runtimeconfig.json for its target framework version and roll Forward policy ( LatestPatch, Minor, Major, LatestMajor, Disable ), enumerates installed runtimes, and picks the highest acceptable one.
+The default is LatestPatch: an app built against 10.0.0 runs on 10.0.5 but not 10.1.0 unless you opt in. This is why patch versions are a production concern, framework CVE fixes only reach a framework-dependent app through roll-forward or a rebuild.
+
+Framework-dependent versus self-contained. Framework-dependent ships only your assemblies and relies on an installed runtime, smallest artifact, and runtime security patches arrive without a rebuild.
+Self-contained bundles the runtime, so it runs where nothing is installed and pins an exact runtime version, at the cost of size and of owning patching yourself. PublishTrimmed and NativeAOT cut the self-contained size substantially by removing unreferenced framework code.
+Exact sizes move every release, publish your own app and read the output rather than quoting figures.
+
+-- pause --
+Section 3. 2. C sharp Core Concepts.
+
+Quick reference. The full treatment lives in the C sharp Mastery sub-chapter (9 files, basics to advanced).
+
+The five things to keep straight when reading C sharp code:
+
+Value versus reference types. int, bool, struct, enum, tuples, copied by value (each variable holds its own data). class, interface, delegate, string, arrays, copied by reference (the variable holds a pointer; assignment shares the object).
+Mutations via a reference are visible everywhere; mutations via a value copy are local. Deep dive: Type System.
+var versus dynamic versus object. var is implicit static typing, the compiler infers and locks the type at compile time. dynamic defers all type-checking to runtime via the DLR (slow, no IntelliSense, runtime errors). object is the root reference type; assigning a value type to object boxes it.
+Use var for locals where the type is obvious; reach for dynamic only for COM or Jason traversal. Deep dive: Fundamentals.
+Single class inheritance + multiple interface implementation. C sharp disallows multiple class inheritance (the diamond problem); a class can implement many interfaces.
+Default interface methods (C sharp 8+) let interfaces ship behavior; explicit interface implementation disambiguates conflicting member names. Static abstract members (C sharp 11) enable generic math. Deep dive: OOP and Polymorphism.
+virtual / override / new / sealed. virtual + override is polymorphic dispatch via the vtable. new hides a base member rather than overriding, almost always wrong. sealed blocks further inheritance. Calling virtual methods from constructors is dangerous (derived fields aren't initialized yet).
+Deep dive: OOP and Polymorphism.
+Records and modern type-system primitives. record is a reference type with auto-generated value equality, with -expressions, and init -only properties, DTO-shaped by design. record struct, readonly struct, ref struct are the value-type variants for performance-sensitive code.
+Span is a ref struct (stack-only). Deep dive: Type System, Memory and Performance.
+
+For modern syntax (records, primary constructors, collection expressions, raw strings, required members), see Modern C sharp Features. For per-version language deltas (C sharp 11 to C sharp 14), see dot NET Version History.
+
+-- pause --
+Value types versus reference types, the real story.
+
+The common shorthand "value types live on the stack, reference types live on the heap" is wrong. The accurate rule:
+
+Value types live where they are declared. Reference types live on the managed heap; variables hold references to them.
+
+A struct field inside a class lives inside the class instance, on the heap. A boxed int lives on the heap. A local captured by a lambda is hoisted into a compiler-generated display class on the heap.
+Only short-lived locals and parameters of value type that the jit doesn't place elsewhere live on the actual call stack.
+
+What actually matters:
+
+Value types are copied on assignment; each variable owns its data; mutations are local.
+Reference types share identity; multiple variables can point at one object; mutations are visible to every holder.
+Allocation cost: a stack local is a pointer bump. A heap allocation adds an object that the garbage collector must track, mark, possibly move, and eventually collect.
+Boxing is the boundary between the two, and it is the performance-critical one.
+
+Every heap object carries a fixed header, a sync-block index and a method-table pointer, one word each, before its fields. That header is why a heap object is never as cheap as a stack local, and why boxing a 4-byte int costs far more than 4 bytes.
+
+-- pause --
+Boxing and unboxing.
+
+Boxing converts a value type to a reference type: the runtime allocates a heap object, copies the value into it, and returns a reference. Unboxing copies the value back out.
+
+The unboxing cast is exact-type only. (int)(object)some Double throws InvalidCastException, it does not convert. That rule is why a generic method must return T, not launder the result through object.
+
+Where boxing silently occurs:
+
+Assigning a struct to object, IComparable, or any interface-typed variable.
+Putting a struct in a non-generic collection ( ArrayList, Hashtable ).
+string.Format("{0}", some Struct) and $"{some Struct}", unless the type implements IFormattable / ISpanFormattable.
+Calling an un-overridden virtual method ( ToString, GetHashCode, Equals ) on a struct.
+Passing a struct to a params object[] parameter.
+
+Mitigation: generic methods and generic collections; override ToString / GetHashCode / Equals on structs; implement IFormattable and ISpanFormattable; prefer where T: IFoo over an IFoo parameter.
+
+-- pause --
+Section 4. 3. Garbage Collection in dot NET 10.
+
+-- pause --
+Generational garbage collector: How It Works.
+
+The design rests on the generational hypothesis: most objects die young. Segregating fresh allocations into a small Gen 0 arena lets the garbage collector reclaim the bulk of garbage by scanning a tiny slice of the heap, and touch the large Gen 2 region rarely.
+Collection cost scales with the size of the region collected, so keeping Gen 0 small keeps the common case fast.
+
+Two facts to state precisely, because interviewers probe both:
+
+A Gen N collection collects generations 0 through N. There is no such thing as collecting Gen 2 without also collecting Gen 1 and Gen 0. "Gen 2 collection" and "full garbage collector" are the same event.
+Generation budgets are dynamic. The runtime tunes them at run time (and DATAS tunes them further); the round numbers you see quoted for Gen 0 or 1 or 2 sizes are illustrative, not contractual.
+The one documented constant is the LOH threshold: 85,000 bytes, configurable via System.garbage collector.LOHThreshold.
+
+Card table and write barrier, the mechanism that makes generational garbage collector actually cheap. If a Gen 2 object holds a reference to a Gen 0 object, a Gen 0 collection must know about it or it would wrongly treat the young object as unreachable.
+Scanning all of Gen 2 to find such references would defeat the whole idea. Instead the garbage collector keeps a card table: a coarse map covering the heap, where writing a reference field marks the containing card dirty. Gen 0 collection scans only dirty cards.
+The write barrier is the small piece of code the jit emits on every reference-field write to mark the card, which is why storing a reference is slightly more expensive than storing an int.
+
+-- pause --
+garbage collector Collection Process.
+
+Suspension is not optional, and it is not workstation-only. Every collection suspends managed threads for at least part of its work, in both workstation and server garbage collector.
+(Threads currently executing native code are not suspended in either mode, they are suspended on return.) What differs is how much is done under suspension:
+
+A blocking (non-concurrent) Gen 2 collection does all of mark, sweep, and compact with the world stopped.
+A background Gen 2 collection does most of its work concurrently on dedicated garbage collector threads, but still has short stop-the-world phases, and any Gen 0 or Gen 1 collection that happens during it (a foreground collection) suspends all managed threads for its duration.
+
+So "does Server garbage collector stop the world?", yes. The honest answer is "every garbage collector stops the world for some window; background garbage collector shrinks that window for Gen 2, and Server garbage collector shortens it further by collecting the heaps in parallel."
+
+-- pause --
+What triggers a collection.
+
+Allocation budget exceeded for a generation, the normal, overwhelmingly most common trigger.
+Explicit garbage collector.Collect(), almost always a mistake in application code.
+Memory pressure from the operating system or container limit.
+By default the garbage collector becomes more aggressive about full compacting collections once physical memory load reaches roughly 90% (tunable via System.garbage collector.HighMemoryPercent ); for a containerized process the container's limit is what counts as physical memory.
+garbage collector.AddMemoryPressure to tell the garbage collector about unmanaged allocations it can't see.
+
+-- pause --
+garbage collector Modes.
+
+There are two flavours (workstation versus server) and, orthogonally, two sub-flavours (background versus non-concurrent). They are separate axes, a common interview trap is to present "Background garbage collector" as a third peer of Workstation and Server. It isn't.
+
+Background garbage collector is not new: it replaced concurrent garbage collector in dot NET Framework 4 for workstation and became available for server garbage collector in dot NET Framework 4.5. In modern dot NET it has been the default since dot NET Core 1.0.
+
+These settings are read once, when the garbage collector initializes, normally at process startup. Changing an environment variable on a running process has no effect.
+Set the flavour in exactly one place; don't split it across csproj, runtimeconfig.json, and the environment and then try to remember which wins.
+
+-- pause --
+dot NET 9 garbage collector Improvements.
+
+Recent garbage collector work, with the version each item actually landed in:
+
+Why DATAS matters for the workstation-versus-server argument. Before DATAS, Server garbage collector's per-core heaps made containerized apps look memory-hungry, and "use Workstation garbage collector in containers" was standard advice.
+With DATAS on by default from dot NET 9, Server garbage collector sizes itself to live data, so that advice needs re-testing rather than repeating. Measure before you switch.
+
+-- pause --
+Finalization queue and IDisposable.
+
+An object that declares a finalizer ( ~MyClass() ) is not reclaimed when it becomes unreachable. The garbage collector moves it to the f-reachable queue, a dedicated finalizer thread drains that queue and runs the finalizer, and only on a later garbage collector is the object actually collected.
+Finalizable objects therefore survive at least two collection cycles and get promoted while they wait, they are genuinely expensive.
+
+IDisposable is the deterministic alternative:
+
+️ Notice what justifies the finalizer: the raw IntPtr, not the SafeHandle.
+Microsoft's guidance is explicit, "A finalizer. is only required if you directly reference unmanaged resources", and "If your class references only managed objects, it's still possible for the class to implement the dispose pattern.
+There's no need to implement a finalizer." Delete _rawBuffer from the class and you must delete ~ResourceHolder with it, a type whose only resource is a SafeHandle gets finalization for free from the handle.
+Writing this pattern with a finalizer over managed-only state is the single most common way people over-implement IDisposable. See Best in Code and diagrams for the version you should actually reach for.
+
+using / using var calls Dispose() at the end of scope even when an exception is thrown:
+
+Key rules:
+
+Call garbage collector.SuppressFinalize(this) in Dispose() to avoid the two-cycle penalty.
+A finalizer must call Dispose(disposing: false), never the public Dispose(), the public method calls garbage collector.SuppressFinalize and touches managed state, both wrong during finalization.
+The disposing flag exists precisely because finalizer order is unspecified: when it's false, other managed objects your instance references may already have been finalized, so you must not touch them.
+If your class only wraps other IDisposable objects and holds no raw unmanaged handle, you don't need a finalizer at all, just implement Dispose() to call the inner Dispose(). Prefer SafeHandle over a raw IntPtr so the finalizer question mostly disappears.
+IAsyncDisposable ( await using ) is the async variant, for cleanup that needs to flush or close over the network.
+
+-- pause --
+Section 5. Common pitfalls.
+
+Forgetting garbage collector.SuppressFinalize in Dispose. The object still joins the finalization queue on collection, survives an extra garbage collector cycle, runs a finalizer that has nothing left to do, and only then gets collected. Double the garbage collector cost for no benefit.
+
+Calling the public Dispose() from a finalizer. ~T() { if (!_disposed) Dispose(); } looks tidy and is wrong: it calls garbage collector.SuppressFinalize during finalization and lets finalization touch managed objects that may already have been finalized.
+The finalizer must call Dispose(disposing: false).
+
+Allocating large buffers in a loop. Anything at least 85,000 bytes goes straight to the LOH, which is collected only with Gen 2 and is not compacted by default. Use ArrayPool.Shared.Rent(size) / .Return(buffer) for transient large buffers.
+
+Assuming "value type = stack allocation." A struct field in a class lives on the heap inside that class. A captured struct lives in the compiler-generated display class on the heap. A boxed struct is on the heap. The rule is where the variable is declared.
+
+Using AppDomain.CreateDomain in modern dot NET. It throws PlatformNotSupportedException. Use AssemblyLoadContext for assembly grouping and unloading, and a process boundary for real isolation.
+
+Calling garbage collector.Collect() in application code. It disrupts the garbage collector's adaptive tuning, forces an expensive full collection, and raises pause times. If garbage collector pressure is the problem, fix the allocation pattern.
+The narrow legitimate cases (a deliberate idle-time GCCollectionMode.Aggressive decommit before scaling down) are deliberate, measured, and rare.
+
+Targeting netstandard2.0 / 2.1 for a library that only needs modern dot NET. Target net10.0 and keep the modern A P I surface. Multi-target only when a dot NET Framework consumer forces it.
+
+Ignoring ALC reference leaks. AssemblyLoadContext.Unload() is asynchronous and releases nothing while any external reference remains. Confirm with a WeakReference sentinel after a full garbage collector; diagnose with !gcroot.
+
+Forgetting that each box is a new heap object. ReferenceEquals((object)42, (object)42) is false, two boxes of the same value have different identities. Compare with .Equals(), not reference equality.
+
+Mixing AssemblyVersion and NuGet package version. Bumping AssemblyVersion on every release causes binding-redirect proliferation for dot NET Framework consumers. Pin AssemblyVersion to the major; let the NuGet semver carry the rest.
+
+Editing runtimeconfig.json inside a container image. It makes the artifact differ per environment. Use DOTNET_* environment variables from your orchestration config so the image stays identical everywhere.
+
+Relying on finalizer ordering. The finalizer thread runs finalizers in an unspecified order; a finalizer must not touch other finalizable objects. Anything with ordering requirements belongs in IDisposable / IAsyncDisposable.
+
+-- pause --
+Section 6. Interview-ready summary.
+
+The C L R is the virtual machine: jit, garbage collector, type system and verifier, exception handling, threading. C sharp compiles to I L + metadata; the C L R turns I L into native code. CoreCLR, Mono, and NativeAOT are different implementations of the same spec.
+Tiered jit: Tier 0 (fast, unoptimized) to Tier 1 (fully optimized, guided by dynamic PGO). ReadyToRun is opt-in pre-compiled native code that tiered jit can still improve on; NativeAOT removes the jit entirely for startup-critical workloads.
+garbage collector generations: a Gen N collection collects generations 0 through N. Gen 0 is small and cheap; Gen 2 is a full garbage collector. LOH holds objects at least 85,000 bytes and is collected with Gen 2, uncompacted by default; POH (dot NET 5+) isolates pinned interop objects.
+Every garbage collector suspends managed threads for at least part of its work, in both workstation and server modes. Background garbage collector (default, both flavours) shrinks the Gen 2 pause; it is a sub-flavour, not a third mode.
+Workstation versus Server is the flavour axis: Server garbage collector gives a heap and thread per core (default for A S P dot NET Core web projects); Workstation is the standalone default and is forced on single-core machines.
+DATAS (opt-in dot NET 8, default from dot NET 9) makes Server garbage collector size itself to live data.
+Stack versus heap myth: value types live where declared. A struct field in a class is on the heap. Boxing is what puts a copy of a value type on the heap; the unboxing cast is exact-type only.
+AppDomain still exists but there is exactly one per process and CreateDomain throws. Use AssemblyLoadContext ( is Collectible: true ) for plugin isolation and unloading.
+P or Invoke marshals between managed and native; blittable types can be pinned with no copy. [LibraryImport] (C sharp 11 / dot NET 7) source-generates the marshaling and is the A O T-safe replacement for [DllImport].
+dot NET Standard was a cross-runtime spec, now superseded by the unified TFM model; target net10.0 for new work.
+RID ( win-x64, linux-arm64 ) selects operating system + architecture for native assets, self-contained publish, R2R, and A O T; the RID graph provides the fallback chain.
+Reflection is metadata-driven and slow; cache a bound delegate or move to source generators for A O T-safe fast paths.
+IDisposable is deterministic cleanup: Dispose() + garbage collector.SuppressFinalize; the finalizer is a safety net that calls Dispose(false); managed-only wrappers need no finalizer.
+Strong naming provides identity only. Modern dot NET never validates the signature and never uses it for binding, do not claim it gives tamper detection.
+Deployment: framework-dependent gets runtime patches for free via roll-forward ( LatestPatch by default); self-contained pins the runtime and makes patching your problem; trimming and NativeAOT shrink it further at the cost of reflection freedom.
+
+-- pause --
+Section 7. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill runs Q to A to Cross-Q to A to Cross-Q² to A, and the deeper ones carry a Cross-Q³. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q² or cross-Q³, go re-read the relevant section.
+
+-- pause --
+Drill 1, C L R versus dot NET Runtime versus BCL.
+
+Q: What's the precise distinction between the C L R, the dot NET Runtime, and the BCL?-- think --
+
+A: The C L R (Common Language Runtime) is the virtual-machine layer, jit, garbage collector, type loader, exception subsystem. The dot NET Runtime is a broader term meaning "C L R + runtime libraries shipped with it" (the bits that must exist for I L to execute).
+The BCL (Base Class Library) is the managed code on top, System.IO, System.Collections, System.Linq, et cetera C L R is the engine; BCL is the standard library; "the runtime" usually refers to both packaged together.
+
+Cross-Q: Where does Span live, C L R or BCL?-- think --
+
+A: Both, by necessity. The type System.Span is defined in the BCL ( System.Memory.dll / System.Private.CoreLib.dll ).
+But its semantics, being a ref struct that cannot escape the stack, cannot be a field of a class, cannot be captured by lambdas, are enforced by the compiler and the C L R's type system. The BCL declares the contract; the runtime refuses to load I L that violates it.
+This is why you can't roll your own Span -like type without the same ref struct machinery, the runtime treats ref struct specially.
+
+Cross-Q²: If I write a NuGet package that uses Span heavily, does it ship the C L R with it?-- think --
+
+A: No. NuGet packages ship managed I L only; the C L R is provided by whatever dot NET runtime the consuming app targets (framework-dependent) or bundled into the executable (self-contained / NativeAOT).
+Your package compiles against the BCL's Span contract via reference assemblies ( ref or net10.0/ ), and at runtime the consumer's C L R enforces the rules. You ship managed code; the runtime ships separately.
+
+Cross-Q³: Is "the C L R" one thing? What are CoreCLR, Mono, and NativeAOT?
+
+A: They are distinct implementations of one specification. CoreCLR is the open-source runtime that ships with modern dot NET and runs most server and desktop workloads. Mono is an alternative implementation used by MAUI and Unity, with different jit or A O T and threading characteristics.
+NativeAOT is a subset runtime with no jit at all, compilation happens at build time via ILC, and the surviving runtime provides garbage collector, exception handling, and type system services only.
+All three execute the same I L against the same BCL contracts; they differ in codegen strategy and in what capabilities survive (reflection breadth, dynamic loading, Reflection.Emit ).
+
+-- pause --
+Drill 2, jit versus A O T versus ReadyToRun.
+
+Q: When would you choose A O T over jit, and what do you give up?-- think --
+
+A: A O T for startup-sensitive workloads (serverless, C L I tools, mobile, containers that scale to zero), size-constrained deployments, or trimmed apps where reflection is restricted anyway.
+You give up: runtime code generation (no Reflection.Emit, no Expression.Compile ), generic instantiations over types unknown at compile time, dynamic assembly loading, unrestricted reflection over statically-unreachable types, and some PGO-driven peak throughput.
+
+Cross-Q: Where does ReadyToRun (R2R) sit between them?-- think --
+
+A: R2R is compiled ahead of time but still jit-compatible, assemblies ship with pre-compiled native code as a cache, and the runtime can still re-jit at tier 1 with full optimizations and PGO. So R2R gives you A O T-like startup without giving up runtime code generation.
+The native code in R2R is conservative; tiered compilation replaces commonly used R2R methods with better jit-generated code at run time.
+Note that R2R is opt-in ( true plus a RID), the thing that is pre-compiled by default is the shared framework itself, which is why R2R helps large apps far more than small ones.
+
+Cross-Q²: Why doesn't A S P dot NET Core default to NativeAOT?-- think --
+
+A: Two reasons. (1) Reflection breadth: E F Core, M V C model binding, Jason serializers without source generation, and many D I extension patterns use reflection that the trimmer can't fully analyze.
+(2) Peak throughput: tiered jit + dynamic PGO can outperform A O T on long-running servers because it specializes hot paths to actual runtime profiles, which static compilation cannot observe.
+A O T support has expanded a lot across dot NET 8 or 9 or 10, but for "general-purpose web server that's been running for six hours," tiered jit still wins. A O T shines for cold-start workloads.
+
+-- pause --
+Drill 3, garbage collector generations.
+
+Q: Walk me through Gen 0, Gen 1, Gen 2, LOH, and POH.-- think --
+
+A: Gen 0 holds newly allocated small objects; collected most often. Objects surviving a Gen 0 collection get promoted to Gen 1. Surviving a Gen 1 collection promotes to Gen 2, long-lived state (caches, singletons, statics).
+LOH (Large Object Heap) holds objects at least 85,000 bytes; collected with Gen 2, and not compacted by default ( GCSettings.LargeObjectHeapCompactionMode lets you force a one-off compaction).
+POH (Pinned Object Heap, dot NET 5+) holds pinned objects for native interop, pre-segregated so pinning doesn't punch holes in the compacted heap. And say it precisely: a Gen N collection collects generations 0 through N, "Gen 2 collection" and "full garbage collector" are the same event.
+
+Cross-Q: Why is allocating a 90 kilobytes array different from allocating ten 9 kilobytes arrays?-- think --
+
+A: The 90 kilobytes array lands on LOH directly, it lives in a non-compacting region and is only reclaimed during Gen 2 collections. Ten 9 kilobytes arrays go to Gen 0 where they get compacted and reclaimed cheaply; most die before ever reaching Gen 1.
+The 90 kilobytes array therefore costs you: (1) a more expensive collection cadence, (2) potential LOH fragmentation, (3) no compaction to reclaim that fragmentation. Rule of thumb: avoid the LOH for short-lived data, use ArrayPool for transient large buffers.
+
+Cross-Q²: How does the card table make generational garbage collector fast?-- think --
+
+A: When a Gen 2 object holds a reference to a Gen 0 object (older to younger pointer), a Gen 0 collection needs to know about it, otherwise the Gen 0 object looks unreachable. Scanning all of Gen 2 to find such references would defeat generational garbage collector.
+The card table is a coarse map of the heap in which writing a reference field marks the covering card dirty; Gen 0 collection scans only dirty cards. The write barrier is the code the jit emits on reference writes to set those bits.
+This is why storing a reference is slightly more expensive than storing a value, the jit emits barrier code for one and not the other.
+
+Cross-Q³: A microservice sees Gen 2 spikes every 30 seconds under moderate load. How do you diagnose it?
+
+A: Likely causes: (a) long-lived caches growing unboundedly, (b) large objects repeatedly allocated onto the LOH and surviving, (c) objects promoted to Gen 2 because their lifetime slightly exceeds the ephemeral budget.
+Diagnosis path: dotnet-counters monitor --counters System.Runtime for collection rates,
+heap size and LOH size in real time to dotnet-trace collect and read it in PerfView for allocation stacks to garbage collector.GetGCMemoryInfo() for per-generation and LOH detail to dotnet-gcdump collect and dotnet-gcdump report to see what actually occupies Gen 2, by type.
+Compare heap size before each Gen 2 collection: a rising floor means retention, a flat floor with a rising ceiling means allocation rate.
+
+-- pause --
+Drill 4, Workstation garbage collector versus Server garbage collector.
+
+Q: What's the default garbage collector mode for A S P dot NET Core, and why?-- think --
+
+A: Server garbage collector, with background collection on (which is the default for both flavours). A S P dot NET Core web projects get it because the Web S D K sets ServerGarbageCollection to true.
+Server garbage collector dedicates a garbage collector thread and heap per logical core so collections parallelize; servers are throughput-sensitive, have cores to spare, and care about steady-state performance more than working set.
+Caveat worth stating: on a single-logical-C P U machine the runtime uses workstation garbage collector regardless of the setting.
+
+Cross-Q: When would Workstation garbage collector be the right call on a server?-- think --
+
+A: The documented case is many active dot NET processes on one box, multi-tenant hosts, sidecars, a fleet of small workers.
+Each Server garbage collector process wants a heap and a garbage collector thread per core, so N processes collecting at once oversubscribe the CPUs and interfere with each other;
+Microsoft's own guidance is that if the processes are active it is not a good idea to have them all use Server garbage collector, and that for hundreds of instances you should consider workstation garbage collector with concurrent garbage collector disabled.
+The second, weaker case is a latency-sensitive service with a small heap and a strict P ninety-nine budget, where you'd rather have many tiny pauses than fewer larger ones. Both are hypotheses to measure, not rules.
+
+Cross-Q²: How does DATAS change that conversation?-- think --
+
+A: DATAS (Dynamic Adaptation To Application Sizes) makes Server garbage collector size the heap to the app's live data instead of holding peak-allocation headroom, it starts with one heap and adds heaps as throughput demands.
+It shipped opt-in in dot NET 8 and is enabled by default from dot NET 9 ( System.garbage collector.DynamicAdaptationMode, MSBuild GarbageCollectionAdaptationMode, or DOTNET_GCDynamicAdaptationMode ).
+That removes most of the memory-footprint argument for switching containers to Workstation garbage collector, so advice written before dot NET 9 should be re-tested rather than repeated. Say "measure it on your workload", that is the senior answer, and it is also the true one.
+
+-- pause --
+Drill 5, Assembly loading (AssemblyLoadContext).
+
+Q: What replaced AppDomain in dot NET Core or 5+, and why?-- think --
+
+A: AssemblyLoadContext (ALC) took over the assembly-grouping role. AppDomain (in dot NET Framework) was a heavyweight isolation boundary, separate security policy, separate type identity, cross-AppDomain calls marshaled through remoting proxies.
+Maintaining per-domain heaps, security policy, and type systems is prohibitively expensive on a cross-platform runtime, and process-level isolation (containers, worker processes) covers the use case better.
+Be precise: the AppDomain type still exists and every process has exactly one; what's gone is creating more of them, AppDomain.CreateDomain throws PlatformNotSupportedException.
+
+Cross-Q: When would you create a custom AssemblyLoadContext ?-- think --
+
+A: Plugin systems with versioning conflicts. Each plugin loads into its own ALC ( is Collectible: true ), so plugin A's Newtonsoft.Json v12 and plugin B's v13 can coexist, type identity is per-ALC.
+When the plugin is removed, its ALC is Unload() -ed and eventually garbage collector'd along with all its types.
+Roslyn's script host, Razor compilation, and test runners use this internally.
+
+Cross-Q²: Why might an ALC fail to unload?-- think --
+
+A: Anything that holds a reference into the ALC from outside prevents unloading.
+Common offenders: events subscribed by long-lived singletons in the default ALC, thread-static fields holding plugin types, Type objects cached in a static dictionary, generic instantiations in the default ALC parameterized over plugin types, an attached debugger.
+The diagnostic is dotnet-dump analyze + !gcroot on a type from the unloaded ALC; if a root path leads to default-ALC code, that's your leak.
+Unload() is asynchronous, there's no synchronous confirmation; you check by watching a WeakReference to a sentinel object go dead after a full garbage collector.
+
+-- pause --
+Drill 6, Value type versus reference type, what's on the stack.
+
+Q: Is the statement "value types live on the stack, reference types live on the heap" correct?-- think --
+
+A: It's a useful first-approximation that's technically wrong. The accurate version: value types live where they're declared. A struct field of a class lives inside the class on the heap. A boxed int lives on the heap. A captured local in a closure lives on the heap.
+Only short-lived locals and method parameters of value type live on the actual call stack. Stack versus heap is about where the variable is declared, not about the type's category.
+
+Cross-Q: Where does the int in class Foo { int x; } live?-- think --
+
+A: Inside the Foo instance on the heap. The instance's layout is: object header (sync-block index + method-table pointer, one word each on 64-bit) followed by the fields. x is part of the heap object, there's no separate stack allocation for it. When Foo is collected, x goes with it.
+
+Cross-Q²: What about a Span over stack memory, does the stack-only rule make Span a value type?-- think --
+
+A: Span is a ref struct, a value-type shape that the language and runtime confine to the stack by restricting where it can appear: not as a field of a class or non- ref struct, not captured by a lambda, not live across an await or yield return, not boxed.
+It's a value type the type system actively prevents from escaping, because it holds a managed pointer plus a length and a heap-resident interior pointer would be a garbage collector nightmare.
+Note the modern nuance: C sharp 13 / dot NET 9 relaxed two of these, allows ref struct lets a ref struct be a generic type argument, and ref struct types may now implement interfaces (they still can't be converted to an interface type, since that conversion is a boxing conversion).
+
+Cross-Q³: Span s = stackalloc int[8];, where does s live, and where does the buffer live?
+
+A: The 8-int buffer is on the current stack frame. s itself, a pointer plus a length, is also a stack local. That's legal precisely because Span is a ref struct: the compiler proves the span cannot outlive the frame, so the interior pointer can never dangle.
+
+-- pause --
+Drill 7, I L versus native code.
+
+Q: What does dotnet build produce?-- think --
+
+A: A .dll (or .exe ) containing Intermediate Language (I L) + metadata, platform-neutral managed code. The I L is C P U-agnostic; it gets compiled to native instructions by the jit at runtime (or by an A O T compiler at build time).
+The metadata describes types, members, attributes, references, it's what powers reflection, the type loader, and tooling like decompilers.
+
+Cross-Q: What's the difference between I L and Java bytecode?-- think --
+
+A: Functionally similar, both are stack-machine ISAs designed for a managed runtime. Differences: (1) I L preserves generics: generic type arguments survive into metadata and the runtime instantiates over them, where Java erases them at compile time.
+(2) I L has first-class value-type semantics ( ldobj / stobj / initobj for structs alongside ldfld for fields); the J V M's only aggregate is the object reference.
+(3) I L was designed for multi-language interop (C sharp, VB, F sharp, C plus plus/C L I), the C L I's Common Type System exists for that reason.
+(4) I L has an unverifiable unsafe subset with raw pointers; Java has no language-level equivalent.
+
+Cross-Q²: Can I decompile I L back to C sharp? Is that legal?-- think --
+
+A: Yes, ILSpy, dn Spy, dot Peek, and ildasm recover readable C sharp (or VB, F sharp). The metadata makes it reliable; you get back near-original code minus comments, formatting, and some local names.
+Legality depends on jurisdiction and licence; reverse-engineering for interoperability is generally permitted in the EU or US, but circumventing licence terms or copyright is not. Practical takeaway: never put secrets, connection strings, A P I keys, encryption keys, in compiled binaries.
+Assume the I L is readable and use environment variables or a secret store.
+
+-- pause --
+Drill 8, Strong-naming and assembly versioning.
+
+Q: What does strong-naming actually give you?-- think --
+
+A: A unique identity, and nothing more. A strong-named assembly carries a public key and a PublicKeyToken; identity becomes Name + Version + Culture + PublicKeyToken instead of just the simple name.
+That's what let dot NET Framework load different versions side by side, register in the GAC, and grant InternalsVisibleTo between signed assemblies. Microsoft's guidance is explicit: "Do not rely on strong names for security. They provide a unique identity only."
+
+Cross-Q: Is strong-naming still relevant in modern dot NET?-- think --
+
+A: Materially, no. Microsoft states that for dot NET Core and dot NET 5+, strong-named assemblies provide no material benefit: the runtime never validates the strong-name signature, and does not use the strong name for assembly binding. The GAC doesn't exist; binding is path-based.
+The one real remaining reason to sign is compatibility with dot NET Framework consumers that are themselves strong-named or that carry binding redirects for your library.
+If you need tamper-evidence or publisher identity, that's Authenticode / code signing for binaries and image signing (for example Sigstore) for containers, those are actually verified.
+If an interviewer offers you "strong naming proves the binary wasn't modified," that's the trap: it doesn't, because nothing checks it.
+
+Cross-Q²: What's delay signing, and does it still matter?-- think --
+
+A: Full signing uses the real private key at build time, so only the key holder can produce a signed build.
+Delay signing embeds the public key and reserves space for the signature, and the assembly is completed with the private key later in the release pipeline, on dot NET Framework it needed a skip-verification registration to run on the dev box in the meantime.
+The whole practice existed to keep the private key off developer machines. Today the same goal is met by signing in CI with the key held in the build system's secret store or an HSM, so delay signing is largely obsolete.
+
+Cross-Q³: Why do most NuGet packages pin AssemblyVersion to just the major number?
+
+A: To avoid binding redirects on dot NET Framework. If your app references Contoso 3.0.0.0 and a transitive dependency references 3.0.1.0, the Framework loader refuses to bind without a redirect. Keeping AssemblyVersion at 3.0.0.0 for every 3.x.y release means the loader only ever sees one version.
+The NuGet package version ( 3.1.2, 3.2.0 ) carries the real release history for humans and for the restore graph. AssemblyVersion bumps are reserved for binary-incompatible major breaks.
+
+-- pause --
+Drill 9, runtimeconfig.json tunables.
+
+Q: What's tunable via runtimeconfig.json that isn't in your csproj?-- think --
+
+A: Careful with the framing, most MSBuild properties ( ServerGarbageCollection, ConcurrentGarbageCollection, TieredCompilation ) are compiled into runtimeconfig.json at build time, so csproj isn't a separate runtime layer, it's a source for that file.
+What runtimeconfig.json gives you is the ability to change those values on a built artifact:
+garbage collector flavour ( System.garbage collector.Server, System.garbage collector.Concurrent, System.garbage collector.RetainVM, System.garbage collector.HeapHardLimitPercent ), thread-pool minimums ( System.Threading.ThreadPool.MinThreads ),
+jit policy ( System.Runtime.TieredCompilation, System.Runtime.TieredCompilation.QuickJit, System.Runtime.TieredPGO ), arbitrary AppContext switches that libraries read, and the framework roll-forward policy.
+
+Cross-Q: What about environment variables, how do they interact?-- think --
+
+A: The runtime also reads DOTNET_ -prefixed environment variables for these knobs ( DOTNET_gcServer, DOTNET_gcConcurrent, DOTNET_TieredPGO ).
+Microsoft's reference documents both mechanisms but does not publish a general precedence rule, so don't assert one, the safe engineering answer is set each knob in exactly one place and verify at runtime ( GCSettings.IsServerGC, garbage collector.GetConfigurationVariables() ).
+The documented fact to lead with is that garbage collector configuration is read once, when the garbage collector initializes, changing an environment variable on an already-running process does nothing.
+
+Cross-Q²: I want Server garbage collector at deployment time without rebuilding, how?-- think --
+
+A: Two mechanisms. (1) Edit .runtimeconfig.json next to the binary to set "System.garbage collector.Server": true, and restart the process. (2) Set DOTNET_gcServer set to 1 in the process environment.
+For containers, prefer the environment variable, it belongs to orchestration config rather than the image, so the same image runs everywhere.
+Don't edit runtimeconfig.json inside the container image: it makes deployments asymmetric across environments and the difference is invisible in your registry.
+
+-- pause --
+Drill 10, dotnet --list-runtimes versus SDKs.
+
+Q: What's the difference between a runtime and an S D K?-- think --
+
+A: An S D K is what you need to build dot NET code, Roslyn, MSBuild, project templates, the dotnet C L I. A runtime is what you need to run compiled dot NET code, the C L R + framework libraries. Runtimes are smaller; SDKs include a runtime plus all the tooling.
+dotnet --list-sdks shows what you can build with; dotnet --list-runtimes shows what compiled apps can bind to.
+
+Cross-Q: Why are there multiple runtime "flavors", Microsoft.NETCore.App, Microsoft.AspNetCore.App, Microsoft.WindowsDesktop.App ?-- think --
+
+A: To keep deployment footprints small. Microsoft.NETCore.App is the core runtime (C L R + base libraries). Microsoft.AspNetCore.App adds the A S P dot NET Core shared framework (Kestrel, M V C, SignalR, hosting and D I extensions) so web apps don't ship those dlls themselves.
+Microsoft.WindowsDesktop.App adds WPF and WinForms. A console app needs only the first; a web app the first two; a WPF app all three on Windows. Shared framework = assemblies installed with the runtime that apps reference but never redistribute.
+
+Cross-Q²: How does roll-forward pick which installed runtime to use?-- think --
+
+A: The host reads the app's runtimeconfig.json for its target framework version and roll Forward policy ( LatestPatch, Minor, Major, LatestMajor, Disable ), enumerates the installed runtimes in that family, and picks the highest acceptable version.
+The default is LatestPatch, an app built against 10.0.0 runs on 10.0.5 but not 10.1.0 unless you opt in.
+This is why patch versions matter in production: for a framework-dependent app, the framework's CVE fixes reach you when the host rolls you forward onto a patched runtime; for a self-contained app, they only reach you when you rebuild.
+
+-- pause --
+Drill 11, Self-contained versus framework-dependent deployment.
+
+Q: When would you choose self-contained over framework-dependent?-- think --
+
+A: Self-contained when: (a) the target machine has no dot NET runtime installed, (b) you must pin an exact runtime version and be immune to whatever is installed (regulated environments, reproducible builds), (c) you're shipping a single-file binary for distribution simplicity.
+Framework-dependent when: you control the base image or the machine, you want the smallest artifact, and you want runtime security patches to arrive through roll-forward without rebuilding the app.
+
+Cross-Q: How big is the size difference?-- think --
+
+A: Give the shape, not fabricated numbers. Framework-dependent output contains only your assemblies. Self-contained adds the entire runtime and framework, which is one to two orders of magnitude larger.
+PublishTrimmed walks the static call graph and strips unreferenced framework code, cutting that substantially; NativeAOT produces a single native binary that is smaller still.
+Exact figures move every release and depend on the app, publish it and read the output rather than quoting a number you can't source. The tradeoff worth naming is that trimming breaks reflection over types that look statically unreachable.
+
+Cross-Q²: My self-contained app works locally but throws System.IO.FileNotFoundException for a managed dll on the customer's machine. What's likely?-- think --
+
+A: A trimmed-away assembly. If PublishTrimmed set to true and your app loads code dynamically (reflection, Assembly.LoadFrom, plugin discovery, Type.GetType(string) ), the trimmer removed types it couldn't see referenced statically.
+The fix: (1) [DynamicDependency] at the call site or a trimmer root descriptor X M L naming the types to keep; (2) turn on trim warnings during development so the analyzer surfaces the problem at build time; (3) replace the reflective pattern with a source generator where one exists (for example
+JsonSerializerContext ). Always test the trimmed, published artifact in CI, not dotnet run.
+
+-- pause --
+Drill 12, Tiered compilation.
+
+Q: What does tiered compilation actually do?-- think --
+
+A: The jit compiles hot methods twice. Tier 0: a quick, minimally optimized compile that runs on the first calls and gets the app started fast.
+Tier 1: once the method is recognized as hot, the jit recompiles it with full optimization, inlining, loop optimization, dead-code elimination, register allocation, and execution transparently switches over. No restart, no source change.
+Don't quote a call-count threshold as if it were a contract; it's an internal, tunable implementation detail.
+
+Cross-Q: How does dynamic PGO fit in?-- think --
+
+A: Dynamic PGO (Profile-Guided Optimization, on by default since dot NET 8) instruments tier-0 code to collect runtime profile data, branch direction, dominant virtual-call targets, type frequencies through generics.
+When the method is promoted to tier 1, the jit consumes that profile: it can guarded-devirtualize a call when one target dominates, inline the hot target, and lay out blocks for better instruction-cache behaviour. PGO is what lets jit peak throughput match or beat static A O T.
+
+Cross-Q²: When would you disable tiered compilation?-- think --
+
+A: Almost never in production. Two niches: (1) Benchmarking, BenchmarkDotNet controls it so every measured iteration runs the same fully-optimized code, otherwise a tier transition mid-run contaminates results.
+(2) A method that must run at peak on its very first call, annotate just that method with [MethodImpl(MethodImplOptions.AggressiveOptimization)] rather than disabling tiering globally. Blanket-disabling tiered compilation in production trades a large startup regression for essentially nothing.
+
+Cross-Q³: A benchmark says method A is 5 times faster than B, but production shows only 2 times. What explains that?
+
+A: Most often dynamic PGO plus workload shape. In a microbenchmark each method is exercised in isolation with a monomorphic call pattern, so A's simpler path inlines perfectly.
+In production the jit observes B's actual profile and re-JITs it with guarded devirtualization and better block layout, B improves in ways the benchmark never let it. Add C P U branch-predictor and cache warmup over millions of real calls, plus contention and I O that dominate wall-clock.
+A microbenchmark cannot reproduce the PGO feedback loop of a long-running server, which is exactly why you profile in production-like conditions before optimizing.
+
+-- pause --
+Drill 13, Span runtime treatment.
+
+Q: Why is Span a ref struct ?-- think --
+
+A: Span holds a managed reference (to the start of some memory) plus a length. That reference might point into a managed array, a stackalloc buffer, native memory, or a string's char buffer.
+If Span could escape to the heap, as a field of a class, captured in a closure, the garbage collector would have to track arbitrary interior pointers from heap objects,
+which is both a performance problem and a correctness minefield (a span over stackalloc memory outliving its frame is a dangling pointer).
+Making it a ref struct confines it to the stack, where lifetime is provable.
+
+Cross-Q: What can't you do with Span because of ref struct ?-- think --
+
+A: It can't be a field of a class or of a non- ref struct. It can't be captured by a lambda or local function. It can't be boxed. It can't live across an await or a yield return. It can't be converted to an interface type (that conversion boxes).
+Two restrictions were lifted in C sharp 13 / dot NET 9: a ref struct may now be used as a generic type argument when the type parameter declares allows ref struct, and a ref struct may implement interfaces (accessed through such a type parameter, never by converting to the interface).
+C sharp 13 also allows ref struct locals in async and iterator methods, as long as they aren't accessed across the await or yield.
+
+Cross-Q²: I want Span -like data held across an await. What are my options?-- think --
+
+A: Three. (1) Memory, the heap-safe analogue; it can be a field and can cross async boundaries, at the cost of one indirection (you call .Span to get a span for the synchronous stretch).
+(2) Materialize to an array or List before the await, copies, defeats the zero-allocation goal, acceptable only for small data. (3) Restructure: keep the span inside a synchronous helper and put the await on either side of it.
+Default choice: Memory for the async plumbing, Span for the synchronous hot path.
+
+-- pause --
+Drill 14, unsafe and fixed.
+
+Q: When is unsafe actually legal in C sharp?-- think --
+
+A: Only when the project sets true. Inside an unsafe context you can use pointer types ( int*, byte* ), pointer arithmetic, and, *, stackalloc, and sizeof on unmanaged types. Such code is unverifiable, it steps outside the guarantees the type system otherwise gives you.
+Used for native interop, performance-critical primitives, and direct memory manipulation.
+
+Cross-Q: What does fixed do that unsafe alone doesn't?-- think --
+
+A: fixed pins a managed object (typically an array, string, or struct field) at a fixed address for the duration of the block, so the garbage collector won't relocate it during compaction. Within the block you take its address as a raw pointer and pass it to native code or walk it directly.
+Without pinning, the object's address could change mid-method as the garbage collector compacts, invalidating any pointer you held.
+
+Cross-Q²: How does fixed interact with the garbage collector's compaction phase?-- think --
+
+A: Pinning marks the object so the garbage collector's compaction phase leaves it in place and relocates everything else around it. Lots of pinned objects, especially long-lived ones, leave gaps the garbage collector can't close, heap fragmentation.
+The POH (Pinned Object Heap, dot NET 5+) exists so frequently-pinned objects live in a dedicated region rather than punching holes in the general heap.
+Practical takeaway: keep fixed blocks short; for long-lived interop buffers allocate with garbage collector.AllocateArray(length, pinned: true) so they start life in the POH.
+
+-- pause --
+Drill 15, Boxing.
+
+Q: When does a value type secretly get boxed?-- think --
+
+A: Any time it's assigned to a reference-typed location: object o = 42;, IComparable c = 42;, putting an int in ArrayList, calling an inherited-but-not-overridden virtual method on a struct (the call to object.ToString / GetHashCode / Equals needs a boxed receiver),
+string interpolation of a struct that doesn't implement IFormattable / ISpanFormattable, and passing a value type to a params object[] parameter.
+
+Cross-Q: How do you call .ToString() on a struct without boxing?-- think --
+
+A: If the struct overrides ToString(), the compiler emits a direct call, no box. If it only inherits object.ToString(), the compiler must box to dispatch through object. So: always override ToString, Equals, and GetHashCode on structs you care about.
+For formatting, implement IFormattable and ISpanFormattable, the latter formats directly into a Span with no intermediate string at all, which is what the interpolated-string handler uses on the modern allocation-free path.
+
+Cross-Q²: Why doesn't List.Add(42) box, but ArrayList.Add(42) does?-- think --
+
+A: List is List instantiated over int, for value types the runtime generates a distinct instantiation, so the backing store is a real int[] and Add takes an int by value; no object ever appears.
+ArrayList predates generics: its store is object[], so every int added must first be wrapped in a heap object. That's one allocation per element, each carrying a full object header, plus the pointer in the array, versus four contiguous bytes per element in an int[].
+This single distinction is why generic collections displaced the non-generic ones in dot NET 2.0, and why ArrayList and Hashtable are effectively obsolete.
+
+Cross-Q³: I have struct Point: IComparable. Does List.Sort() box each element?
+
+A: No. List.Sort() goes through Comparer.Default, which for a type implementing IComparable resolves to a comparer specialized over Point. Because T is known to be Point at instantiation time, the call to CompareTo is a constrained call on the value type, dispatched directly, no boxing.
+Boxing would only occur if you explicitly assigned a Point to an IComparable -typed variable, or used the non-generic IComparable.
+
+-- pause --
+Drill 16, Managed versus unmanaged code and P or Invoke.
+
+Q: What is marshaling in P or Invoke?-- think --
+
+A: Converting data between the C L R's managed representation and the layout the native callee expects.
+A managed string (UTF-16 on the garbage collector heap) becomes a pointer to a null-terminated buffer the native side can read; a managed array must either be copied to native memory or pinned so the garbage collector can't move it while the call is in flight; ref / out become pointers.
+The marshaller also handles calling convention, SetLastError, and converting HRESULT / bool return shapes.
+
+Cross-Q: What is a "blittable" type and why does it matter?-- think --
+
+A: A blittable type has the same layout in managed and native memory, byte, short, int, long, float, double, pointers, and structs composed only of blittable fields. Blittable data can be pinned and handed to native code with no copy and no conversion.
+Non-blittable types ( bool, char, string, arrays of non-blittable structs, anything with reference fields) force the marshaller to allocate and convert on every call, which is exactly where interop-heavy code loses its performance.
+
+Cross-Q²: [LibraryImport] (C sharp 11 / dot NET 7) is the recommended replacement for [DllImport]. Why?-- think --
+
+A: [LibraryImport] is a source generator: it emits the marshaling stub as ordinary C sharp at compile time instead of relying on the runtime's reflection-driven marshaller.
+That gives you (1) A O T compatibility, no runtime code generation needed; (2) trimmer visibility, the generated code is statically analyzable; (3) less per-call overhead; (4) explicit, debuggable marshaling you can read in obj/, with [MarshalUsing] for custom marshallers.
+The constraint that surprises people: the generator requires partial methods and pushes you toward explicit types (for example it won't silently marshal a string without you choosing the marshalling).
+
+-- pause --
+Drill 17, Finalization and IDisposable.
+
+Q: What is the finalization queue, and how does it interact with the garbage collector?-- think --
+
+A: When an object that declares a finalizer becomes unreachable, the garbage collector does not reclaim it. It moves it to the f-reachable queue, which is itself a garbage collector root, so the object survives, and gets promoted.
+A dedicated finalizer thread drains the queue and runs each finalizer.
+Only on a subsequent collection is the object actually reclaimed. Net effect: finalizable objects survive at least two collection cycles and drag whatever they reference along with them.
+
+Cross-Q: What does garbage collector.SuppressFinalize(this) do, and why does it belong in Dispose() ?-- think --
+
+A: It clears the object's "needs finalization" bit, so the garbage collector never queues it. Once Dispose() has released the resources, running the finalizer would achieve nothing while costing the object an extra collection cycle and an extra promotion.
+Calling garbage collector.SuppressFinalize(this) at the end of Dispose() is how a type opts back out of that cost.
+
+Cross-Q²: My class holds only a SqlConnection, managed, and already IDisposable. Does it need a finalizer?-- think --
+
+A: No. A finalizer is only warranted when your type directly owns an unmanaged resource, a raw handle or native allocation that leaks if nobody disposes. For a type that only wraps other managed disposables: implement Dispose(), forward to the inner Dispose(), keep a _disposed guard, and stop.
+No finalizer and no garbage collector.SuppressFinalize, they cost the object two collection cycles and buy nothing when there is no finalizer to suppress.
+One precision point interviewers like: the protected virtual Dispose(bool) overload is about inheritance, not about finalization, keep it if the class is non-sealed so subclasses can extend cleanup, and drop it if you seal the class. The overload is free; it is the finalizer that costs.
+And if you do hold an unmanaged handle, prefer wrapping it in a SafeHandle, which brings its own critical finalizer, so your type stays in the managed-only case.
+
+-- pause --
+Drill 18, dot NET Standard and the unified TFM model.
+
+Q: What is dot NET Standard, and is it still relevant?-- think --
+
+A: A specification, a set of A P I contracts every conforming dot NET runtime agreed to implement, so library authors could target netstandard2.0 once and run on dot NET Framework 4.6.1+, dot NET Core 2.0+, Mono, and Xamarin.
+With the dot NET 5 unification, a single net5.0 + TFM covers all modern runtimes and no new dot NET Standard versions are being produced. It is now a compatibility bridge, not a target you choose by default.
+
+Cross-Q: When should a new library target netstandard2.0 today?-- think --
+
+A: Only when it genuinely must run on dot NET Framework 4.6.1+. If your consumers are modern dot NET, target net10.0, the current L T S. The cost of netstandard2.0 is a 2017-era A P I surface: no Span in your public A P I, no IAsyncEnumerable, none of the modern BCL.
+If you need both audiences, multi-target rather than settling for the lowest common denominator.
+
+Cross-Q²: A library targets netstandard2.0; a consumer targets net10.0. What happens at runtime?-- think --
+
+A: It works, the Standard 2.0 A P I surface is present on the modern runtime, so the library's I L runs unchanged and the reference resolves. What you lose is inside the library: it was compiled against the Standard surface, so it can't use anything newer regardless of what runtime it ends up on.
+The fix is multi-targeting, netstandard2.0;net10.0 with #if NET8_0_OR_GREATER -style guards, so the modern build uses Span and the Framework build stays compatible.
+
+-- pause --
+Drill 19, Runtime Identifiers and deployment.
+
+Q: What is a Runtime Identifier (RID), and when do you need one?-- think --
+
+A: A string identifying an operating system + architecture combination, win-x64, linux-x64, linux-arm64, osx-arm64.
+You need one whenever the output contains native code or native asset selection: self-contained publish, NativeAOT, ReadyToRun, and restoring NuGet packages that ship native binaries under runtimes//native/.
+
+Cross-Q: What is the RID graph and why does it exist?-- think --
+
+A: Packages can't ship an asset for every conceivable RID, so RIDs form a fallback hierarchy, linux-arm64 to linux to unix to any. NuGet walks from the most specific match to the most general until it finds an asset.
+That's how a package shipping one generic linux binary still satisfies both linux-x64 and linux-arm64 consumers.
+
+Cross-Q²: You publish linux-x64, the container runs, and the app dies at startup with a native library load error. How do you triage?-- think --
+
+A: Confirm the architectures actually match at each layer. Check the image ( docker image inspect --format '{{.Architecture}}' ) and the host, an amd64 image on an arm64 host runs under emulation, where native assets frequently misbehave.
+Confirm the base image tag matches the published RID (a linux-arm64 publish inside an amd64 runtime image will not load).
+If architectures do match, the failure is usually a transitive native dependency with no asset for your RID, or a missing operating system-level library, ldd on the failing .so names it.
+Alpine is the classic trap: it uses musl rather than glibc, so it needs the linux-musl-x64 RID.
+
+-- pause --
+Drill 20, Assembly metadata and reflection.
+
+Q: What does a dot NET assembly contain besides I L?-- think --
+
+A: Metadata: the manifest (name, version, culture, public key, referenced assemblies, embedded resources) and the type tables (every type's hierarchy, fields, method signatures, properties, events, custom attributes).
+Metadata is what makes reflection, the type loader, serializers, decompilers, IntelliSense, and analyzers possible, without it, I L is opaque bytes.
+
+Cross-Q: MethodInfo.Invoke is slow. How do you make reflection-driven code production-fast?-- think --
+
+A: Bind once, call many. Convert the MethodInfo to a strongly-typed delegate and cache it: var f = mi.CreateDelegate>(target); (the generic overload exists on dot NET 5+). Subsequent calls are near-direct dispatch, with no argument array and no per-call boxing.
+Watch the open-versus-closed distinction: if you pass no target for an instance method you get an open instance delegate, and the delegate type must then include the receiver as its first parameter, binding Func with a null target throws ArgumentException.
+For A O T and genuinely hot paths, go further and use source generators so there's no runtime reflection at all.
+
+Cross-Q²: Can you always decompile a dot NET assembly back to readable C sharp?-- think --
+
+A: Effectively yes, ILSpy, dn Spy, and dot Peek reconstruct near-original C sharp because the metadata is so rich; you lose comments, formatting, and some local names. Obfuscators raise the cost but don't change the security model. The practical implication: never embed secrets in an assembly.
+Connection strings, A P I keys, and encryption keys in I L are readable by anyone with the binary. Use environment variables, a managed identity, or a secret store.
+
+-- pause --
+Drill 21, ArrayPool and buffer lifetime.
+
+Q: How does ArrayPool reduce garbage collector pressure?-- think --
+
+A: ArrayPool.Shared.Rent(size) hands back an existing array from a pooled bucket instead of allocating; .Return(array) puts it back.
+For transient large buffers, request bodies, serialization scratch space, image tiles, that removes the allocation entirely, which means no LOH traffic, no LOH fragmentation, and no Gen 2 pressure from that source.
+
+Cross-Q: What's the contract you must honour when you rent?-- think --
+
+A: Return in a finally so an exception can't lose the buffer; never touch the array after returning it; and pass clear Array: true on Return if the buffer held sensitive data, because the pool does not clear by default.
+Renting and never returning is legal, the array is simply collected normally, so a leak degrades to plain allocation rather than corruption.
+
+Cross-Q²: Rent can return an array larger than you asked for. What bug does that cause?-- think --
+
+A: Any code that trusts array.Length instead of the requested length. You ask for 1,000 bytes, get 1,024, then write buffer.Length bytes or hand buffer whole to a serializer, and you've just emitted 24 bytes of whatever the previous renter left there.
+That's both a correctness bug and a potential information leak across requests. Track the logical size yourself and slice: var buf = ArrayPool.Shared.Rent(needed); try { Process(buf.AsSpan(0, needed)); } finally { ArrayPool.Shared.Return(buf); }.
+
+-- pause --
+Section 8. Cheat Sheet.
+
+C L R = jit + garbage collector + type system + exception handling + threading, executing I L. CoreCLR / Mono / NativeAOT are implementations of one spec.
+Tiered jit: Tier 0 (fast, minimal opts) to Tier 1 (full opts + dynamic PGO, on by default since dot NET 8). R2R is opt-in ( PublishReadyToRun + RID); NativeAOT removes the jit.
+Gen N collects generations 0.N. Gen 0 frequent and cheap; Gen 2 = full garbage collector. LOH at least 85,000 bytes, collected with Gen 2, not compacted by default. POH (dot NET 5+) for pinned interop objects.
+Every garbage collector suspends managed threads for part of its work, workstation and server. Background garbage collector (default in both flavours) only shrinks the Gen 2 window.
+Flavour axis: Workstation (standalone default; forced on single-core) versus Server ( ServerGarbageCollection; A S P dot NET Core web default). Sub-flavour axis: background (default) versus non-concurrent ( System.garbage collector.Concurrent set to false ).
+DATAS: Server garbage collector sizes to live data. Opt-in dot NET 8, default from dot NET 9. Regions replaced segments in dot NET 7. garbage collector.RefreshMemoryLimit() (dot NET 8) re-reads container limits without a restart.
+Card table + write barrier = how older to younger references are tracked without scanning Gen 2.
+Stack versus heap myth: value types live where declared. Struct field in a class = on the heap.
+Boxing = value type to heap object with a full header. Unboxing casts are exact-type only. Avoid in hot loops; use generics, List, where T: IFoo.
+AppDomain: one per process; CreateDomain throws. Use AssemblyLoadContext ( is Collectible: true ); Unload() is async and fails silently while any external reference remains.
+P or Invoke: blittable types pin with no copy. [LibraryImport] (C sharp 11 / dot NET 7) source-generates the stub, A O T-safe, prefer it over [DllImport].
+dot NET Standard = cross-runtime spec, frozen. Target net10.0 for new libraries; multi-target only for dot NET Framework consumers.
+RID ( win-x64, linux-arm64 ) = operating system + arch for native assets, self-contained, R2R, and A O T. RID graph falls back linux-arm64 to linux to unix to any. Alpine needs linux-musl-*.
+Reflection is slow; cache mi.CreateDelegate(target) (dot NET 5+) or use source generators. A null target on an instance method makes an open delegate needing the receiver in the signature.
+IDisposable: Dispose() + garbage collector.SuppressFinalize; the finalizer calls Dispose(false), never the public Dispose(); no finalizer for managed-only wrappers; prefer SafeHandle.
+Strong naming = identity only. Modern dot NET never validates the signature and never binds on it. Use Authenticode / image signing for tamper-evidence.
+AssemblyVersion = loader identity (pin to major); NuGet version = semver for humans.
+Deployment: roll Forward defaults to LatestPatch. Framework-dependent gets runtime CVE fixes without a rebuild; self-contained does not. Trimming breaks reflection over statically-unreachable types, test the published artifact in CI.
+
+-- pause --
+Section 9. Walkthrough.
+
+Problem: A long-running A S P dot NET Core service loads report-generation plugins using Assembly.LoadFrom. After several hours, memory grows continuously and never stabilizes, even when no requests are being processed.
+
+Diagnosis steps:
+
+Attach dotnet-counters monitor --process-id --counters System.Runtime and watch gen-2-gc-count, gc-heap-size, and loh-size. A rising Gen 2 size with a stable Gen 0 size points at retention, not allocation rate.
+
+Take a dotnet-gcdump collect --process-id. Open it in Visual Studio's heap snapshot viewer or dotnet-gcdump report. Look for unexpected accumulation of plugin types, and for multiple AssemblyLoadContext instances.
+
+If plugin types are accumulating: determine whether a new ALC is created per request or invocation versus a single long-lived one. A new ALC per call that is never unloaded is an ALC leak, and it leaks the assembly, its types, and their static state each time.
+
+If there is one long-lived ALC, the growth is data inside the plugin, caches, event subscriptions, static collections. Run !gcroot on one of the large retained objects to find who holds it.
+
+Fix (for the ALC-leak case):
+
+Why this matters: AssemblyLoadContext with is Collectible: true is the only way to get true assembly unloading in modern dot NET.
+But Unload() is asynchronous and does nothing while a reference survives, so the fix is only complete once you have also removed the events, cached Type objects, and statics that reach into the ALC.
+Verify with a WeakReference sentinel: after Unload() plus a full garbage collector, it should be dead.
+If it isn't, !gcroot will name the holder.
+
+-- pause --
+Section 10. Self-test.
+
+Most objects die young: the majority of allocations in a typical app are short-lived temporaries, request-scoped objects, local builders, intermediate results.
+By putting new allocations in a small Gen 0 arena and collecting that arena frequently, the garbage collector reclaims the vast majority of garbage while touching only a tiny slice of the heap.
+Survivors are promoted to Gen 1 (a buffer that absorbs objects that merely outlive one collection) and then to Gen 2, which is collected rarely. Collection cost scales with the size of the region being collected, so keeping Gen 0 small keeps the common case fast.
+State the nesting rule too: a Gen N collection collects generations 0 through N, so a Gen 2 collection is a full garbage collector.
+
+Boxing. The assignment INotifyPropertyChanged npc = my Struct creates a heap copy of the struct. Adding a handler attaches it to that copy's event field, not to my Struct, the original is untouched, so when it raises events nothing reaches the handler.
+Every subsequent conversion of my Struct to the interface creates yet another box with yet another handler list. Mutable structs implementing INotifyPropertyChanged is an anti-pattern for exactly this reason: use a class.
+(Note the C sharp 13 nuance: a ref struct may now implement an interface, but it still cannot be converted to one, precisely because that conversion is this boxing conversion.)
+
+The trimmer removed the type or method because it wasn't statically reachable from the entry point. NativeAOT requires trimming; the trimmer analyzes the call graph and strips everything it can't see referenced.
+Anything you reach dynamically, reflection, Type.GetType(string), Activator.CreateInstance(string), deserialization into a runtime-determined type, is invisible to it.
+Fixes, in order of preference: (a) replace the reflective pattern with a source generator ( JsonSerializerContext for Jason, and the equivalents for logging, config binding, and interop); (b) annotate the call site with [DynamicDependency(DynamicallyAccessedMemberTypes.All, typeof(MyType))];
+(c) add a trimmer root descriptor X M L naming the type.
+And turn on trim warnings during development so the analyzer surfaces this at build time rather than in production.
+
+Assembly.Load(string) resolves by assembly identity (name, version, culture, public key token) through the current AssemblyLoadContext 's resolution logic, probing the app's dependency graph and configured paths.
+Assembly.LoadFrom(string) resolves by file path into a special load-from context with different identity semantics:
+an assembly with the same simple name already loaded there wins, so the file you pointed at may not be the assembly you get, and dependencies resolve relative to the loading assembly's directory.
+That produces the classic "same type from two paths isn't the same type" bugs in plugin systems. For plugin loading, prefer AssemblyLoadContext.LoadFromAssemblyPath(path) on a custom, collectible ALC: explicit resolution, no accidental sharing, and unloadable.
+
+By default, yes, StreamReader takes ownership and disposes the underlying stream when it is disposed. That's the "owns the resource" convention, and it is the right default for the common case where the reader is the only consumer.
+It becomes a bug when you need the stream afterwards: write to a MemoryStream through a StreamWriter, dispose the writer, and the MemoryStream is closed before you can read it back.
+The fix is the leave Open constructor overload, new StreamReader(stream, encoding, detectEncodingFromByteOrderMarks, buffer Size, leave Open: true) (and the matching StreamWriter overload), which keeps ownership with the caller.
+The general principle: exactly one component should own a disposable's lifetime, and that ownership should be explicit in the code.
