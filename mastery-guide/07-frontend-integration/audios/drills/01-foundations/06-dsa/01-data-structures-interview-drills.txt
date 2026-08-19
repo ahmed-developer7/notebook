@@ -1,0 +1,310 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, List versus T[].
+
+Q: When would you use T[] over List ?-- think --
+
+A: When the size is known and constant, function signatures with a fixed-shape return, P or Invoke marshaling boundaries, hot loops where the slightly faster index access matters, and any path where you want AsSpan() directly without a CollectionsMarshal.AsSpan(list) hop.
+List is the default; T[] is the optimization for known-size scenarios.
+
+Cross-Q: Is List[i] actually slower than arr[i] ?-- think --
+
+A: Marginally, List[i] does a bounds check against _size (not the array's Length ), plus an indirection through the _items field. The jit often inlines and eliminates the bounds check in tight loops, narrowing the gap.
+Difference is single-digit nanoseconds; matters in tight numeric loops, negligible in typical app code.
+
+Cross-Q²: How do I get the underlying array from a List for Span use?-- think --
+
+A: CollectionsMarshal.AsSpan(list) (dot NET 5+). Returns a Span over the internal _items array, length = _size. Caveat: mutations to the list (Add, Remove) can resize the backing array, invalidating the span, pin the span to a snapshot and don't mutate the list while iterating.
+
+-- pause --
+Drill 2, LinkedList, does it ever win?.
+
+Q: Textbook says LinkedList is O(1) for middle insert versus List O(n). When does that translate to a real win?-- think --
+
+A: Almost never for typical N. List is cache-friendly contiguous memory; LinkedList is pointer-chasing scattered across the heap. Modern CPUs move 64 bytes per cache line in nanoseconds but stall ~100 nanoseconds on a cache miss.
+The "O(n) shift" of List is fast; the "O(1) chase" of LinkedList is slow per element. Empirically, LinkedList only wins for N > 10⁴ AND you have node references in hand AND you splice frequently without traversing.
+
+Cross-Q: Where does LinkedList show up in real dot NET code?-- think --
+
+A: Almost nowhere in app code. The classic legit case: hand-rolled LRU cache where you store (LinkedListNode, TValue) so you can move a node to the head in O(1). Even there, modern alternative: use MemoryCache / IDistributedCache / a library cache; let it pick the right structure.
+
+Cross-Q²: What's the memory difference between LinkedList and List for 1M entries?-- think --
+
+A: List approximately 4 megabytes (int per slot + headers). LinkedList approximately 48 megabytes (each node has prev or next pointers + the int + object header + alignment, ~48 bytes on x64). 12 times more memory plus heap fragmentation.
+For 100M entries, that's the difference between "fits" and "OOM."
+
+-- pause --
+Drill 3, Dictionary internals.
+
+Q: How does dot NET's Dictionary handle a hash collision?-- think --
+
+A: Separate chaining, not open addressing, but the chain lives in an array, not in per-node objects.
+Backing: an int[] _buckets (each slot stores a 1-based index of the chain head; 0 = empty) and an Entry[] _entries (each entry is {uint hash Code; int next; TKey key; TValue value}, where next is the 0-based index of the next entry in the chain and -1 ends it).
+On Add: compute key.GetHashCode(), map into a bucket, link the new entry at the chain head. On lookup: same bucket, walk the next chain comparing Equals until match or end. Collisions degrade to O(chain length).
+No probing sequence is ever used, a colliding key never occupies a different key's slot.
+
+Cross-Q: When does the bucket array resize, and to what size?-- think --
+
+A: When count exceeds capacity (load factor ~1.0). The new capacity is the next prime at least 2 times old capacity. Primes give better hash distribution than powers of two.
+All existing entries are rehashed into the new bucket array, O(n) work for a single Add that triggers the resize, amortized O(1) across all Adds.
+
+Cross-Q²: I'm doing 1M adds with a known size. How do I avoid resize work?-- think --
+
+A: new Dictionary(capacity: 1_000_000) presizes both arrays, the constructor picks the next prime at least 1M and no resize ever runs.
+
+The answer they're testing is the amortization argument, so lead with it: each resize copies the old capacity, and capacity grows geometrically, so the copy counts form a geometric series dominated by its last term. The total is Θ(n), not (number of resizes) times n.
+That's precisely why a single resize being O(n) still leaves Add at amortized O(1), the expensive adds are rare enough, and each one is only as expensive as the table was before it grew.
+
+If pressed for the real number, note that dot NET does not double. HashHelpers.ExpandPrime computes GetPrime(2 times old Size), which snaps to the next entry in a fixed prime table, roughly 2 times each time, but not exactly.
+From the default constructor the capacities are 3, 7, 17, 37, 89, 197, 431, 919, 1931, 4049, 8419, 17519, 36353, 75431, 156437, 324449, 672827, 1395263, 17 resizes to hold 1M entries.
+Summing every capacity except the last (you copy the old table each time) gives 1,299,115 entry copies approximately 1.3 n.
+Both the old "~30 million" and a glib "2n because it doubles" are wrong; the Θ(n) reasoning is what earns the point, and the exact figure only confirms it.
+
+-- pause --
+Drill 4, Dictionary versus SortedDictionary versus SortedList.
+
+Q: Three sorted-ish dictionaries, when each?-- think --
+
+A: Dictionary is unsorted; O(1) lookup. SortedDictionary is a red-black tree; O(log n) lookup or insert, in-order iteration free, range queries via GetViewBetween.
+SortedList is two parallel sorted arrays; O(log n) lookup (binary search), O(n) insert (shift array), but smaller memory footprint and faster iteration than the tree.
+
+Cross-Q: My data is mostly built once at startup, queried in sorted order forever. Which one?-- think --
+
+A: SortedList, build once (sorts at the end is O(n log n) total; insertions during build incur shifts but you can populate from a sorted source for O(n)), then it's faster to iterate than SortedDictionary (contiguous arrays versus scattered tree nodes), and lookup is O(log n) binary search.
+Modern alternative: FrozenDictionary if you don't need ordering, or ImmutableSortedDictionary if you want thread-safe snapshots.
+
+Cross-Q²: When does SortedList lose to SortedDictionary ?-- think --
+
+A: When inserts or removes happen frequently after build. Every insert in SortedList shifts ~n or 2 elements (the array tail), O(n) per insert. SortedDictionary (red-black tree) is O(log n) per insert. For build-once / query-many: SortedList. For ongoing mutation: SortedDictionary.
+
+-- pause --
+Drill 5, HashSet versus List.Contains, perf delta.
+
+Q: I have 10K items and I want to check membership in a loop of 1M iterations. List or HashSet ?-- think --
+
+A: HashSet. List.Contains is O(n), linear scan. HashSet.Contains is O(1) average. For 10K items times 1M loops that's ~10¹⁰ element comparisons for the list versus ~10⁶ hash lookups for the set, four orders of magnitude fewer operations.
+Don't quote wall-clock numbers you haven't measured; the asymptotic gap is the answer, and it's decisive.
+
+Cross-Q: At what N does HashSet stop being worth the build cost?-- think --
+
+A: Answer by mechanism, not by a threshold, the deciding variable is how many times you query, not N. Building a HashSet of N items allocates two arrays (an int[] bucket array and an Entry[], both sized to a prime at least N) and computes N hash codes to populate them; that cost is paid once.
+List.Contains allocates nothing and walks a contiguous block, branch-predictable, prefetcher-friendly, and it can exit early on a hit; that cost is paid per query.
+So the single defensible claim is: for a one-shot membership check the set is never worth building, because you compute N hash codes to answer a question that at most N cheaper comparisons already answer.
+Once you query repeatedly, the O(1) lookup amortizes the build and the set wins by an unbounded margin.
+
+Note that hashing is not a fixed small constant either: string.GetHashCode reads the entire string, so for long string keys one hash can cost more than several early-exiting comparisons, which is why the crossover moves with the key type.
+Where it actually lands depends on T, the comparer, key length, and whether the set is reused across calls, so measure your own case rather than carrying a number into the interview.
+
+Cross-Q²: My items are custom classes without overridden Equals / GetHashCode. What happens?-- think --
+
+A: HashSet falls back to reference equality ( object.Equals and object.GetHashCode ). Two value-equal but distinct instances are treated as different, deduplication fails silently. The List approach (with custom comparer or Where ) at least lets you specify equality.
+The fix: override Equals + GetHashCode (together) or use record, or pass an IEqualityComparer to the HashSet constructor.
+
+-- pause --
+Drill 6, ImmutableList versus List, when worth it.
+
+Q: Why would I use ImmutableList if every "mutation" allocates?-- think --
+
+A: When you need snapshot semantics, readers see a consistent point-in-time view that can't be mutated under them. Examples: reactive state in U I frameworks, multi-reader caches where you swap whole snapshots, audit trails where each version is a permanent record.
+ImmutableList.Add returns a new instance; the old reference is still valid and unchanged.
+
+Cross-Q: What's the cost per "mutation"?-- think --
+
+A: O(log n) time + O(log n) allocations. ImmutableList is backed by an AVL tree with structural sharing, Add clones the path from root to insertion point (~log n nodes), leaves the rest shared. For 1M elements: ~20 nodes allocated per Add, not 1M.
+
+Cross-Q²: For bulk construction (build a 1M-element immutable list from a stream), do I really pay log n per Add?-- think --
+
+A: No, use the builder. var b = ImmutableList.CreateBuilder(); foreach (.) b.Add(x); var result = b.ToImmutable();. The builder is mutable internally; ToImmutable materializes the AVL tree once. Bulk construction is O(n) total, not O(n log n).
+Same pattern for ImmutableDictionary.CreateBuilder and the other immutable collections.
+
+-- pause --
+Drill 7, Stack versus Queue, interview classic.
+
+Q: Implement a queue using two stacks.-- think --
+
+A: Two stacks, inbox and outbox. Enqueue: push to inbox. Dequeue: if outbox is empty, drain inbox into outbox (reversing order); then pop from outbox. Amortized O(1) per operation; each element moves through both stacks exactly once.
+
+Cross-Q: What's the worst-case complexity per Dequeue ?-- think --
+
+A: O(n), when outbox is empty and you have to drain inbox of n elements. But amortized: each element is pushed to inbox once, transferred to outbox once, popped once = 3 ops over its lifetime. Total work for n operations: O(n). Per operation amortized: O(1).
+
+Cross-Q²: Why does dot NET's Queue not use two stacks under the hood?-- think --
+
+A: Because a single circular array is simpler and has better constants. Two stacks have an occasional O(n) spike (the drain); circular array Queue is O(1) per op except for the doubling resize (also amortized O(1)).
+The two-stack technique is an interview chestnut for "compose primitives", in production, you reach for the BCL Queue directly.
+
+-- pause --
+Drill 8, ConcurrentDictionary versus lock + Dictionary.
+
+Q: Multi-threaded read-heavy cache. ConcurrentDictionary or lock(_dict) + Dictionary ?-- think --
+
+A: ConcurrentDictionary for read-heavy. Per the docs, it "uses fine-grained locking to ensure thread safety" for writes, while "read operations on the dictionary are performed in a lock-free manner", so readers never block readers or writers.
+Writes are lock-striped across an array of internal locks so writes to different buckets don't contend.
+Careful with the default stripe count in interviews: on dot NET Framework it was 4 times ProcessorCount, but dot NET Core removed that multiplier, and DefaultConcurrencyLevel goes to Environment.ProcessorCount today (the 4 times cost too much memory for too little write throughput).
+A single lock over a Dictionary serializes all operations through one mutex; reads block reads.
+
+Cross-Q: When does lock + Dictionary actually win?-- think --
+
+A: When the critical section spans multiple operations atomically, "check, then update, then notify." ConcurrentDictionary.GetOrAdd is atomic for that pattern, but multi-step compound updates (read X, compute Y, write Z) aren't.
+With lock, you wrap the whole transaction; with ConcurrentDictionary you'd need AddOrUpdate with a careful factory or end up with race conditions.
+
+Cross-Q²: What's the GetOrAdd factory gotcha?-- think --
+
+A: Under contention, the factory may execute multiple times, only one result wins the slot, but the others are wasted work. Bad if the factory has side effects (DB call, file write, expensive computation).
+Fix: wrap with Lazy: cd.GetOrAdd(key, _ goes to new Lazy(Factory)).Value, Lazy ensures the factory runs exactly once even under concurrent first-access.
+
+-- pause --
+Drill 9, PriorityQueue, Dijkstra.
+
+Q: How does PriorityQueue (dot NET 6+) power Dijkstra?-- think --
+
+A: Min-heap by priority. Dijkstra pulls the closest unvisited vertex; that's a min-priority dequeue. pq.Enqueue(neighbor, distance) adds a candidate; pq.Dequeue() returns the cheapest. The heap maintains the min-priority invariant with O(log n) enqueue or dequeue.
+
+Cross-Q: PriorityQueue doesn't have DecreaseKey. How do you handle "found a shorter path to v"?-- think --
+
+A: You don't update, you just Enqueue again with the new (shorter) priority. The old (longer) entry stays in the heap. On dequeue, check if (popped Distance > dist[v]) continue;, the stale entry is silently skipped.
+Cost: heap grows to ~E entries instead of V, but the asymptotic O((V+E) log V) is preserved.
+
+Cross-Q²: Why didn't Microsoft add DecreaseKey ?-- think --
+
+A: It requires finding an entry by value (not priority), which a heap doesn't support efficiently, finding by value is O(n). Some libraries maintain a side dictionary for value to heap index, but that doubles memory and complicates the implementation.
+Microsoft chose A P I simplicity + the stale-entry pattern that's idiomatic for Dijkstra. dot NET 9 did add Remove(element, out removed Element, out priority), but the docs describe it as "a linear-time scan of every element in the heap", so it is not a DecreaseKey substitute in an inner loop.
+
+-- pause --
+Drill 10, Span versus Memory, boundary.
+
+Q: When do I use Span versus Memory ?-- think --
+
+A: Span for synchronous, non-await code paths. It's a ref struct, must live on the stack, can't be a field of a class or boxed, can't cross an await. Memory for async or stored-as-field scenarios, it's a regular struct, can be a field, can cross await.
+You typically take Span in inner loops and convert from Memory via .Span when entering a sync hot path.
+
+Cross-Q: Why can't Span cross await ?-- think --
+
+A: await may suspend the method and resume on a different thread. The compiler hoists local variables into a state-machine class on the heap. Span is a ref struct, can't be a field of a class, so the compiler refuses to compile.
+The deeper reason: a span over a stack-allocated buffer would become dangling if the stack unwinds during suspension.
+
+Cross-Q²: I want to pass a slice into an async method. How?-- think --
+
+A: Take ReadOnlyMemory (or Memory ). The async method can do var span = memory.Span; for sync inner work, but the parameter / state-machine field is the Memory (heap-safe). Pattern: async Task ParseAsync(ReadOnlyMemory data) { ProcessSync(data.Span); await DoIoAsync(); }.
+
+-- pause --
+Drill 11, FrozenDictionary (dot NET 8+).
+
+Q: When is FrozenDictionary worth the slower build?-- think --
+
+A: When the dictionary is built once (startup, config, lookup tables) and queried many times in a hot path.
+Microsoft's own framing: "relatively high cost to create but provides excellent lookup performance." Build is materially slower because the factory analyzes the keys to pick a specialized internal layout; lookups are faster than Dictionary. The amortization wins when query count >> build count.
+(Quote a multiplier in an interview only if you measured it yourself on your keys, the published figures vary widely by key type and set size.)
+
+Cross-Q: Why is the read path faster if it's still hashing?-- think --
+
+A: Because the key set is closed at construction, the implementation can do work that Dictionary can't. It sizes the table and assigns hash codes to minimize (often eliminate) collisions for exactly these keys, so the read path usually hits its entry directly instead of walking a chain.
+For very small sets it skips hashing altogether and does a linear scan, which is cheaper than computing a hash.
+For string keys it may hash only the substring that actually distinguishes the keys (the OrdinalString*Substring layouts hash s.AsSpan(hash Index, hash Count); the final Equals is still a full string comparison), or bucket by length first and skip everything of the wrong length.
+
+Cross-Q²: When does it NOT win?-- think --
+
+A: When you mutate the dictionary (you can't, it's immutable, so each "change" rebuilds the whole thing, death). When N is very large (build cost dominates) or query count is low (build overhead exceeds query savings). And when keys have poor hash distribution that even the analyzer can't improve.
+Rule: build once at startup, query forever, yes. Anything else, Dictionary.
+
+-- pause --
+Drill 12, Custom IEqualityComparer.
+
+Q: When do I implement IEqualityComparer instead of overriding Equals / GetHashCode ?-- think --
+
+A: When the equality definition is context-dependent rather than intrinsic to the type. User.Equals should encode "two Users are the same User" (Id-based identity).
+But for a deduplication pass keyed by Email, you want new HashSet(new UserEmailComparer()), context-specific equality without touching the User class.
+
+Cross-Q: What's the contract for IEqualityComparer ?-- think --
+
+A: Same as Equals / GetHashCode: Equals(x, y) == true ⟹ GetHashCode(x) == GetHashCode(y). Reflexive ( Equals(x, x) == true ), symmetric ( Equals(x, y) == Equals(y, x) ), transitive. GetHashCode should distribute well; Equals must be consistent with GetHashCode.
+Violating these breaks HashSet, Dictionary, Distinct, GroupBy, entries become unfindable.
+
+Cross-Q²: I have a Dictionary and want case-insensitive lookup. IEqualityComparer ?-- think --
+
+A: Yes, but use StringComparer.OrdinalIgnoreCase (built-in static; no per-comparer allocation, ordinal byte comparison is fastest for non-cultural matching). new Dictionary(StringComparer.OrdinalIgnoreCase).
+Avoid StringComparer.CurrentCultureIgnoreCase for keys (culture-dependent to different keys on different machines or locales to bugs). Avoid StringComparer.InvariantCultureIgnoreCase (slower than Ordinal; rarely what you want for keys).
+
+-- pause --
+Drill 13, Dictionary after deletes, bucket reuse.
+
+Q: I Remove half my dictionary entries. Does the capacity shrink?-- think --
+
+A: No. Dictionary never shrinks its bucket array, removed entries leave "free slots" reusable by future adds. The memory stays allocated. To reclaim: TrimExcess() (dot NET Core 2.0+), which copies the live entries into a smaller bucket array and discards the old.
+
+Cross-Q: What if I add new entries after deletes, does it reuse the freed slots?-- think --
+
+A: Yes. The implementation tracks a _freeList of recently-removed entry indices. Adds prefer reused slots before extending. This keeps Add cheap after a Remove-heavy workload, no resize unless the working set exceeds capacity again.
+
+Cross-Q²: I see a _version field in the implementation, what's that for?-- think --
+
+A: Enumeration invalidation. Every mutation (Add, Remove, Clear) increments _version. Iterators capture the version on creation; on MoveNext, they compare current version with captured. If different to throw InvalidOperationException("Collection was modified").
+This catches the "mutate during foreach" bug, defensive design preserved across dot NET versions.
+
+-- pause --
+Drill 14, Tree versus hash, when each.
+
+Q: I need a key-value store with O(log n) bounded operations. Why would I pick a tree over a hash?-- think --
+
+A: Three reasons. (1) Sorted iteration: SortedDictionary gives in-order traversal free; hash requires a sort. (2) Range queries: GetViewBetween(low, high) is O(log n + k); hash requires a full scan.
+(3) Predictable worst case: tree is always O(log n); hash is O(1) average but O(n) worst case under adversarial input (or terrible GetHashCode ).
+
+Cross-Q: What about cache locality?-- think --
+
+A: Hash wins for typical access patterns, bucket array is contiguous. Tree nodes are scattered.
+For iteration in random key order, hash is faster; for ordered iteration, tree is faster (sequential nodes via the tree's in-order walk are typically close in memory due to allocation order, plus the iteration is the use case the tree is optimized for).
+
+Cross-Q²: B-trees versus binary search trees?-- think --
+
+A: B-trees (used by sequel Server, Postgres Q L indexes) have high fan-out (hundreds of children per node). Optimized for disk I O, one node read fetches hundreds of keys, minimizing seeks.
+In-memory binary search trees (red-black, AVL) have fan-out of 2; optimal for in-memory but disastrous for disk.
+dot NET BCL has no B-tree, they're a database concern; you interact via the database engine, not your own implementation.
+
+-- pause --
+Drill 15, Bloom filter, when right.
+
+Q: When is a Bloom filter the right tool?-- think --
+
+A: When you want a fast probabilistic membership check with no false negatives (definitely-not-present is reliable) but possible false positives (might-be-present requires confirmation).
+Use case: "is this URL in the cache?", if Bloom says no, skip the cache (definitely not there); if Bloom says yes, do the actual cache lookup (might be there). Avoids cache lookups for the vast majority of misses.
+
+Cross-Q: How does it work mechanically?-- think --
+
+A: A bit array + k hash functions. To add x: compute k hashes, set those k bits. To check x: compute k hashes, check those k bits. All set to "maybe present"; any unset to "definitely not present." False positive rate depends on bit-array size, k, and N, typically ~1% with reasonable sizing.
+Memory is tiny (~10 bits per item for 1% FPR).
+
+Cross-Q²: Why isn't BloomFilter in the BCL?-- think --
+
+A: Niche. The BCL favors general-purpose collections. Bloom filters need tuning (FPR target, size, hash count), which makes a one-size-fits-all A P I awkward. Third-party libraries ( BloomFilter.NetCore, Lib.AspNetCore.Mvc.Security.BloomFilter ) provide them.
+Modern alternative: FrozenSet for membership where the set is small and known, RedisBloom for distributed. Bloom filter is right when the dataset is too large to fit in memory but you want sub-microsecond rejection of the absent majority.
+
+-- pause --
+Section 2. Self-test.
+
+dot NET's Dictionary uses separate chaining over an array of entries: each bucket stores the index of a chain head, and each entry (hash, key, value, next) points at the next entry in its chain. On collision, lookup walks the chain calling Equals on each entry until match or end.
+With a good hash, chains are length 1-2, O(1) amortized. With a bad hash (for example, GetHashCode() goes to 0 ), all keys land in one bucket; the chain is length n; every lookup is O(n).
+This was historically a DoS vector, sending crafted keys could pin a server's C P U at 100%; modern dot NET adds randomized hashing in some collections to mitigate.
+
+FrozenDictionary (dot NET 8+).
+It pays a materially more expensive build in exchange for faster lookups, the docs' own trade-off:
+"relatively high cost to create but provides excellent lookup performance." With 50K reads per request against a dictionary written only at startup, read performance dominates and the build cost is paid once.
+Build at startup (singleton D I), query forever. If keys are strings, FrozenDictionary selects from multiple internal layouts for best speed, bucketing by length, or hashing only a distinguishing substring.
+Be precise about that last one: the substring narrows the hash only; a hash hit is still confirmed with a full-key Equals. Avoid ConcurrentDictionary here, its overhead is unjustified when there are no writes after startup.
+
+Textbook says LinkedList wins, O(1) insert versus O(n) shift.
+Reality: for typical N ( beats LinkedList because (a) List is contiguous memory, prefetched and cached; (b) LinkedList allocates a node per element, fragmenting memory and missing cache; (c) modern CPUs move bytes faster than they chase pointers.
+LinkedList only wins for very large N with frequent middle inserts or removes and you don't traverse often. Default to List; reach for LinkedList only after profiling proves the shift is the bottleneck.
+
+ImmutableDictionary is implemented as a balanced tree (AVL variant) with structural sharing: Add doesn't copy the whole tree, it walks down the path to the insertion point (~log n nodes) and clones only the nodes along that path. The unmodified subtrees are shared between old and new instances.
+Result: log n new nodes allocated, O(log n) time, both old and new dictionaries remain valid and independent. Cost: every individual Add is slower than Dictionary.Add (which is O(1) amortized).
+For bulk construction, use ImmutableDictionary.CreateBuilder(), it adds in O(1) into a mutable builder, then ToImmutable() materializes the final tree once.
+
+HashSet uses EqualityComparer.Default which falls back to object.Equals (reference equality) for classes without an Equals override. Two different User instances with the same Id + Name are treated as distinct, so dedup fails.
+Fix: (1) make User a record for value equality; (2) override Equals / GetHashCode on the class; or (3) pass an explicit comparer: new HashSet(new UserIdComparer()) where the comparer keys on Id only.
+Option 3 is best when you want equality semantics that vary by use case (for example, dedup-by-id here, but full value-equality elsewhere).

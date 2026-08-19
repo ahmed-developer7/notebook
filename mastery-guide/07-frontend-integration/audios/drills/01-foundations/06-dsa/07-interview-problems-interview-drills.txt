@@ -1,0 +1,298 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Two pointers.
+
+Q: What's the "two pointers" pattern and when does it apply?-- think --
+
+A: Two pointers (typically left and right ) traverse a data structure with coordinated motion. Applies when (a) the data is sorted or can be sorted, (b) you're looking for pairs or triplets with a target property, (c) you can decide which pointer to advance based on the current relation.
+Common shapes: opposite ends moving toward middle (Container With Most Water), same-direction at different speeds (Floyd's cycle detection), fixed gap (window of size k).
+
+Cross-Q: Walk through 3Sum with two pointers.-- think --
+
+A: Sort the array. For each i, use two pointers left = i+1, right = n-1 to find pairs that sum to -nums[i]. If nums[i] + nums[left] + nums[right] == 0: record triplet, advance both. If sum 0: advance right (need smaller). Skip duplicates by advancing past equal values. O(n²) total.
+
+Cross-Q²: Why does two pointers fail on unsorted data?-- think --
+
+A: Because the decision "which pointer to advance" relies on the sorted invariant. On [5, 1, 8, 3] searching for sum 11: left set to 0 (5), right set to 3 (3), sum set to 8. Should advance left (need bigger)? No, array isn't sorted; advancing left could miss the 8 entirely.
+Without sortedness, no monotonic decision rule exists. Sort first (O(n log n)) then use two pointers (O(n)), net O(n log n) beats brute O(n²).
+
+-- pause --
+Drill 2, Sliding window, fixed versus variable.
+
+Q: What's the difference between fixed and variable sliding window?-- think --
+
+A: Fixed window: size k is known ("max sum of any subarray of size 3"). Slide one position at a time; maintain a running sum / state by adding the new element and removing the leaving one. Variable window: size depends on a constraint ("longest substring with at most 2 distinct chars").
+Expand right while constraint holds; shrink left when violated.
+
+Cross-Q: Implement "longest substring with all unique chars."-- think --
+
+A: var seen = new HashSet(); int left = 0, max = 0; for (int right = 0; right < s.Length; right++) { while (!seen.Add(s[right])) seen.Remove(s[left++]); max = Math.Max(max, right - left + 1); } return max;. Variable window: expand right; shrink left while duplicate exists.
+
+Cross-Q²: When does sliding window fail?-- think --
+
+A: When the constraint isn't monotonic in window size. Sliding window works when "if a window of size k satisfies the constraint, so does some smaller window" (or vice versa).
+For non-monotonic constraints (for example, "longest window with exactly k distinct chars"), you may need two sliding windows (one for " at most k" and one for " at most k-1"; subtract).
+
+-- pause --
+Drill 3, Hash map for O(n) lookup.
+
+Q: Two Sum, why does the hash map approach beat brute force?-- think --
+
+A: Brute force checks every pair: O(n²). Hash map insight: for each nums[i], we need to know if target - nums[i] has been seen earlier. Hash map lookup is O(1), turns "find the partner" from O(n) scan to O(1) lookup. Total: O(n) with O(n) space. The classic time-space trade-off.
+
+Cross-Q: Why iterate and store rather than precompute the whole map first?-- think --
+
+A: Edge case: target = 6, array = [3, 3]. If we precompute the map then look up, we'd find target - 3 = 3 and return [0, 0] (same index). The "iterate and store" pattern ensures the complement was seen earlier (different index), naturally avoids self-pairing.
+
+Cross-Q²: When does the hash approach not win?-- think --
+
+A: When duplicates are allowed and you need all pairs (not just one). Then you iterate the hash with all pairings, could be O(n²) pairs anyway. Also: when memory is tight; brute force is O(1) space, hash is O(n).
+For n = 10⁹ with strict memory constraints, two pointers on a sorted array (O(n log n) sort + O(n) two-pass) beats O(n) hash because no extra storage.
+
+-- pause --
+Drill 4, Floyd's cycle detection.
+
+Q: Walk through Floyd's tortoise-and-hare for linked-list cycle detection.-- think --
+
+A: Two pointers: slow advances 1 step per iteration, fast advances 2. If there's no cycle, fast reaches null. If there's a cycle, fast eventually laps slow, they meet inside the cycle. O(n) time, O(1) space (versus hash-set approach which is O(n) time but O(n) space).
+
+Cross-Q: Why does fast catch slow?-- think --
+
+A: In a cycle of length k, fast gains 1 step per iteration relative to slow. Once both pointers are inside the cycle, the gap closes by 1 per iteration. Within k iterations after slow enters the cycle, they meet. The math: if slow is at position s, fast at 2 seconds.
+In a cycle of length k starting at offset μ, slow enters at iteration μ. After m more iterations: slow at μ+m mod k, fast at 2(μ+m) mod k. They meet when 2(μ+m) ≡ μ+m (mod k), that is, m ≡ -μ (mod k). Always solvable.
+
+Cross-Q²: How do you find the start of the cycle?-- think --
+
+A: After they meet, reset one pointer (say slow) to head. Advance both 1 step. They meet at the cycle start. Proof: slow traveled μ steps to enter the cycle and m more to meet; total μ+m. Fast traveled 2(μ+m). Difference = μ+m is a multiple of k (cycle length). So μ ≡ -m (mod k).
+Resetting slow to head and advancing μ steps puts it at the cycle start. Advancing the meeting-point pointer μ steps wraps around the cycle to the start. They converge there.
+
+-- pause --
+Drill 5, Reverse a linked list.
+
+Q: Iterative versus recursive reverse, which do you prefer in production?-- think --
+
+A: Iterative. O(n) time, O(1) space, no stack risk. Recursive is O(n) stack, and in dot NET running out of stack terminates the process, you cannot catch StackOverflowException, so there is no degraded mode to fall back to.
+Don't quote a depth number: the ceiling is stack bytes divided by frame bytes and both are properties of the build. Iterative pattern: three pointers ( prev, curr, next ); reverse one link per iteration.
+
+Cross-Q: Write iterative reverse.-- think --
+
+A: ListNode prev = null; ListNode curr = head; while (curr != null) { var next = curr.Next; curr.Next = prev; prev = curr; curr = next; } return prev;. Five lines. The trick is saving next before overwriting curr.Next.
+
+Cross-Q²: Reverse k consecutive nodes, variation?-- think --
+
+A: Group into k-sized chunks, reverse each chunk in place, link the reversed chunks. Track the previous group's tail to splice. O(n) time, O(1) space. The off-by-one is in handling the last group (if < k nodes remain, leave them or reverse them, depends on the problem statement).
+
+-- pause --
+Drill 6, Merge intervals.
+
+Q: Given a list of intervals, merge overlapping ones. Approach?-- think --
+
+A: Sort by start. Iterate; for each interval, if it overlaps with the last merged interval (start at most last End), extend last End to max(last End, current End); else push a new interval. O(n log n) for sort + O(n) for merge.
+
+Cross-Q: How do you detect overlap?-- think --
+
+A: Sorted by start ensures current.start >= last.start. Overlap when current.start <= last.end. (Touching intervals like [1,3] and [3,5], depends on the problem; usually they're considered overlapping.) Update last.end = max(last.end, current.end) to handle nested intervals.
+
+Cross-Q²: Insert a new interval into a sorted list of disjoint intervals, O(n) or O(log n)?-- think --
+
+A: O(n), even if you binary-search the position (O(log n)), inserting may require shifting elements (O(n)) or merging adjacent intervals (chain of merges, O(n) worst). Binary search finds the position; the merging logic is the bottleneck.
+For "add interval to sorted set with merging" use a TreeSet or SortedSet variant, O(log n) per insert with merge.
+
+-- pause --
+Drill 7, LRU cache.
+
+Q: Design an LRU cache with O(1) get or put.-- think --
+
+A: LinkedList> for ordering + Dictionary> for lookup. Get: dict lookup to if found, move node to head, return value. Put: if key exists, update value, move to head. If at capacity, remove tail node from both list and dict; add new node at head.
+
+Cross-Q: Why a doubly-linked list specifically?-- think --
+
+A: To remove an arbitrary node in O(1). When we hit a key, we move that node from its current position to the head. Single-linked list requires O(n) to find the predecessor. Doubly-linked list has prev pointer, splice out in O(1), splice in at head in O(1).
+
+Cross-Q²: dot NET has MemoryCache, does it use LRU?-- think --
+
+A: No, and be precise about which MemoryCache, because there are two types with that name ( Microsoft.Extensions.Caching.Memory.MemoryCache, the modern one, and the older System.Runtime.Caching.MemoryCache ).
+The modern one evicts on expiration, and on size pressure only if you set SizeLimit and every entry supplies a Size, without both it grows until something else stops it, which is its most-reported surprise.
+When it does compact, the documented policy in MemoryCache.cs is: remove expired entries, then bucket by CacheItemPriority (Low, then Normal, then High; NeverRemove is skipped), and only within a bucket sort by LastAccessed and drop the least recently used.
+So LRU is the tiebreaker, not the policy, a High -priority entry survives a thousand more-recently-used Low ones. For strict LRU, hand-roll the LinkedList + Dictionary pattern, or take BitFaster.Caching (LRU or LFU).
+Production caches often go further still, TinyLFU or ARC, because pure LRU is trivially defeated by a single large scan.
+
+-- pause --
+Drill 8, Producer-consumer with Channel.
+
+Q: Implement producer-consumer using Channel for backpressure.-- think --
+
+A: var channel = Channel.CreateBounded(new BoundedChannelOptions(100) { FullMode = BoundedChannelFullMode.Wait });. Producer: await channel.Writer.WriteAsync(item), blocks (awaits) when full. Consumer: await foreach (var item in channel.Reader.ReadAllAsync()) Process(item);.
+When producer finishes: channel.Writer.Complete();, consumer's foreach ends naturally.
+
+Cross-Q: Why Channel over BlockingCollection ?-- think --
+
+A: First-class async. BlockingCollection.Take blocks a thread (sync); Channel.Reader.ReadAsync awaits (yields the thread). For async-heavy pipelines (web A P Is, async I O), Channel avoids thread starvation.
+Also: better backpressure semantics, integration with IAsyncEnumerable, modern dot NET idiomatic pattern.
+
+Cross-Q²: Multiple producers + multiple consumers, same code?-- think --
+
+A: Yes. Channel is multi-producer multi-consumer safe by default (the SingleReader / SingleWriter options are opt-in optimisations, not the default). Spawn N producer tasks all writing to channel.Writer; spawn M consumer tasks all reading from channel.Reader.
+Start the consumers first, then the producers, and only then await Task.WhenAll(producers); channel.Writer.Complete(); await Task.WhenAll(consumers);.
+The ordering is not style: on a bounded channel, await Task.WhenAll(producers) before any consumer exists deadlocks as soon as the item count exceeds the capacity, producers park in WriteAsync waiting for space, nothing drains, Complete is never reached.
+On an unbounded channel the naive ordering happens to work, which is exactly why the bug survives code review. Closing the writer signals all consumers' foreach to end; Complete(ex) makes them all rethrow instead, which is how a producer failure reaches the caller rather than being silently dropped.
+
+-- pause --
+Drill 9, Rate limiter, token bucket.
+
+Q: Implement a token-bucket rate limiter.-- think --
+
+A: Bucket has capacity C (burst size) and refill rate R tokens or sec. Each request consumes 1 token; if bucket empty, request rejected (or queued). Refill on demand: tokens = min(C, tokens + (now - last Refill) R).
+Implementation: private double _tokens; private DateTime _lastRefill; public bool TryConsume() { Refill(); if (_tokens >= 1) { _tokens--; return true; } return false; } void Refill() { var now = DateTime.UtcNow; _tokens = Math.Min(C, _tokens + (now - _lastRefill).TotalSeconds R); _lastRefill = now;
+}.
+Thread-safe with lock.
+
+Cross-Q: Token bucket versus leaky bucket?-- think --
+
+A: Token bucket allows bursts up to capacity (saved-up tokens). Leaky bucket smooths output, fixed-rate drain regardless of input bursts. Token bucket is forgiving (sudden spikes after quiet period are fine); leaky bucket is strict (consistent rate).
+A P I rate limiters typically use token bucket (allow occasional bursts for retries, ramp-ups).
+
+Cross-Q²: dot NET built-in for rate limiting?-- think --
+
+A: System.Threading.RateLimiting (dot NET 7+). Provides TokenBucketRateLimiter, SlidingWindowRateLimiter, ConcurrencyLimiter, FixedWindowRateLimiter. A S P dot NET Core has middleware to apply them per-endpoint.
+Use the built-ins; the hand-rolled version is for understanding (interview answer) or for distributed rate limiting (Redis-backed) where built-ins don't apply.
+
+-- pause --
+Drill 10, Top-K frequent.
+
+Q: Top K most frequent elements in an array. Approach?-- think --
+
+A: Count frequencies with Dictionary (O(n)). Then use a min-heap of size K, iterating the frequency map: push (frequency, element); if heap size > K, pop the minimum. O(n + m log K) where m = distinct elements. The heap holds top K.
+
+Cross-Q: When does bucket sort beat the heap?-- think --
+
+A: When frequencies are bounded. Bucket sort: bucket[freq] holds list of elements with that frequency. Iterate buckets from high to low, collect top K. O(n) total. For arrays where many elements have the same frequency, this beats O(n log K).
+For widely varying frequencies, the heap is simpler with comparable performance.
+
+Cross-Q²: Quickselect variant, O(n) for top K?-- think --
+
+A: Quickselect on the frequency-tuple array partitions to find the Kth largest frequency, then collects elements with frequency at least that. O(n) average, O(n²) worst. Combined with sorting just the top K group: O(n + K log K).
+For huge n and small K, both heap and quickselect are sub-second; pick based on simplicity of implementation.
+
+-- pause --
+Drill 11, Median from data stream.
+
+Q: Maintain the running median of a data stream. Approach?-- think --
+
+A: Two heaps. Max-heap holds the smaller half; min-heap holds the larger half. Invariant: max-heap.size ∈ {min-heap.size, min-heap.size + 1}. New element goes to max-heap if at most max-heap.peek, else min-heap. Rebalance if sizes diverge by > 1.
+Median: if max-heap larger, its top; else average of both tops. O(log n) per insertion, O(1) per query.
+
+Cross-Q: Why not just keep a sorted list?-- think --
+
+A: Sorted list insertion is O(n) (shift elements). Two heaps give O(log n), asymptotically better, and by a margin that matters long before the stream is large.
+Multiplying out the complexities for n = 10⁶ inserts: a sorted list is n²/2 approximately 5 times 10¹¹ element moves worst case (n²/4 approximately 2.5 times 10¹¹ if insertion positions are uniformly distributed), two heaps are n log₂n approximately 2 times 10⁷ comparisons.
+That is an operation count derived from the formula, not a measurement, the constant factors differ (an array shift is a memmove, a heap sift is pointer-chasing plus comparisons), so quote it as "four to five orders of magnitude in operations" and offer to measure if they push.
+
+Cross-Q²: How to handle deletions / sliding window median?-- think --
+
+A: Hard, and the version of this answer you have read elsewhere is out of date.
+dot NET 9 added PriorityQueue.Remove(element, out removed, out priority, comparer?), but read what it does before offering it:
+"the method performs a linear-time scan of every element in the heap" and "in case of duplicate entries, what entry does get removed is non-deterministic and does not take priority into account" (Microsoft Learn, PriorityQueue and lt;TElement,TPriority and gt;.Remove).
+Microsoft's own note introducing it says it exists to emulate priority updates at O(n), for education and prototyping. So: the A P I exists, it is O(n), and saying "there's no Remove" is wrong while saying "there's a Remove so it's solved" is worse.
+Real options: (a) lazy deletion, mark elements dead in a side set and skip them on dequeue, the standard trick and what most Dijkstra implementations actually do;
+(b) SortedSet (red-black tree), O(log n) insert, delete and ordered navigation, at the cost of needing distinct elements or a tie-breaking comparer; (c) an indexed heap with a side dictionary from element to heap position, which is the only structure that gives genuine O(log n) decrease-key.
+Sliding-window median is an advanced problem; the sorted set is the expected interview answer.
+
+-- pause --
+Drill 12, Trie problems.
+
+Q: When do you reach for a trie?-- think --
+
+A: Three signals. (1) Prefix queries, "all words starting with 'pre'". HashSet can't do prefix; trie does O(L + k). (2) Many similar strings, IP routing prefixes, dictionary autocomplete, URL routing, trie shares prefix nodes, saving memory.
+(3) Pattern multi-search, Aho-Corasick (trie + failure links) for searching many patterns at once.
+
+Cross-Q: Implement word-search problem (find words in a 2D grid).-- think --
+
+A: Build a trie of target words. DFS each grid cell; at each step, descend in the trie if the current character matches a child. On reaching a terminal node, record the word. Pruning: stop DFS if current trie node has no children.
+Without trie, you'd do M independent searches; trie shares the prefix exploration across all words.
+
+Cross-Q²: When does a trie lose to a HashSet?-- think --
+
+A: When you only need exact match. HashSet: O(1) lookup, simpler. Trie: O(L) lookup, more memory overhead for parent-child pointers. For "given a word, is it in the dictionary?", HashSet wins on simplicity and speed. Trie wins when you'd otherwise iterate a sorted list with prefix matching.
+
+-- pause --
+Drill 13, Backtracking, N-queens.
+
+Q: Walk through N-queens with backtracking.-- think --
+
+A: For each row r, try each column c. If (r, c) is safe (no queen in same column, no queen on either diagonal): place queen, recurse to row r+1, then unplace (backtrack). Base case: all rows placed to record solution. Pruning: O(N!) naive becomes much less with safety checks early.
+
+Cross-Q: How do you check "safe" in O(1)?-- think --
+
+A: Track three sets: cols[col], diag1[row + col] (top-left to bottom-right), diag2[row - col + N] (top-right to bottom-left). Setting a queen: mark all three; check before placing. O(1) per check. Bitmask version: three integers as bitmasks, check via bit AND. Even faster.
+
+Cross-Q²: Sudoku, same pattern?-- think --
+
+A: Yes. Backtracking with constraint sets: rows[r], cols[c], boxes[r or 3 * 3 + c or 3] each hold "digits already in this row or column or box." For each empty cell, try digits 1-9; check none in the three constraint sets; place; recurse; backtrack.
+O(9empty_cells) worst case; in practice, constraint propagation prunes massively.
+
+-- pause --
+Drill 14, String permutations.
+
+Q: Generate all permutations of a string. Approach?-- think --
+
+A: Backtracking with swap. For each position i: swap s[i] with each s[j] (j at least i); recurse for position i+1; swap back. Base case: position == length to record permutation. O(n times n!) time, O(n) recursion depth.
+
+Cross-Q: How do you handle duplicates without duplicate output?-- think --
+
+A: Sort the string first. At each position, skip s[j] if s[j] == s[i] and j > i (already tried this value at position i). Alternative: collect into a Set to dedupe at the end (simpler but O(n!) memory).
+The "skip duplicate at same position" approach is O(n times distinct_permutations), much less memory.
+
+Cross-Q²: Why backtracking with swap rather than choose-and-build?-- think --
+
+A: Memory. Choose-and-build ( used[] array, append or remove from path list) needs extra memory for tracking. Swap version mutates the input in place, O(1) extra per call. For interview purity, choose-and-build is clearer. For tight memory, swap is preferred. Functionally equivalent.
+
+-- pause --
+Drill 15, Structuring a 30-min coding answer.
+
+Q: I have 30 minutes and a coding problem. How do I structure the answer?-- think --
+
+A: 1) Restate the problem in your words (1 min), confirm you understand. 2) Work an example by hand (2 min), small N; reveal patterns. 3) Brute force + complexity (2 min), state the obvious solution and its cost.
+4) Identify bottleneck, propose optimization (3 min), pattern recognition (hash for lookup, two pointers, DP, et cetera). 5) Code the optimal (15 min), talk while coding. 6) Trace through example (3 min), verify correctness. 7) Complexity analysis (2 min), time + space.
+8) Edge cases (2 min), empty, single element, all equal, max size.
+
+Cross-Q: What if I'm stuck at brute force, can't see the optimization?-- think --
+
+A: Stay calm and verbalize. "The brute force is O(n²) because [reason]. The bottleneck is [the inner loop / repeated computation]. If we could [do X in O(1)], we'd save the inner loop.
+[Sliding window / hash map / two pointers / DP] often achieves that here." Often the interviewer drops a hint when you verbalize the bottleneck, they want to see your thought process, not just a flash of brilliance.
+
+Cross-Q²: What if I finish early?-- think --
+
+A: (1) Verify with a second example (a tricky case). (2) Discuss complexity in detail. (3) Discuss edge cases explicitly. (4) Propose variants ("if memory were tight, I'd. " / "if input were sorted, I'd. "). (5) Discuss testing strategy.
+Don't start over-engineering, the interviewer might ask a follow-up; save time for it. Senior signal: own the time, narrate trade-offs, don't fill silence with code.
+
+-- pause --
+Section 2. Self-test.
+
+Use a min-heap of size K. Iterate the input; push each element, and if heap size > K, pop the minimum. After processing all elements, the heap contains the top K largest, with the K-th largest at the top (the min of the top K). Time: O(n log k); space: O(k).
+Sort would be O(n log n) and O(n), wins only for tiny n. The heap approach beats sort dramatically when k ≪ n (for example, n set to 10⁹, k set to 10) and uses bounded memory regardless of n.
+dot NET implementation: var heap = new PriorityQueue(); foreach (var x in nums) { heap.Enqueue(x, x); if (heap.Count > k) heap.Dequeue(); } return heap.Peek();.
+
+Sliding window with a Dictionary mapping char to most recent index. Two pointers: left (window start), right (window end). For each right, if s[right] is in the map and map[s[right]] >= left, advance left to map[s[right]] + 1 (skip past the prior occurrence). Update map[s[right]] = right.
+Track max(right - left + 1). Time: O(n), each character visited at most twice (once by right, once via left jump). Space: O(min(n, alphabet)). Edge cases: empty string to 0; all same char to 1. The trick is updating left to skip past the duplicate, not start at the duplicate.
+
+BFS (queue, level-by-level) when: (a) you need shortest path in steps (unweighted), (b) you need level-order traversal (for example, "average value of each level"), (c) the answer is "found at depth at most d," (d) the tree is wide but shallow, DFS would push too many siblings.
+DFS (stack or recursion) when: (a) you need to explore each path to leaves (for example, "all root-to-leaf paths summing to X"), (b) you can use the recursion to elegantly express "best answer through this subtree" (for example, diameter, max path sum),
+(c) memory is tight and the tree is balanced, DFS uses O(height) stack versus BFS's O(width) queue.
+Recognize the question type before picking.
+
+The candidate is wrong about optimality. The brute force checks every pair (n choose 2 = O(n²)), but the optimal uses a hash map of "values I've seen, mapping to their index." For each nums[i], look up target - nums[i] in the map; if present, return both indices.
+If not, add nums[i] -> i to the map and continue. Time O(n), space O(n). The insight: we don't need to check pairs; we need to know if the complement of the current value has been seen.
+Hash maps turn "is X present" from O(n) (scan) to O(1) (lookup), which is the classic time-space trade-off pattern senior interviewers probe for.
+
+Three angles. (1) Streaming: can the algorithm work on one pass through a stream? for example, online K-th largest with a fixed-size heap; running sum or product; sliding window over a stream.
+(2) External: chunk the input, process each chunk in memory, write intermediate results to disk, k-way-merge the chunks (external sort). Mention IAsyncEnumerable / Channel for the streaming layer in dot NET.
+(3) Approximation: if exact answer is impossible (for example, distinct count over 10TB), use probabilistic data structures, HyperLogLog, Bloom filters, Count-Min Sketch.
+Senior signal: name the technique, sketch the trade-off (memory versus accuracy), and ask "what's the size?" before committing to one.
+Don't memorize an answer, show you know the menu.

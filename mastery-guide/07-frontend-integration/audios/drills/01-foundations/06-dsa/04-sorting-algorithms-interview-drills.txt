@@ -1,0 +1,356 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Quicksort partition strategy.
+
+Q: Walk through Lomuto partition for [3, 6, 8, 1, 4, 9, 2, 7, 5] with pivot = 5 (last element).-- think --
+
+A: Maintain index i = lo - 1 (boundary between at most -pivot and >-pivot).
+Scan with j from lo to hi-1: if arr[j] 5) skip; j set to 2 (8>5) skip; j set to 3 (1 at most 5): i set to 1, swap; j set to 4 (4 at most 5): i set to 2, swap; j set to 5 (9>5) skip; j set to 6 (2 at most 5): i set to 3, swap; j set to 7 (7>5) skip.
+Final swap of arr[4] and arr[8]: result [3,1,4,2,5,9,6,8,7].
+Pivot index = 4.
+
+Cross-Q: What's wrong with Lomuto versus Hoare?-- think --
+
+A: Lomuto does more swaps than Hoare, for each at most -pivot element, one swap, even if that element is already in the right place.
+Hoare uses two pointers converging from both ends and swaps only when both find an out-of-place element, so on random input it performs fewer swaps for the same number of comparisons. That matters more the larger the element is, since a swap moves whole elements.
+Lomuto wins on simplicity (one index, easy to verify); Hoare wins on work done, which is why the BCL's PickPivotAndPartition is the Hoare shape.
+The BCL adds a second reason to prefer it: with the median-of-three pre-sort leaving guard values at both ends and the pivot parked at hi - 1, the two scan loops need no bounds checks at all.
+
+Cross-Q²: How does the partition affect quicksort's stability?-- think --
+
+A: Partition swaps equal elements past each other, not stable. The "swap with arr[j] " doesn't preserve relative order of <= pivot elements. For stability, you need a different algorithm (mergesort) or a stable partition variant (extra space).
+Quicksort is inherently unstable due to its partition mechanic.
+
+-- pause --
+Drill 2, Quicksort worst case.
+
+Q: When does quicksort hit O(n²)?-- think --
+
+A: When the pivot consistently lands at an extreme (smallest or largest). With first-element pivot on already-sorted data: pivot is always min, partition produces sizes [0, n-1], recursion depth = n, total work = n². Same with reverse-sorted.
+Median-of-three pivot avoids this for sorted or reverse-sorted but adversarial inputs can still target it.
+
+Cross-Q: How does Introsort defend against worst case?-- think --
+
+A: Hybrid. Start with quicksort with a partition budget of 2 times (log₂ n + 1), decremented once per partition; when it hits zero, switch to heapsort for the remaining partition.
+Heapsort guarantees O(n log n) worst case, so the overall worst case is bounded, and because the budget also bounds recursion depth, the stack is bounded too, which a naive recursive quicksort cannot promise.
+For partitions of at most 16 elements, switch to insertion sort (lower constants), with hardcoded swap networks for exactly 2 and 3 elements. Used by Array.Sort, List.Sort and Span.Sort in dot NET.
+Note what it does not do: there is no randomised pivot, so an adversary who knows median-of-three can still force bad splits, they just cannot force quadratic time.
+
+Cross-Q²: Why heapsort as the fallback and not mergesort?-- think --
+
+A: In-place. Mergesort needs O(n) auxiliary space; heapsort is O(1) auxiliary. Introsort's whole pitch is "quicksort speed in average case + bounded worst case + in-place". Mergesort fallback would allocate, defeating the in-place promise.
+Heapsort is slower than quicksort in practice (cache-unfriendly heap access) but the constant-factor hit is acceptable for the worst-case guarantee.
+
+-- pause --
+Drill 3, Mergesort over quicksort.
+
+Q: When do you choose mergesort over quicksort?-- think --
+
+A: Three cases. (1) Stability required, mergesort is stable; quicksort isn't. Multi-key sort or order-preserving dedup needs stable. (2) Worst-case guarantee, mergesort is always O(n log n); quicksort is O(n²) on bad pivots (mitigated by introsort).
+(3) Linked lists, mergesort is natural; quicksort needs random access which linked lists don't provide.
+
+Cross-Q: Why is mergesort slower than quicksort in practice despite same Big-O?-- think --
+
+A: (a) Cache pattern, mergesort allocates an auxiliary buffer and copies between buffers, doubling memory traffic. Quicksort works in-place with great cache locality (partition is sequential reads or writes on one array).
+(b) Mergesort's constants in the merge step (compare + copy per element) are higher than quicksort's partition. (c) garbage collector pressure, mergesort allocates the temp array.
+
+Cross-Q²: When does mergesort beat quicksort even on speed?-- think --
+
+A: External sorting (data exceeds RAM). Mergesort's merge step is naturally streamed, read sorted runs from disk, merge with a small in-memory window. Quicksort needs random access to the full data set. Database engines, MapReduce shuffle, large file sorters all use external mergesort.
+
+-- pause --
+Drill 4, Heapsort and the heap property.
+
+Q: What's the heap property and how does heapsort use it?-- think --
+
+A: Max-heap property: parent at least children. Stored as an array: parent at i, children at 2i+1 and 2i+2. Heapsort: (1) build a max-heap from the array (O(n) using sift-down from middle to start); (2) repeatedly swap root (max) with last element, shrink the heap by 1, sift-down to restore heap.
+After n iterations, the array is sorted in ascending order.
+
+Cross-Q: Why does build-heap take O(n), not O(n log n)?-- think --
+
+A: Sift-down from each non-leaf takes O(h) where h is that node's height. Leaves are h set to 0 (most of the tree); root is h set to log n. Total: Σ h times (nodes at height h) = n or 2 times 0 + n or 4 times 1 + n or 8 times 2 +. = O(n) by series convergence.
+Counterintuitive but true: building bottom-up is linear, even though sorting from the heap is O(n log n).
+
+Cross-Q²: Why is heapsort slower than quicksort in practice?-- think --
+
+A: Cache-hostile access pattern. Sift-down at node i accesses children at 2i+1, 2i+2, these are far in memory for large heaps. Each comparison can cache miss. Quicksort's partition is sequential and cache-friendly.
+Heapsort wins on worst-case guarantee and O(1) auxiliary; loses on average-case speed.
+
+-- pause --
+Drill 5, Stability, which sorts are stable.
+
+Q: What does "stable sort" mean and which BCL sorts are stable?-- think --
+
+A: A sort is stable if elements with equal keys preserve their relative order from the input. dot NET stability: Enumerable.OrderBy / OrderByDescending / ThenBy are stable, and documented as such. Array.Sort, List.Sort, Span.Sort are not stable (they use introsort), and are documented as such.
+ParallelEnumerable.OrderBy, that is, AsParallel().OrderBy(. ), is not stable either, which the docs call out explicitly as a contrast with the sequential version.
+Also SortedSet and SortedDictionary have no notion of stability at all: anything that compares equal to an existing element is a duplicate, so SortedSet.Add returns false and SortedDictionary.Add throws.
+That makes comparer or equality consistency a correctness requirement there rather than an ordering nicety.
+
+Cross-Q: Why does stability matter for multi-key sort?-- think --
+
+A: Stable sort lets you chain: sort by secondary key first (stable), then by primary (stable) to final order is "primary, then secondary as tiebreaker." Unstable sort scrambles the secondary order on the second pass.
+The classic bug: list.Sort((a,b) goes to a.Date.CompareTo(b.Date)); list.Sort((a,b) goes to a.Customer.CompareTo(b.Customer)); produces customer-ordered data with date order scrambled within each customer group. Use OrderBy(p).ThenBy(s) instead.
+
+Cross-Q²: If Array.Sort is unstable, how does the BCL provide stable behavior?-- think --
+
+A: Not by using a stable algorithm, this is the part almost everyone gets wrong. OrderBy buffers the source into a TElement[], computes a TKey[] by running the key selector once per element, builds an int[] map of 0.n-1, and then sorts the map with Span.Sort, the same unstable introsort.
+Stability comes from the comparison: when two keys tie and there is no ThenBy left in the chain, it returns index1 - index2, which the runtime source annotates // ensure stability of sort.
+Because the original index is a final tiebreak, the comparison is a total order, so there is exactly one valid answer and no unstable algorithm can produce a different one.
+For an in-place stable sort you apply the same idea yourself: a composite comparer whose last tiebreak is an index or another unique key, then Array.Sort / List.Sort. Or accept the allocation and use arr.OrderBy(x goes to x).ToArray().
+
+-- pause --
+Drill 6, In-place sorts.
+
+Q: Which sorts are in-place (O(1) auxiliary space)?-- think --
+
+A: Bubble, selection, insertion, quicksort (with O(log n) stack), heapsort. Not in-place: mergesort (O(n) auxiliary), TimSort (some auxiliary for merging). The BCL Array.Sort is in-place because introsort is in-place.
+
+Cross-Q: Is "in-place" the same as "no allocations"?-- think --
+
+A: No, and the distinction is worth being precise about in dot NET. In-place means O(1) auxiliary data structure space (excluding recursion stack), it says nothing about small fixed allocations. Array.Sort(arr) with no comparer is genuinely zero-allocation.
+Array.Sort(arr, comparer) is in-place but allocates one Comparison delegate per call, because the BCL calls IntrospectiveSort(keys, comparer.Compare) and a method-group conversion on an instance method has to capture the receiver. A capturing lambda comparer adds a display class on top of that.
+And Span.Sort(comparer) boxes a value-type comparer, the runtime source carries the comment // value-type comparer will be boxed on that exact line. So: in-place, yes; allocation-free, only on the Comparer.Default path.
+
+Cross-Q²: When does the "in-place" property matter in dot NET?-- think --
+
+A: garbage collector-sensitive code, and specifically the large-object heap.
+An O(n) auxiliary array for a 10⁶-element int sort is 4 megabytes, well past the 85,000-byte LOH threshold, and the LOH is only collected by a gen-2 garbage collector, so an allocating sort in a per-request path converts a temporary into full-garbage collector work.
+The mechanism, not a number, is the interview answer: for latency-sensitive code (p99-bound) prefer in-place; for batch or throughput code the allocation amortises and mergesort's buffer is fine.
+If you need the auxiliary buffer and the latency, rent it from ArrayPool.Shared rather than allocating it, but then carry the logical length separately, because Rent returns an array at least as large as you asked for.
+
+-- pause --
+Drill 7, Array.Sort internals, introsort.
+
+Q: What algorithm does Array.Sort use in dot NET?-- think --
+
+A: Introsort (introspective sort), hybrid of quicksort + heapsort + insertion sort. Starts with quicksort, median-of-three pivot. Carries a partition budget of 2 times (log₂ n + 1), decremented per partition; at zero it switches to heapsort, which bounds the worst case at O(n log n).
+For partitions of at most 16 elements ( Array.IntrosortSizeThreshold ) it stops recursing and runs insertion sort, with hardcoded swap networks for exactly 2 and 3 elements. It recurses on the right partition and loops on the left, so half the recursion is eliminated by hand.
+On top of that, for the built-in numeric types with the default comparer, comparisons go through LessThan / GreaterThan helpers that use the raw operators rather than IComparable.CompareTo, and for double,
+float and Half that requires a pre-pass ( SortUtils.MoveNansToFront ) because < is not an ordering when NaN is present.
+
+Cross-Q: Why 16 as the insertion-sort threshold?-- think --
+
+A: Empirically tuned, and the tuning is per-runtime rather than universal. roughly that size, insertion sort's zero-overhead inner loop and cache-friendly contiguous access beat quicksort's pivot selection and partition setup; it the O(n²) starts to bite.
+Other runtimes land in the same neighbourhood by their own measurement, CPython's TimSort computes a minrun between 32 and 64 and binary-insertion-sorts within it (listsort.txt), and Java's dual-pivot quicksort has its own insertion-sort threshold for primitives.
+The number itself is not the interesting part; what matters is that the threshold exists at all, which is the admission that asymptotic analysis stops describing reality at small n.
+
+Cross-Q²: Did Array.Sort always use introsort?-- think --
+
+A: No. Through dot NET Framework 4.0 it was straight quicksort with no fallback, vulnerable to O(n²) on adversarial or already-sorted input; it switched to introsort in dot NET Framework 4.5, and List.Sort with it.
+One behavioural side effect from Microsoft's own compatibility notes: sorts that previously threw ArgumentException for a bad comparer may now complete without throwing, because the two algorithms notice comparer inconsistency in different places.
+What did not change is the algorithm family, dot NET 5 through dot NET 10 all run introsort, so any claim that modern dot NET uses an adaptive or TimSort-like variant, or a stable variant for reference types, is wrong.
+What dot NET 5 actually changed was the implementation: the remaining native primitive-array sort was removed in favour of the managed span-based one, which is what made Span.Sort possible as public A P I.
+Microsoft still documents the algorithm as an implementation detail, so do not rely on Array.Sort being unstable in some particular way either, rely only on the documented fact that it is not stable.
+
+-- pause --
+Drill 8, Sort a million ints.
+
+Q: I have 1M random 32-bit ints in [0, 10⁹). Which sort?-- think --
+
+A: Array.Sort (introsort), and specifically Array.Sort(arr) with no comparer so you get the int -specialised path where each comparison is a raw <. It is O(n log n) with about 20 levels of partitioning for n = 10⁶, zero allocations, and one line.
+For specialised scenarios: if the range were small (say 0, 1000), counting sort would be O(n) with a 1000-entry counter and no comparisons at all, a clear win. If the data were near-sorted, an adaptive sort would help, but dot NET does not have one, so you would be writing it.
+For 1M random values in a wide range, introsort is the right trade and there is nothing to reach for. Say what you would measure rather than quoting a time: sorted / reverse-sorted / all-equal / few-distinct / random are five different inputs for this algorithm.
+
+Cross-Q: What if it's 10 billion ints (doesn't fit in RAM)?-- think --
+
+A: External sort. (1) Chunk into RAM-sized pieces (for example, 100M ints = 400 megabytes each). (2) Sort each chunk in-memory with Array.Sort; write sorted runs to disk. (3) K-way merge the runs using a PriorityQueue of size K (K = number of runs).
+Memory bounded by chunk size + K times buffer size.
+This is what databases do for ORDER BY on huge tables.
+
+Cross-Q²: What if it's 1M but I have only 1 megabyte RAM?-- think --
+
+A: External sort applies even for smaller datasets, chunk to whatever fits, sort, merge. Or radix sort if ints have a fixed digit length: 4-byte ints sorted by 4 passes of counting sort over each byte to O(d times n) = O(n).
+Radix sort can be in-place with care; if not, the temp array fits if you split the input into chunks.
+
+-- pause --
+Drill 9, Sort with multiple keys.
+
+Q: Sort Person by Age ascending, then Name descending, then Id ascending.-- think --
+
+A: link chains: people.OrderBy(p goes to p.Age).ThenByDescending(p goes to p.Name).ThenBy(p goes to p.Id).ToList(). There is one sort, not three: each clause adds an EnumerableSorter node to a linked chain, and the comparison walks the chain on ties.
+The compiler does nothing special here, OrderBy returns IOrderedEnumerable, and ThenBy calls its CreateOrderedEnumerable to wrap it. The cost is one TKey[] of length n per clause, computed once per element up front, plus the buffered source and the int[] map.
+
+Cross-Q: Why does OrderBy().ThenBy() work but two separate Sort calls don't?-- think --
+
+A: OrderBy().ThenBy() produces a single comparison function that consults all keys in order and ends in an index tiebreak, so it never needs stability from the algorithm.
+Two separate Sort calls on a List, Sort(by Age) then Sort(by Name), rely on the second sort preserving the first's ordering among ties, which only a stable sort does. List.Sort is introsort and unstable to the first ordering is scrambled.
+The general rule: chained sorts require stability; a composite comparer does not. Prefer the composite comparer, because it does not depend on a property the A P I does not promise.
+
+Cross-Q²: How would you do this with a custom IComparer for in-place sort?-- think --
+
+A: A cached singleton comparer chaining the three keys, with the middle one reversed: int c = a.Age.CompareTo(b.Age); if (c != 0) return c; c = string.Compare(b.Name, a.Name, StringComparison.Ordinal); if (c != 0) return c; return a.Id.CompareTo(b.Id);, then list.Sort(PersonComparer.Instance).
+Three points to make. Use string.Compare with an explicit StringComparison rather than CompareTo, which is culture-sensitive and null-hostile.
+Cache the instance as a static readonly, list.Sort(new PersonComparer()) allocates a comparer per call, and the BCL then allocates a Comparison delegate on top.
+And it avoids link's four O(n) arrays rather than being "faster" in some general sense: the comparison work is similar, the allocation is not. Use link for clarity; reach for IComparer when the sort is on a hot path or the allocation profile matters.
+
+-- pause --
+Drill 10, External sort.
+
+Q: When data exceeds RAM, how do you sort?-- think --
+
+A: External sort. (1) Read chunks that fit in memory; (2) sort each chunk in-memory (write as a sorted run to disk); (3) k-way merge the runs using a min-heap of size k. For 100 gigabytes file with 8 gigabytes RAM: ~13 sorted runs of ~7.7 gigabytes each; merge them streaming.
+
+Cross-Q: What's the I O complexity?-- think --
+
+A: O(n) reads and writes for the chunk-sort phase (each byte read once, written once). O(n) reads and writes per merge level, for k-way merge of K runs, one level. Total I O: O(n) per phase times 2 phases = O(n). The C P U is also O(n log n) (in-memory sort within each chunk).
+Disk I O usually dominates total time.
+
+Cross-Q²: How does the choice of k affect performance?-- think --
+
+A: It is a trade between merge passes and per-stream buffer size, and the correct value is derived rather than looked up.
+Larger k means fewer passes, one pass instead of two once k at least the number of runs, but the memory you have is divided among k read buffers, so a larger k means smaller buffers and more seeking per byte read.
+The number you actually optimise is "reads per byte", and the derivation is: given a memory budget M and a minimum sequential read size B that keeps the device happy, k is at most M or B. That is why the answer is a calculation on the hardware and not a constant.
+dot NET implementation: PriorityQueue Reader, T Value), (TKey Key, int RunIndex)>, dequeue the min, advance that reader, enqueue its next value.
+The RunIndex in the priority is not decoration: PriorityQueue gives no tie guarantee, so without it a re-run of the same merge can emit equal-keyed records in a different order.
+
+-- pause --
+Drill 11, Counting / radix sort.
+
+Q: When does counting sort apply?-- think --
+
+A: Bounded-range integer keys. Range k must be O(n) or smaller for memory to fit. Time O(n + k); ideal for sorting many elements over a small value range, sort 10M user ages (range [0, 150]) in two linear passes over the data plus one pass over a 151-entry counter, with no comparisons at all.
+The diagnostic to state out loud: compare the number of distinct keys to the number of elements. When distinct keys ≪ n, a comparison sort is paying for a total order the data does not contain.
+
+Cross-Q: What about negative numbers?-- think --
+
+A: Offset. Find min value, subtract from all keys (or use min as the array origin). Allocate counts[max - min + 1]. For unbounded range or very wide ranges (for example, signed int with realistic data spanning 10⁹), counting sort needs too much memory. Switch to radix sort.
+
+Cross-Q²: When radix sort beats counting sort?-- think --
+
+A: When key range is too large for counting but keys have fixed digit length. 32-bit ints: 4 passes of counting sort (one byte each); O(4 times n) = O(n) without the memory blowup. Radix sort handles each digit's range independently, each pass needs only O(256) counter array (one byte).
+Used for sorting large arrays of integers in O(n) effective time when n >> 256.
+
+-- pause --
+Drill 12, Sorting a linked list.
+
+Q: How do you sort a LinkedList efficiently?-- think --
+
+A: Mergesort. Quicksort needs random access (pivot, partition by index) which linked lists don't support without O(n) traversal. Mergesort splits via slow or fast pointer (find middle in O(n)), recursively sorts halves, merges in O(n). Total O(n log n) time, O(log n) stack space.
+
+Cross-Q: Why is mergesort especially good for linked lists?-- think --
+
+A: Merge of two sorted linked lists is in-place (just rewire pointers, no copying). Mergesort on arrays needs auxiliary space for merge; on linked lists, no aux space needed. The "split" is a slow or fast walk; the "merge" is pointer-relinking.
+Clean O(n log n) algorithm with O(1) extra space (excluding stack).
+
+Cross-Q²: In dot NET, what's the practical recommendation?-- think --
+
+A: Convert to an array, sort, build new linked list: var sorted = ll.OrderBy(x goes to x).ToArray(); ll.Clear(); foreach (var x in sorted) ll.AddLast(x);. Two allocations (the array and rebuilt list), but Array.Sort is highly optimized.
+Hand-rolled linked-list mergesort is rarely worth it unless you can't afford the array copy.
+
+-- pause --
+Drill 13, Top-K elements.
+
+Q: Find the top 10 highest scores in an array of 10⁹ scores. Best approach?-- think --
+
+A: Min-heap of size K set to 10. Iterate the array; push each score onto the heap; if heap size exceeds 10, pop the minimum. After all scores, the heap holds the top 10. Time O(n log k); space O(k). Beats sorting (O(n log n)) for k ≪ n.
+
+Cross-Q: When does partial sort beat heap?-- think --
+
+A: When you can mutate the input. Quickselect (Hoare's selection algorithm) finds the K-th element in O(n) average time, partition around a pivot, recurse only on the side containing K. Once you have the K-th element, the top K is the prefix (or suffix).
+O(n) versus O(n log k), heap wins for very small K; quickselect for moderate K. For K = 10 out of 10⁹, both are sub-second; heap is simpler.
+
+Cross-Q²: In dot NET 6+, what's the modern A P I?-- think --
+
+A: PriorityQueue (dot NET 6+) for the heap approach: var heap = new PriorityQueue(); foreach (var s in scores) { heap.Enqueue(s, s); if (heap.Count > 10) heap.Dequeue(); } return heap.UnorderedItems.Select(e goes to e.Element).Order().ToArray();. Two things to get right that most candidates miss.
+UnorderedItems means what it says, the docs note it enumerates "following the internal array heap layout" because ordering it would cost O(n log n) and O(n) space, so if the caller wants the top 10 in order, you sort those 10 at the end.
+And PriorityQueue is a quaternary min-heap ( Arity = 4 ), not a binary one; shallower tree, more comparisons per sift-down level, fewer levels on sift-up.
+Note also that scores.OrderByDescending(s goes to s).Take(10) is not the full O(n log n) it looks like, link's Skip / Take over an ordered sequence runs PartialQuickSort, documented in the source as O(n + k log k), so the honest comparison for k = 10 is "both are effectively linear;
+the heap has bounded O(k) memory and needs no buffering of the source."
+
+-- pause --
+Drill 14, Stable sort, why important for multi-key.
+
+Q: Walk through a multi-key sort that fails with unstable sort.-- think --
+
+A: Data: (Alice, 25), (Bob, 30), (Carol, 25), (Dave, 30). Sort by Age then Name. With stable sort: sort by Name first to (Alice, 25), (Bob, 30), (Carol, 25), (Dave, 30). Then sort by Age (stable) to (Alice, 25), (Carol, 25), (Bob, 30), (Dave, 30). Final: age primary, name secondary.
+With unstable sort: sort by Name to same; sort by Age (unstable) to (Carol, 25), (Alice, 25), (Dave, 30), (Bob, 30). Name ordering scrambled within each age group.
+
+Cross-Q: How do you do multi-key sort correctly?-- think --
+
+A: Three options. (1) link chain: OrderBy(p goes to p.Age).ThenBy(p goes to p.Name), both stable, one sort under the hood. (2) Composite comparer: Array.Sort(people, (a, b) goes to { int c = a.Age.CompareTo(b.Age); return c != 0?
+c: a.Name.CompareTo(b.Name); }), one comparison call; no stability requirement.
+(3) Stable two-pass, only if you have a stable sort algorithm.
+
+Cross-Q²: Why does List.Sort not provide a stable option?-- think --
+
+A: Implementation choice, and it is the right one once you see how link gets stability. Stable algorithms (mergesort, TimSort) need O(n) auxiliary memory, which would make List.Sort allocate, the one thing it currently never does on the default path.
+So the BCL splits the two cases: Array.Sort / List.Sort are in-place and unstable, and OrderBy buys stability with three O(n) arrays. Notice that OrderBy does not use a stable algorithm either, it runs the same introsort and makes the comparison a total order by tiebreaking on the original index.
+That means the A P I you are asking for already exists, just not as a flag: pass List.Sort a comparer whose final tiebreak is a unique key, and you have a stable in-place sort. The split is intentional; pick the right tool, or build the third one out of the first.
+
+-- pause --
+Drill 15, IComparer versus Comparison.
+
+Q: When do I use IComparer versus Comparison delegate?-- think --
+
+A: Comparison is a lambda-friendly delegate: Array.Sort(arr, (a, b) goes to a.CompareTo(b)). Concise for one-off comparisons. IComparer is an interface, instantiated as a class: useful when you want to cache the comparer, name it, share it, inject it via D I, or implement it efficiently with state.
+Both are accepted by Array.Sort, List.Sort, et cetera
+
+Cross-Q: Is there a perf difference?-- think --
+
+A: Yes, and it is not the direction most people guess. Three separate effects:
+
+Fast-path loss. For T implementing IComparable, GenericArraySortHelper takes a specialised path only when the comparer is null or exactly Comparer.Default.
+Any other IComparer, including a hand-written one that just forwards to CompareTo, sends the sort to ArraySortHelper, where every comparison is a delegate invocation. For the built-in numeric types the specialised path compares with the raw < operator, so this is the largest of the three effects.
+Allocation. A non-capturing lambda is cached by the compiler in a static field, so Array.Sort(arr, (a, b) goes to a.CompareTo(b)) allocates nothing per call. A capturing lambda allocates a display class and a delegate per call.
+A cached IComparer singleton allocates nothing itself, but the BCL then allocates one Comparison delegate per Sort call from comparer.Compare, because an instance method group has to capture its receiver.
+**What does not help.** Making the comparer a readonly struct and calling span.Sort(comparer) looks like it should get devirtualisation from the generic TComparer constraint.
+It does not, the runtime source line reads ArraySortHelper.Default.Sort(span, comparer); // value-type comparer will be boxed.
+
+Practical order of preference for a hot path over a primitive: Array.Sort(arr) with no comparer at all; then a non-capturing Comparison; then a cached IComparer singleton. Avoid capturing lambdas inside loops, and never new a comparer per call.
+
+Cross-Q²: What about IComparable (on the type itself)?-- think --
+
+A: That's a third thing, implementing IComparable on the element type itself gives natural ordering, and it is also what selects the specialised sort helper: ArraySortHelper.Default is chosen once per closed generic type on the test typeof(IComparable).IsAssignableFrom(typeof(T)).
+So implementing IComparable on your own type is not just documentation, it changes which code path Array.Sort runs.
+Use IComparable for "this type has one obvious sort order" ( DateTime, a money type, a version number) and implement the non-generic IComparable alongside it only for legacy interop, since that one boxes.
+Use IComparer for context-specific orderings ("sort by display priority for this U I"), cached as a singleton. Use Comparison for inline one-off sorts.
+One caution: if you implement IComparable, keep it consistent with Equals, CompareTo(x) == 0 and Equals(x) disagreeing is a contract violation that breaks SortedSet, BinarySearch, and anything that dedupes by comparison.
+
+-- pause --
+Section 2. Self-test.
+
+Decision-tree argument: any comparison-based sort can be modeled as a binary tree where each internal node is a comparison and each leaf is a permutation of the input. Sorting n elements requires distinguishing n! permutations, so the tree has at least n! leaves. A binary tree with n!
+leaves has depth at least log₂(n!) approximately n log n − n / ln 2 = Θ(n log n). The longest root-to-leaf path corresponds to the worst-case number of comparisons. Therefore, no comparison sort can do better than Θ(n log n) in the worst case.
+Counting or radix sorts beat this bound by not being comparison-based, they use the structure of the keys instead.
+
+Compare operation counts and memory, not wall-clock times you have not measured. (1) Array.Sort (introsort): O(n log n) approximately 100M times 27 approximately 2.7 times 10⁹ comparisons, each one a raw < on the int-specialised path, zero allocations, in place.
+(2) Counting sort: O(n + k) with k = 10⁶, so approximately 100M increments plus a 10⁶ prefix-sum pass plus 100M placements, no comparisons at all, and it allocates a 10⁶- int counter (4 megabytes, which lands on the large object heap) plus, unless you do it cleverly, an output array.
+(3) Radix sort: O(d times n) with d = 4 bytes, so four counting passes approximately 400M placements, each pass needing only a 256-entry counter, plus one scratch array of length n.
+Counting sort does the fewest operations here; radix is close and uses far less counter memory;
+introsort does billions of comparisons where the others do hundreds of millions of array writes, different operations, so that ratio is an operation-count ratio, not a speed ratio, but it allocates nothing.
+Which wins depends on whether you are optimising operations or allocations, say that rather than guessing a millisecond figure. The structural insight is the point: bounded-range integers admit non-comparison sorts.
+If the range were 10⁹ instead of 10⁶, counting sort needs a 4 gigabytes counter and is dead; radix or introsort wins. The rule: counting sort wins when k = O(n).
+
+First, correct a claim you will hear often and which the runtime source disproves: ThenBy does not invoke the key selector during comparisons. EnumerableSorter.ComputeKeys runs each selector exactly once per element, up front, into a TKey[].
+Nor does it box value-typed keys, TKey[] is a typed array. So the cost of OrderBy().ThenBy() is not repeated projection; it is memory and indirection. Each clause allocates one TKey[] of length n, on top of the buffered source TElement[], the int[] map, and the result you materialise.
+A four-clause ordering over n rows is seven arrays of length n.
+Beyond a certain size those arrays cross the 85,000-byte large-object-heap threshold and are only reclaimed by a gen-2 collection, so a per-request link ordering over a large collection turns into full-garbage collector work under concurrency.
+A single cached IComparer doing all key comparisons inline avoids every one of those arrays and lets you sort in place on a collection you already own.
+Trade-off: harder to read, and easy to get the multi-key logic wrong, particularly the descending clauses, and particularly the final tiebreak, which link gives you for free and a hand-written comparer must add explicitly if the result has to be deterministic.
+Use link for clarity; reach for IComparer when the sort is on a hot path or the allocation profile matters, and measure allocations rather than only time.
+
+Insertion sort is O(n²) but with very small constants, at small n it beats quicksort and mergesort due to (a) zero recursion overhead, (b) cache-friendly contiguous access, (c) no pivot selection or partition step, (d) it's adaptive, runs in O(n) on already-sorted data.
+Introsort exploits this: when the partition size drops to 16 or fewer, it stops recursing and runs a single insertion sort pass, with hardcoded swap networks for exactly 2 and 3 elements so even the call into insertion sort is avoided at the very bottom.
+Why it matters at all: the number of subproblems doubles at each level of the recursion, so most partitions are small ones, about half of all the partition calls a quicksort ever makes are at the bottom level.
+The per-call overhead (pivot selection, three SwapIfGreater comparisons, a recursive call) is therefore paid overwhelmingly on tiny inputs, where it dwarfs the comparisons it is meant to save. That is the argument for having a threshold; it is not an argument for any particular value.
+The threshold is empirically tuned per runtime: dot NET uses 16 ( Array.IntrosortSizeThreshold ); CPython's TimSort computes a minrun between 32 and 64 and binary-insertion-sorts within it.
+Do not quote a speedup percentage for the optimisation, it depends entirely on n, element size and comparison cost, and any single figure is a figure about one benchmark.
+One consequence worth carrying instead: because the insertion-sort branch has no sentinel and the partition branch does, a broken comparer behaves differently on either side of the threshold.
+
+Integer overflow. If a.Score = int.MinValue and b.Score = 1, the subtraction overflows to a positive number, so the comparer reports a > b when it should report a < b.
+The comparer is then not antisymmetric and not transitive, so the sort's result is unspecified, and in the BCL, the concrete failure is that the sentinel-bounded partition scan can walk off the end of the array, producing ArgumentException:
+Unable to sort because the IComparer.Compare() method returns inconsistent results.
+Always use a.Score.CompareTo(b.Score), which is overflow-safe and returns -1 or 0 or 1. The same trap appears with long differences, DateTime / TimeSpan ticks, and anything you subtract to get a sign.
+
+There is a second, subtler reason to avoid it that shows the framework agrees: a subtraction can return int.MinValue, and -int.MinValue == int.MinValue, so a caller who tries to reverse your comparer by negating its result gets the wrong sign.
+link's OrderByDescending avoids exactly this by normalising to plus or minus 1 rather than negating, return (_descending != (c > 0))? 1: -1;, with a source comment saying so. Any code of yours that reverses a comparer with -comparer.Compare(a, b) inherits the bug.
+
+There is no Roslyn analyzer for subtraction-as-comparer, do not expect the compiler to catch it.
+( CA1310 and CA1309 are about specifying StringComparison, which is a different, also-worth-fixing problem.) Treat any subtraction used as a comparison result as a review finding, and test comparers with int.MinValue / int.MaxValue and with a collection of more than 16 elements,
+since a smaller one takes the insertion-sort path and can pass while wrong.

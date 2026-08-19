@@ -1,0 +1,427 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, DP problem recognition.
+
+Q: How do you recognize a DP problem in the first 30 seconds of an interview?-- think --
+
+A: Two signals. (1) Overlapping subproblems, write the natural recursive solution; if the same subproblem appears in multiple branches of the recursion tree, you have overlapping subproblems to DP.
+(2) Optimal substructure, the answer to the whole is built from optimal answers to parts ( min or max or count of sub-answers). Both signals together = DP. Bonus: keywords like "longest," "shortest," "minimum or maximum," "count the number of ways," "can we partition" often signal DP.
+
+Cross-Q: What problems look like DP but aren't?-- think --
+
+A: Divide-and-conquer (mergesort, binary search, FFT) has optimal substructure but no overlapping subproblems, each subproblem is independent.
+Greedy problems (activity selection, Huffman coding, Dijkstra) have optimal substructure but local choices suffice, no need for the table of all subproblems. If you can prove the greedy choice is always safe, skip DP for the cheaper greedy.
+
+Cross-Q²: What if I'm not sure?-- think --
+
+A: Write the brute-force recursion. Trace it for n set to 4 or n set to 5. Are subproblem calls repeated? If yes to DP. If subproblems are independent to divide-and-conquer or greedy. The brute-force trace is the cheapest test for DP applicability.
+
+-- pause --
+Drill 2, Memoization versus tabulation.
+
+Q: When do I pick memoization (top-down) versus tabulation (bottom-up)?-- think --
+
+A: Memoization for prototyping and sparse state spaces, it mirrors the recursion you'd write anyway; only the states actually visited are computed and stored.
+Tabulation for production hot paths and deep state spaces, no recursion-stack risk, easier to space-optimize (rolling arrays), better cache locality. For interview: memoize first; convert to tabulation if asked to optimize space or remove stack.
+
+Cross-Q: Same Big-O, what's the constant-factor difference?-- think --
+
+A: Name the mechanisms rather than a multiplier, because the multiplier depends entirely on how much work the transition does.
+Per state visited, memoization pays a call (argument setup, a frame, a return), a cache probe (for a Dictionary: hash the key, index _buckets, walk the chain in _entries comparing keys), and a cache write on a miss.
+Tabulation pays an array index, a multiply-add and a bounds check the jit can often hoist out of the loop, and its access pattern is sequential, so the prefetcher works. Against that, memoization visits only reachable states and tabulation visits all of them.
+Which side wins is a property of your transition cost and your state density, which is why the answer to "which is faster" is a [Params] sweep, not a number. See the benchmark shape in the Memoization versus tabulation section.
+
+Cross-Q²: When does memoization actually win on perf?-- think --
+
+A: When the state space is sparse, when the reachable subgraph of the dependency DAG is a small fraction of the nominal states = ∏ dimension sizes product. Tabulation's cost is proportional to the nominal count; memoization's is proportional to the reachable count.
+So the win scales with the density ratio, and it can be arbitrarily large: a DP whose state is (node, mask) but where only a handful of masks are legal per node has a nominal table that may not even be allocatable and a reachable set that fits in a dictionary.
+The corollary matters just as much, at density near 1.0 the dictionary overhead is pure loss, so "memoize for sparse, tabulate for dense" is the rule and measuring your density is how you apply it.
+
+-- pause --
+Drill 3, Space optimization.
+
+Q: What's space optimization in DP?-- think --
+
+A: When the recurrence only depends on the previous row or column, drop the unused dimensions. Fibonacci: dp[i] only needs dp[i-1] and dp[i-2] to two variables. LCS 2D dp[i, j] needs only row i-1 and row i to two 1D arrays (or rolling).
+Knapsack: cleverly drop to a single 1D array using reverse iteration. Memory drops from O(n²) to O(n) or O(1).
+
+Cross-Q: What's the trade-off?-- think --
+
+A: The naive rolling array loses the ability to reconstruct the actual solution, you still get "minimum edit distance = 5", but the rows you would backtrack through have been overwritten. For length-only or value-only queries, optimize freely.
+If you need both, the correct answer is not "keep the full table": it is Hirschberg's algorithm (CACM, 1975), which finds the column where the optimal path crosses the middle row by adding a forward row and a backward row, then recurses on the two quadrants.
+Linear space, still quadratic time with a small constant multiplier. Knowing that the trade is "constant factor of time" rather than "space or the path, pick one" is the senior answer here.
+
+Cross-Q²: Knapsack 1D, why iterate capacity in reverse?-- think --
+
+A: To prevent double-counting an item. 1D rolling dp[c] holds "best with items 0.i-1, capacity c." Updating dp[c] = max(dp[c], dp[c - w[i]] + v[i]) for item i: if we iterate forward, dp[c - w[i]] may have already been updated with item i, so the second add of item i double-counts.
+Reverse iteration ensures dp[c - w[i]] still reflects "best WITHOUT item i," so the update represents "include item i once."
+
+-- pause --
+Drill 4, 0 or 1 knapsack recurrence.
+
+Q: Write the 0 or 1 knapsack recurrence.-- think --
+
+A: State: dp[i, c] = max value using first i items with capacity c. Transitions: skip item i to dp[i, c] = dp[i-1, c]; take item i (if fits) to dp[i, c] = max(dp[i-1, c], dp[i-1, c - w[i]] + v[i]). Base: dp[0, c] = 0 for all c. Time O(n times C), space O(n times C) or O(C) with rolling.
+
+Cross-Q: What's the difference between 0 or 1 and unbounded knapsack?-- think --
+
+A: 0 or 1 = each item picked 0 or 1 time. Unbounded = unlimited copies. The recurrence changes: unbounded takes from dp[i, c - w[i]] (same item index, allows reuse), not dp[i-1, c - w[i]]. In 1D rolling: 0 or 1 iterates capacity reverse; unbounded iterates forward.
+Coin change (minimum coins for amount) is unbounded knapsack.
+
+Cross-Q²: Why is knapsack called "pseudo-polynomial"?-- think --
+
+A: The complexity O(n times C) is polynomial in n (item count) and C (capacity value). But the input size of C is log(C) bits, not C itself.
+As C grows exponentially in input size (for example, 32-bit capacity = 4 billion), the algorithm is exponential in input size, even though it's polynomial in C's value.
+True polynomial algorithms (in input size) for knapsack don't exist; it's NP-hard.
+
+-- pause --
+Drill 5, Coin change variations.
+
+Q: Coin change, two common variants. Differentiate.-- think --
+
+A: (1) Minimum coins for amount: dp[a] = min(dp[a-c] + 1 for c in coins if a-c >= 0). Base dp[0] = 0. Returns minimum count (or impossible). (2) Count ways to make amount: dp[a] = sum(dp[a-c] for c in coins if a-c >= 0), but this double-counts orderings (3+2 and 2+3 are different paths).
+For combinations (unordered), iterate coins outer, amount inner: for c in coins: for a in [c.target]: dp[a] += dp[a-c].
+
+Cross-Q: Why does iterating coins outside versus inside matter for counting?-- think --
+
+A: Coins outside (outer loop) enforces "consider coin c only after committing to use coins 0.c-1 zero or more times." This gives combinations (no duplicate orderings). Amount outside (outer) considers all coins for each amount to counts permutations (orderings matter).
+Subtle but huge difference; classic interview trap.
+
+Cross-Q²: Greedy works for US coins [1, 5, 10, 25], when fails?-- think --
+
+A: For non-canonical denomination sets. Classic: [1, 3, 4] and amount 6, greedy picks 4 + 1 + 1 = 3 coins; DP finds 3 + 3 = 2 coins. The greedy choice property fails when small-coin combinations can match what a single bigger coin can do at lower count.
+DP is the safe general solution; greedy is a valid optimization only when you can prove the denomination set is "canonical" (Dijkstra's coin problem).
+
+-- pause --
+Drill 6, LCS recurrence.
+
+Q: Longest Common Subsequence, state and recurrence.-- think --
+
+A: State: dp[i, j] = length of LCS of s1[0.i] and s2[0.j]. Recurrence: if s1[i-1] == s2[j-1]: dp[i, j] = dp[i-1, j-1] + 1. Else: dp[i, j] = max(dp[i-1, j], dp[i, j-1]). Base: dp[0, ] = dp[, 0] = 0. Returns dp[m, n].
+
+Cross-Q: How do you reconstruct the actual subsequence?-- think --
+
+A: Backtrack from dp[m, n]. If s1[i-1] == s2[j-1]: this char is in LCS; move to dp[i-1, j-1]. Else: move to whichever neighbor has the same value ( dp[i-1, j] or dp[i, j-1] ). Collect matched chars; reverse at the end. O(m + n) backtracking.
+
+Cross-Q²: LCS versus longest common substring, what's the difference in recurrence?-- think --
+
+A: LCS allows gaps (chars need not be contiguous). LCSubstring requires contiguous match. Recurrence change: if chars match to dp[i, j] = dp[i-1, j-1] + 1. If they don't to reset to 0 (substring broken). LCS keeps the max via the else branch; substring restarts.
+Track max(dp[i, j]) across all (i, j), that's the answer. Both O(m times n), different recurrence.
+
+-- pause --
+Drill 7, Edit distance (Levenshtein).
+
+Q: Write the edit distance recurrence.-- think --
+
+A: State: dp[i, j] = min edits to transform s1[0.i] into s2[0.j]. If chars match: dp[i, j] = dp[i-1, j-1] (no edit needed). Else: dp[i, j] = 1 + min(dp[i-1, j-1] / substitute /, dp[i-1, j] / delete from s1 /, dp[i, j-1] / insert into s1 /).
+Base: dp[i, 0] = i (delete all of s1), dp[0, j] = j (insert all of s2). O(m times n).
+
+Cross-Q: How does Levenshtein vary from Damerau-Levenshtein?-- think --
+
+A: Damerau-Levenshtein adds transposition of adjacent characters as a single edit. Recurrence: also check dp[i-2, j-2] + 1 if s1[i-1] == s2[j-2] and and s1[i-2] == s2[j-1]. Spell-checkers use Damerau-Levenshtein because typos are often transpositions (for example, "teh" for "the").
+
+Cross-Q²: How would I make it support insert or delete with different costs?-- think --
+
+A: Weighted edit distance. Replace the 1 + min(.) with min(dp[i-1, j-1] + sub_cost(s1[i-1], s2[j-1]), dp[i-1, j] + del_cost(s1[i-1]), dp[i, j-1] + ins_cost(s2[j-1])). Same O(m times n).
+Used for DNA alignment (insertion or deletion of gaps cost differently than substitutions), OCR error models, plagiarism detection.
+
+-- pause --
+Drill 8, Climbing stairs versus Fibonacci.
+
+Q: How are climbing stairs and Fibonacci related?-- think --
+
+A: Same problem. Climbing stairs: n stairs, take 1 or 2 at a time, count ways to reach top. Recurrence: ways(n) = ways(n-1) + ways(n-2). Base: ways(0) = ways(1) = 1. That's Fibonacci shifted by one. Both are O(n) time with DP, O(1) space with rolling variables.
+
+Cross-Q: What if you can take 1, 2, OR 3 steps?-- think --
+
+A: Tribonacci. ways(n) = ways(n-1) + ways(n-2) + ways(n-3). Same DP shape; window of three instead of two. Generalizes: "take k different step sizes" to recurrence with k terms. O(n times k) time, O(k) space.
+
+Cross-Q²: Why not a closed-form Binet's formula for Fibonacci?-- think --
+
+A: Fib(n) = (φⁿ - ψⁿ) / √5 is closed form (φ = golden ratio). Computes in O(1) with floating point, BUT loses precision for n > ~70 (double overflow / rounding). For exact arbitrary-precision integers, iterative O(n) DP wins.
+Matrix exponentiation gives O(log n) exact, for n = 10⁹, that's ~30 steps versus 10⁹.
+
+-- pause --
+Drill 9, House robber.
+
+Q: Houses in a row, can't rob adjacent. Recurrence?-- think --
+
+A: State: dp[i] = max loot considering first i houses. Transitions: skip house i to dp[i] = dp[i-1]; rob house i to dp[i] = dp[i-2] + loot[i]. Combined: dp[i] = max(dp[i-1], dp[i-2] + loot[i]). Base: dp[0] = loot[0], dp[1] = max(loot[0], loot[1]). O(n) time, O(1) space.
+
+Cross-Q: What if houses are in a circle (first and last are adjacent)?-- think --
+
+A: Run the linear DP twice: once excluding the last house (can rob first) and once excluding the first house (can rob last). Take max of the two. The constraint "first and last adjacent" forces this case-split.
+
+Cross-Q²: What if you can rob k apart (for example, must skip at least 2 between robberies)?-- think --
+
+A: dp[i] = max(dp[i-1], dp[i-k-1] + loot[i]). The recurrence depends on k. State remains 1D. Same O(n) time. The general "adjacency constraint" is a sliding window of k positions you can't pick.
+
+-- pause --
+Drill 10, Subset sum / knapsack relation.
+
+Q: How is subset sum related to knapsack?-- think --
+
+A: Subset sum is 0 or 1 knapsack with value[i] = weight[i] and asking "is there a subset summing to target?" Recurrence: dp[i, s] = true if some subset of items 0.i-1 sums to s. Transitions: skip item i to dp[i, s] = dp[i-1, s]; include item i to dp[i, s] = dp[i-1, s] OR dp[i-1, s - w[i]].
+Base: dp[*, 0] = true. O(n times target).
+
+Cross-Q: What's the space optimization?-- think --
+
+A: Same 1D rolling trick as knapsack. dp[s] bool array. For each item: iterate s reverse from target down to w[i]; dp[s] |= dp[s - w[i]]. Reverse iteration avoids reusing item i. O(target) space.
+
+Cross-Q²: Partition into two equal-sum subsets, variation?-- think --
+
+A: Compute total sum; if odd, impossible. Else target = total or 2. Run subset sum looking for target. If dp[target] is true, partition exists. O(n times total) time. Used in fair partitioning, balanced load distribution, equal-task scheduling.
+
+-- pause --
+Drill 11, DP versus greedy.
+
+Q: When do you pick DP over greedy?-- think --
+
+A: When local choices don't compose to a global optimum. Greedy: activity selection (sort by end time, pick non-conflicting), provably optimal via exchange argument. DP: 0 or 1 knapsack, greedy by value or weight ratio fails (counterexample exists). The test: can you prove greedy correctness?
+If yes, use it (O(n log n) typically); if not, fall back to DP (O(n times W) or worse).
+
+Cross-Q: Coin change, when can greedy work?-- think --
+
+A: Only for canonical denomination sets. US [1, 5, 10, 25] and sterling [1, 2, 5, 10, 20, 50, 100, 200] are canonical; the arbitrary set [1, 3, 4] at amount 6 is not, greedy picks 4+1+1 = 3 coins, DP finds 3+3 = 2.
+Greedy validity depends on the specific denominations, not on the problem shape, so it is a property you have to check per coin system. Two results make checking cheap.
+Kozen and Zaks (1994) proved that if a system 1 = c₁ <. < c_m is non-canonical, the smallest counterexample lies strictly between c₃ + 1 and c_m + c_{m−1}, a finite window you can brute-force in a unit test. Pearson (2005) gave an O(m³) decision algorithm.
+Note what this is not: it is not a matroid argument. Matroid theory explains greedy for MST and for scheduling-with-deadlines; coin systems are not matroids, and citing matroids here is a common and checkable error. If unsure: DP is safe.
+
+Cross-Q²: Fractional knapsack versus 0 or 1, different answer?-- think --
+
+A: Fractional (can split items) is greedy: sort by value or weight ratio descending; take items until full; take a fraction of the last. Provably optimal. 0 or 1 (can't split) is DP: greedy fails. The "fractional" constraint is what unlocks greedy.
+Lesson: the same problem with different constraints can be greedy or DP, recognize the variant.
+
+-- pause --
+Drill 12, Top-down versus bottom-up, same complexity?.
+
+Q: Memoization and tabulation have the same Big-O. Are they equivalent?-- think --
+
+A: Asymptotically yes; practically not always. Memoization may skip unreachable states; tabulation computes all states. For dense state spaces (every state reachable), tabulation is faster constants. For sparse state spaces, memoization saves time AND memory by only computing reachable states.
+
+Cross-Q: What about cache locality?-- think --
+
+A: Tabulation usually wins on locality, it walks the table in address order, so the hardware prefetcher predicts the next line and the jit can hoist bounds checks out of a counted loop.
+Memoization scatters: a Dictionary probe reads _buckets then jumps into _entries at a data-dependent index, and the recursion interleaves those reads with frame setup.
+Both are the same Big-O; the difference is entirely in how many cache lines each state visit touches, which is why the honest form of this answer is a measurement rather than a factor.
+Note that the direction can reverse for a sparse DP, where tabulation's sequential walk is sequential over states nobody needs.
+
+Cross-Q²: What's the deciding factor in production?-- think --
+
+A: Stack risk, and it is a step change rather than a gradient. Memoization recurses, and a StackOverflowException cannot be caught, the process terminates, taking every other in-flight request with it, with no exception in the logs. Tabulation iterates; there is no stack to exhaust.
+There is no depth threshold worth memorising, because a frame costs whatever that method's locals and spills cost;
+the question to ask instead is "can input data make this deeper?" If yes, that is an availability bug and tabulation (or an explicit Stack ) is the fix, with RuntimeHelpers.TryEnsureSufficientExecutionStack() as the guard while you get there.
+Use memoization for prototyping; harden the hot or input-driven paths.
+
+-- pause --
+Drill 13, State definition, the hardest part.
+
+Q: Why is "defining the state" called the hardest part of DP?-- think --
+
+A: Because the recurrence is mechanical once the state is right, but the state is creative. Common mistakes: too few dimensions (recurrence wrong), too many (extra dimensions slow it down).
+The state must (a) uniquely identify a subproblem so memoization works, (b) be small enough that the state space is tractable, (c) expose the recurrence, adjacent states should relate via a few options.
+
+Cross-Q: Give a problem where state design matters.-- think --
+
+A: "Burst balloons", pop balloons in some order to maximize coin score (coins depend on neighbors). Natural state dp[i] (last popped) doesn't capture which balloons remain. Right state: dp[i, j] = max coins from popping all balloons in range (i, j) exclusive. Decision: which balloon to pop last.
+This inverted thinking ("pop last, not first") is the key insight; without it, the recurrence is wrong.
+
+Cross-Q²: How do you know if your state is right?-- think --
+
+A: Test with small n by hand. n set to 3 or n set to 4. Write what the answer should be; check if your recurrence produces it. If the recurrence gives a wrong answer for small n, the state is missing something.
+The trap: passing all unit tests on n at most 10 doesn't mean correctness, DP bugs often hide at specific state combinations only triggered by larger inputs.
+
+-- pause --
+Drill 14, Bitmask DP.
+
+Q: When is bitmask DP applicable?-- think --
+
+A: When state includes a subset of N items and N at most ~20-25. Encode the subset as a bitmask (32-bit int). Use cases: TSP (visited cities mask), assignment problem (assigned tasks mask), subset-sum variants, "best path visiting these nodes." Beyond N = 25, 225 approximately 33M states explodes.
+
+Cross-Q: Walk through bitmask state for TSP.-- think --
+
+A: State: dp[mask, current] = min cost of a path visiting cities in mask, ending at current. Transition: from dp[mask, u], try adding city v not in mask: dp[mask | (1<<v), v] = min(dp[., v], dp[mask, u] + dist[u, v]). Base: dp[{start}, start] = 0.
+Answer: min over u of dp[full Mask, u] + dist[u, start] (return to start).
+
+Cross-Q²: Why N set to 25 limit?-- think --
+
+A: Do the arithmetic rather than quoting the rule, memory is what binds first, and it is a two-line calculation. The table is 2N times N cells.
+At N set to 20 with a double cell that is 2²⁰ times 20 times 8 B approximately 168 megabytes; at N set to 22, approximately 738 megabytes; at N set to 25, approximately 6.7 gigabytes.
+A service pod does not have 6.7 gigabytes, so the feature does not exist at 25 regardless of how patient you are about C P U. The levers this exposes: halving the cell (integer minor units instead of double ) buys about one more city, and nothing buys five, because the table doubles per city.
+Say the arithmetic in the interview, it demonstrates you can derive the boundary instead of having memorised one, and it is the same "count the states, multiply by the cell size" move that sizes every other DP.
+
+-- pause --
+Drill 15, DP on trees.
+
+Q: What's "DP on trees" and how does it work?-- think --
+
+A: DFS on the tree; at each node, compute the answer as a function of its children's answers. State: dp[node] or dp[node, state]. Recurrence: combine children's results.
+Example: longest path in a tree, at each node, the longest path through it is max_child_depth(left) + max_child_depth(right) + 1; global answer is max over all nodes. O(N), one DFS.
+
+Cross-Q: Concrete example?-- think --
+
+A: "Maximum sum of a path from any node to any node in a tree." For each node u: down(u) = max sum of a path from u down to some descendant. Recurrence: down(u) = max(0, max over children c of (val(u) + down(c))). Global answer: max over all u of val(u) + max two highest down(c) values.
+The "path through u" connects two of u's subtrees. O(N) single DFS.
+
+Cross-Q²: When is DP on trees harder than DP on arrays?-- think --
+
+A: When state requires multiple values per node. Example: "house robber on a tree", at each node, track two states: (max if not robbed, max if robbed). Returning a tuple from the recursive call.
+The recurrence: not Robbed = max(child.not Robbed, child.robbed) summed over children; robbed = node.val + sum of child.not Robbed. Compose carefully; the tuple is essentially the state's second dimension.
+
+-- pause --
+Drill 16, What do you memoize into?.
+
+Q: You've decided on top-down. What do you store the memo in, in C sharp?-- think --
+
+A: Four options with different costs. T[] or T[,] with a sentinel, index arithmetic and a bounds check; right whenever the state is dense and indexed by small integers, which is most interview DPs.
+Dictionary, hash, bucket index, walk the chain in _entries; right when the state is sparse or the key isn't small integers. Key it with a ValueTuple, never an interpolated string.
+ConcurrentDictionary, same shape, safe to share, and its GetOrAdd factory runs outside the lock so it can execute more than once per key. IMemoryCache, when the memo must outlive the request and be evictable; needs SizeLimit and a per-entry Size or it grows forever.
+Sizing rule for the first: pre-size the dictionary with the expected state count, or a long run pays a sequence of full rehashes.
+
+Cross-Q: You picked int[] and initialised it to zero. What breaks?-- think --
+
+A: 0 is a legal answer in most DPs, so "not computed yet" and "the answer is zero" become indistinguishable. Reads miss forever, or worse, hit and return a value that was never computed.
+The same trap bites hardest with bool[] in a yes or no DP: false means both "no" and "unvisited", so only positive results are ever cached and the algorithm degrades back to exponential on precisely the inputs that answer "no".
+Fixes: a sentinel outside the value range ( Array.Fill(dp, -1) ), a parallel bool[] computed, or int?[], no boxing, but Nullable is a bool plus an int with alignment padding, so the cell goes from 4 bytes to 8 and the table doubles.
+
+Cross-Q²: CollectionsMarshal.GetValueRefOrAddDefault gives you get-or-insert in one hash. Why not use it for the memo?-- think --
+
+A: Because the documented contract is "items should not be added to or removed from the Dictionary while the ref TValue is in use," and recursive memoization violates it by construction:
+the computation you run to fill the slot recurses and inserts other keys, and any insert can trigger a resize that reallocates _entries.
+Your ref then points into the orphaned array and the write is lost, silently, with no exception, leaving the entry at its default and recomputing forever. It's the right tool for a tabulation-shaped fill where you compute the value first and take the ref second, and the wrong tool here.
+
+-- pause --
+Drill 17, Is your state sufficient?.
+
+Q: What does it mean for a DP state to be "correct"? Not "does it work", what's the property?-- think --
+
+A: Sufficiency: any two paths that arrive at the same state must have interchangeable futures.
+If two different prefixes both reach state s and the optimal continuation from s differs between them, s is not a state, it's a lossy summary, and memoization is then actively wrong, because the cache's whole premise is "same state, same answer." This is the Markov property;
+it's what makes caching legal rather than merely fast.
+
+Cross-Q: Test it on "maximum profit from at most K stock transactions."-- think --
+
+A: Propose (day). Two prefixes reach day 5, one having used all K trades and one none; their futures differ, so it fails. Add trades: (day, trades Used). Two prefixes reach (day 5, 2 used), one holding a share and one not; only one can sell tomorrow, so it still fails.
+Add the position: (day, trades Used, holding). Now the futures genuinely are interchangeable. Each failed test named exactly one missing dimension, that's the procedure, and it turns state design from a creative act into a checklist.
+
+Cross-Q²: What's the production smell that a state has gone insufficient?-- think --
+
+A: A new requirement containing the words "so far", "cumulative", "remaining", "up to", or "at most". Those phrases are dimensions.
+Adding such a rule to the transition without adding it to the state gives you a DP that is right whenever the constraint isn't binding, which is most inputs, and wrong for the extremes. The output stays plausible, so tests pass and monitoring is quiet; it surfaces in reconciliation months later.
+
+-- pause --
+Drill 18, Linear space and the path.
+
+Q: You space-optimised edit distance to two rows and the caller still needs the edit script. Now what?-- think --
+
+A: Hirschberg's algorithm. Split s1 at its midpoint. Run the forward rolling DP down to that row, keeping only the final row; run the same DP backwards from the end up to that row on reversed inputs, keeping only its final row; add the two rows elementwise and take the argmax.
+That column is where the optimal path crosses the midpoint, one point on the path, found in O(n) space. Recurse on the two quadrants. Work halves each level, so the total is about twice a single pass: O(m, n) time, O(min(m,n)) space, full reconstruction.
+
+Cross-Q: What's the cost you're accepting?-- think --
+
+A: A constant factor of time (roughly 2 times, from the geometric series) and considerably more code than "keep two rows." You're trading C P U for memory, which is the right trade when the table is the thing that OOMs you and the wrong trade when it isn't.
+The practical design is a threshold: full table a size where it's cheap, Hirschberg it.
+
+Cross-Q²: Where would I have seen this?-- think --
+
+A: Sequence alignment (it was published for exactly that, CACM 1975) and diff tools, Myers' diff algorithm, which git diff is built on, carries a linear-space refinement built on the same divide-at-the-middle idea.
+
+-- pause --
+Drill 19, The DP that costs you memory you didn't budget.
+
+Q: Your DP allocates its table per request. What do you have to know about that in dot NET?-- think --
+
+A: The 85,000-byte line. At or it, the object goes on the large object heap, which is collected only with generation 2 and swept rather than compacted by default.
+Dividing through (and allowing for the array header), an int[] crosses it a little over 21,000 elements and a double[] a little over 10,600.
+So a DP table that looks like an ordinary local variable can be the reason your service's garbage collector trigger reason is AllocLarge and its gen-2 rate is high.
+Microsoft's own LOH guidance says to pool and reuse large objects rather than allocating temporary ones.
+
+Cross-Q: So you switch to ArrayPool.Shared. What breaks?-- think --
+
+A: Two documented behaviours that DP code routinely assumes away. Rent(minimum Length) returns a buffer that is "at least" the requested length, so buffer.Length is no longer your table width and any loop bounded by it walks into another tenant's data.
+And the returned array "may not be zero-initialized", so every base case that relied on default is now reading whatever the previous renter left. Clear at exactly one end, Array.Clear(buf, 0, n) after rent, or Return(buf, clear Array: true), and take every bound from your own n.
+
+Cross-Q²: How would you decide between pooling and just making the table smaller?-- think --
+
+A: Make it smaller first, because it's strictly better: a rolling array that drops the table under 85,000 bytes removes the LOH problem and the pooling complexity and the initialisation hazard. Reach for the pool only when the table is irreducibly large.
+And measure the right column, [MemoryDiagnoser] 's Allocated is total churn per operation, not peak live set, so it answers "how hard is this on the collector," not "will this fit in the container." Those are different failure modes with different fixes.
+
+-- pause --
+Section 2. Self-test.
+
+Memoization is top-down: write the natural recursion, cache results in a dictionary or array keyed by state. Tabulation is bottom-up: explicitly iterate from base cases to the final answer, filling a table.
+Memoization is faster to write (mirrors the recursion you'd have written anyway), handles sparse state spaces (only computed states use memory), and is easier to debug.
+Tabulation has no recursion-stack overhead (safer for deep chains, n > 10⁵), allows space optimization (rolling arrays, drop dimensions you don't need), and often has better cache locality.
+Choose memoization for prototyping or sparse states; tabulation for production hot paths or when stack depth matters.
+
+Maintain tails[k] = smallest possible tail of any increasing subsequence of length k+1. For each a[i], binary-search the position in tails where a[i] would go (lower-bound, replacing the first tails[j] >= a[i] ). If a[i] exceeds all tails, append it (subsequence is one longer).
+Final answer: tails.Count.
+
+This isn't a literal LIS, tails doesn't hold the actual subsequence, but the count is correct. The O(n log n) comes from binary search inside an O(n) loop.
+
+Greedy wins when (a) the problem has the greedy choice property, locally optimal choices always lead to a globally optimal solution; (b) you can prove the property (exchange argument or matroid theory).
+Examples: activity selection (sort by end time, take non-conflicting), Dijkstra's relaxation (always extract min), Huffman coding, MST (Prim or Kruskal). Greedy is O(n log n) typically versus DP's O(n²) or O(n times W).
+Greedy fails on coin change with non-canonical denominations ( [1, 3, 4], target 6: greedy picks 4+1+1 set to 3 coins, DP finds 3+3 set to 2 coins). Rule: try greedy first if you can prove correctness; fall back to DP when local choices interact non-trivially.
+
+LCS recurrence: dp[i, j] = dp[i-1, j-1] + 1 if match, else max(dp[i-1, j], dp[i, j-1]). Notice the recurrence only references row i-1 (previous) and row i (current). You don't need rows 0.i-2 ever again.
+Replace the 2D table with two 1D arrays ( prev, curr ); after computing curr for row i, swap the references, a tuple deconstruction, not a copy. Memory drops from O(m times n) to O(2 times min(m,n)) approximately O(min(m,n)).
+
+Do the arithmetic, because it is what makes the optimisation worth doing: at m = n = 10⁴ the full table is (10⁴+1)² ints approximately 10⁸ cells times 4 bytes approximately 400 megabytes, on the large object heap and collected only with gen 2;
+two rows are 2 times 10,001 times 4 approximately 80 kilobytes in total, each row about 40 kilobytes, comfortably under the 85,000-byte LOH threshold, so each is an ordinary gen-0 allocation.
+The optimisation changes the kind of allocation, not just its size.
+
+Trade-off: the naive two-row form loses the table needed to reconstruct the actual subsequence, so only the length survives. For length-only queries, optimise freely.
+If you need the path and the space, the answer is Hirschberg's algorithm (linear space, full reconstruction, roughly 2 times the time), not "keep the full table."
+
+Work through what a probe actually costs, rather than reaching for a multiplier. (a) Every lookup does more work than an index.
+Dictionary hashes the key, masks it to a bucket, reads _buckets, then follows the int next chain through _entries comparing keys, versus an array index, which is a multiply-add and one bounds check the jit can frequently hoist out of a counted loop. (b) The access pattern is data-dependent.
+The bucket index comes from a hash, so consecutive states land in unrelated cache lines and the prefetcher cannot help; a table walk is sequential. (c) It may be growing under you.
+A memo that fills as the DP runs rehashes every entry into a larger _entries array each time it fills, pre-size it with new Dictionary(expected States). (d) Check the key isn't allocating.
+ValueTuple is a struct and does not box (its GetHashCode funnels into HashCode.Combine ), but an interpolated string key allocates on every probe including hits, which is the single most common version of this bug.
+
+The fix, when the state ranges are bounded (say 0 at most i at most 1000, 0 at most j at most 1000, 0 at most k at most 100 ): replace the dictionary with int[1001, 1001, 101] filled with a -1 sentinel.
+Before you do, price it, 1001 times 1001 times 101 times 4 bytes approximately 405 megabytes, which is on the large object heap and may be worse than the dictionary was.
+That calculation is the actual decision: array memo when the nominal state space is both bounded and affordable; dictionary when it is sparse, unbounded, or too big to allocate. And whichever you pick, settle "which is faster" with a [Params] sweep over state density, not with a remembered ratio.
+
+bool[] is zero-initialised, so false is simultaneously "the answer is no" and "I haven't computed this yet." Only positive results are ever recorded as cache hits.
+On an input whose answer is yes, the first success short-circuits the search and everything looks fine; on an input whose answer is no, every subproblem is recomputed and you are back to the exponential search the memo was supposed to remove.
+So the profile is not "uniformly slow", it is fast on yes, exponential on no, which is why a test corpus built from valid examples never catches it.
+
+Three fixes, in order of preference. A sentinel outside the value range: sbyte[] or int[] filled with -1, with 0 = no and 1 = yes; one array, one branch, one cache line. A parallel bool[] computed: no encoding, works for any value type, costs a second read.
+bool?[]: clearest to read, no boxing ( Nullable is a struct), but the cell carries a flag plus the value with alignment padding, so the table grows.
+
+The generalisation is the part worth saying: this is not a bool problem, it is a sentinel collision problem. int[] for a counting DP where zero ways is a real answer, or a minimising DP where zero cost is a real answer, has the identical defect.
+After choosing the memo type, finish the sentence "and the value meaning not yet computed is ___."
+
+The mechanism is the large object heap. Any object at or 85,000 bytes is allocated on the LOH, which is collected only during a generation 2 collection and is swept rather than compacted by default.
+Dividing through (allowing for the array header), an int[] crosses that line a little over 21,000 elements and a double[] a little over 10,600, so a per-request DP table of quite modest dimensions is a large object,
+and a stream of them drives gen-2 collections whose trigger reason a PerfView trace will show as AllocLarge, with an LOH survival rate near zero.
+That last detail is the tell: the objects are large and short-lived, which is the worst combination, because you pay full-heap collections to reclaim garbage that died immediately.
+
+The fix ladder, cheapest and safest first:
+
+Make the table smaller. Rolling arrays. If two rows put you under 85,000 bytes, the problem is gone entirely and you have added no complexity, no pooling, and no new failure mode. Always try this first.
+Reduce the cell. int instead of long, minor units instead of double, sbyte for a small enumeration. Halving the cell halves the table.
+Pool it. ArrayPool.Shared.Rent / Return, Microsoft's own LOH guidance recommends reusing a pool of large objects rather than allocating temporary ones.
+But this changes two contracts your DP probably depends on: Rent returns a buffer "at least" the requested length (so buffer.Length is no longer your width) and one that "may not be zero-initialized" (so default base cases are now garbage).
+Clear at exactly one end and bound every loop by your own n.
+stackalloc for genuinely small rows, behind a size guard, and never inside a loop, stackalloc releases at method exit, not iteration exit.
+
+Say which column you would measure, too: [MemoryDiagnoser] 's Allocated is total churn per operation, not peak live set. Churn is a throughput problem; live set is an OOM problem. This is the first.
+
+The O(n²) version indexes by position and stores a length: dp[i] = length of the longest increasing subsequence ending at index i, and the transition scans every j < i.
+The O(n log n) version swaps the state and the value: f[len] = the smallest value that can end an increasing subsequence of length len.
+
+That inversion is the whole algorithm.
+Because a longer increasing subsequence can never have a smaller tail than a shorter one, f is automatically sorted, so the transition, "find the shortest subsequence whose tail is at least x and improve its tail to x," becomes a binary search instead of a linear scan.
+Appending when x exceeds every tail is the case where the answer grows. f.Count at the end is the length. f itself is not the subsequence, which is why reconstruction needs a separate parent array.
+
+The reason to be able to say this rather than just code it: the same substitution is a general technique, not an LIS quirk. Whenever one dimension of your state ranges over something enormous and the quantity you are storing ranges over something small, trade them.
+Knapsack does it too, dp[i, c] = max value in capacity c costs O(n, C), while g[i, v] = minimum weight to reach value v costs O(n, ΣV), and you get to pick whichever of capacity and total value is smaller.
+Interviewers who ask "can you do better than O(n²)?" are usually asking whether you know this move exists.

@@ -1,0 +1,527 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, BFS versus DFS, when each.
+
+Q: I have a graph. When do I use BFS versus DFS?-- think --
+
+A: BFS (queue, level-by-level): shortest path in unweighted graphs, level-order tree traversal, bipartite check, connected components in undirected graphs.
+DFS (stack or recursion, deep-first): cycle detection, topological sort, strongly-connected components, path-finding when any path works, tree pre or in or post-order traversals.
+
+Cross-Q: Why doesn't BFS work for shortest path in weighted graphs?-- think --
+
+A: BFS commits a vertex to its level when first dequeued, equivalent to "shortest in hops." A weighted graph can have a 3-hop path of cost 1+1+1 set to 3 that's shorter than a 1-hop path of cost 10.
+BFS would finalize the 1-hop neighbor at distance "1 hop = whatever weight" and miss the cheaper multi-hop.
+Dijkstra (with priority queue) generalizes BFS to weighted by extracting minimum weight, not minimum hops.
+
+Cross-Q²: When does DFS need explicit-stack iterative form?-- think --
+
+A: Whenever the depth is driven by data you did not author, chained linked lists, deeply-nested Jason, package-dependency graphs with long chains.
+There is no fixed frame budget to quote: the default stack size comes from the executable header (Microsoft's docs cite 1 megabyte as that default) and frame size depends on each method's locals.
+What makes it non-negotiable is the failure mode, not the threshold: StackOverflowException cannot be caught and the process is terminated, so one malicious or malformed input takes down every in-flight request on that worker.
+Convert to iterative with an explicit Stack, heap-allocated, growable, and failing with a catchable OutOfMemoryException. If you must stay recursive, guard with RuntimeHelpers.TryEnsureSufficientExecutionStack(), which returns false while you still have a stack to return false on.
+
+-- pause --
+Drill 2, Cycle detection: directed versus undirected.
+
+Q: How does cycle detection differ for directed versus undirected graphs?-- think --
+
+A: Undirected: DFS, when visiting neighbor v from u, if v is already visited and v not equal to parent(u), there's a cycle. Parent check filters out the "back to where I came from" trivial back-edge. Directed: DFS with three colors (white, gray, black). Gray = currently on the DFS stack.
+Hitting a gray vertex = cycle (back-edge in DFS tree).
+
+Cross-Q: Why three colors for directed?-- think --
+
+A: Because "visited" alone is ambiguous. In directed graphs, a node can be visited and processed (black) without participating in the current path. Only gray nodes are on the current DFS path; reaching one means we've come back to where we started.
+Two colors (visited or unvisited) would false-positive on diamond shapes ( A to B to D, A to C to D, re-encountering D from a different path isn't a cycle).
+
+Cross-Q²: Can you detect a directed cycle without DFS?-- think --
+
+A: Yes, Kahn's algorithm (in-degree BFS). Repeatedly remove in-degree-0 vertices and decrement their neighbors. If all vertices are processed to no cycle. If some vertices remain (in-degree > 0 trapped) to cycle exists.
+Kahn's is simpler than three-color DFS and gives topological order as a side effect when there's no cycle. Doesn't reconstruct the cycle path; three-color DFS does.
+
+-- pause --
+Drill 3, Topological sort.
+
+Q: When is topological sort valid? When isn't it?-- think --
+
+A: Valid: directed acyclic graphs (DAGs). Output: any linear order respecting "u before v" for every edge u to v. Invalid: graphs with cycles, no linear order can satisfy a cycle (if A to B to A, A must come before B AND B before A, contradiction).
+Algorithms: Kahn's (BFS in-degree) or DFS post-order reversed.
+
+Cross-Q: How do you detect a cycle while doing Kahn's?-- think --
+
+A: Count vertices added to the result. If result count 0 forever), cycle exists. The trapped set contains every cycle plus everything downstream of one.
+It is not true that you must switch to three-colour DFS to name the cycle: within the trapped set every vertex has an incoming edge, so following predecessors from any of them must revisit a vertex within V steps, and the segment between the two visits is a real cycle.
+Three-colour DFS is more direct, but "Kahn's can't tell you where" is a myth worth being able to correct.
+
+Cross-Q²: Are topological orders unique?-- think --
+
+A: No, any valid order works. A to B, A to C, B to D, C to D has both A, B, C, D and A, C, B, D as valid orders. To get a deterministic order: replace the Queue with a PriorityQueue keyed on the vertex itself, which yields the lexicographically smallest valid order.
+Be precise about what that claims, determinism means "the same input always produces the same output", not "only one output is correct". Two different implementations can both be right and disagree, which is why comparing your build order against another tool's is not a test.
+
+-- pause --
+Drill 4, Dijkstra versus Bellman-Ford.
+
+Q: When does Bellman-Ford win over Dijkstra?-- think --
+
+A: When the graph has negative-weight edges. Dijkstra commits a vertex's distance when first dequeued (greedy), a later-discovered negative edge could provide a shorter path, but Dijkstra has moved on.
+Bellman-Ford does V-1 relaxation rounds, allowing negative weights to propagate through the graph. Also: Bellman-Ford detects negative cycles (running one extra round; if any distance still decreases, a negative cycle exists).
+
+Cross-Q: What's the cost?-- think --
+
+A: Bellman-Ford is O(V times E), slower than Dijkstra's O((V+E) log V). For sparse graphs (E approximately V), that's O(V²) versus O(V log V), order-of-magnitude slower. Use Dijkstra by default; reach for Bellman-Ford only when negative weights are inherent.
+
+Cross-Q²: Real-world negative weights, where?-- think --
+
+A: Currency arbitrage detection (negative cycle = profitable arbitrage loop). Energy minimization in physics simulations. Profit-maximization graphs (find maximum-profit path = negate weights and find shortest path). Routing protocols with cost adjustments.
+Rare in app code; common in optimization research.
+
+-- pause --
+Drill 5, A* versus Dijkstra, heuristic role.
+
+Q: What does A*'s heuristic do that Dijkstra doesn't have?-- think --
+
+A: A* prioritizes vertices by g(v) + h(v) where g is actual distance from source (Dijkstra has this) and h is estimated distance to target. The heuristic biases exploration toward the target, exploring fewer vertices than Dijkstra.
+With a perfect heuristic, A* visits only the optimal path's vertices.
+
+Cross-Q: What makes a heuristic "admissible"?-- think --
+
+A: It never overestimates the true distance to target. For grid pathfinding: Manhattan distance is admissible (you can never go faster than Manhattan in a grid with unit moves). Euclidean is admissible for any geometric graph. Straight-line distance is admissible for road networks.
+Non-admissible heuristics produce suboptimal paths, A* finds a path, not the shortest.
+
+Cross-Q²: When does A* degenerate to Dijkstra?-- think --
+
+A: When the heuristic always returns 0, h(v) = 0 is trivially admissible but useless. A* then prioritizes purely on g, becoming Dijkstra. When the heuristic equals the true distance, A* is perfect (one straight-line exploration).
+Real heuristics fall between, the closer to true distance, the faster A* runs.
+
+-- pause --
+Drill 6, Floyd-Warshall.
+
+Q: When do you use Floyd-Warshall?-- think --
+
+A: All-pairs shortest path on dense graphs where V is small enough that V³ fits your budget, measure that rather than quoting a threshold, since the constant is a few array reads and an add. Three nested loops, O(V³) time, O(V²) space, easy to implement and parallelize.
+For sparse graphs, Johnson's algorithm (V Dijkstra runs after a Bellman-Ford preprocessing) is O(V² log V + VE), faster.
+
+Cross-Q: Does Floyd-Warshall handle negative edges?-- think --
+
+A: Yes (without negative cycles). The recurrence d[i,j] = min(d[i,j], d[i,k] + d[k,j]) works for any edge weights. To detect negative cycles: after running, check if any d[i, i] < 0, that means there's a negative-cost path from i back to itself, that is, a negative cycle involving i.
+
+Cross-Q²: Why O(V³) and not faster?-- think --
+
+A: The algorithm considers each vertex k as a potential intermediate in the shortest path between every (i, j) pair. Three nested loops over V.
+There's no known substantially faster combinatorial all-pairs algorithm for general dense weighted graphs, the known improvements shave sub-polynomial factors and are not practical. Reason about the growth rather than quoting a runtime: the work is V³, so each doubling of V is eight times the work.
+Measure once at a V you have, then scale by the cube to find where your budget runs out; the constant per operation is a few array reads and an add, so the arithmetic transfers reasonably well across machines. Beyond that point, switch to Johnson's or a sparse-specific approach.
+
+Cross-Q³: What's the one-token bug people ship in Floyd-Warshall?
+
+A: Putting k anywhere but the outermost loop. The invariant is "best i to j route using only 0.k as intermediates", which requires the whole matrix to be updated for one k before the next begins. for i { for j { for k } } } compiles and produces plausible output that is wrong for some pairs.
+The close second is leaving dist[i, i] at infinity, which silently disables the dist[i, i] < 0 negative-cycle test.
+
+-- pause --
+Drill 7, MST: Prim versus Kruskal.
+
+Q: When does Prim's algorithm beat Kruskal's for MST?-- think --
+
+A: Dense graphs. Prim grows the tree one edge at a time using a priority queue of frontier edges; O((V+E) log V). Kruskal sorts all edges by weight, then adds them in order if they don't create a cycle (using union-find); O(E log E). Dense E approximately V² to Prim wins.
+Sparse E approximately V to Kruskal wins.
+
+Cross-Q: What does union-find do in Kruskal?-- think --
+
+A: Maintains connected components incrementally. Each vertex starts in its own component. When considering an edge (u, v): if Find(u) == Find(v), they're already connected, adding this edge creates a cycle, skip. Else Union(u, v), merges their components.
+After processing all edges (in sorted order), the kept edges form the MST.
+
+Cross-Q²: Why is union-find effectively O(1)?-- think --
+
+A: With path compression + union-by-rank, the amortized complexity is O(α(n)) where α is the inverse Ackermann function. α grows so slowly that for any practical n ( at most 265536), α(n) at most 4. So amortized O(1) for all practical inputs, though worst-case for a single op is O(log n).
+
+-- pause --
+Drill 8, SCC, Tarjan versus Kosaraju.
+
+Q: Strongly-connected components, Tarjan or Kosaraju?-- think --
+
+A: Both are O(V + E). Tarjan: single DFS pass, tracks lowlink (smallest index reachable from this node). Conceptually denser. Kosaraju: two DFS passes, first on G to get finish order, second on G-reversed in reverse finish order. Each DFS tree in the second pass is one SCC.
+Conceptually simpler; easier to remember.
+
+Cross-Q: When is the distinction practically relevant?-- think --
+
+A: Rarely in app code. Both have constant-factor differences (Tarjan slightly faster, Kosaraju easier to parallelize because the two passes are independent).
+For interview: knowing both exists and they're O(V+E) is enough; implementation often deferred to libraries, QuikGraph, not the unmaintained CodePlex-era QuickGraph whose name it deliberately misspells.
+
+Cross-Q²: What problems are SCC solutions used for?-- think --
+
+A: Compiler optimization (each SCC in the call graph can be analyzed as a single unit), dead-code elimination (unreachable SCCs are dead), 2-SAT (implication graph SCCs determine satisfiability), social-network "communities" (loose SCC variant), web graph "cycles" of mutually-linking pages.
+Most app code never needs SCC; recognize the pattern in academic / systems contexts.
+
+-- pause --
+Drill 9, Bipartite check.
+
+Q: How do you check if a graph is bipartite?-- think --
+
+A: BFS or DFS with 2-coloring. Start at any vertex, color it 0. Color all neighbors 1; their neighbors 0; et cetera If you ever encounter a neighbor that's already colored the same as the current vertex, not bipartite. If the BFS completes without a same-color conflict, bipartite.
+
+Cross-Q: What if the graph is disconnected?-- think --
+
+A: Run the BFS from each unvisited vertex (across all components). The graph is bipartite iff every component is bipartite. A disconnected forest of bipartite components is itself bipartite.
+
+Cross-Q²: What's a real-world use of bipartite check?-- think --
+
+A: Job assignment (workers versus tasks, bipartite if you can model them as two groups with edges meaning compatibility). Conflict scheduling (two teams, edges meaning "can't be in the same group"). Cross-platform tests (server versus client, bipartite means tests don't cross types).
+Less common: chemical compound matching, document classification with two classes.
+
+-- pause --
+Drill 10, Graph representation, list versus matrix.
+
+Q: When do you use adjacency list versus adjacency matrix?-- think --
+
+A: Adjacency list for sparse graphs (E ≪ V²), memory O(V + E). Iterating a vertex's neighbors is O(degree(v)). Edge existence check is O(degree(v)). Adjacency matrix for dense graphs (E approximately V²) or fast edge-existence check, memory O(V²).
+Edge check is O(1); neighbor iteration is O(V) regardless of degree.
+
+Cross-Q: For 10⁶ vertices and 10⁷ edges, which?-- think --
+
+A: Adjacency list, clearly.
+A matrix would need 10¹² entries, which exceeds the runtime's own limit before it exceeds your RAM: the maximum number of elements in a dot NET array is UInt32.MaxValue ( approximately 4.29 times 10⁹), a cap that even enabling gcAllowVeryLargeObjects explicitly does not lift.
+Count the list instead of quoting a figure: as CSR the whole graph is int[] row Ptr of 10⁶ + 1 entries plus int[] col Idx of 10⁷ entries, so 1.1 times 10⁷ times 4 bytes approximately 44 megabytes in two allocations.
+As Dictionary> the same information costs the same 4 bytes per edge plus a million List objects, a million backing arrays, and a million dictionary entries, same asymptotics, an order of magnitude more bytes, and a garbage collector that has to walk every one of those objects.
+
+Cross-Q²: Are there hybrids?-- think --
+
+A: Yes. Compressed sparse row (CSR), used in scientific computing. Two arrays: row Ptr[V+1] (offset into adjacency list) and col Idx[E] (neighbor vertices). O(V + E) memory like adj list, but more cache-friendly (contiguous arrays).
+Iterating neighbors of v is col Idx[row Ptr[v].row Ptr[v+1]], sequential read. Common in graph databases and ML graph libraries.
+
+-- pause --
+Drill 11, Union-find / disjoint set.
+
+Q: What problems naturally fit disjoint-set / union-find?-- think --
+
+A: Anything involving dynamic connectivity, "are these two things in the same group?" Examples: Kruskal's MST (group vertices into connected components), network connectivity (online queries:
+is A reachable from B?), image segmentation (group pixels by similarity), social-network "is this person in any of these communities?", cycle detection in incremental edge addition.
+
+Cross-Q: How does path compression speed things up?-- think --
+
+A: When finding the root of a tree, point every node on the path directly to the root. Subsequent Find on those nodes is O(1) instead of walking the chain. Combined with union-by-rank (always attach the smaller tree under the larger), total amortized cost is O(α(n)) per operation.
+
+Cross-Q²: How would I implement union-find in 20 lines of C sharp?-- think --
+
+A: class UnionFind { int[] parent; int[] rank; public UnionFind(int n) { parent = Enumerable.Range(0, n).ToArray(); rank = new int[n]; } public int Find(int x) { if (parent[x] != x) parent[x] = Find(parent[x]); return parent[x]; } public bool Union(int a, int b) { int ra = Find(a); int rb = Find(b);
+if (ra == rb) return false; if (rank[ra] < rank[rb]) (ra, rb) = (rb, ra); parent[rb] = ra; if (rank[ra] == rank[rb]) rank[ra]++; return true; } }.
+Path compression in Find; union-by-rank in Union.
+
+-- pause --
+Drill 12, Eulerian versus Hamiltonian.
+
+Q: What's the difference between Eulerian and Hamiltonian paths, and which is NP?-- think --
+
+A: Eulerian path: visit every edge exactly once. Hamiltonian path: visit every vertex exactly once. Eulerian: O(V + E), exists iff all edges lie in a single connected component and exactly 0 or 2 vertices have odd degree (undirected).
+Quoting the degree condition without the connectivity condition is the standard slip: two disjoint triangles have every vertex at even degree and no Eulerian path at all. Hamiltonian: NP-complete, no known polynomial algorithm.
+The asymmetry is famous: traversing edges is easy; traversing vertices is hard.
+
+Cross-Q: How do you find an Eulerian circuit?-- think --
+
+A: Hierholzer's algorithm. Start at any vertex; follow edges, removing them as you traverse, until you return to start (Eulerian circuit, closed loop). If the original graph still has edges, splice in another circuit from a vertex that's already in your circuit. O(V + E) total.
+The classic example: solving the Königsberg bridges problem (Euler's 1736 origin of graph theory).
+
+Cross-Q²: Why is Hamiltonian hard while Eulerian is easy?-- think --
+
+A: Information theoretic. Eulerian's degree-parity condition is a local property, each vertex checks its own degree. Hamiltonian requires a global tour where each vertex is constrained by every other vertex's tour position. The decision tree has n! permutations to consider; no shortcut is known.
+Hamiltonian is NP-complete; TSP (Hamiltonian + minimize weight) is its weighted variant.
+
+-- pause --
+Drill 13, Recursive DFS stack overflow.
+
+Q: When does recursive DFS blow the stack?-- think --
+
+A: When depth is unbounded by anything you control. On a chain graph ( 1 to 2 to 3 to. to n ) DFS depth is n.
+Resist quoting a frame count:
+the Thread constructor documents maxStackSize as "the maximum stack size, in bytes. or 0 to use the default maximum stack size specified in the header for the executable", so the default is a PE-header value on Windows (Microsoft's docs cite 1 megabyte) and a ulimit on Linux;
+how many frames fit depends on locals, spills, and inlining.
+The number that matters is not a threshold but a consequence: per Microsoft's docs, "You can't catch a StackOverflowException object with a try / catch block, and the corresponding process is terminated by default."
+
+Cross-Q: How do you fix it?-- think --
+
+A: Convert to iterative with explicit Stack. Heap-allocated, grows like a List, and fails with a catchable OutOfMemoryException.
+Pattern: var stack = new Stack(); stack.Push(start); while (stack.TryPop(out var v)) { if (!visited.Add(v)) continue; foreach (var n in neighbors(v)) if (!visited.Contains(n)) stack.Push(n); }.
+If you genuinely need recursion (post-order over a tree with lots of per-frame state, say), guard each call with RuntimeHelpers.TryEnsureSufficientExecutionStack(), which returns false rather than killing the process, or cap the depth explicitly and return a 4xx.
+
+Cross-Q²: What about Task.Run to get a larger stack?-- think --
+
+A: It doesn't help, Task.Run schedules onto thread-pool threads, which take the same default stack size. There is no StackSize property on Thread; the size is a constructor argument only, so the crude fix is new Thread(Work, 32 1024 1024).Start();.
+Microsoft's own remarks on that overload say "Avoid using this constructor overload. If a thread has memory problems, the most likely cause is programming error, such as infinite recursion", which is the interviewer's point.
+A bigger stack moves the cliff without removing it, and you have now dedicated a whole thread and 32 megabytes of reserved address space to postponing the crash. Rewrite to iterative.
+
+-- pause --
+Drill 14, Shortest path in unweighted.
+
+Q: I have an unweighted graph (or all weights are 1). What's the shortest-path algorithm?-- think --
+
+A: BFS. Since every edge has the same cost, BFS's level-by-level exploration is exactly shortest-path. parent[v] tracks where each vertex was reached from; reconstruct path by walking parent pointers from target back to source. O(V + E) time, O(V) space.
+
+Cross-Q: Can I use Dijkstra instead?-- think --
+
+A: Yes, but it's overkill, Dijkstra's priority queue is unnecessary when all weights are equal. BFS's plain queue gives the same answer with less overhead. Dijkstra on unweighted is O((V+E) log V); BFS is O(V+E). Use BFS.
+
+Cross-Q²: 0-1 weights, both 0 and 1 only?-- think --
+
+A: 0-1 BFS with a deque. When relaxing an edge: if weight 0, add neighbor to front of deque; if weight 1, add to back. The deque maintains the "process in distance order" invariant without a priority queue. O(V + E), better than Dijkstra's O((V+E) log V).
+Common in grid-based pathfinding with "teleport" (weight 0) edges.
+
+-- pause --
+Drill 15, Dependency resolution, topo sort.
+
+Q: How does NuGet / MSBuild resolve dependencies?-- think --
+
+A: Build a directed graph where each package or project is a vertex, then topologically sort it. State the edge orientation before anything else, because it decides whether the answer is right or exactly backwards. A topological sort emits u before v for every edge u to v.
+So if you draw "A depends on B" as A to B, the sort gives A, B, dependency last, which is the reverse of a build order. Either orient edges dependency to dependent ( B to A, "B enables A"), or keep A to B and reverse the result.
+MSBuild states its convention in the A P I surface: ProjectGraph.ProjectNodesTopologicallySorted is documented as "Referenced projects appear before the referencing projects." With the orientation fixed, Kahn's algorithm does the rest:
+start with in-degree-0 vertices, append to the result, decrement neighbours' in-degrees, repeat; if the result is shorter than the vertex count, there is a cycle.
+
+Cross-Q: What if there are multiple valid topological orders?-- think --
+
+A: Pick one deterministically, replace the Queue with a PriorityQueue keyed on the vertex identifier, so whenever several vertices are simultaneously ready the smallest name wins.
+That makes the output a function of the input alone, which is what reproducible builds require; without it, the seed order comes from Dictionary enumeration and can change with insertion history or a runtime upgrade.
+Non-determinism here surfaces as "this build only fails on agent 3" in ordering-sensitive scripts, which is among the worst classes of bug to chase. Note the distinction the interviewer is probing: deterministic not equal to unique.
+Many valid orders still exist; you have only made your choice among them stable.
+
+Cross-Q²: How does dependency resolution handle versions?-- think --
+
+A: It doesn't fit neatly into pure topological sort, versions create a constraint-satisfaction problem. NuGet's resolver picks compatible versions across the dependency tree (for example, "library A requires B 1.x, library C requires B 1.5+").
+Resolution is NP-hard in general (similar to SAT); NuGet uses heuristics. The topological sort step follows version resolution, once versions are pinned, build order is a simple topo sort.
+
+-- pause --
+Drill 16, PriorityQueue internals.
+
+Q: You're using PriorityQueue for Dijkstra. What is it internally, and what does that cost you?-- think --
+
+A: An array-backed quaternary min-heap, dotnet or runtime's PriorityQueue.cs declares Arity = 4 / Log2Arity = 2 and says so in the header comment.
+Four children per node means depth log₄n instead of log₂n, so Enqueue (sift up, one comparison per level) walks fewer levels and the four children of any node are contiguous in the backing array. Dequeue (sift down) pays for it with more comparisons per level.
+Since Dijkstra with lazy re-insertion does many more enqueues than dequeues, the trade suits it. Be ready to say "not a binary heap", that is the whole point of the question.
+
+Cross-Q: There's no DecreaseKey. dot NET 9 added Remove, can you build one from it?-- think --
+
+A: Mechanically yes, Remove(v, out, out ) then Enqueue(v, better). Do not. The docs describe Remove as locating the first matching element, which is a linear scan of the heap array, so a decrease-key built on it is O(V) and turns Dijkstra quadratic.
+The correct pattern is unchanged: enqueue the improved entry and skip stale ones on dequeue with if (u Dist > dist[u]) continue;. Remove exists for one-off surgical deletions, cancelling a scheduled item, not for relaxation.
+
+Cross-Q²: Your routing A P I returns different-but-equal-cost routes on repeated identical calls. Where's the bug?-- think --
+
+A: Not a concurrency bug, a missing total order. The heap is not stable and makes no promise about equal priorities, so the winner among tied paths is whatever the internal array layout produces, and that layout depends on insertion history.
+Two fixes stack: accumulate costs in an exact integer type so paths that should tie actually do (accumulated double s tie only by luck), and enqueue a composite priority such as (cost, carrier Id) with an IComparer so genuine ties resolve on a property of the input.
+Related trap: UnorderedItems enumerates in heap-array order, not priority order, the name is the documentation.
+
+-- pause --
+Drill 17, Representation as the optimisation.
+
+Q: Your BFS over a million-vertex graph is slow, and the profiler shows most of the time in Dictionary.FindValue. The algorithm is textbook-correct. What now?-- think --
+
+A: The algorithm is not the problem; the representation is. Dictionary> costs a hash, a bucket probe and a possible chain walk per vertex expansion, then two dereferences to reach neighbour data scattered wherever the allocator put each List<>.
+Convert to CSR: number the vertices 0.V-1 once, then hold int[] row Ptr of length V+1 and int[] col Idx of length E, where the neighbours of v are col Idx[row Ptr[v]. row Ptr[v+1]).
+Neighbour lookup becomes two array reads and a Span slice, no hashing, no pointer chasing, and the neighbour run is contiguous so the prefetcher works. Complexity is identical; what changes is what the C P U spends its time on.
+
+Cross-Q: What do you give up?-- think --
+
+A: Mutability of shape. Inserting an edge shifts every row Ptr entry after the insertion point, so CSR means rebuild-on-change.
+That is the right trade whenever a graph is loaded once and traversed many times, from a database, a manifest, a set of .csproj files, and the wrong trade for a graph edited during traversal.
+Building it is cheap: count edges per source into row Ptr, prefix-sum, then place each edge with a per-vertex write cursor. Two linear passes, no comparisons.
+
+Cross-Q²: What's the bigger win you get for free once vertices are integers?-- think --
+
+A: visited becomes a bool[V] instead of a HashSet, one byte and an array index instead of a hash and a probe. That usually matters more than the CSR conversion itself, because visited is tested once per edge while Neighbors is called once per vertex.
+For the vertex-key-to-index map that you build once and then only read, a FrozenDictionary (dot NET 8+) is the type designed for exactly that access pattern.
+
+-- pause --
+Drill 18, Critical path and parallel build order.
+
+Q: A 300-project solution builds in eleven minutes on a 32-core agent, and C P U sits mostly idle. Where do you look?-- think --
+
+A: At the critical path, the longest chain of dependent work through the project DAG. No amount of parallelism can beat it, because each link cannot start until the previous finishes.
+Compute it by relaxing in topological order with max instead of min: finish[v] = cost(v) + max over predecessors u of finish[u]. Because topological order guarantees every predecessor is final when you reach v, this is one linear pass.
+Keep a prev pointer to recover the chain itself, which is the actionable output: "these six projects, in series, are your eleven minutes."
+
+Cross-Q: Longest path is NP-hard. Why is this linear?-- think --
+
+A: Longest simple path is NP-hard on general graphs because the search must avoid revisiting vertices, and on a graph with cycles you can inflate a path indefinitely by looping.
+On a DAG neither problem exists: there are no cycles to loop, so every path is automatically simple, and topological order gives a valid evaluation order for the DP. Same reason you can negate all weights and run a shortest-path relaxation on a DAG but not on a general graph.
+This is the cleanest available example of "the structure decides tractability, not the size".
+
+Cross-Q²: How would you actually schedule the parallel build?-- think --
+
+A: Two options with a real trade-off. Level-synchronous: take the whole in-degree-0 set as one level, run it with Parallel.ForEachAsync, decrement, form the next level.
+Simple, deterministic, easy to log, and wasteful, because every project in level 3 waits at a barrier for the slowest project in level 2 even with no dependency on it. Barrier-free: start each project the instant its own in-degree hits zero, with a bounded task set or a TPL Dataflow ActionBlock.
+Keeps cores busy, much harder to debug and to reproduce. The number of levels is the critical path in hops; the widest level is the maximum parallelism the graph can ever use, which tells you whether a bigger agent would help at all.
+
+-- pause --
+Drill 19, Max flow and bipartite matching.
+
+Q: You have 40 engineers, 40 on-call shifts, and a table of who is eligible for which. Assign as many shifts as possible. What is this?-- think --
+
+A: Maximum bipartite matching, engineers on one side, shifts on the other, an edge for each eligibility.
+The standard reduction is to maximum flow: add a source with a capacity-1 edge to every engineer, a sink with a capacity-1 edge from every shift, capacity-1 on each eligibility edge, and run any max-flow algorithm.
+The unit capacities force each engineer and each shift into at most one pairing, so the maximum flow value is the size of the maximum matching. Edmonds-Karp (BFS-augmenting Ford-Fulkerson) is O(V, E²) in general; the specialised Hopcroft-Karp runs in O(E, √V) for bipartite graphs (CLRS 4th ed., ch.
+24-25).
+
+Cross-Q: What makes flow algorithms work at all, why isn't greedy enough?-- think --
+
+A: Residual edges. Greedy pairing gets stuck: assign engineer A to shift 1, and if A was the only person eligible for shift 2 while several people could cover shift 1, you have lost a shift with no local move that recovers it.
+Flow algorithms add a backward residual edge of capacity equal to the flow already pushed, so a later augmenting path can route through that reverse edge, which is exactly "un-assign A from shift 1, put someone else there, move A to shift 2".
+Every augmenting path found this way increases the total by one, and the algorithm stops only when no path remains. Undoing an earlier decision without backtracking is the whole idea.
+
+Cross-Q²: Where else does max-flow show up, and what's the theorem?-- think --
+
+A: The max-flow min-cut theorem: the maximum flow from source to sink equals the minimum total capacity of any set of edges whose removal disconnects them.
+That duality is why flow answers questions phrased as cuts, "what is the cheapest set of links an attacker must sever to isolate this datacentre?", "what is the least-cost way to partition these images into foreground and background?" (image segmentation is min-cut),
+"can this network survive any two link failures?" (edge connectivity is a max-flow computation).
+For bipartite graphs it also gives you König's theorem: the maximum matching equals the minimum vertex cover, which turns "assign the most people" and "cover every eligibility with the fewest people" into the same computation.
+
+-- pause --
+Drill 20, Cycles you didn't write.
+
+Q: SaveChanges throws "a circular dependency was detected in the data to be saved", and you never wrote a graph algorithm. Explain what happened.-- think --
+
+A: E F Core builds a dependency graph of the pending INSERT or UPDATE or DELETE commands on every SaveChanges and topologically sorts it ( CommandBatchPreparer to Multigraph.BatchingTopologicalSort ) so that the batch is emitted in an order that satisfies foreign keys and unique constraints inside the transaction.
+If the sort finds a cycle it throws, with the message templated from CoreStrings.CircularDependency: "Unable to save changes because a circular dependency was detected in the data to be saved:
+'{cycle}'." The usual cause is two entities inserted in the same call with required FKs pointing at each other, Customer.PrimaryAddressId non-nullable and Address.CustomerId non-nullable, which genuinely cannot be satisfied by any ordering, because each row needs a key that does not exist yet.
+
+Cross-Q: How do you fix it, and why is "just reorder the Add calls" wrong?-- think --
+
+A: Because the order you call Add in has no effect, E F Core computes the order itself from the model, which is the entire purpose of the sort.
+The fix has to change the graph, not the calling code: make one side of the pair nullable and write in two SaveChanges calls, inserting the rows first and setting the back-reference second.
+Same shape as breaking a project-reference cycle: you cannot reorder your way out of a cycle, you can only remove an edge.
+
+Cross-Q²: Name two other graph algorithms running inside tools you use daily.-- think --
+
+A: Microsoft's D I container runs cycle detection over the service-resolution chain ( CallSiteChain ), which is a three-colour DFS in disguise, the chain is the grey set, and resolving a service already on it is a back-edge; the exception even prints the A -> B -> C -> A path.
+MSBuild's static graph mode topologically sorts evaluated projects ( ProjectGraph.ProjectNodesTopologicallySorted ), and Roslyn's ProjectDependencyGraph exposes both GetTopologicallySortedProjects and GetDependencySets, the latter returning groups "with shared interdependency",
+which is a condensation by another name.
+
+-- pause --
+Drill 21, Multi-source BFS.
+
+Q: For every warehouse, find the distance to its nearest depot. There are 5,000 warehouses and 40 depots on a road graph with uniform-cost segments. How?-- think --
+
+A: One multi-source BFS, not forty single-source ones. Seed the queue with all 40 depots at distance 0 and run a single BFS; because all sources start on the same frontier, the first time any vertex is reached it is reached from its nearest depot. Total cost O(V + E) instead of O(40 times (V + E)).
+The mental model is a single virtual super-source with zero-cost edges to every depot, same trick Johnson's algorithm uses for reweighting and the same trick that fixes single-source negative-cycle detection.
+
+Cross-Q: Now the segments have travel times. What changes?-- think --
+
+A: BFS becomes Dijkstra, and the seeding is identical: enqueue every depot with priority 0 instead of one source. Everything else, the relaxation, the stale-entry skip, is unchanged. If you also need to know which depot won, carry it alongside: owner[v] = owner[u] whenever you relax u to v.
+That gives you the depot's service area for free, which is a Voronoi partition of the road network and usually the thing the business actually asked for.
+
+Cross-Q²: Same question, but you need the distance from every warehouse to every depot, not just the nearest.-- think --
+
+A: Now it is 40 separate Dijkstras, one per depot, because the "nearest wins" collapse is exactly what multi-source throws away. Run them from the depots, not the warehouses: 40 runs versus 5,000.
+On an undirected road graph distance is symmetric so this is free; on a directed one you run each Dijkstra on the reverse graph to get "distance to the depot". Choosing which side to run from is worth saying out loud, it is a two-orders-of-magnitude decision that costs one line.
+
+-- pause --
+Drill 22, Low-link: what it means and what else it buys.
+
+Q: Tarjan's algorithm "tracks lowlink values". Define lowlink precisely and say what the algorithm does with it.-- think --
+
+A: Two numbers per vertex. index[v] is the order v was discovered, assigned once. lowlink[v] is the smallest index reachable from v by descending zero or more tree edges into v 's subtree and then taking at most one edge back up to a vertex still on the stack.
+The algorithm is that definition plus one test: when v 's call returns, lowlink[v] == index[v] means nothing in v 's subtree found a route to anything discovered earlier and still open, so v roots a strongly-connected component and the component is the run of vertices v on the stack.
+Two details carry the correctness: the check is on Stack[w], not visited[w], an edge into an already-closed component must be ignored entirely, or its low value leaks backwards and merges two separate components, and the non-tree edge absorbs index[w], not low[w].
+The low[w] variant produces correct SCCs and destroys the meaning of low, which matters the moment you reuse the skeleton.
+
+Cross-Q: Why would you pick Tarjan over Kosaraju, given both are O(V + E)?-- think --
+
+A: One pass instead of two, and no reverse graph to build, Kosaraju needs the transpose, which is another O(V + E) of memory you may not want on a large graph.
+The bigger reason is the ordering: Tarjan closes a component only when nothing in it can reach anything still open, so every component it emits has already had all of its successors emitted.
+The output list is therefore the condensation in reverse topological order, reverse it and you have both the DAG and a valid order over it from a single traversal, with no second sort.
+Kosaraju's first pass gives you a finish order, but the components come out in the order the second DFS happens to find them.
+
+Cross-Q²: Same DFS skeleton, undirected graph. What else can low tell you?-- think --
+
+A: Bridges and articulation points, the single-point-of-failure questions.
+With low[v] redefined as "earliest discovery time reachable from v 's subtree via at most one back edge", a tree edge u to v is a bridge iff low[v] > disc[u], and a non-root u is an articulation point iff some child v has low[v] >= disc[u];
+the DFS root is one iff it has two or more children in the tree.
+The > versus >= is the whole distinction: a subtree that can climb back to u itself is still severed by deleting u, but the edge is no longer its only way in.
+The trap worth naming unprompted is that you must skip the parent edge, not the parent vertex, with two parallel links between u and v neither is a bridge, but the by-vertex form throws away both and reports one. In a redundancy audit that is the most expensive possible wrong answer.
+
+-- pause --
+Drill 23, Traversing a graph whose edges are network calls.
+
+Q: You need to crawl a dependency tree where fetching a node's children is an H T T P call. You parallelise the BFS with Parallel.ForEachAsync and the results become non-deterministic, occasionally a missing subtree. What broke?-- think --
+
+A: The visited set. HashSet is not safe for concurrent writes, and the failure is not a stale read, interleaved Add calls can leave the bucket and entry arrays structurally inconsistent, so a node that was already fetched can look unfetched and get re-claimed down a different path.
+There is a second bug underneath that survives making the set thread-safe: if (!visited.Contains(n)) { visited.Add(n);. } is check-then-act, and two threads can both pass the Contains.
+What a concurrent traversal needs is a single atomic claim, one operation that returns true to exactly one caller. ConcurrentDictionary.TryAdd is that operation; the BCL has no ConcurrentHashSet, and ConcurrentDictionary is the standing idiom for one.
+
+Cross-Q: You replace the queue with a Channel. How does the traversal know it is finished?-- think --
+
+A: Not by the channel being empty, empty and "eight workers are mid-fetch and about to publish more" are indistinguishable. Keep an Interlocked counter of vertices published but not yet finished.
+Increment it before writing to the channel and decrement it in a finally; the worker that takes it to zero completes the writer, which ends ReadAllAsync and therefore ForEachAsync.
+Both orderings people get wrong have quiet failure modes: incrementing after the write lets a worker see zero while another is about to publish, so the crawl stops early and returns a partial graph that looks plausible;
+decrementing outside a finally leaks the count on any thrown fetch, so the channel is never completed and the traversal hangs forever.
+
+Cross-Q²: Why not use a bounded channel for backpressure?-- think --
+
+A: Because here the producers and the consumers are the same workers. When the channel fills, every worker blocks inside WriteAsync, and the only thing that could drain it is a worker. That is a deadlock, and it will not reproduce on your small test graph.
+Backpressure has to come from somewhere other than the consumer: bound the concurrency with MaxDegreeOfParallelism, which is simultaneously your rate limit against someone else's service and belongs in configuration, not as a literal, and leave the channel unbounded.
+If you must bound it, use non-blocking TryWrite and decide explicitly what happens when it is rejected. The rule generalises: a bounded queue is only safe when producers and consumers are distinct.
+
+-- pause --
+Section 2. Self-test.
+
+Dijkstra fails on graphs with negative-weight edges. The settled-set formulation assumes that once a vertex is dequeued its distance is final, but a negative edge discovered later can beat it. Concrete four-vertex counterexample:
+
+Note that the error propagates: every distance computed through A inherits it. Second-order point worth having ready, the lazy formulation in this session has no settled set (it re-enqueues whenever a distance improves), so on this graph it happens to converge to the right answer.
+It is still the wrong algorithm, because the re-expansion count is unbounded (Johnson, JACM 20(3), 1973, exhibits graphs that take exponentially many steps) and it never terminates on a negative cycle.
+Fix: Bellman-Ford, O(V times E), whose V−1 rounds are precisely the missing bound, and whose V-th round detects negative cycles. For most production cases (road networks, network latency, shipping costs) all weights are non-negative; Dijkstra wins on speed.
+Reach for Bellman-Ford only when negative weights are inherent (currency arbitrage, energy gradients, profit-maximization graphs).
+
+The algorithm: start with vertices that have no incoming edges (in-degree 0); dequeue, append, decrement successors' in-degrees, enqueue any that hit 0. If the result has fewer vertices than the graph, a cycle exists.
+
+Three details that separate this from the version most candidates write. Seed every vertex, not just the dictionary keys, a sink vertex that only ever appears inside a successor list has no key of its own, so graph.Keys.ToDictionary(. ) misses it and in Degree[d]++ throws KeyNotFoundException.
+Guard graph[v] with TryGetValue for the same reason. And compare against in Degree.Count, not graph.Count, once sinks are included, those two numbers differ, and using the wrong one reports a phantom cycle on every graph that has a leaf.
+Swapping Queue for PriorityQueue is the fourth: it costs a log V factor and buys a reproducible build order.
+
+A* uses a heuristic h(v) to guide the search toward the goal, exploring fewer vertices than uninformed Dijkstra.
+It wins when (a) you have a single source-target pair (not all-pairs); (b) you have a meaningful, admissible heuristic, for road maps, straight-line distance; for grids, Manhattan distance; for puzzles, # of misplaced tiles.
+Loses when no good heuristic exists (abstract graphs, social networks), A* with a constant-zero heuristic degenerates to Dijkstra. Trade-off: A* is harder to implement correctly (admissibility, consistency), and using a non-admissible heuristic can return a suboptimal path.
+Choose Dijkstra for correctness-critical paths; A* for performance-critical paths where the heuristic is well-known.
+
+DecreaseKey requires finding an existing entry by value (not priority), which a heap doesn't support efficiently, finding by value is O(n). Some libraries maintain a side dictionary for value to heap-index, but that doubles memory and complicates the implementation.
+dot NET's design choice: keep the A P I simple, let users handle stale entries. Workaround in Dijkstra: don't try to update; just enqueue the new (shorter) distance, and on dequeue check if (popped.Priority > dist[v]) continue;, the stale entry is silently skipped.
+Cost: more enqueues (up to E instead of V), so the heap may temporarily hold V + E entries. Net: still O((V+E) log V), barely worse than textbook Dijkstra.
+
+Adjacency matrix at 10⁶ times 10⁶ = 10¹² booleans = 1 terabyte of memory (or 125 gigabytes even at 1 bit per entry).
+It also cannot be allocated as a single dot NET array at any memory budget:
+the runtime caps the total number of elements in an array at UInt32.MaxValue, about 4.29 times 10⁹, documented alongside gcAllowVeryLargeObjects as a limit that lifting the 2 gigabytes object-size cap explicitly does not change.
+So new bool[1_000_000, 1_000_000] is 10¹² elements and fails on the runtime's terms before it ever fails on RAM.
+
+The fix is an adjacency list sized at O(V + E).
+Most real-world graphs are sparse (average degree ≪ V), so count the storage explicitly rather than quoting a figure:
+at average degree 10 there are 10⁷ edges, which as int[][] is 10⁷ times 4 bytes = 40 megabytes of neighbour data plus 10⁶ array headers, and as CSR ( int[] row Ptr + int[] col Idx ) is 40 megabytes plus 4 megabytes with no per-vertex object at all.
+Two flat arrays versus a million small ones is also the difference between a graph the garbage collector never has to walk and one it does.
+Adjacency matrix only wins when (a) the graph is dense (E approximately V²) and (b) V is small enough that V² of your element type fits comfortably, where O(1) edge-existence checks pay for the memory.
+
+Because StackOverflowException is not an exception you can handle.
+Microsoft's documentation states it plainly: "You can't catch a StackOverflowException object with a try / catch block, and the corresponding process is terminated by default." No catch, no finally, no logging sink flush, no graceful 500.
+In a hosted service the whole worker process dies and takes every concurrent in-flight request with it, so a single crafted payload is a denial-of-service vector against every other user on that instance.
+Compare with a deep-but-bounded recursion that throws InvalidOperationException: one request fails, everyone else is unaffected.
+
+Two fixes, in order of preference. Rewrite iteratively with an explicit Stack, the stack then lives on the heap, grows like a List, and its failure mode is a catchable OutOfMemoryException. Use the (node, exiting) frame pattern if you need post-order.
+Or probe before recursing with RuntimeHelpers.TryEnsureSufficientExecutionStack(), which returns false while there is still stack left to return on (the paired EnsureSufficientExecutionStack() throws InsufficientExecutionStackException instead).
+Either converts an uncatchable process kill into an ordinary error you can map to a 4xx.
+What is not a fix: try / catch (does nothing), Task.Run (thread-pool threads take the same default stack size), or new Thread(work, 32 1024 1024), a bigger stack moves the cliff without removing it,
+and Microsoft's own remarks on that overload say to avoid it because "if a thread has memory problems, the most likely cause is programming error, such as infinite recursion."
+
+Both orders are almost certainly valid; topological order is not unique, and Kahn's algorithm resolves the choice among simultaneously-ready vertices by queue insertion order.
+If the initial in-degree-0 set is collected with foreach (var (v, d) in in Degree), that order comes from Dictionary enumeration, which is unspecified, it reflects insertion history, resize history, and the hash implementation, and is free to change between runtime versions.
+A different file-enumeration order on the CI agent is enough to change it.
+
+The fix is to make the tie-break a function of the input: replace Queue with PriorityQueue keyed on the vertex identifier, so among simultaneously-ready vertices the lexicographically smallest always wins.
+Cost is a log V factor on an O(V + E) algorithm; benefit is a build order that is byte-identical everywhere, which is a precondition for cached and reproducible builds.
+
+Be precise about the claim when you say it out loud: this makes the output deterministic, not unique. Many valid orders still exist and another correct implementation may pick a different one, so "our order differs from tool X's" is not evidence of a bug in either.
+The property you now have is that your own output is a pure function of your own input, which is the one the build cache actually needs.
+
+CSR replaces per-vertex hashing and pointer-chasing with two array reads and a contiguous slice, so it pays whenever the traversal inner loop dominates and the graph is read far more often than it is written:
+a call graph loaded from an analysis run, a road network loaded at startup, a project graph parsed from disk, anything served repeatedly from memory.
+The complexity does not change, it is O(V + E) before and after, which is exactly why this is a representation decision rather than an algorithm decision, and why the profiler shows it as time in Dictionary.FindValue rather than as a complexity problem.
+The secondary win is often larger than the primary one: once vertices are integers 0.V-1, visited becomes a bool[V], and visited is touched once per edge while Neighbors is touched once per vertex.
+
+It is the wrong call when the graph mutates during traversal, because inserting an edge shifts every row Ptr entry after the insertion point and forces a rebuild; when V is small enough that the whole graph fits in cache regardless, where you would be trading readability for nothing;
+or when vertex identity is genuinely dynamic (vertices created and destroyed at run time), since the 0.V-1 numbering is the thing CSR is built on.
+The honest senior answer names the measurement that would settle it: benchmark both representations on the same graph across a sweep of V with [MemoryDiagnoser], and report the crossover rather than a speedup, because the crossover transfers to other machines and the speedup does not.

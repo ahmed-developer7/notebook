@@ -1,0 +1,546 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Big-O formal versus colloquial.
+
+Q: What's the formal definition of f(n) = O(g(n)) ?-- think --
+
+A: There exist constants c > 0 and n₀ at least 0 such that f(n) at most c, g(n) for all n at least n₀. Plain English: "for large enough n, f grows no faster than g, ignoring constant factors."
+
+Cross-Q: Most people say "O(n)" when they actually mean Θ(n) (tight bound). Why does the distinction matter?-- think --
+
+A: Because "O" only bounds. Saying "quicksort is O(n²)" is technically true (the worst case fits), but "quicksort is Θ(n log n)" is what people mean about the average case. Mixing them confuses lower bounds with upper bounds.
+In academic papers, Θ is the precise claim; in interviews, "O" is used colloquially for Θ, pin down the speaker if precision matters.
+
+Cross-Q²: What's "Ω"? Why do we need a separate symbol?-- think --
+
+A: f(n) = Ω(g(n)) is the lower bound, f grows at least as fast as g. We need it for impossibility arguments: "any comparison sort is Ω(n log n)" means no comparison-based algorithm can do better. Without Ω, we can't prove lower bounds.
+In practice, Ω appears mostly in proofs and competitive programming; day-to-day analysis is dominated by O.
+
+-- pause --
+Drill 2, Amortized versus worst-case.
+
+Q: List.Add is "amortized O(1)", what does that actually mean and when does it matter?-- think --
+
+A: It means the average cost across a sequence of operations is O(1), even though individual operations may be O(n). For List.Add: most adds are O(1) (write to next slot); occasional resize is O(n) (allocate double, copy). Over n adds, total cost is ~3n, so per-add average is constant.
+
+Cross-Q: When does amortized analysis lie to you?-- think --
+
+A: When you care about latency rather than throughput. P ninety-nine-sensitive code (real-time, games, trading) cares about the single O(n) spike, one Add allocates a new array and runs an Array.Copy of every element, and the request that happens to trigger it pays the whole thing.
+Two further cases where the bound is simply not applicable: when the structure is shared, because the copy happens while every other thread waits on the lock; and when the sequence can rewind, because amortisation assumes you keep moving forward and never re-enter the expensive state.
+Worst-case-bounded structures ( SortedDictionary, always O(log n)) sometimes beat amortized-O(1) in latency-sensitive contexts even with worse throughput.
+
+Cross-Q²: How do you eliminate the resize spike for known-size workloads?-- think --
+
+A: Presize: new List(capacity: 1_000_000) or list.EnsureCapacity(1_000_000) (dot NET 6+). Allocates the backing array once at the target size; subsequent adds are guaranteed O(1) with no resize. Dictionary and HashSet take a capacity in their constructors and expose EnsureCapacity too.
+StringBuilder is the exception people include by mistake, its capacity hint still helps, but not for the same reason: StringBuilder is not a doubling array.
+Its own source describes it as "a linked list of blocks each of which holds a chunk of the string" ( MaxChunkSize = 8000 ), so a full chunk is followed by linking a new chunk, never by copying the existing text.
+Appending to a StringBuilder has no resize spike to eliminate; the one copy happens at ToString().
+
+-- pause --
+Drill 3, List.Add deep dive on amortization.
+
+Q: Walk through why List.Add averages O(1) given the doubling-resize strategy.-- think --
+
+A: Starting from capacity 0, the resizes happen at sizes 4, 8, 16,., 2k. Each resize at size 2k copies 2k elements. Total copy work across all resizes up to size n: 1 + 2 + 4 +. + n or 2 = ~n. Adding the n "write to slot" operations gives ~2n total work. Divide by n adds to O(1) amortized.
+
+Cross-Q: What if the growth factor were 1.5 instead of 2?-- think --
+
+A: Still amortized O(1), any constant growth factor > 1 gives amortized O(1), because the geometric series still converges; only the constant in front changes.
+1.5 is what Microsoft's C plus plus STL uses (libstdc++ and libc++ use 2, so "the C plus plus choice" is a myth); a smaller factor wastes less peak memory and resizes more often.
+dot NET's List is plainly 2 * _items.Length, clamped to Array.MaxLength, the source offers no cleverer rationale than that, and the constant-factor difference between 1.5 and 2 is rarely material.
+The interesting property of 1.5 that people cite, that freed blocks can eventually be coalesced and reused for a later growth, which doubling can never do, depends on the allocator, and does not apply to a compacting managed heap.
+
+Cross-Q²: What if growth were linear (for example, +10 per resize)?-- think --
+
+A: That breaks amortization. Resize work becomes 10 + 20 + 30 +. + n approximately n²/20, quadratic total. Per-add amortized: O(n). Linear growth is the textbook "wrong" choice; geometric growth is the right one.
+Same lesson applies to your own resizing code, if you're growing a buffer, double it, don't add a constant.
+
+-- pause --
+Drill 4, Average versus worst for HashSet.
+
+Q: When does HashSet.Add diverge from O(1) average to O(n) worst?-- think --
+
+A: When GetHashCode() produces collisions. With a good hash, each bucket has ~1-2 entries; lookup walks at most 2 entries to O(1). With a bad hash (for example, GetHashCode() goes to 0 ), all keys collide into one bucket; lookup walks all n entries to O(n).
+The average-versus-worst gap depends entirely on hash quality.
+
+Cross-Q: How does modern dot NET defend against pathological inputs?-- think --
+
+A: With adaptive randomized hashing, and the mechanism is more interesting than "it uses a random seed." A Dictionary built with the default comparer does not start out randomized, it starts with an internal NonRandomizedStringEqualityComparer, because the fast non-randomized hash is cheaper.
+TryInsert counts how many entries it walked in the collision chain; when that count exceeds HashHelpers.HashCollisionThreshold (100 in the current source) it resizes with forceNewHashCodes:
+true, recomputes every hash, and swaps in EqualityComparer.Default, whose string hashing is randomized with a per-process seed.
+So you pay for the defence only once an attack (or a genuinely awful key distribution) actually shows up.
+Two things follow: the mitigation is for string keys with the default comparer, supply your own comparer and you have opted out, and a dictionary resize is normally not a rehash, because each Entry stores its hash Code; this is the one case where it is.
+
+Cross-Q²: For my own types, what makes a good GetHashCode ?-- think --
+
+A: Combine fields with HashCode.Combine(a, b, c), its source states "xxHash32 is used for the hash code", which mixes properly rather than merely merging bits. Don't XOR raw values ( a.GetHashCode() b.GetHashCode() ), that collides for swapped fields, (a, b) versus (b, a). Don't return a constant.
+For records the auto-generated GetHashCode is high-quality; use record when the type is a value. One consequence worth knowing before it bites you: HashCode seeds itself from Interop.GetRandomBytes once per process, so HashCode.Combine(x) returns a different number in every run.
+It is fine for in-memory bucketing and catastrophic as a persisted key, a cache key shared across processes, a shard selector, or an ETag. Any hash that outlives the process must be an explicitly stable algorithm you chose (SHA-256, xx Hash with a fixed seed), never GetHashCode.
+
+-- pause --
+Drill 5, Big-O versus constants.
+
+Q: When do constants dominate Big-O in real systems?-- think --
+
+A: At small N or when the constant is huge. (1) O(n log n) mergesort loses to O(n²) insertion sort on small inputs, dot NET's own introsort encodes that judgement with IntrosortSizeThreshold = 16, which it stops partitioning and insertion-sorts.
+(2) An allocation-heavy O(n) algorithm can lose to an in-place O(n log n) one at any N, because allocations become garbage collector work.
+(3) Cache-friendly O(n) array iteration beats cache-hostile O(n) linked-list iteration by a wide margin, same Big-O, and the difference is entirely a constant that Big-O is defined to discard.
+
+Cross-Q: How do you detect when constants matter?-- think --
+
+A: Profile. dotnet-trace collect --profile cpu-sampling, BenchmarkDotNet, or the new dotnet-counters. Big-O reasoning narrows candidates; profiling picks the winner. Senior judgment: use Big-O to rule out options (avoid O(n²) on n set to 10⁶), then benchmark to choose among Big-O-equivalent options.
+
+Cross-Q²: Give an example where the better Big-O loses in practice.-- think --
+
+A: KMP string search versus string.IndexOf. KMP is O(n+m) worst case; the naive scan is O(n times m).
+But dot NET's IndexOf is a hand-vectorized naive scan, it loads a whole SIMD register of characters, compares them against the candidate in one instruction, and only falls back to a character-by-character check where the vector reports a possible hit.
+KMP cannot do that: its next comparison position depends on the result of the previous one, which is a serial dependency, so it processes one character at a time no matter how wide the machine is.
+On ordinary text the vectorized scan wins despite the worse asymptotic; KMP's bound only pays off on self-similar pathological input ( aaaab inside aaaa. a ).
+The reusable lesson is about the shape of the algorithm, not the multiplier: a data-parallel algorithm with a worse bound often beats a serial one with a better bound, because the model that produced the bound counts operations and the machine executes them many at a time.
+(Note also that vectorization here is written by hand in the BCL, not inferred by the jit, you get it by calling the BCL method, not by writing a loop that looks like it.)
+
+-- pause --
+Drill 6, Space complexity: auxiliary versus total.
+
+Q: What's the difference between auxiliary space and total space?-- think --
+
+A: Total space = input + everything else. Auxiliary space = everything except the input. Quicksort: input is O(n); auxiliary is O(log n) stack (recursion depth). Total O(n) (dominated by input); auxiliary O(log n).
+When papers say "in-place" they mean auxiliary O(1); total is still O(n) because the input exists.
+
+Cross-Q: Why does the distinction matter?-- think --
+
+A: For "can I sort this 10 gigabytes file with 1 gigabyte of RAM", total space is irrelevant (the file is on disk), but auxiliary tells you whether the algorithm fits in RAM. Mergesort needs O(n) auxiliary to doesn't fit. Heapsort needs O(1) to fits.
+External sort uses O(K) auxiliary to merge K sorted runs.
+
+Cross-Q²: What's the dot NET-specific gotcha with "auxiliary space"?-- think --
+
+A: Allocations trigger garbage collector. An algorithm with O(n) auxiliary may be slower than one with O(n log n) time and O(1) auxiliary, because the garbage collector pauses for the allocations.
+For latency-sensitive code (game loops, real-time pipelines), prefer in-place / Span / stackalloc algorithms even at worse asymptotic time, the lack of garbage collector churn dominates.
+
+-- pause --
+Drill 7, Recursion stack as space.
+
+Q: Does recursion depth count as space complexity?-- think --
+
+A: Yes. A frame holds the arguments, the locals the jit could not keep in registers, spilled register state and the return address, so its size depends on the method, but it is bounded and known at compile time, and depth d costs O(d) stack. For mergesort: depth = log n to O(log n) auxiliary.
+For naive quicksort on worst-case input: depth = n to O(n) auxiliary, and past some depth, a stack overflow.
+The thread's stack is a fixed reservation, not a growable region: on Windows the main thread's size comes from the executable's PE header, and threads you create take it from new Thread(start, maxStackSize).
+There is no equivalent knob for thread-pool threads, which is why "just recurse, it's a tree" is a bad default in a request handler.
+
+Cross-Q: How does the dot NET runtime guard against stack overflow in recursive algorithms?-- think --
+
+A: StackOverflowException itself is unrecoverable, the process is torn down and no catch runs, by design, because the runtime cannot guarantee enough stack to execute a handler.
+But the framework does give you a way to check before you recurse, and this is the part most people miss:
+RuntimeHelpers.EnsureSufficientExecutionStack(), which throws the ordinary, catchable InsufficientExecutionStackException, and RuntimeHelpers.TryEnsureSufficientExecutionStack(), which returns bool.
+Both "try to ensure there is sufficient stack to execute the average dot NET function." Call one at the top of each recursive step and a deeply-nested input becomes a 400 response instead of a dead process.
+This is exactly how the BCL's own recursive parsers protect themselves against hostile nesting depth.
+Beyond that, the defence is structural: convert to iteration with an explicit Stack (heap-allocated, bounded by memory rather than by the stack reservation), or impose an explicit depth limit, JsonSerializerOptions.MaxDepth exists for precisely this reason.
+
+Cross-Q²: When is the recursive form fine despite the stack risk?-- think --
+
+A: When depth is bounded by log n, balanced trees, divide-and-conquer with halving, mergesort, well-implemented quicksort with median-of-three pivot. For n = 10⁹, depth = 30. The recursion is clear and the stack is fine.
+Worry when depth could approach n: linear recursion, unbounded linked-list traversal, parsing deeply-nested user input.
+
+-- pause --
+Drill 8, Why is sorting Ω(n log n)?.
+
+Q: Prove that any comparison-based sort is Ω(n log n).-- think --
+
+A: Decision-tree argument. Any comparison-based sort can be modeled as a binary decision tree, each internal node is a comparison, each leaf is a permutation of the input. To sort, the tree must distinguish all n! permutations, so it has at least n! leaves. A binary tree with n!
+leaves has depth at least log₂(n!) approximately n log₂ n − n / ln 2 = Θ(n log n). The longest root-to-leaf path is the worst-case comparison count.
+
+Cross-Q: How do counting sort and radix sort beat the bound?-- think --
+
+A: They're not comparison-based. Counting sort uses the value of keys to index into a counter array, no comparisons. Radix sort processes digit by digit, again without pairwise comparison.
+The Ω(n log n) lower bound applies only to algorithms whose decisions are based on element comparisons; bucketing or keying algorithms operate on a different model.
+
+Cross-Q²: Why doesn't dot NET's Array.Sort just use counting sort for ints?-- think --
+
+A: Range. Counting sort needs O(range) auxiliary memory. For int (range = 2³² approximately 4 billion), that's 16 gigabytes of counter array, won't fit. Radix sort handles this in 4 passes (one byte at a time), but the constants are higher than introsort for typical data.
+dot NET's introsort is the safe default; if you know your range is small (for example, ages 0-150), you can implement counting sort yourself and win.
+
+-- pause --
+Drill 9, Counting / radix, n log n.
+
+Q: When can you sort O(n log n)?-- think --
+
+A: When keys are bounded-range integers (or convertible). Counting sort: O(n + k) where k = range; wins when k = O(n). Radix sort: O(d times n) where d = digits; wins when d is small (32-bit ints = 4 bytes = 4 passes). Bucket sort: O(n) average for uniformly-distributed reals in a known range.
+
+Cross-Q: Why doesn't this contradict the Ω(n log n) lower bound?-- think --
+
+A: The lower bound is for comparison-based sorts. Counting and radix don't compare elements, they index by key value directly. The bound is information-theoretic about comparison decisions; non-comparison algorithms aren't constrained by it.
+They trade information-theoretic optimality for assumptions about the data (bounded range, fixed-length keys).
+
+Cross-Q²: What's the catch for counting sort?-- think --
+
+A: Memory. A 10⁶-element array with values in [0, 10⁹) needs 4 gigabytes counter array to won't allocate. The "n + k" only wins when k is bounded. Practical sweet spot: integer arrays where k is comparable to n (for example, sort 10⁶ student grades 0-100, k = 100, n = 10⁶, counting sort blazes).
+For wide ranges: radix sort (handles each digit independently) or back to comparison sorts.
+
+-- pause --
+Drill 10, O(n) versus O(n + k).
+
+Q: When does O(n + k) differ from O(n) ?-- think --
+
+A: When k can grow independently of n. Counting sort is O(n + k); if k = O(n), the whole thing is O(n). If k = O(n²), it's O(n²). The distinction matters when discussing whether an algorithm is truly linear in input size or only linear plus a range-dependent term.
+
+Cross-Q: Give an example where collapsing O(n + k) to O(n) is wrong.-- think --
+
+A: Counting sort over a sparse range. n = 1000 elements, range [0, 10⁹). The algorithm needs a 4 gigabytes counter array, k dominates. Calling this "O(n)" hides the 10⁶ times memory blowup. The right characterization: O(n + k), and pick a different algorithm if k >> n.
+
+Cross-Q²: In Big-O notation, when do we drop one of two additive terms?-- think --
+
+A: When one is asymptotically dominated by the other. O(n + log n) to O(n) (log n is dominated). O(n + k) doesn't simplify because k is a free parameter, its relationship to n isn't specified. Big-O drops constants and dominated terms; free parameters stay.
+
+-- pause --
+Drill 11, P versus NP, interview surface.
+
+Q: What's P versus NP in 30 seconds?-- think --
+
+A: P = problems solvable in polynomial time on a deterministic machine. NP = problems where a proposed solution is verifiable in polynomial time. P = NP? is the open question: can every easily-verified problem also be easily solved? Most believe P not equal to NP, but it's unproven.
+NP-complete problems (SAT, TSP, Knapsack, Graph Coloring) are the hardest in NP, if any one has a polynomial solution, all do.
+
+Cross-Q: When does P versus NP show up in interviews?-- think --
+
+A: As a "what's the complexity" curveball. "Find the Hamiltonian path" to NP-complete; no known polynomial algorithm. "Is this graph 3-colorable" to NP-complete.
+The senior answer: recognize the problem as NP-complete, state "no known polynomial solution;
+we'd use heuristics (greedy, simulated annealing), approximation algorithms, or exact algorithms with exponential worst case but acceptable for small N." Don't invent a polynomial algorithm, interviewers know the problem is hard.
+
+Cross-Q²: What about TSP for small N?-- think --
+
+A: For N at most 20, bitmask DP gives O(N² times 2N) exact solution, practical. For larger N, exact is impossible; use approximations (Christofides for metric TSP: 1.5-approximation; nearest neighbor heuristic; or-tools / LKH library).
+Production code rarely solves exact TSP, it uses approximations sized to the time budget.
+
+-- pause --
+Drill 12, Master theorem.
+
+Q: When does the master theorem apply?-- think --
+
+A: For recurrences of the form T(n) = a, T(n or b) + f(n) where a at least 1, b > 1. It gives T(n) in closed form by comparing f(n) with n(log_b a).
+Three cases: (1) if f is smaller to T = Θ(n(log_b a)); (2) if f matches to T = Θ(n(log_b a), log n); (3) if f is bigger and regularity holds to T = Θ(f(n)).
+
+Cross-Q: Solve T(n) = 2T(n or 2) + n.-- think --
+
+A: a = 2, b = 2, f(n) = n. Compute n(log_b a) = n1 = n. f(n) matches to case 2 to T(n) = Θ(n log n). This is the mergesort recurrence. Same shape: T(n) = 4T(n or 2) + n² to a = 4, b = 2, f = n² = n(log_2 4) to Θ(n² log n) (matrix mult naive).
+T(n) = T(n or 2) + 1 to a = 1, b = 2, f = 1 = n0 = match to Θ(log n) (binary search).
+
+Cross-Q²: When does master theorem NOT apply?-- think --
+
+A: When subproblems aren't equal-sized ( T(n) = T(n or 3) + T(2n or 3) + n, Akra-Bazzi instead), when f is non-polynomial ( T(n) = T(n or 2) + log n, handled by extensions), or when a < 1 / b at most 1 (degenerate).
+For interview problems, master theorem covers ~80% of divide-and-conquer recurrences; the rest yield to recursion-tree analysis or substitution method.
+
+-- pause --
+Drill 13, Cache friendliness, when big-O lies.
+
+Q: Why is O(n) array iteration so much faster than O(n) linked-list iteration?-- think --
+
+A: Cache locality, and specifically the serial dependency in pointer chasing. Array elements are contiguous, so one cache-line fill brings in several elements at once and the hardware prefetcher, seeing a constant stride, can fetch lines the loop has not asked for yet.
+A linked list cannot be prefetched at all: the address of node k+1 is stored inside node k, so the memory system cannot begin the next fetch until the current one has landed. Every step is a full-latency dependent load.
+Same Big-O; the constant differs by roughly the ratio of a DRAM round trip to an L1 hit, which is orders of magnitude on modern hardware. LinkedList also costs an object header per element, so it uses more memory to hold the same data, which makes the cache behave worse still.
+
+Cross-Q: How does the jit exploit cache friendliness?-- think --
+
+A: Not directly, the win comes from the hardware prefetcher, which the jit enables by emitting a simple strided loop. What the jit does contribute is removing the work that would break the pattern: bounds-check elimination when it can prove the index is in range, and loop-invariant hoisting.
+The deeper point is about what can be vectorized:
+a Vector256 holds 8 int s and a SIMD instruction operates on all of them at once, but only if their addresses are known simultaneously, true for an array, structurally impossible for a linked list, where you must dereference to learn the next address.
+In dot NET this width is exploited by hand-written intrinsics in the BCL ( Span.IndexOf, SequenceEqual, TensorPrimitives ) and by System.Numerics.Vector in your own code, not by asking the jit to auto-vectorize an arbitrary loop.
+
+Cross-Q²: Are there cases where linked-list cache pattern doesn't hurt?-- think --
+
+A: When the working set fits in L1 or L2 cache (~32-256 kilobytes). For a 100-node linked list, all nodes likely fit in cache after one warmup pass; subsequent iterations are fast. But this is a corner case; for typical N > ~10⁴, the cache thrashes and array wins.
+
+-- pause --
+Drill 14, dot NET-specific allocation overhead.
+
+Q: How does allocation overhead show up in Big-O analysis?-- think --
+
+A: It doesn't, formally, Big-O is hardware-agnostic. But in dot NET, every allocation triggers garbage collector bookkeeping, occasional Gen0 collection (sub-millisecond), occasional Gen2 collection (10-100 milliseconds STW).
+An algorithm that's O(n) time but allocates O(n) objects can be slower than an O(n log n) in-place algorithm at production scale.
+
+Cross-Q: Give a concrete example.-- think --
+
+A: link's source.Where(p).Select(f).ToList() over a large array. Asymptotically O(n), one pass.
+In reality it allocates an iterator object per operator, a display class and delegate for each capturing lambda, an enumerator per operator when enumerated, and the result list with its own doubling growth;
+and it pays an interface MoveNext / Current call per element per operator, none of which the jit can inline through.
+The manual for loop with Add allocates the result list and nothing else, and reads the array directly.
+Both are O(n); the gap is entirely constant factor, which is why the honest answer is "measure it with [MemoryDiagnoser] on your element type" rather than a remembered multiplier, the ratio depends completely on how much work p and f do per element.
+
+Cross-Q²: When does the allocation cost not matter?-- think --
+
+A: When the inner work per element dominates. If f(x) is a database call or a 100-microsecond computation, the allocation overhead is negligible. link is fine for I O-bound or compute-heavy pipelines.
+The trap is using link in tight C P U-bound loops on primitive arrays, there, Span + manual loops win.
+
+-- pause --
+Drill 15, Tail-recursive versus iterative.
+
+Q: A tail-recursive function and its iterative equivalent both have the same Big-O. So why prefer iterative in C sharp?-- think --
+
+A: Because C sharp doesn't guarantee tail-call optimization. The jit can total cost of ownership in release mode but not always, and never in debug. The recursive version may grow the stack despite being structurally tail-recursive. F sharp ( tail.
+I L prefix) guarantees total cost of ownership; C sharp does not.
+For arbitrary recursion depth, write iterative.
+
+Cross-Q: Can I force tail-call optimization in C sharp?-- think --
+
+A: Not directly. You can write I L with the tail. prefix using System.Reflection.Emit (insane). You can rewrite as an explicit loop with an accumulator (the standard fix).
+You can use Func thunks and a manual trampoline (functional-style "step until done"), preserves the recursive structure with bounded stack.
+
+Cross-Q²: Is iterative always faster than non-tail recursion?-- think --
+
+A: Usually marginally, saves the call-frame setup and teardown. But the jit inlines small recursive methods sometimes, eliminating the gap. The bigger win is safety: iterative is bounded by available heap, which is large and growable; recursive is bounded by the thread's fixed stack reservation.
+For unbounded data structures (deep trees, long linked lists, large graphs), iterative is the correct choice independent of perf.
+
+-- pause --
+Drill 16, Amortised versus average versus expected.
+
+Q: List.Add is amortised O(1) and Dictionary lookup is O(1). Are those the same kind of claim?-- think --
+
+A: No, and the difference is what an adversary can do to you. Amortised averages over a sequence of operations and is a worst-case guarantee: no input makes n Add calls cost more than O(n) in total, because the argument is arithmetic about the doubling, not an assumption about data.
+Expected averages over randomness, dictionary lookup is O(1) provided the hash spreads the keys, which is a property of the hash function meeting the data.
+Average-case averages over an assumed distribution of inputs and is the weakest of the three: quicksort with a fixed pivot is O(n log n) "on average" only for inputs that are not sorted, and sorted input is extremely common.
+
+Cross-Q: Which of those three can an attacker break, and how does dot NET defend?-- think --
+
+A: Average-case and expected. Average-case is broken by sending the bad input, sorted data to a fixed-pivot quicksort, or a self-similar string to a backtracking regex. Expected is broken by predicting the hash, send keys that collide and every dictionary lookup becomes a linear chain walk.
+dot NET's defences are structural rather than statistical: Array.Sort bails from quicksort to heapsort at a recursion-depth limit, so the O(n log n) bound does not depend on the input at all;
+Dictionary with the default comparer switches to randomized string hashing after a collision chain crosses HashHelpers.HashCollisionThreshold, so the attacker cannot compute the colliding keys in advance;
+and RegexOptions.NonBacktracking (dot NET 7+) "guarantees linear-time processing in the length of the input," which converts a probabilistic hope into a bound.
+
+Cross-Q²: Give a case where the amortised bound is true and still the wrong thing to quote.-- think --
+
+A: Any shared structure.
+Ten worker threads appending to one List under a lock:
+the amortised argument still holds for the sequence, n adds still cost O(n) total copy work, but the copy now happens with nine threads blocked behind the lock, so the wall-clock cost of that one operation is multiplied by the number of waiters.
+Amortisation is a statement about total work on one structure, not about latency, and definitely not about concurrency. The same reasoning applies to a p99 SLO with a single thread: the customer whose request triggered the resize does not get to average it with the previous thousand.
+
+-- pause --
+Drill 17, Space complexity on a managed runtime.
+
+Q: An algorithm is "O(n) space." On dot NET, what did you just tell me?-- think --
+
+A: Not enough, because dot NET has three space quantities with three different failure modes. Total bytes allocated, everything ever handed out by the allocator; costs throughput via garbage collector work, and is what BenchmarkDotNet's Allocated column reports.
+Live set, what is reachable at the peak moment; that is what hits a container memory limit and causes an OOM kill. Stack, recursion depth; overflows uncatchably.
+A mergesort with an O(n) auxiliary array and a link chain that allocates one small object per element can have the same O(n) on paper: the first has a large live set (one big array, possibly on the LOH), the second has near-zero live set and large churn. Confusing them means fixing the wrong one.
+
+Cross-Q: What changes at 85,000 bytes?-- think --
+
+A: Microsoft Learn: "If an object is greater than or equal to 85,000 bytes in size, it's considered a large object" and is allocated on the large object heap. The LOH is collected only with generation 2, a full garbage collector, and is swept, not compacted, by default, so it fragments.
+The practical effect on an algorithm is a cliff, not a slope:
+an int[] auxiliary buffer is an ordinary cheap Gen0 allocation until it passes roughly 21,000 elements (85,000 divided by 4), and past that every call is contributing to full-garbage collector pressure and to fragmentation that nothing compacts.
+You can request compaction once via GCSettings.LargeObjectHeapCompactionMode, but the real answers are to chunk the buffer the threshold or to rent it from ArrayPool so it is allocated once and reused.
+
+Cross-Q²: Show me the pattern for O(n) auxiliary space with no heap allocation.-- think --
+
+A: A constant-size stackalloc for small inputs, ArrayPool the threshold, and a slice so the logical length is right:
+
+csharp.
+const int Threshold = 256;
+int[]? rented = null;
+Span buf = length <= Threshold.
+? stackalloc int[Threshold] // constant size, never stackalloc a variable.
+: (rented = ArrayPool.Shared.Rent(length));
+buf = buf[.length]; // Rent returns "at least" length.
+try { / work / } finally { if (rented is not null) ArrayPool.Shared.Return(rented); }.
+
+The three failure modes to name: stackalloc int[length] with attacker-influenced length is a stack overflow; using rented.Length instead of slicing processes stale data from the previous renter;
+and relying on zeroed memory is wrong because "the array returned by this method may not be zero-initialized."
+
+-- pause --
+Drill 18, The unit-cost assumption.
+
+Q: Dictionary.TryGetValue, is it O(1)?-- think --
+
+A: O(1) in the number of entries, which is what the table means, but not O(1) in work. Hashing the key reads every character, and a successful lookup compares the full key at least once, so each operation is O(k) in the key length.
+The complete statement is "O(k) with no dependence on n." For short identifier keys nobody cares; for keys that are URLs, serialized composite keys or file paths, k is a real term, and the fix is to shorten the key or hash it once and reuse the value, not to change the collection.
+
+Cross-Q: Where else does the unit-cost assumption break in ordinary dot NET code?-- think --
+
+A: Three places worth naming.
+Sorting strings: O(n log n) comparisons, each O(k), so O(n, k, log n), and if you did not pass a comparer, each comparison also runs culture-sensitive collation, because Comparer.Default goes through string.CompareTo,
+which Microsoft Learn documents as "a word (case-sensitive and culture-sensitive) comparison using the current culture." BigInteger: addition is linear in digit count and multiplication superlinear, so a loop that "just adds" is not O(n).
+Anything past RAM: at that point the unit is a page read, not a word read, and the right model is the external-memory one, which is exactly the argument for a B-tree index over a binary tree.
+
+Cross-Q²: How would you phrase the complexity of "look up 10 million users by email in a dictionary" in an interview?-- think --
+
+A: "O(n) lookups, each O(1) in the table size and O(k) in the email length, so O(n, k), and since k is bounded and small, effectively linear.
+The thing I would actually check first is the comparer: StringComparer.OrdinalIgnoreCase if emails are case-insensitive, because the default comparer for a Dictionary is ordinal case-sensitive, and getting that wrong produces a correctness bug that looks like a performance bug, every lookup misses,
+so the code falls into whatever slow path handles a miss."
+
+-- pause --
+Drill 19, Shrink-thrash and hysteresis.
+
+Q: You are designing a growable buffer. Growing doubles the capacity. When should it shrink?-- think --
+
+A: Not at 50%, that is the classic trap. Grow when full, shrink when half empty, then sit exactly at the boundary and alternate add or remove: every single operation reallocates and copies, so an amortised-O(1) structure becomes O(n) per operation on a workload that does nothing unusual.
+The fix is hysteresis, separate the two thresholds so that after a shrink you are nowhere near the grow point.
+Shrinking at 25% full to half the capacity is the standard choice: after shrinking, the buffer is 50% full, and it takes Θ(capacity) further operations to reach either threshold again, which restores the amortised bound.
+
+Cross-Q: What does dot NET do?-- think --
+
+A: It declines the problem. No BCL collection shrinks automatically. List, Queue, Stack, Dictionary and HashSet keep their high-water capacity for life unless you call TrimExcess yourself, and Dictionary.Remove does not even free the slot, it links it onto a free list for reuse.
+Even the explicit call has hysteresis built in: List.TrimExcess and Queue.TrimExcess compute int threshold = (int)(_items.Length * 0.9) and do nothing unless the count is it, so trimming a nearly-full collection is a no-op rather than a pointless copy.
+Dictionary.TrimExcess is the one that does more than resize:
+it calls CopyEntries, which copies only the live entries into a fresh array and resets _count and _freeCount, so it compacts away the tombstones as well, which is the only thing that lowers the enumeration cost described in Amortized analysis.
+
+Cross-Q²: What is the operational consequence of "never shrinks"?-- think --
+
+A: A collection is a high-water mark, not a live measurement. One traffic spike, one oversized batch, one replay of a backlog, and the backing array stays at that size for the lifetime of the object holding it, which for a singleton cache or a long-lived queue means for the lifetime of the process.
+It looks exactly like a leak in a memory graph and is not one, so the search for a rooted object goes nowhere.
+Two habits prevent it: call TrimExcess() after a known drain, and prefer a bounded structure ( Channel with a capacity, a fixed-size ring buffer) so that backpressure, rather than the buffer's peak, sets the memory ceiling.
+And the same high-water mark governs iteration cost on a Dictionary: its enumerator's loop bound is the peak entry count, not Count, because Remove frees a slot without lowering it.
+
+-- pause --
+Drill 20, Lower bound of the problem versus the algorithm.
+
+Q: You have written an O(n) scan over an unsorted array to find whether a value is present. Your interviewer asks: "can you do better?" What is the correct answer?-- think --
+
+A: Not for this problem as stated. The answer changes if any single element changes, so a correct algorithm must read every element, the problem is Ω(n), which is a statement about all possible algorithms, not just mine. Saying that out loud is the answer; offering a cleverer scan is not.
+The follow-up I would volunteer is what would have to change for a better bound to exist:
+a precondition (if the array were sorted, binary search is O(log n), sublinear because someone already paid Ω(n log n) to sort it), a precomputed index (build a HashSet once, O(n), and every subsequent probe is O(1), which only pays off if there is more than one probe), or giving up exactness.
+
+Cross-Q: What does "giving up exactness" buy, concretely?-- think --
+
+A: A different complexity class in exchange for a bounded error, and the trade is only safe if you know which direction the error can go. A Bloom filter answers membership with no false negatives and some false positives: "definitely not present" is authoritative, "possibly present" is not.
+That asymmetry is the whole design constraint, it means a Bloom filter is only ever correct as a pre-filter in front of an exact oracle, never as a replacement for one.
+Put it before a database lookup and its errors cost you a query you didn't need; put it in place of the database lookup and its errors cost you correctness. The same reasoning applies to HyperLogLog for distinct counts and Count, Min for frequencies: fine for a dashboard, wrong for a bill.
+None of the three is in the BCL, so you write it over a BitArray / ulong[] or take a dependency.
+
+Cross-Q²: Someone tells you their algorithm is "at least O(n log n)". What do you say?-- think --
+
+A: That the sentence has no content.
+O is an upper bound, so "at least an upper bound" bounds nothing, the phrase they want is Ω(n log n) if they mean "nothing can do better," or Θ(n log n) if they mean "this is tight." It sounds like pedantry and it is not:
+the same confusion is why people say "quicksort is O(n log n)" and then get surprised by the O(n²) worst case.
+O bounds and only above; if you want a floor you have to reach for a different letter.
+
+-- pause --
+Drill 21, Work, span, and why parallel didn't help.
+
+Q: You wrapped an O(n²) all-pairs comparison in Parallel.For and it got fast enough. Six months later the data doubled and it's slow again. What happened, in complexity terms?-- think --
+
+A: Nothing unexpected, parallelism reduced T_p, the time on p processors, and left T₁, the total work, exactly where it was. On p cores an O(n²) algorithm is O(n²/p): still quadratic, just divided by a constant.
+Doubling n multiplies the work by four, and the core count did not change, so the one division by p was consumed by a single doubling of the data. The general form is that parallelism buys you a constant factor once, and a growth curve spends that constant on its next doubling.
+Only changing the algorithm changes the class, here, bucketing by a cheap blocking key so the comparison happens within buckets, which turns "the square of the total" into "the sum of the squares of the bucket sizes."
+
+Cross-Q: What is span, and why does it matter more than core count?-- think --
+
+A: Span T∞ is the longest chain of operations that must execute in order, the critical path, and it is the time the algorithm would take on infinitely many processors. Two bounds hold at once: T_p at least T₁/p and T_p at least T∞.
+The ratio T₁/T∞ is the parallelism, the ceiling on speedup no matter how much hardware you buy. Amdahl's law is the same fact restated: if a fraction s of the work is inherently serial then T∞ at least s, T₁, so the best possible speedup is 1 or s.
+This is why the useful question about a parallel loop is not "how many cores" but "what did I serialise?"
+
+Cross-Q²: Give a concrete way a Parallel.For body creates its own serial term.-- think --
+
+A: Any shared mutable accumulator.
+A body that does lock (_gate) { _total += Compute(i); }, or appends every result to one List, or even hammers a single ConcurrentDictionary key, has put an Ω(n) chain in the middle of an otherwise parallel loop, the span is now linear and the speedup is capped,
+which shows up as "we added cores and nothing improved." The BCL's answer is the thread-local overload, Parallel.For(int, int, Func local Init, Func body, Action local Finally): each worker accumulates into its own TLocal and merges once in local Finally, so the serial term drops from n merges to p.
+Note this is the same shape as the argument in Drill 16 about a shared List under a lock, in both cases the per-operation analysis is fine and the sharing is what ruins it.
+
+-- pause --
+Drill 22, Where the complexity crosses a boundary.
+
+Q: A repository method returns IQueryable and a caller does .Where(o goes to o.Total > 100).Skip(page * 50).Take(50).ToList(). Where does the complexity analysis on this page apply, and where does it stop?-- think --
+
+A: It stops at the provider. IQueryable operators build an expression tree; nothing on this page's cost model runs until E F Core translates it and the database executes it, at which point the asymptotics belong to the query planner and the indexes. What I still own is the shape of what I asked for.
+Skip(page * 50) becomes OFFSET, and the E F Core docs are direct about it: "The database must still process the first 20 entries, even if they aren't returned to the application;
+this creates possibly significant computation load that increases with the number of rows being skipped." So the endpoint is O(offset + limit), flat-looking on page 1, a scan on page 500.
+Keyset pagination replaces the offset with a WHERE on the last key seen and makes it O(log n + limit), flat in page depth.
+
+Cross-Q: The same repository has a sibling returning IEnumerable. Why does that one type change matter more than it looks?-- think --
+
+A: Because it decides which side of the boundary the rest of the query runs on.
+Once the static type is IEnumerable, every subsequent Where executes in my process over rows already fetched, so an index seek becomes "fetch everything, then filter," identical link with a different complexity class and a different volume on the wire.
+AsEnumerable(), ToList() and AsAsyncEnumerable() are the explicit versions of the same switch. When I read a repository, I look for that line first: it is the boundary between two cost models, and the return type is the A P I's promise about where the boundary sits.
+A return type of IReadOnlyList says "already materialised, enumerate it as often as you like"; IQueryable says "nothing has run yet, and every operator you add changes the sequel."
+
+Cross-Q²: What is the complexity of exporting an entire table by looping over pages with Skip / Take ?-- think --
+
+A: Quadratic in the number of pages. Each page costs O(offset + size) and the offsets are 0, s, 2 seconds, 3 seconds., so the total is the sum of an arithmetic series, Θ(n²/s) for a table of n rows and page size s.
+It is a genuinely counterintuitive result because paging is chosen precisely to be the safe, bounded-memory option, and it is: it trades a constant memory budget for a quadratic time budget, and nobody writes the page index down as a variable.
+The diagnostic that gives it away is that increasing the page size barely helps, it divides the constant and leaves n² alone. Keyset pagination makes the same loop linear.
+
+-- pause --
+Section 2. Self-test.
+
+List has a backing array of capacity at least count. Most Add calls just write to the next slot, O(1). When count == capacity, the list allocates a new array of double the size and copies all existing elements, that single Add is O(n).
+The amortized analysis: across n Adds, total resize work is n + n or 2 + n or 4 +. + 1 = ~2n. Average per Add is 2, constant. Worst-case individual Add is still O(n), but if you Add n times the total cost is O(n), so the amortized cost per Add is O(1).
+The doubling strategy is what makes this work; linear growth (for example, +10 per resize) gives O(n) amortized.
+
+List.Insert(0, x) shifts every existing element right by one, O(n) per call. Inside an outer loop of n, total work is O(n²). At n = 100K, that's 10¹⁰ shifts, minutes.
+Fix options: (1) list.AddRange(items.Reverse()), O(n) total; (2) build a LinkedList if true head-inserts dominate (O(1) per insert); (3) use a Stack if order semantics fit (O(1) push); (4) build the result in reverse, then list.Reverse() once at the end, O(n).
+The textbook lesson: any operation at index 0 of a List should be rare or avoided; head-insert is the canonical anti-pattern.
+
+Small n with low constants. Insertion sort is O(n²) but has tiny constants and cache-friendly access, for n at most 16 it beats merge or quicksort. dot NET's Array.Sort exploits this: it's introsort + falls back to insertion sort when partition size drops ~16.
+Other examples: brute-force string match O(nm) often beats KMP O(n+m) for small patterns due to constant-factor advantage; nested loops over small arrays are sometimes faster than building a hash table. Rule of thumb: asymptotic wins matter at n at least ~100; that, profile.
+
+Master theorem case 2: a = 2, b = 2, f(n) = n. Compute n(log_b a) = n1 = n. Since f(n) = Θ(n(log_b a)), we're in case 2, solution is T(n) = Θ(n log n). This is the merge-sort recurrence: split into halves ( 2T(n or 2) ), merge in linear time ( + n ), total O(n log n).
+Same shape applies to Array.Sort (introsort), OrderBy (link stable sort), and balanced-tree operations. Recognize this recurrence on sight in interviews.
+
+Algorithmically, yes, Dictionary[key] is amortized O(1) for both read and write. Hidden costs: (a) dict[key] += 1 compiles to an indexer get followed by an indexer set, so it hashes and probes twice; CollectionsMarshal.GetValueRefOrAddDefault (dot NET 6+) returns a ref TValue from a single probe.
+(b) The hash and equality themselves are O(k) in the key, not O(1), if TKey is a string. (c) Hash quality, a bad GetHashCode degrades every probe to a chain walk. (d) KeyNotFoundException if key is absent on the get path; TryGetValue or the ref form avoids it.
+The tight version, which is one probe rather than two and also removes the missing-key branch:
+
+Note the return is a ref into the dictionary's entries array, so it is invalidated by anything that resizes the dictionary, use it and be done with it, do not hold it across an insert.
+
+Those are two different quantities and only one of them is a problem. Allocated, total bytes handed out over time, is a throughput cost: every allocation is a cheap pointer bump, but the volume determines how often Gen0 collections run.
+A flat working set means it is nearly all dying in Gen0, which is the case the generational garbage collector is built for; the cost is C P U spent collecting, visible as time-in-garbage collector, not as memory. Working set / live set is the number that gets you OOM-killed, and it is fine here.
+
+So: is 2 gigabytes or min a problem? Only if time-in-garbage collector is meaningful, or if the allocations are large enough to cross 85,000 bytes and land on the LOH, where they are collected only with gen 2 and turn cheap churn into full GCs.
+Check dotnet-counters for gc-heap-size, time-in-gc and gen-2-gc-count before changing anything. If it is worth attacking, the levers are per-allocation: pool large buffers with ArrayPool, use Span / stackalloc for short-lived scratch space, and cut boxing on hot paths.
+If instead the working set were climbing while allocation stayed flat, that is the opposite bug, retention, and pooling would make it worse.
+
+The interview-grade version of this answer is one sentence: " Allocated measures churn and costs throughput; live set measures retention and costs availability. I would find out which one is actually moving before optimising either."
+
+Three, and only the first is the one people usually think of.
+
+Hashing and equality are O(k), not O(1). If the key is built by string-concatenating those three parts, every lookup hashes the whole concatenation, and the URL is unbounded. The table lookup is O(1) in the number of entries, and O(k) in the key length.
+Prefer a record or readonly record struct key over a concatenated string: HashCode.Combine mixes the three components without building an intermediate string, so you also stop allocating a key object per lookup.
+
+Hash quality determines whether "O(1)" is true at all. A hand-written GetHashCode that returns only TenantId.GetHashCode() compiles, passes tests, and puts every key for a given tenant in one bucket, turning the cache into a linear scan exactly for your largest tenant.
+Use HashCode.Combine(tenant Id, resource Type, url) or let record generate it.
+
+Which comparer? URLs may need case-insensitive host comparison but case-sensitive path comparison; resource Type is an identifier, so StringComparer.Ordinal is right and the culture-sensitive default is wrong.
+Decide explicitly, because the failure mode of getting it wrong is a silent 100% miss rate, which looks like a performance problem and is a correctness one.
+
+And one thing that is not a complexity question but bites here anyway: HashCode.Combine is seeded per process, so these keys must never leave memory, no persisting them, no using them as a shard selector or an ETag.
+
+Four things, in the order they usually turn out to matter.
+
+Which n? "Small" usually refers to the request, a page of 50 items. The loop body may touch a collection that is not small (a lookup table, a permissions list, the result of another query), and that second variable is the real term. Ask for both letters.
+
+Small today. n is a fact about the current data, not the code. The question is what n is a function of, items per page (bounded by validation, genuinely safe) or rows per tenant (unbounded, and the largest tenant defines your worst case). Only a bound enforced somewhere makes "small" durable.
+
+Small per request, times concurrency. An O(n) live allocation per request is O(n times concurrent requests) of memory at peak. This is how a harmless-looking per-request lookup dictionary becomes a memory incident without any single allocation looking wrong.
+
+Is the per-item work actually constant? O(n) with an I O call in the body is n round trips, the classic N plus one. The complexity claim is correct and completely beside the point; what matters is that the constant is measured in milliseconds and off-box.
+
+The concurrency reasoning is right and the collection is wrong for the access pattern.
+
+The indexer is not O(1). ImmutableList is a balanced binary tree, dotnet or runtime calls its root "the root node of the AVL tree that stores this set", and Microsoft Learn's comparison table on the ImmutableArray page gives its Item as O(log n) against ImmutableArray 's O(1).
+So for (int i = 0; i was O(n).
+
+Two fixes, and they are not equivalent. foreach is the immediate one, the enumerator walks the tree once, restoring O(n), and it is a one-word change.
+But the durable fix is the type: this table is built once per config reload and listen on every request, which is precisely the profile Learn describes for ImmutableArray ("updating the data is rare. you need to be able to iterate over the data in performance critical sections").
+ImmutableArray is a readonly struct around one T[], so it gives O(1) indexing and array cache behaviour, and it swaps atomically just as well, a reference assignment either way.
+
+The constant moves with the asymptotic, not against it. ImmutableList stores a heap node per element with child references, so iterating it is a pointer chase; ImmutableArray iterates contiguously.
+This is the rare case where the better Big-O also has the better constants, because the two properties come from the same layout decision.
+
+What I would not flag: choosing immutability. Swapping a whole table by reference assignment is a genuinely good pattern for read-mostly configuration.
+Immutability and layout are separate decisions and the BCL offers both combinations; the bug is picking the collection for its thread-safety story and never checking its indexer cost.
+
+Count is not a field read. ConcurrentDictionary gets its throughput from a bank of fine-grained locks with lock-free reads; its Count property acquires all of them ( AcquireAllLocks(ref locks Acquired); return GetCountNoLocks(); ) before summing the per-lock counters.
+So every request performs a full quiesce of the dictionary, blocking every writer for the duration. That is why C P U looks fine, the threads are waiting, not working, which is the classic signature of a contention problem rather than a throughput one.
+
+Three things to do with that:
+
+Delete the call, or replace it.
+IsEmpty is written to avoid the lock storm, it checks the buckets first and only escalates if that check already says "empty." If you genuinely need a running size, maintain your own Interlocked.Increment / Decrement counter alongside the dictionary;
+an approximate count is almost always what a metric wanted anyway.
+Look for the same shape elsewhere in the file.
+GetOrAdd(key, value Factory) is the other one: Learn notes the factory "is called outside the locks," so " value Factory may be called multiple times, but only one key or value pair will be added." A build-once cache built with a raw GetOrAdd can run its expensive factory once per racing thread.
+Storing Lazy as the value fixes it, the threads race on cheap Lazy objects and the default ExecutionAndPublication mode runs the real factory exactly once.
+Name the general lesson. A concurrent collection's documented thread safety says nothing about which of its members are cheap.
+"Thread-safe" and "scalable" are different properties, and the members that need a globally consistent answer, Count, ToArray, Clear, are the ones that have to stop the world to produce it.

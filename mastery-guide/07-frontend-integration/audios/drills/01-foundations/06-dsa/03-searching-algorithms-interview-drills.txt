@@ -1,0 +1,298 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Linear versus binary.
+
+Q: When is linear search actually faster than binary search?-- think --
+
+A: For very small N (< ~16-32 elements) where the constant factor of binary's branching beats linear's straight scan, especially when the data is cache-resident.
+Also when the data is unsorted and you only search once, sorting first costs O(n log n) which dominates O(n) linear, unless you'll search many times.
+
+Cross-Q: With SIMD-vectorized Span.IndexOf, where does the crossover move?-- think --
+
+A: Upward, and the honest answer is "measure it on your data." A vector register tests a whole batch of elements per comparison and the loop is branch-light, while binary search does a data-dependent, branch-heavy,
+cache-unfriendly jump per step, so vectorized linear stays competitive over ranges far larger than the classic hand-waved cut-off.
+For reference types the vectorized path doesn't apply at all (each comparison is an Equals / virtual call), so binary search wins much sooner. Don't quote a number you haven't benchmarked; the interviewer is testing whether you know why the crossover moves.
+
+Cross-Q²: Why doesn't dot NET's Array.IndexOf use binary search automatically when the array is sorted?-- think --
+
+A: Because Array.IndexOf doesn't know if the array is sorted, sortedness isn't a property of the type. The caller must opt into Array.BinarySearch, which assumes sorted input (and returns garbage if it isn't).
+Modern alternative: Array.BinarySearch on sorted; Span.IndexOf (SIMD-accelerated) for general; let the caller pick based on what they know.
+
+-- pause --
+Drill 2, Binary search edge cases.
+
+Q: Write binary search and explain the three off-by-one traps.-- think --
+
+A: int lo = 0, hi = arr.Length - 1; while (lo <= hi) { int mid = lo + (hi - lo) / 2; if (arr[mid] == target) return mid; if (arr[mid] < target) lo = mid + 1; else hi = mid - 1; } return -1;.
+Three traps: (1) mid = (lo + hi) / 2 overflows on huge arrays, use lo + (hi - lo) / 2; (2) while (lo <= hi) versus lo < hi, must match hi = mid - 1 versus hi = mid; (3) initializing hi = Length (exclusive) versus Length - 1 (inclusive), must match the loop and the update.
+
+Cross-Q: Convert this to lower-bound (find first arr[i] >= target ).-- think --
+
+A: Convention shift: int lo = 0, hi = arr.Length; (hi exclusive). while (lo < hi) { int mid = lo + (hi - lo) / 2; if (arr[mid] < target) lo = mid + 1; else hi = mid; } return lo;. Returns arr.Length if all elements are less than target.
+The single difference from upper-bound: < instead of <= in the comparison.
+
+Cross-Q²: What does Joshua Bloch's famous binary search bug have to do with this?-- think --
+
+A: Bloch found in 2006 that Java's Arrays.binary Search and most binary search implementations in textbooks had mid = (low + high) / 2, overflows for arrays larger than 2³¹/2 elements. Fixed by low + (high - low) / 2. The bug had been in the JDK since 1.0; in mergesort too.
+Now standard knowledge; if you write (low + high) / 2 in an interview, expect to be corrected.
+
+-- pause --
+Drill 3, Find-first versus find-last.
+
+Q: How do the binary searches differ when the array has duplicates and you want the first occurrence versus the last?-- think --
+
+A: Find-first = lower-bound with equality fallthrough. When arr[mid] >= target, don't return, narrow hi = mid (keep searching left). When arr[mid] = target; check arr[lo] == target to confirm match. Find-last = upper-bound minus 1.
+Upper-bound finds first arr[i] > target; the last occurrence is upper - 1. Pattern: same loop, different comparison.
+
+Cross-Q: Show the comparison difference in one symbol.-- think --
+
+A: Lower-bound uses <: if (arr[mid] < target) lo = mid + 1; else hi = mid;. Upper-bound uses <=: if (arr[mid] <= target) lo = mid + 1; else hi = mid;. Just < versus <=. Equal-element count = upper_bound - lower_bound.
+
+Cross-Q²: Does Array.BinarySearch give first or last when duplicates exist?-- think --
+
+A: Neither, it returns some matching index, unspecified which. For deterministic first or last on duplicates, implement lower-bound / upper-bound yourself. This is the #1 cause of "intermittent wrong tier" bugs in pricing / threshold lookups (see the walkthrough section).
+
+-- pause --
+Drill 4, Binary search on rotated sorted array.
+
+Q: Given a sorted array rotated at an unknown pivot (for example, [4,5,6,7,0,1,2] ), find a target in O(log n).-- think --
+
+A: Modified binary search. At each step, one half is sorted; the other is rotated. Determine which by comparing arr[lo] with arr[mid]: if arr[lo] <= arr[mid], left half is sorted; else right half is.
+Check if target is in the sorted half (compare against its endpoints); if yes, search there; otherwise, the other half.
+
+Cross-Q: What if duplicates are allowed?-- think --
+
+A: Edge case: arr[lo] == arr[mid] == arr[hi], can't determine which half is sorted. Fall back to incrementing lo and decrementing hi (linear shrink at the boundary). Worst case becomes O(n), duplicates can defeat the divide-and-conquer. Without duplicates, strict comparison saves us.
+
+Cross-Q²: How do you find the pivot index itself?-- think --
+
+A: Same modified binary search, but instead of comparing to target, compare to arr[hi]. If arr[mid] > arr[hi], pivot is in right half ( lo = mid + 1 ); else in left half including mid ( hi = mid ). Loop until lo == hi, that index is the pivot (the smallest element).
+O(log n), then you know the rotation offset and can do regular binary search adjusted by the offset.
+
+-- pause --
+Drill 5, Boyer-Moore intuition.
+
+Q: How does Boyer-Moore achieve sub-linear average-case string search?-- think --
+
+A: It compares the pattern right-to-left against the text.
+On a mismatch, it uses two heuristics: (1) bad-character rule, skip ahead so the mismatched text character aligns with its rightmost occurrence in the pattern (or skip entire pattern length if it doesn't appear);
+(2) good-suffix rule, if a suffix of the pattern matched, shift to align the next occurrence of that suffix.
+Combined, skips average ~m or 2 characters per mismatch, giving O(n or m) average.
+
+Cross-Q: What's the worst case?-- think --
+
+A: O(n times m), pathological patterns and texts (for example, pattern = aaaab, text = aaaaaaaa. ) reduce skips to 1 per step. Boyer-Moore is great average-case but doesn't beat KMP's worst-case guarantee. GNU grep uses Boyer-Moore variants because real text rarely hits worst case.
+
+Cross-Q²: Why does dot NET's string.IndexOf not use Boyer-Moore?-- think --
+
+A: SIMD beats it, and dot NET decided this explicitly. Regex used Boyer-Moore from its earliest days; dot NET 7 deleted that implementation and switched to vectorized IndexOf. Microsoft's stated reasoning: "Boyer-Moore was created at a time when vector instruction sets weren't yet a reality.
+Most modern hardware can examine 8 or 16 16-bit chars in just a few instructions, whereas with Boyer-Moore, it's rare to be able to skip that many at a time", and a vectorized scan can compare several positions at once (for example first and last char of the prefix),
+staying in the inner loop longer.
+So string.IndexOf searches for the needle's first element with a vector loop, then verifies the tail with SequenceEqual. Boyer-Moore still has a case for very long patterns where skips exceed a vector width; for typical needles in real text, SIMD wins.
+
+-- pause --
+Drill 6, KMP failure function.
+
+Q: What does KMP's failure function compute?-- think --
+
+A: For each position i in the pattern, fail[i] is the length of the longest proper prefix of pattern[0.i] that's also a suffix.
+On a mismatch at position i+1 in the text, we know pattern[0.fail[i]] already matched (it's a prefix that we just slid into a suffix position), so we can resume comparison at pattern[fail[i]] without rescanning the text.
+
+Cross-Q: Trace the failure function for pattern "ABABCAB".-- think --
+
+A: A to 0, AB to 0 (no proper prefix is a suffix), ABA to 1 ( A is both prefix and suffix), ABAB to 2 ( AB ), ABABC to 0 (the C breaks any prefix-suffix match), ABABCA to 1 ( A ), ABABCAB to 2 ( AB ). So fail = [0, 0, 1, 2, 0, 1, 2].
+
+Cross-Q²: How does KMP achieve O(n + m)?-- think --
+
+A: The text pointer i never goes backward. On a mismatch, only the pattern pointer j resets via fail. Each text character is examined at most twice (once moving forward, possibly once during a backtrack via fail ).
+Total work: O(n) for the search loop + O(m) for the failure-function preprocessing = O(n + m).
+
+-- pause --
+Drill 7, Array.BinarySearch versus writing your own.
+
+Q: When should I use Array.BinarySearch versus hand-roll?-- think --
+
+A: Use Array.BinarySearch for generic match-or-not lookups on sorted arrays, it's tested, optimized, and handles IComparer properly. Hand-roll when you need lower-bound, upper-bound, find-first, find-last, or any variant.
+Array.BinarySearch returns some matching index but doesn't guarantee first or last on duplicates, for those, you need explicit lower or upper-bound implementations.
+
+Cross-Q: What's the ~insertion Point convention?-- think --
+
+A: When the target isn't found, Array.BinarySearch returns the bitwise complement of where the target would be inserted to maintain sort order. ~result (or -result - 1 ) gives the insertion index. Surprises C plus plus developers expecting -1 for not-found.
+Pattern: int idx = Array.BinarySearch(arr, target); if (idx < 0) idx = ~idx; // now idx is the insert position.
+
+Cross-Q²: Are there bugs in Array.BinarySearch to watch for?-- think --
+
+A: Two. (1) Comparer mismatch: if you sort with IComparer X and binary-search with Y, undefined behavior, same comparer must be used for both. (2) Unsorted input: Array.BinarySearch returns garbage on unsorted; no validation.
+Validate sortedness if the source is untrusted, or sort + cache the comparer in a single place to keep them paired.
+
+-- pause --
+Drill 8, Interpolation search.
+
+Q: When does interpolation search beat binary search?-- think --
+
+A: On uniformly-distributed sorted numeric data, interpolation search estimates target position by linear interpolation: mid = lo + (target - arr[lo]) * (hi - lo) / (arr[hi] - arr[lo]), guesses where target lives. On uniform data, hits in O(log log n), vastly better than binary's O(log n).
+
+Cross-Q: When does it degenerate?-- think --
+
+A: On non-uniform data (clustered values, exponential distributions, gaps), the interpolation estimate is wrong, and the search degrades to O(n) worst case. Binary search has predictable O(log n) regardless of distribution. Interpolation is a "use only if you can guarantee uniformity" tool.
+
+Cross-Q²: Real-world use?-- think --
+
+A: Rare in production. Database engines sometimes use interpolation-style page jumps for B-tree leaf scans. Telephone-directory searches (alphabetic data is roughly uniform).
+For typical sorted arrays (timestamps with bursty arrivals, prices with gaps, log files), binary search wins because its worst case is predictable. Interpolation is more of an interview "did you know" than a daily tool.
+
+-- pause --
+Drill 9, Search in 2D matrix.
+
+Q: Given an m times n matrix where rows AND columns are sorted, find a target.-- think --
+
+A: Start at top-right (or bottom-left). At each step: if current cell > target, move left (smaller column); if current cell < target, move down (larger row); if equal, found. Each step eliminates a row or a column. O(m + n) time, O(1) space. Beats naive O(m times n).
+
+Cross-Q: Why does starting in a corner work?-- think --
+
+A: At top-right, you can go left (decrease) or down (increase). Each move eliminates one possibility along that axis. Starting in the middle gives four directions and the eliminated region is unclear. Top-right (and bottom-left) are the only corners where each step is monotonic.
+
+Cross-Q²: What if only rows are sorted (not columns)?-- think --
+
+A: Binary search per row: O(m log n). For "fully sorted in row-major" (each row's last < next row's first, like a flattened sorted array), one binary search on the linearized matrix: O(log(m times n)). The "rows AND columns both sorted but not flattened" case is the staircase O(m+n) variant.
+
+-- pause --
+Drill 10, Bloom filter, probabilistic search.
+
+Q: What's a Bloom filter used for?-- think --
+
+A: Fast probabilistic membership test with bounded memory and zero false negatives. A bit array + k hash functions; "Add" sets k bits; "Contains" checks k bits, all set to "maybe present", any unset to "definitely not". False positive rate tunable via size + k.
+Used for cache-existence checks, distributed system "do I have this key" filtering, URL crawlers' visited-set.
+
+Cross-Q: Why probabilistic instead of a HashSet?-- think --
+
+A: Memory, and you can derive the gap rather than quote one. The optimal Bloom filter size is m = -n, ln(p) / (ln 2)² bits, at p = 1% that is approximately 9.6 bits per item regardless of how big the items are, so 10⁹ items cost on the order of a gigabyte.
+A HashSet must store every key plus object header, length, and bucket or entry overhead, so its cost scales with the keys themselves, orders of magnitude more for real strings.
+That asymmetry, bits-per-item versus bytes-per-key, is the whole argument, and it justifies false positives whenever the cost of a false positive is small (one extra authoritative lookup to confirm).
+
+Cross-Q²: Why no false negatives?-- think --
+
+A: Because if x was added, the k bits at positions h₁(x).hₖ(x) were set. They remain set forever (Bloom filters don't support delete). On lookup, the same k positions are checked; all set to consistent with "added".
+False positives come from other additions collectively setting all k bits without x ever being added. Variant: Counting Bloom filter (bytes instead of bits) supports delete, at higher memory cost.
+
+-- pause --
+Drill 11, Hash lookup, O(1) caveat.
+
+Q: Dictionary is "O(1) average". What's the worst case and when does it bite?-- think --
+
+A: O(n) when all keys collide on GetHashCode(). Real-world causes: (1) bad GetHashCode (always returns 0 or a small constant); (2) adversarial input designed to collide (DoS attacks); (3) reusing hash codes across types where two types' hashes overlap heavily.
+The dictionary degenerates from constant-time to linear scan.
+
+Cross-Q: How does modern dot NET defend?-- think --
+
+A: Adaptive randomized hashing for strings, and note the type names, because the naming is counter-intuitive. Dictionary starts with NonRandomizedStringEqualityComparer (fast, no random seed).
+The runtime's own comment: it "doesn't use the randomized string hashing which keeps the performance not affected till we hit collision threshold and then we switch to the comparer which is using randomized string hashing." Once one bucket's collision chain crosses that threshold,
+the dictionary rehashes with the randomized Marvin hash, whose per-process seed an adversary can't precompute.
+For custom types, HashCode also mixes in a per-process random seed.
+
+Cross-Q²: When should I worry about hash quality in production?-- think --
+
+A: When (a) keys come from untrusted input (web parameters, Jason bodies, file uploads), (b) you're using a custom type as a key with hand-rolled GetHashCode, (c) the dictionary is large (~10⁵+) and on a hot path.
+Mitigation: use record (auto good hash), HashCode.Combine if you must hand-roll, validate distribution under load test, consider FrozenDictionary for build-once-query-many to get perfect hashing.
+
+-- pause --
+Drill 12, Trie versus hash for string searches.
+
+Q: When is a trie better than a HashSet for string lookups?-- think --
+
+A: When you need prefix queries, "all words starting with 'pre'". HashSet can only do O(1) exact lookup; finding all prefixes requires O(n) full scan. Trie does prefix in O(L + k) where L = prefix length, k = matches.
+Use cases: autocomplete, spell-check candidates, IP routing (longest-prefix match), tab-completion.
+
+Cross-Q: What's the memory trade-off?-- think --
+
+A: Trie shares prefixes, "the", "this", "they" share the t-h- prefix nodes. For a vocabulary with heavy prefix overlap (English words), trie memory is comparable to or less than HashSet. For dissimilar strings, trie has more overhead (each character = node + child dictionary).
+Rule of thumb: trie wins for natural-language vocabularies; loses for random or hashes-of-strings.
+
+Cross-Q²: Why isn't there a Trie in the BCL?-- think --
+
+A: Niche enough. Most C sharp code does exact-match lookups ( Dictionary / HashSet ) and doesn't need prefix support. Tries are common in compilers, search engines, IDE autocomplete, but those domains use specialized libraries.
+For dot NET: hand-roll a basic trie (50 lines) for one-off use; reach for rm.Trie or similar libraries for serious use.
+Modern alternative for prefix search: FrozenDictionary with prefix-indexed entries, or just Dictionary + link Where(k goes to k.StartsWith(prefix)) (works for small N but is O(n times L)).
+
+-- pause --
+Drill 13, Spell checker, what algorithm.
+
+Q: How would you build a spell checker?-- think --
+
+A: Two passes. (1) Membership check: word in dictionary? Use a HashSet or FrozenSet. If yes, done. (2) Suggestion: for misspellings, find dictionary words within edit distance 2 (Damerau-Levenshtein).
+Naive: compute distance for every dictionary word, O(D times L²) where D = dictionary size, L = avg word length. Too slow for D = 10⁵.
+
+Cross-Q: How do you speed up the suggestion step?-- think --
+
+A: Three approaches. (1) BK-tree, tree organized by edit distance; pruning lets you skip subtrees that can't contain candidates. (2) SymSpell, precompute all deletions of each dictionary word; lookup is then dictionary-keyed by deletion. Fast O(L²) lookup independent of D.
+(3) Trie + edit distance walk, explore the trie with bounded edit-distance budget; prune subtrees that can't match.
+
+Cross-Q²: In dot NET, what library?-- think --
+
+A: SymSpell for fast suggestion, the reference implementation is C sharp, so it drops straight into dot NET. Or NHunspell, a managed wrapper over Hunspell (the spell-check engine used by LibreOffice and Firefox).
+For most apps, the dictionary is small enough that naive Levenshtein with early termination at distance > 2 works fine. Optimize only when you're indexing millions of words or doing real-time suggestion at scale.
+
+-- pause --
+Drill 14, Substring search in a stream.
+
+Q: How do you search for a pattern in a stream you can't fully buffer?-- think --
+
+A: KMP. The failure function lets you maintain a small state (current match position in pattern, at most m chars) and stream the text one char at a time. On match: report the match position. On EOF: done. Memory: O(m), independent of n.
+Boyer-Moore doesn't stream as cleanly because it needs to read ahead.
+
+Cross-Q: What about multiple patterns simultaneously?-- think --
+
+A: Aho-Corasick. Build a trie of patterns, augment with "failure links" (KMP-generalized to a tree). Streaming through text, the automaton state moves char by char; matches are reported when the state hits a terminal node. O(n + m + z) where z = matches.
+Used for antivirus signature matching, intrusion detection.
+
+Cross-Q²: dot NET options?-- think --
+
+A: Regex with a small pattern works for streaming via Regex.Match over chunks (with care at chunk boundaries, overlap each chunk by m-1 chars or you'll miss straddling matches).
+For multi-pattern on dot NET 9+, SearchValues.Create(ReadOnlySpan, StringComparison.Ordinal) gives you a built-in optimized multi-substring searcher; that, hand-roll Aho-Corasick or take a library dependency.
+For simple single-pattern across chunks: maintain a sliding buffer of size m and search it each time you append.
+
+-- pause --
+Drill 15, Fuzzy search, Levenshtein.
+
+Q: Implement a "find all dictionary words within edit distance 2 of a query."-- think --
+
+A: Brute force: for each dictionary word, compute EditDistance(query, word); keep if at most 2. O(D times L²) where D = dictionary size, L = word length. Optimization: early termination, if the DP table's minimum exceeds 2 anywhere, stop computing that pair.
+
+Cross-Q: What's the Levenshtein DP recurrence?-- think --
+
+A: dp[i, j] = dp[i-1, j-1] if s[i-1] == t[j-1]; else 1 + min(dp[i-1, j-1] / substitute /, dp[i-1, j] / delete /, dp[i, j-1] / insert /). Base: dp[i, 0] = i, dp[0, j] = j. Result: dp[m, n] is the minimum number of single-character edits.
+
+Cross-Q²: For real-time autocomplete with millions of words, what's the right structure?-- think --
+
+A: SymSpell, precompute all deletions of dictionary words (up to edit distance 2). Lookup: compute deletions of the query; intersect with the precomputed deletions table. O(L²) per query, independent of dictionary size.
+The trade is memory: the deletion table is many entries per dictionary word, so it dwarfs the dictionary itself, budget for it and measure, don't assume a multiplier. For smaller scale ( at most 10⁴ words), brute-force Levenshtein with early termination works fine.
+
+-- pause --
+Section 2. Self-test.
+
+The single change is =; upper bound finds the first >. Equal-range count = UpperBound - LowerBound. Both are O(log n) with the same invariants.
+
+(1) Linear scan O(n), too slow at 10M. (2) Two Array.BinarySearch calls (one for start, one for end), O(log n) each, O(k) to copy results, but BinarySearch doesn't promise first or last on ties. (3) Lower bound + upper bound, O(log n) each, deterministic, returns range [lo, hi).
+(4) SortedSet.GetViewBetween(start, end) with a timestamp comparer, clean A P I, O(log n + k) where k is the result size. ( SortedDictionary has no GetViewBetween; that's a common misremembering.) For arrays choose option 3; for a tree-backed collection choose option 4.
+Either way the probe is ~log₂(10⁷) approximately 23 comparisons instead of 10⁷, the asymptotic gap is the point, not any particular benchmark number.
+
+Interpolation search uses the formula mid = lo + (target - a[lo]) * (hi - lo) / (a[hi] - a[lo]), guesses where target lives based on linear interpolation. On uniformly distributed sorted data it's O(log log n), much better than binary's O(log n).
+On non-uniform data (clustered values, skewed distributions) it degenerates to O(n), far worse. Use only when you can guarantee uniform distribution and the data is large enough for the constant-factor improvement to matter (n at least 10⁶).
+For typical sorted arrays in production (timestamps with bursts, prices with gaps) binary search wins because of its predictable worst case.
+
+string.IndexOf with StringComparison.Ordinal vectorizes: it scans for the needle's first element a whole vector register at a time, then verifies the tail with SequenceEqual, dropping to scalar work only on a candidate.
+A KMP loop, by contrast, examines one character per iteration no matter how good its skip table is, so the vectorized scan does far fewer instructions per byte of text even though it does more comparisons in theory.
+KMP wins asymptotically (O(n+m) versus O(n times m) worst case), but the constant-factor advantage dominates until pathological inputs (highly-self-similar patterns like aaaaab in aaaaaaaa. ).
+dot NET made this call at the framework level: dot NET 7 deleted Regex 's Boyer-Moore implementation in favour of vectorized IndexOf. For real-world strings, log lines, Jason, HTML, vectorized scanning wins, and custom KMP is rarely worth it in modern dot NET.
+If you want a number, benchmark it; don't quote one. (Note the trap in the question's premise: the bare string.IndexOf(string) overload is culture-sensitive and does not take the vectorized ordinal path at all.)
+
+Recursive DFS visits children in the order they appear; iterative DFS pushes children onto the stack and pops them, the last pushed is visited first (LIFO), so the traversal is reversed at each level.
+To make iterative match recursive ordering, push children in reverse order: for (int i = children.Count - 1; i >= 0; i--) stack.Push(children[i]);, now the first child is on top, popped first.
+The order matters when DFS has side effects (for example, topological sort, lexicographic ordering of paths).
+For correctness in cycle detection it doesn't matter; for reproducibility it does.

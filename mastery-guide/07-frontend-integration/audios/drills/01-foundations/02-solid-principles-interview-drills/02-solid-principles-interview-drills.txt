@@ -1,0 +1,491 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, What is a "responsibility" in SRP?.
+
+Q: SRP says "one reason to change", but what's a "reason"? Two engineers always disagree.-- think --
+
+A: A reason maps to a stakeholder / actor / axis of change, someone who would request a change.
+Martin's own restatement in Clean Architecture is "a module should be responsible to one, and only one, actor," which is checkable in a way "one responsibility" is not: name the person who files the ticket.
+OrderProcessor that does persistence (DBA's axis), email (marketing's axis), and audit logs (compliance's axis) has three actors. Each actor's change risks regressing the others. The "and" in the class description is the seam.
+
+Cross-Q: A class with 50 methods all doing string manipulation, is that SRP-compliant?-- think --
+
+A: Almost certainly yes. Method count doesn't measure responsibilities; axes of change do. A 50-method StringUtilities has one axis (string operations); a 5-method class that touches database + email + validation has three. SRP is about coupling axes, not line counts.
+
+Cross-Q²: Where does the "responsibility" line blur in practice?-- think --
+
+A: When two responsibilities have the same actor today but could split tomorrow. Sending emails and sending SMS feel like "notification", one actor, until the SMS team forms and now they're two. The pragmatic rule: split when the team / change-cadence diverges, not preemptively.
+Premature SRP splits cost more in indirection than they save in coupling, and the smell they produce has a name, Fowler's shotgun surgery, the exact inverse of the divergent change smell SRP exists to cure.
+
+-- pause --
+Drill 2, Spot the SRP violation.
+
+Q: I have class UserService { void Register(User u); void SendWelcomeEmail(User u); void Authenticate(string user, string pwd); }. Is this SRP-compliant?-- think --
+
+A: No. Three responsibilities: lifecycle (Register, Authenticate spans persistence + identity), notification (SendWelcomeEmail), and credential validation (Authenticate). Three actors: identity team owns auth, marketing owns email templates, DBAs own user storage.
+Split into IUserRepository, IEmailService, IAuthService.
+
+Cross-Q: What's the smallest split that fixes it without over-engineering?-- think --
+
+A: Extract IEmailService first, that's the clearest standalone axis (email server changes, template changes, throttling rules). Keep Register + Authenticate together initially as IUserAccountService; if auth grows (MFA, O auth, password reset flows), split out IAuthService.
+Don't pre-split, wait for the second reason to change.
+
+Cross-Q²: Senior interviewer says "but now I have three interfaces with one implementation each, isn't that SRP overkill?"-- think --
+
+A: The interfaces aren't there for SRP, they're there for DIP or testability. SRP justifies the classes; DIP justifies the interfaces. If you're never going to swap, drop the interfaces and keep the class split.
+SRP can be satisfied with concrete classes that depend on each other, interfaces are a separate decision, and one you should make on the "name the second implementation" test rather than reflexively.
+
+-- pause --
+Drill 3, Open or Closed: what does it actually mean?.
+
+Q: "Open for extension, closed for modification", explain in 30 seconds.-- think --
+
+A: You should add new behaviour by adding new types (subclasses, new interface implementations, plugins), not by editing existing tested code. The mechanism is polymorphism, define an abstraction, swap implementations.
+Editing tested code risks regressing the existing test surface; adding new types leaves it untouched. Worth flagging that there are two OCPs: Meyer's 1988 version was inheritance-based, Martin's 1996 reformulation is abstraction-based, and modern dot NET means Martin's.
+
+Cross-Q: Adding a new if branch to a switch satisfies "extension" in plain English. Why doesn't it count?-- think --
+
+A: Because it modifies the switch, the tested function changes, all callers re-verify, and the if-chain grows linearly with variants. OCP wants polymorphic dispatch where the dispatch site is closed ( strategy.Handle() ) and the variant count is unbounded without touching the closed code.
+Switches violate OCP unless the set of cases is genuinely closed (H T T P verb, LogLevel ), over-abstracting for a set that changes once a decade is yag-nee.
+
+Cross-Q²: With modern pattern matching, isn't switch polymorphism in disguise, with the compiler enforcing exhaustiveness?-- think --
+
+A: It is structurally similar, but be careful with the exhaustiveness claim, because it's the popular wrong answer.
+C sharp 14 has no discriminated unions and does no closed-hierarchy exhaustiveness analysis for classes, the compiler cannot prove a switch over Shape covers every subtype,
+and it emits CS8509 (the switch expression does not handle all possible values of its input type) unless you supply a catch-all arm.
+So adding a new subtype does not light up every switch in red; you get a runtime UnreachableException from your discard arm if you were disciplined, and a SwitchExpressionException if you weren't.
+For enums, a switch expression without a discard arm does warn on unhandled values, which is the closest C sharp gets. Discriminated unions remain a language proposal. For genuinely open sets (plugins, user-extensible variants), interfaces still win regardless.
+
+-- pause --
+Drill 4, Square / Rectangle (the LSP classic).
+
+Q: Why does making Square inherit Rectangle violate LSP?-- think --
+
+A: Rectangle contract: Width and Height are independent. Test: r.Width = 5; r.Height = 10; assert(r.Area == 50);. When r is a Square (override forces W = H), setting Width also changes Height, the assertion fails.
+The subtype has weakened the parent's contract; callers written against Rectangle break. In Liskov and Wing terms it breaks an invariant, and arguably the history rule too.
+
+Cross-Q: Mathematically, every square is a rectangle. Why doesn't math save us?-- think --
+
+A: Math defines immutable shapes; the type system models mutable behaviour. The set-theoretic "square is a rectangle" is true for instances but breaks for behaviours when both have setters.
+The fix: model the abstraction the code actually uses (an immutable IShape with Area ), Square and Rectangle are siblings, not parent-and-child. The taxonomy of the real world doesn't always map to the type hierarchy that works in code.
+
+Cross-Q²: If both were immutable records ( record Square(int Side): Rect(Side, Side) ), is it still an LSP violation?-- think --
+
+A: The mutation violation goes away, with no setters there's no way to break "Width and Height are independent", which is why immutable hierarchies are so much harder to get wrong.
+But records add a substitutability wrinkle of their own that's worth knowing: the synthesised protected virtual Type EqualityContract means a derived record is never equal to a base record, even through a base-typed reference.
+new Rect(2,2).Equals(new Square(2)) is false, and so is ((Rect)new Square(2)).Equals(new Rect(2,2)).
+That's deliberate, it's what keeps Equals symmetric, which is itself a contract obligation, but it means Square is not substitutable for Rect under equality, and a test asserting expected.Equals(actual) fails in a way that looks like a value bug rather than a type-design one.
+
+-- pause --
+Drill 5, LSP violation by NotSupportedException.
+
+Q: I want class ReadOnlyList: List { public override void Add(T item) goes to throw new NotSupportedException(); }. Is that an LSP violation?-- think --
+
+A: It's worse than a violation, it doesn't compile.
+List.Add is an implicit interface implementation, which the C sharp compiler emits as sealed virtual (reflection reports Final, Virtual ), so you get CS0506:
+"cannot override inherited member 'List.Add(T)' because it is not marked virtual, abstract, or override." List is unsealed, which is not the same thing as designed for inheritance.
+Getting this right on the spot is a strong signal, because the invalid version of this snippet is all over the internet.
+
+Cross-Q: Fine, I'll use new instead of override. Does that fix it?-- think --
+
+A: It compiles and it is more dangerous, because the guard is bypassable by a cast. public new void Add(T item) goes to throw new NotSupportedException(); only runs when the caller holds the derived type.
+Assign the instance to a List variable, which is exactly what happens when you pass it to any method taking List, and the base Add runs, the item is appended, and nothing throws. You've built a read-only collection that is silently writable through its own base type.
+The BCL's answer is System.Collections.ObjectModel.Collection, which routes every mutation through four protected virtual seams ( InsertItem, SetItem, RemoveItem, ClearItems ) that a cast cannot get around, or just use ReadOnlyCollection,
+which implements IList and throws NotSupportedException from the mutators by design.
+
+Cross-Q²: ReadOnlyCollection and Array both throw from IList.Add. Isn't the BCL violating LSP then?-- think --
+
+A: Yes for Array, and it's a known 1.0-era wart: int[] as IList throws NotSupportedException on Add, and the flags don't even agree with each other, ((ICollection)arr).IsReadOnly is true while ((IList)arr).IsReadOnly is false and IsFixedSize is true.
+Arrays were forced into those interfaces for compatibility with legacy A P Is.
+ReadOnlyCollection is the more defensible case: ICollection declares IsReadOnly precisely so that a read-only implementation is within the contract rather than outside it, the contract is "mutators are defined when IsReadOnly is false".
+That's the same conditional-contract trick as Stream.CanSeek, and it's a trade, not a free win: the obligation moves from the compiler to every caller. The modern design is IReadOnlyList / IReadOnlyCollection, which have no mutators to lie about, IReadOnlyCollection has exactly one member, Count.
+
+-- pause --
+Drill 6, Fat interface, when ISP applies.
+
+Q: I have interface IRepository { Get, Find, Add, Update, Delete, BulkInsert, ExecuteRaw, Migrate }. What's wrong?-- think --
+
+A: Fat interface, ISP violation. A controller that only needs Get is forced to depend on BulkInsert, ExecuteRaw, Migrate.
+Mocking explodes (have to stub eight methods for a one-method test); the interface couples unrelated concerns (read-side versus write-side versus admin); evolution of one method (say, ExecuteRaw becomes async + cancellation token) cascades to every consumer, including the ones that never call it.
+
+Cross-Q: How do you split it without an interface explosion?-- think --
+
+A: Split by role: IRepository becomes IReader ( Get, Find ), IWriter ( Add, Update, Delete ), IBulkOps ( BulkInsert ), IAdmin ( ExecuteRaw, Migrate ). Consumers depend only on what they need. The repository class still implements all four; the interfaces are split.
+Fowler's vocabulary is the useful one here, you're converting a header interface (a mechanical copy of one class's surface) into role interfaces (named for what a consumer needs).
+
+Cross-Q²: Splitting interfaces means more types. Where's the break-even?-- think --
+
+A: Two conditions, and you need both. (1) Different consumers use disjoint subsets, if every consumer uses every method, splitting is yag-nee. (2) Different methods have different lifecycles, if BulkInsert evolves on a different cadence from Get, splitting decouples the change.
+If only one holds, leave it. And there's a registration gotcha on the other side: two AddScoped, EfRepo>() / AddScoped, EfRepo>() calls give you two EfRepo instances per scope, two change trackers serving one request. Anchor on the concrete type and alias the roles to it.
+
+-- pause --
+Drill 7, Splitting an interface, what about implementers?.
+
+Q: I split IPrinter into IPrinter, IScanner, IFax. My MultiFunctionDevice implemented all 3 as IPrinter. What changes?-- think --
+
+A: MultiFunctionDevice: IPrinter, IScanner, IFax, implements three small interfaces instead of one big one. Same total method count; clearer intent. D I registration: register the concrete MultiFunctionDevice once and alias, that is
+services.AddSingleton(); services.AddSingleton(sp goes to sp.GetRequiredService());. so the same instance backs all three.
+
+Cross-Q: That feels like ceremony. Can D I just resolve "any interface this class implements"?-- think --
+
+A: Not out of the box. services.AddSingleton() registers the concrete; injecting IPrinter will fail unless you also register the interface mapping.
+Two common patterns: (a) explicit per-interface registration as, or (b) an assembly-scanning package (Scrutor) that registers all interfaces a class implements, with the caveat that AsImplementedInterfaces() also registers it under IDisposable if it implements that,
+and reflection-based scanning is invisible to the trimmer on a Native A O T target.
+Vanilla MS D I is intentionally explicit, magic registration leads to surprises.
+
+Cross-Q²: What if BasicPrinter only implements IPrinter and someone tries to resolve IScanner for it?-- think --
+
+A: GetRequiredService() throws InvalidOperationException at resolution time, exactly what you want.
+ISP's whole point is that consumers depend only on the interfaces their target supports; trying to resolve IScanner from a BasicPrinter -only context is a startup or resolution error rather than a silent NotSupportedException at the call site.
+The "fat interface forces NotSupportedException" anti-pattern is replaced by "the type doesn't even implement that interface", a much louder failure mode, and with ValidateOnBuild = true it surfaces at builder.Build() rather than on the first request.
+Be precise about the limit of that, because it is a fair cross-question: validation walks the registered descriptors and their constructor parameters,
+so it does not cover a type the container never registered, M V C controllers are activated through ActivatorUtilities by default rather than resolved as services, so a controller's missing dependency is only validated at build time if you also call AddControllersAsServices().
+
+-- pause --
+Drill 8, DIP versus D I: what's the difference?.
+
+Q: My team uses "DIP" and "D I" interchangeably. Are they the same?-- think --
+
+A: No. D I (dependency injection) is a technique, passing collaborators in via constructor or property or method instead of constructing them internally.
+DIP (dependency inversion principle) is a direction rule, high-level modules depend on abstractions, abstractions are owned by the high-level (domain) layer, low-level (infrastructure) implements them.
+You can do D I while violating DIP, inject a concrete SqlOrderRepository and you have D I (technique) but not DIP (still depending on concrete low-level).
+
+Cross-Q: Give a concrete example of D I without DIP.-- think --
+
+A: class OrderService(SqlOrderRepository repo) {. } registered via services.AddScoped(). That's D I, repo is injected. But OrderService (high-level domain) depends on SqlOrderRepository (low-level infrastructure concrete), DIP violation.
+There's a subtler version that passes review: class OrderService(IOrderRepository repo) where IOrderRepository is declared in the infrastructure project. Every file looks correct, but Domain.csproj has a ProjectReference to Infrastructure.csproj and the dependency still points outward.
+Inversion is a project-reference fact, not a file-content fact.
+
+Cross-Q²: Does Clean Architecture's "dependency rule" map to DIP?-- think --
+
+A: Yes, Clean Architecture is DIP scaled to layers. The dependency rule says "inner circles never depend on outer circles"; outer circles depend on inner-circle abstractions. That's structurally identical to DIP: domain (inner) owns interfaces; infrastructure (outer) implements them.
+The difference is granularity, solid DIP is per-class; Clean Architecture is per-layer. Same direction, different scope.
+And the enforcement is the same in both cases: make the domain project reference nothing but the BCL, and add an architecture test so a stray PackageReference fails CI rather than a review.
+
+-- pause --
+Drill 9, solid + D I container, relationship.
+
+Q: Does a D I container automatically make code solid?-- think --
+
+A: No. A D I container is plumbing for dependency injection, passing collaborators. It can't tell whether the injected type is a concrete (DIP violation) or an abstraction owned by the right layer (DIP-compliant). It can't tell whether the class has SRP (multiple responsibilities).
+It can't enforce LSP. The container amplifies your design, good design becomes easier to wire; bad design becomes a noisy mess of registrations.
+
+Cross-Q: But isn't services.AddScoped() the "S" / "I" / "D" of solid in one line?-- think --
+
+A: It's enabled by I and D, but doesn't cause them. The IFoo interface and Foo implementation exist whether you use a container or hand-wire constructors. The container just resolves the graph at runtime.
+You can write solid code with no container (manual ctor wiring in Main is a perfectly valid composition root); you can write anti-solid code with a container (god class with 30 dependencies, all injected).
+
+Cross-Q²: A 30-dependency constructor, what solid failure does that indicate?-- think --
+
+A: SRP, almost certainly. 30 collaborators implies 30 reasons to change. The productive move is to cluster the dependencies rather than the methods: deps for billing belong in BillingService, deps for fraud in FraudService.
+The dependency list is a more honest picture of the actors than the method names, because method names get renamed to fit the class and dependencies don't. Often the god class is an orchestrator that should delegate; split it and inject a handful of high-level facades.
+Secondary: ISP, some of those 30 may be fat interfaces. Constructor parameter count is the cheapest solid smell to detect during code review, zero tooling required.
+
+-- pause --
+Drill 10, Records and solid.
+
+Q: If a record has methods on it, does it violate SRP?-- think --
+
+A: Not inherently.
+A record is a data shape with auto-generated equality; adding methods that operate on its own fields (computed properties, validation,
+transformations to other records) is fine, single responsibility = "represent this concept." SRP violations appear when the record starts pulling external dependencies (saving itself to a database, sending an email, calling an A P I).
+At that point, behaviour belongs in a service; the record stays a value.
+
+Cross-Q: Where does the line sit between "record with methods" and "anemic domain model"?-- think --
+
+A: The D D D "tell, don't ask" line. Money.Add(other) to Money is a method on the value type because addition is intrinsic to Money's semantics, no external dependency. Order.PlaceAsync(IEmail, IInventory) reaches out to the world, it's not Order's responsibility, it's an OrderService 's.
+Rich domain model = methods that operate on the type's own state; service layer = methods that orchestrate across types and external resources.
+
+Cross-Q²: With record class + primary ctor + D I service patterns, is the line blurring?-- think --
+
+A: A bit. public record class CalculatorService(IRateProvider rates) is a record (auto-equality) that's also injected with services, a D D D purist would say "that's a service, not a record." Modern C sharp makes both shapes look similar syntactically.
+The right test: does equality by content matter?
+If CalculatorService(rates1) == CalculatorService(rates2) is meaningful, record. If not (it's identity / reference-equal services), class. Most D I services are not equality-meaningful; use class. Records remain for value objects + DTOs + messages.
+
+-- pause --
+Drill 11, Is solid still relevant in 2026?.
+
+Q: Functional programming, records, pattern matching, primary ctors, does solid still matter, or is it 2000-era OO baggage?-- think --
+
+A: The principles map to FP just differently. SRP = small focused functions. OCP = pattern matching over a closed set of cases. LSP = function input or output contracts. ISP = small typeclasses / capability interfaces. DIP = pass functions as arguments ( Func instead of constructed dependencies).
+The acronym is OO-flavoured; the underlying ideas (axis-of-change, polymorphism, contracts, role-based dependencies, direction-of-dependency) are language-agnostic.
+
+Cross-Q: Where does FP do it better than OO-solid?-- think --
+
+A: Immutability. Records plus immutability eliminate entire categories of LSP violation, no mutable setters means no way to weaken an invariant through one. Pure functions eliminate hidden dependencies: the signature is the contract, which is the same insight TimeProvider encodes for the clock.
+Where you should be careful is the claim people make next, that algebraic data types make OCP compiler-enforced in C sharp. In a language with real discriminated unions, yes; in C sharp 14, no.
+There are no DUs, no closed-hierarchy exhaustiveness for classes, and CS8509 fires unless you write a catch-all arm.
+
+Cross-Q²: Are there cases where solid is replaced by simpler patterns now?-- think --
+
+A: Yes, when the variability is genuinely small and stable. The classic 2010-era "strategy pattern with three implementations and a factory" is often a switch over a sealed hierarchy in 2026, with a _ goes to throw new UnreachableException() arm doing the work the compiler won't.
+The OCP value (extensibility) was speculative, if no fourth strategy ever arrives, the strategy pattern was over-engineering. solid's strength has always been paying ceremony where variability is real; modern C sharp makes the "no ceremony for closed sets" path cleaner.
+
+-- pause --
+Drill 12, When to ignore each principle.
+
+Q: Name a case where you'd intentionally violate each solid principle.-- think --
+
+A: SRP: throwaway scripts; a 100-line C L I tool that does parse-validate-process-output is fine in one class. OCP: closed enums (H T T P method, log level), a strategy registry is overkill.
+LSP: BCL legacy you inherit ( Array: IList with throwing Add ); sometimes you're handed a bad design and ship it.
+ISP: framework-mandated wide bases ( ControllerBase, PageModel, DbContext ) where you can't choose.
+DIP: stable dependencies, you don't abstract string, List or Math, and hot-path code where devirtualisation matters, which is the tension CA1859 (use concrete types when possible for improved performance) exists to surface.
+
+Cross-Q: Senior judgment is knowing when to violate. How do you build that judgment?-- think --
+
+A: Three inputs. (1) Change frequency, look at the last ten commits touching the file and see which dimension they varied; that's your axis, and if there is no axis, there's no abstraction to justify.
+(2) Blast radius, if a violation means one method changes, ignoring the principle is cheap; if it means fifty call sites, the principle pays. (3) Team familiarity, an abstraction half the team won't recognise is a maintainability cost on this team even when it's the textbook answer.
+
+Cross-Q²: What's the dogma trap to avoid?-- think --
+
+A: Thinking solid is the goal. solid is a means to change-friendly code, and every abstraction is a bet on an axis of change.
+Win the bet and adding a variant is a new file; lose it and you pay twice, for the indirection every day, and again when you have to modify the abstraction, every implementation and every consumer, which is strictly more work than editing the if -chain you replaced.
+The honest answer to "should I apply solid here?" is "what changes are likely, and which axes does this code couple?", if you can't answer those, solid is decoration, not design.
+
+-- pause --
+Drill 13, solid + microservices.
+
+Q: How does solid translate to microservice decomposition?-- think --
+
+A: Each principle has a service-level analog. SRP to "one bounded context per service". OCP to services exposed via versioned A P Is; new behaviour = new endpoint, not breaking existing. LSP to service contract evolves backward-compatibly; v2 substitutable for v1 in all existing use cases.
+ISP to small focused A P Is rather than one kitchen-sink gateway. DIP to services depend on a contract / schema (Protobuf, AsyncAPI, OpenAPI), not on each other's implementation or database.
+
+Cross-Q: Where do solid and microservices conflict?-- think --
+
+A: SRP at class-level and service-level optimise for different things. A UserService class may correctly bundle crud + authentication (one axis at the class level, user lifecycle); splitting them into separate microservices crosses a network boundary for what is logically one team's responsibility.
+Class-level SRP optimises for code coupling; service-level SRP optimises for team coupling and deployment cadence. You don't need a microservice per solid-compliant class.
+
+Cross-Q²: A team has 50 services because "SRP, each service does one thing." What's the failure mode?-- think --
+
+A: Service explosion, and it's the distributed twin of the shotgun-surgery smell. The class-level rubric doesn't translate to "one method per service". The right cut is bounded context, a coherent business capability that shares a model.
+The 50-service team is suffering distributed-monolith pain: every business operation crosses many network boundaries, traces are unreadable, a single logical transaction is now a saga, and the ops burden is brutal.
+Senior signal: recognise that solid's "small classes" doesn't justify "small services", the axes of change differ, and one of them has a network in it.
+
+-- pause --
+Drill 14, The price of solid.
+
+Q: What does over-applied solid look like in real codebases?-- think --
+
+A: Interface explosion (one interface per class with one impl, "for testability"), factories that build one type, ISP-induced micro-interfaces ( IGetById, IFindByName, IExistsCheck ), handler layers of one-line pass-throughs, DIP-induced abstraction layers that obscure the actual flow.
+Symptoms: nobody can follow a single request from controller to DB; "where does this actually happen" takes three Go-to-Definitions; adding one column touches six files.
+
+Cross-Q: How do you detect over-application during code review?-- think --
+
+A: Five red flags. (1) Interface with one implementation and no test fake. (2) A pattern (Strategy, Factory, Visitor) wrapping a one-variant case. (3) Constructor with a dozen-plus dependencies. (4) Deep inheritance chains. (5) A method that's a one-line delegation through three layers.
+Each is a candidate for removal, collapse the abstraction, inline the delegation. Net code reduction is the senior achievement when refactoring an over-SOLIDed codebase, and being comfortable saying "we deleted abstractions and the design improved" is itself a signal.
+
+Cross-Q²: A team's culture says "always add interfaces for testability." How do you push back?-- think --
+
+A: Ask to see the test that uses the fake, literally open the test project and search. If there isn't one, the interface earns nothing and you delete it.
+If there is one, ask the better question: could this test use the real implementation against SQLite-in-memory or a Testcontainer, and would that test be stronger?
+Usually yes, because the fake accepts things the real thing rejects, untranslatable link, writes that violate a unique index, a migration that was never applied.
+The bar: an interface earns its place when something else genuinely implements it, a second production implementation, a decorator, a fake you actually use, or a plugin boundary. "We might need it" is not on the list.
+
+-- pause --
+Drill 15, solid + LSP + variance interaction.
+
+Q: In C sharp, IEnumerable is assignable to IEnumerable but IList isn't to IList. What's the solid connection?-- think --
+
+A: It's LSP enforced by the type system. IEnumerable is covariant, T is only an output (return position); returning Dog where Animal is expected is safe (every Dog is an Animal).
+IList is invariant, T is also input ( Add(T), Insert(int, T), the indexer setter); if IList were assignable to IList, you could Add(new Cat()) through the Animal-typed reference. Type safety breaks; LSP is structurally violated. The compiler refuses.
+
+Cross-Q: So variance annotations are LSP at the type-system level?-- think --
+
+A: Exactly. out means "only produces T" (safe to upcast, Liskov-substitutable in covariant position). in means "only consumes T" (safe to downcast, substitutable in contravariant position).
+Invariant means "produces and consumes; no substitutability either direction." This is Liskov and Wing's contravariance-of-arguments / covariance-of-results rule expressed as a language feature, the C sharp compiler is enforcing LSP statically,
+and you can't accidentally write a non-substitutable generic interface if you opt into the annotations.
+
+Cross-Q²: Arrays in C sharp are covariant ( Dog[] to Animal[] ). Why is that an LSP design wart?-- think --
+
+A: object[] a = new string[2]; a[0] = 42; compiles (covariance accepts the upcast) but throws ArrayTypeMismatchException at runtime, because the heap object really is a string[].
+LSP says "substitutability without breaking program correctness", covariant arrays violate that, and the runtime pays for it:
+storing a reference into a reference-type array carries a covariance check ( stelem.ref semantics) that the jit can only elide where it can prove the array's exact element type.
+Java has the same wart, for the same reason: it predates generics, and void Sort(object[]) needed to accept a string[]. Modern dot NET generics are correctly invariant and the compiler refuses the upcast at compile time.
+Covariant arrays are the canonical language-level LSP violation, preserved for backward compatibility.
+
+-- pause --
+Drill 16, Is Stream an LSP violation?.
+
+Q: NetworkStream and GZipStream throw NotSupportedException from Seek. Isn't Stream a textbook LSP violation shipped by Microsoft?-- think --
+
+A: Careful, the good answer is "no, and here's why the question is interesting." Stream 's contract is conditional: Seek is defined when CanSeek is true and documented to throw NotSupportedException otherwise.
+A subclass that returns CanSeek == false and throws is honouring the contract, not breaking it. What the design actually does is move the substitutability obligation out of the type system into a runtime flag, every caller that needs seeking now has to branch, and it discovers it didn't at runtime.
+That's a real cost, just not an LSP violation.
+
+Cross-Q: So where does Stream genuinely break the rules?-- think --
+
+A: On the exception type, and you can run this. new MemoryStream(buffer, writable: false).WriteByte(1) throws NotSupportedException, the documented contract.
+new GZipStream(milliseconds, CompressionMode.Compress).ReadByte() throws InvalidOperationException ("Reading from the compression stream is not supported"). Same category of misuse, two Stream subclasses, two exception types.
+A caller with catch (NotSupportedException) handles one and crashes on the other.
+"No new exception types" is one of the Liskov and Wing rules, and that's a real break, a much sharper example than Penguin-can't-fly because it's four lines you can execute.
+
+Cross-Q²: Why didn't they segregate, IReadableStream, ISeekableStream, and so on?-- think --
+
+A: Because the combinations multiply.
+Every consumer signature would have to name the exact combination it needs ( IReadableSeekableStream ), every producer would have to return the right one, and at the scale of a framework used by every dot NET program ever written, the capability-flag design is the cheaper mistake.
+The honest framing is that it's a trade, not an oversight: compile-time substitutability was sold for a manageable type count, and the bill is paid by every caller in a runtime branch.
+Where you meet the bill in practice is A S P dot NET Core, HttpRequest.Body isn't seekable, so middleware that reads it silently starves model binding, and the fix is request.EnableBuffering(), which swaps in a FileBufferingReadStream that buffers to memory and spills to disk.
+
+-- pause --
+Drill 17, ISP taken literally.
+
+Q: If ISP says clients shouldn't depend on methods they don't use, why not one interface per method? That's the logical endpoint.-- think --
+
+A: Because you'd optimise the one cost ISP names and inflate four it doesn't. Registration multiplies, each interface needs a D I entry, and if they must resolve to the same object you need the concrete-anchor-plus-alias pattern or you get N instances (N change trackers in one request).
+Consumers that needed one dependency now take three constructor parameters. "Where is this implemented?" goes through a five-name interface list. And nothing can implement the role as a unit, a second implementation has to discover and implement five separate contracts to be a drop-in replacement.
+
+Cross-Q: So what's the actual rule for how small is small enough?-- think --
+
+A: Fowler's distinction: a role interface is named for what a consumer needs and is typically one to three members; a header interface is a mechanical copy of a class's whole public surface. Aim for role interfaces.
+The split test needs both conditions true: different consumers use disjoint subsets, and the subsets change on different cadences. If everybody calls everything, or everything changes together, splitting decouples nothing and costs navigation.
+
+Cross-Q²: Give me a one-member interface in the BCL that's genuinely right, and a fat one that's genuinely unavoidable.-- think --
+
+A: Right: IReadOnlyCollection has exactly one member, Count, and it's a complete role. IDisposable has one. IAsyncDisposable has one, and notably it's a separate interface rather than a widening of IDisposable.
+So is IHostedLifecycleService, which added four lifecycle hooks in dot NET 8 as a new interface deriving from IHostedService rather than adding four methods to the interface every hosted service in the world implements, that's ISP as a versioning strategy. Unavoidable: ControllerBase.
+Reproduce it with typeof(ControllerBase).GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly).Length, 192 on dot NET 9, nearly all result helpers any given controller ignores.
+You can't segregate a base class the framework hands you; you keep your dependency on it thin instead, which is another argument for controllers that only do H T T P shape.
+
+-- pause --
+Drill 18, Where does the interface live?.
+
+Q: My OrderService takes IOrderRepository in its constructor. Have I satisfied DIP?-- think --
+
+A: Not necessarily, you've satisfied D I. DIP has a second clause that's about ownership: the abstraction must belong to the high-level module.
+If IOrderRepository is declared in Company.Infrastructure next to SqlOrderRepository, then Company.Domain has a ProjectReference to Company.Infrastructure and the dependency still points from high-level to low-level. Nothing was inverted; a file was added.
+Move the interface into the domain project and the reference flips: infrastructure references domain, domain references nothing.
+
+Cross-Q: Does that actually matter, if the runtime behaviour is identical?-- think --
+
+A: Yes, and it shows up the first time someone wants to reuse the domain. On one codebase, referencing the domain model from a reporting tool transitively pulled in E F Core, SendGrid and the Azure S D K, because the interfaces lived with their implementations.
+It also matters for change isolation: a domain that references infrastructure recompiles when infrastructure changes, and it can accidentally start using an infrastructure type because IntelliSense offers it.
+The interface's shape degrades too, an interface that lives beside its one implementation drifts into being a copy of that implementation's surface, complete with parameters that only make sense for it.
+
+Cross-Q²: How do you enforce it, given it passes every unit test?-- think --
+
+A: Make it a build fact rather than a review convention. Keep the domain .csproj free of PackageReference entries beyond the BCL, so adding E F Core to it is a visible diff in a file people watch.
+Then add an architecture test, NetArchTest or ArchUnitNET, or a hand-written reflection test over Assembly.GetReferencedAssemblies(), asserting that the domain assembly references nothing from infrastructure.
+It runs in CI and it fails on the pull request, which is the only enforcement mechanism that survives a busy sprint.
+
+-- pause --
+Drill 19, The hidden dependency.
+
+Q: This method has no constructor dependencies at all. Can it still violate DIP? public bool IsExpired(Subscription s) goes to DateTime.UtcNow > s.EndsAt;-- think --
+
+A: Yes. DateTime.UtcNow is a static call into the operating system, a dependency on the environment that appears in no signature, no constructor and no registration.
+It's the purest DIP violation there is, because the high-level rule ( IsExpired ) is coupled directly to a low-level detail (the machine clock) with no abstraction between them. The observable symptom is that you cannot test the boundary conditions without changing the machine clock or sleeping.
+The same applies to Guid.NewGuid(), Random.Shared, Environment.MachineName and every File.* static.
+
+Cross-Q: What's the dot NET answer, and be precise about the A P I.-- think --
+
+A: TimeProvider, added in dot NET 8. It's an abstract class, not an interface, deliberately, so members can be added later with default bodies without breaking implementers.
+Its surface is GetUtcNow(), GetLocalNow(), LocalTimeZone, GetTimestamp(), TimestampFrequency, GetElapsedTime(.), CreateTimer(.), and the static TimeProvider.System. The two members people invent do not exist on it: there is no TimeProvider.Delay and no TimeProvider.CreateCancellationTokenSource.
+The time-aware delay and cancellation A P Is live on the other types, Task.Delay(TimeSpan, TimeProvider, CancellationToken) and new CancellationTokenSource(TimeSpan, TimeProvider).
+In tests you use FakeTimeProvider from the Microsoft.Extensions.TimeProvider.Testing package and advance time explicitly instead of sleeping.
+
+Cross-Q²: Doesn't that mean abstracting everything static? Where's the line?-- think --
+
+A: The line is volatility, which is Martin's own qualifier: invert away from volatile concretions. A dependency is volatile if it can fail, vary by environment, be slow, or make a test non-deterministic, clocks, randomness, the file system, the network, the database.
+string, List, Math.Sqrt and Enumerable.Where are stable: no alternative implementation, no failure mode, no test benefit. Wrapping them is pure ceremony.
+The test question isn't "is this a static call?", it's "does this make the behaviour depend on something outside the process, and would I want to control it in a test?"
+
+-- pause --
+Drill 20, The interviewer disagrees with solid.
+
+Q: I'll play the skeptic. solid is 1990 seconds consultantware, it produces bloated enterprise Java-style code, and modern C sharp doesn't need it. Convince me, or agree with me.-- think --
+
+A: Partly agree, and be specific about which parts. LSP is not consultantware, it's a formal property from a 1987 keynote and a 1994 TOPLAS paper, and violating it produces actual bugs, which is why the compiler enforces its generic-variance form for you.
+DIP is not either: it's why your app has a composition root and why TimeProvider exists. The two that deserve the skepticism are OCP and ISP, because both are predictions, OCP predicts the axis of variation, ISP predicts which consumers will want which subset.
+Predictions taken as rules produce the bloat the skeptic is describing: strategy interfaces with one implementation, IGetUserById, factories that build one type.
+
+Cross-Q: Then give me the version you'd actually put in a team's coding standard.-- think --
+
+A: Something like: split a class when two different teams file tickets against it. Add an interface when you can name the second implementation. Never make a subtype that throws from a method its base promises. Keep the domain project's references pointing inward, and make CI enforce it.
+Prefer duplication to an abstraction you can't yet name the shape of. That's five sentences, it's actionable, and it's solid with the predictions labelled as predictions.
+
+Cross-Q²: What would change your mind about an abstraction you'd already argued for?-- think --
+
+A: Evidence from the commit log. If I argued for an abstraction on an expected axis of change and a year of commits varied a different dimension, I was wrong and the honest move is to collapse it, inline the delegation, delete the interface, take the net deletion.
+The failure I'd want to avoid is the sunk-cost one: keeping an abstraction because removing it would look like admitting the design was wrong.
+**The design was wrong; the code is what has to be right.** Being visibly comfortable with that is more of the senior signal in this topic than any of the five definitions.
+
+-- pause --
+Section 2. Self-test.
+
+D I is a technique, passing collaborators in via constructor or property or method instead of constructing them. DIP is a principle, the high-level module owns the abstraction (the interface lives in the domain layer), and the low-level concrete implements it.
+You can practise D I while violating DIP two ways: by injecting a concrete SqlOrderRepo, or, the subtler one that passes review, by injecting an interface that is declared in the infrastructure project, so the domain project still has a compile-time reference pointing outward.
+True inversion is a project-reference fact, not a file-content fact.
+
+SRP violation, 11 collaborators implies multiple axes of change. Confirm by clustering the dependencies rather than the methods, and asking which team would file a ticket against each cluster: IFraudCheck + IRiskScorer belong to risk; IInvoiceRepo + IReceiptEmailer belong to billing.
+If the clusters don't share state, they're separate classes. Secondary check: ISP, some of those 11 may be fat header interfaces; look for consumers that call one method of an eight-method interface. Tooling that helps: class coupling from Visual Studio's Calculate Code Metrics, or SonarQube S1200.
+
+An interface with one implementation you never substitute is dead weight: indirection, a registration, a navigation hop, and a second file to keep in sync. The justification "for testability" only holds if a test actually uses a fake, go and look.
+If the integration tests run against SQLite-in-memory or a Testcontainer, the interface has been paying rent for nothing, and worse, a hand-written fake would have been weaker than those tests because it accepts link E F Core can't translate and writes a unique index would reject.
+solid is not "always add interfaces"; DIP says depend on abstractions when the dependency is volatile and something else implements the abstraction. Acceptable triggers: a second production implementation, a decorator, a fake you actually use, a plugin boundary.
+
+Three cases. Closed sets, LogLevel, H T T P verbs, card suits: a switch is correct code and a strategy registry is ceremony for a change that happens once a decade. Hot paths where a megamorphic virtual call is measurably the cost and a branch the jit can see is not, measure before claiming it.
+Unknown axis, if you can't say which dimension will vary, closing the wrong one is strictly worse than the if -chain, because the next change means editing the interface, every implementation and every consumer instead of one line.
+OCP's value is amortised maintenance cost; if change frequency is near zero, or you can't name the axis, it costs more than it saves.
+
+Yes, SqlRepo.Save 's postcondition is "the row is persisted on return." CachedRepo.Save weakens that to "persisted if changed." A caller that immediately queries for the saved row may see stale data, and a caller relying on a database-side trigger or rowversion bump sees nothing happen at all.
+Fixes, in order of preference: (1) make the caching transparent, write-through, so the postcondition still holds; (2) move the caching the abstraction as a decorator at a layer where staleness is an accepted contract;
+(3) if neither is possible, give it an explicitly weaker interface so callers opt in.
+The rule: subtypes may strengthen postconditions, never weaken them.
+
+Mostly wrong, but interestingly so. Stream 's contract is conditional, Seek is defined when CanSeek is true and documented to throw NotSupportedException otherwise, so GZipStream returning CanSeek == false and throwing is honouring the contract, not violating it.
+What the design really does is move the substitutability obligation from the compiler to a runtime flag, which is a genuine cost paid by every caller.
+Where it does break a rule is exception types:
+a non-writable MemoryStream throws NotSupportedException from Write, while GZipStream in compress mode throws InvalidOperationException from Read, same misuse, two Stream subclasses, two exception types, and "no new exception types" is one of the Liskov and Wing conditions.
+The design rationale for the flags is worth stating too: segregating into IReadableStream / ISeekableStream /. multiplies the combinations every signature must name, and at framework scale that was judged the worse trade.
+
+It optimises the single cost ISP names and inflates four it doesn't. D I registration multiplies, and if the interfaces must resolve to one object you need the concrete-anchor-plus-alias pattern, miss it and you get N instances, which for a repository means N change trackers in one request.
+Consumers that took one dependency now take three or four. "Where is this implemented?" becomes a five-name search.
+And nothing can implement the role as a unit: a second implementation must discover and satisfy five separate contracts to be a drop-in replacement, which is the exact opposite of what abstraction was for.
+The workable rule is Fowler's role interface, named for what a consumer needs, typically one to three members, with a split gate that requires both disjoint consumer subsets and divergent change cadence.
+
+A DIP violation, and the purest kind: DateTime.UtcNow is a static call into the operating system clock, so the dependency exists but appears in no signature, no constructor and no registration.
+The symptom is that boundary conditions, the leap day, the DST transition, the month-end renewal, are untestable without changing the machine clock or sleeping.
+The dot NET answer is TimeProvider (dot NET 8+), an abstract class rather than an interface, with GetUtcNow(), GetLocalNow(), LocalTimeZone, GetTimestamp(), TimestampFrequency, GetElapsedTime(.), CreateTimer(.) and the static TimeProvider.System;
+FakeTimeProvider from Microsoft.Extensions.TimeProvider.Testing drives it in tests.
+Note the two A P Is that are not on the type: delay and cancellation are Task.Delay(TimeSpan, TimeProvider, CancellationToken) and new CancellationTokenSource(TimeSpan, TimeProvider). The generalisation: Guid.NewGuid(), Random.Shared, Environment. and File.
+are all hidden dependencies too, and the line for when to abstract one is volatility, not staticness.
+
+Delete the interfaces that nothing else implements. For each one, apply the gate: is there a second production implementation, a decorator, a fake used by a test, or a plugin boundary? If none of those, register the concrete type and delete the interface.
+Expect the answer to be "none" for most of them, and expect the pull request to be a net deletion of files.
+Justify it on the three costs the interfaces were charging with no benefit: a doubled type count and navigation hop per call, a registration file nobody dares change, and a false signal to readers that these types are swappable when they're not.
+Keep the ones that pass the gate, and say so explicitly in the pull request description so the change doesn't read as anti-abstraction ideology. Being able to say "we removed abstractions and the design improved" without flinching is the point.
+
+A specific axis you predicted wrong. The strong shape: "We abstracted over X because we expected the variation there; every subsequent change varied Y, so each one meant editing the interface, all three implementations and every consumer, strictly more work than the switch we'd replaced.
+We collapsed it, and the diagnostic I now use is to read the last ten commits touching the file and see which dimension they actually varied." That answer demonstrates three things at once: you shipped an abstraction, you measured its outcome, and you were willing to remove it.
+The weak answer is "I once over-engineered something" with no axis named, it's the same generic self-deprecation everyone gives, and it doesn't show that you know abstraction is a directional bet rather than a quality level.
+
+The constructor changing is the signal, it is the class telling you it acquired another dependency, and hiding that signal is the whole cost of the change.
+Four specifics to name: the constructor now declares a dependency ("a container") that every class in the process has, so it says nothing;
+ValidateOnBuild walks registered descriptors and their constructor parameters, so it cannot see a GetRequiredService inside a conditional branch and the missing registration now surfaces on the first request that takes that branch;
+the domain assembly picks up a compile-time reference to Microsoft.Extensions.DependencyInjection.Abstractions, which is the outward-pointing arrow this whole principle is about; and tests must build a container instead of calling a constructor with two fakes.
+Microsoft's own D I guidelines say to avoid the pattern, and also to avoid its disguise, "injecting a factory that resolves dependencies at runtime".
+The legitimate uses are the composition root, IServiceScopeFactory where you genuinely own a scope (a BackgroundService is a singleton, so constructor-injecting a scoped DbContext would be a captive dependency), and ActivatorUtilities for objects the container does not own.
+And if the constructor is genuinely unmanageable, that is an SRP finding, not a reason to hide it, Microsoft's guidelines say the same thing: many injected dependencies "might be a sign that the class has too many responsibilities".
+
+Partly, and the useful answer names mechanisms rather than measuring. First, check the premise: allocation usually dominates dispatch, so look at what the loop body allocates per iteration before touching the design.
+Second, there are three ways to keep the extension point without the runtime indirection.
+(1) Make the variant a type parameter constrained to the interface and implement it as a struct:
+the runtime shares one compiled body across all reference-type instantiations but compiles a separate body per value-type instantiation, so inside that body the constrained call has nothing to dispatch, a struct method cannot be overridden, and the jit can inline it.
+(2) Use static abstract interface members (C sharp 11, dot NET 7): the compiler resolves those calls at compile time; there is no runtime dispatch mechanism for them at all, which is how generic math works. (3) Use a source generator to emit the specialised body against a partial declaration.
+All three trade runtime selection away: the variant has to be known where the call is written, so config-driven or per-tenant selection still needs the interface.
+Finally, be honest about measurement:
+dynamic PGO has been enabled by default since dot NET 8 and its guarded devirtualisation puts a fast path behind a type check for the dominant type at a call site, so a benchmark with a single implementation loaded measures the best case the jit will ever give you.
+
+A decorator implementing the same interface, registered in place of the original.
+Show the wiring, because that is where the dot NET knowledge is: IServiceCollection has no Decorate method, so either anchor on the concrete type and nest in a factory lambda ( AddScoped() plus AddScoped(sp goes to ActivatorUtilities.CreateInstance(sp, sp.GetRequiredService())) ),
+or register the inner one keyed (dot NET 8+) and resolve it with GetRequiredKeyedService, or take the Scrutor dependency for Decorate().
+ActivatorUtilities.CreateInstance matters because it fills the decorator's other constructor parameters from the provider, so the lambda does not need re-editing every time the decorator grows one.
+Then volunteer the failure modes: the decorator's registered lifetime governs, so a singleton decorator over a scoped inner is a captive dependency; ordering with successive Decorate calls is last-registered-outermost, which is easy to get backwards;
+and keyed and non-keyed registrations are distinct, so keying one side and not the other is a startup error.
+The alternative worth explicitly rejecting is a bool use Cache parameter or a flag inside the class, that is the same behaviour with the branch moved into tested code, and it makes the next variation another flag.
