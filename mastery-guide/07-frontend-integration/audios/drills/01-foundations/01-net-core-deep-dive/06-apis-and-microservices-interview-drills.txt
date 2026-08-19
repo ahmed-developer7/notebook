@@ -1,0 +1,340 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, rest versus R P C.
+
+Q: When does rest shine and when does R P C?-- think --
+
+A: rest shines for resource-oriented public A P Is, browser-facing, cacheable via H T T P semantics, discoverable via OpenAPI, no codegen needed. R P C (G R P C) shines for action-oriented internal calls, high throughput, strict contracts, bi-directional streaming, multi-language codegen.
+
+Cross-Q: Can you point to a "verb" that doesn't fit rest cleanly?-- think --
+
+A: Anything that isn't crud. "Send email," "process payment," "calculate-route", these are R P C operations being shoehorned into rest as POST /emails, POST /payments, POST /route-calculations.
+The endpoint name is a noun-form gymnastic; the actual semantics are "do this action." That's fine, rest tolerates action endpoints, but it's a smell that maybe G R P C fits better.
+
+Cross-Q²: graph Q L claims to be neither rest nor R P C, where does it sit?-- think --
+
+A: It's its own paradigm: query-language-over-H T T P. One endpoint ( /graphql ), POST a query describing exactly what fields you want, server returns just that. Solves over-fetching or under-fetching that rest suffers with deep resource graphs.
+Trade-offs: caching becomes harder (every query is different), N plus one in resolvers is a real risk (DataLoader required), authorization at field-level not endpoint-level. dot NET has Hot Chocolate as the leading server.
+Pick graph Q L when clients are wildly diverse (web + mobile + integrations) and need different shapes of the same data.
+
+-- pause --
+Drill 2, Idempotency.
+
+Q: What makes an H T T P method idempotent, and which verbs are?-- think --
+
+A: Idempotent = calling N times has the same observable effect as calling once. GET, HEAD, OPTIONS, PUT, DELETE are idempotent. POST and PATCH are not (by default). The contract is about server-side state, not response identity.
+
+Cross-Q: But DELETE /orders or 42 returns 404 on the second call, same state but different response. Idempotent?-- think --
+
+A: Yes, the state is the same (order 42 is gone) after the first call; subsequent calls don't change state further. The 404 is a status describing the request, not a state change. Idempotency cares about effect on resources, not whether the response code is identical.
+Some A P Is return 204 on every DELETE (idempotent in response too) by treating "delete non-existent" as success.
+
+Cross-Q²: How do I make POST /payments idempotent for retries?-- think --
+
+A: Require an Idempotency-Key header. Server stores (key, response) for some T T L; if the same key arrives again, return the stored response without re-executing. Stripe popularized this pattern.
+Implementation: hash the key to look up in Redis to if hit, return cached response; if miss, execute, store, return. The key is client-generated (UUID per request) so retries (network timeout, 502) reuse the same key. Without this, a network retry double-charges.
+
+-- pause --
+Drill 3, Versioning.
+
+Q: URL versus header versus media-type versioning, which is best?-- think --
+
+A: URL ( /api or v1/. ) is most explicit, easiest to route, easiest for clients to see. Header ( X-A P I-Version: 2.0 ) keeps URLs clean but is invisible in logs and harder to test in browsers.
+Media-type ( Accept: application or vnd.app.v2+json ) is the most "RESTful" per Roy Fielding but rarely used in practice. URL versioning wins on pragmatism in 90% of dot NET shops.
+
+Cross-Q: Doesn't URL versioning violate rest principles (a URI should identify a resource, not a version of it)?-- think --
+
+A: Strictly yes. Fielding argues that /orders or 42 is the resource; v1, v2 are representations of it and belong in Accept.
+In practice, URL versioning won because routers, gateways, monitoring, and caching all treat URLs as the natural sharding key, splitting deployments by version, applying different policies per version, et cetera The purity-versus-pragmatism trade falls on pragmatism.
+
+Cross-Q²: How do you sunset v1?-- think --
+
+A: A three-phase rollout: (1) announce, communicate to clients with a sunset header Sunset: Sat, 01 Jan 2027 00:00:00 GMT and changelog; (2) deprecate, log every v1 call with the caller (User-Agent, A P I key) so you can identify holdouts;
+(3) terminate, return 410 Gone (not 404) for v1 endpoints after the date.
+The whole timeline is usually 6-18 months. Some A P Is (Stripe) never sunset, they version forever via the Stripe-Version header.
+
+-- pause --
+Drill 4, Minimal A P I versus Controller.
+
+Q: When do you reach for a Controller over a Minimal A P I endpoint?-- think --
+
+A: Complex action filters (multiple cross-cutting concerns layered: auth + validation + logging + caching), model binding heavy lifting (file uploads, multipart, custom binders), existing M V C team conventions, OData / view-server scenarios.
+Minimal A P Is fit greenfield microservices, Jason-only crud, A O T-compiled cold-start-sensitive services.
+
+Cross-Q: Are there perf differences?-- think --
+
+A: Yes. Minimal A P Is allocate ~30% less (no controller instantiation, no IActionResult wrapping, source-generated RequestDelegate ). For TechEmpower-style microbenchmarks, Minimal A P I hits ~620k requests per second versus Controllers at ~520k. Native-A O T Minimal A P I pushes to ~720k.
+For real apps (DB calls, business logic), the framework overhead is <5% of total request time, perf is rarely the deciding factor.
+
+Cross-Q²: Can I mix both in the same app?-- think --
+
+A: Yes, the routing system unifies them. app.MapControllers() registers M V C controllers as endpoints; app.MapGet(.) adds Minimal A P I endpoints alongside. They share the same middleware pipeline, the same D I, the same OpenAPI generation.
+The pragmatic pattern: Minimal A P I for new microservices, keep Controllers in existing apps, don't migrate just for migration's sake.
+
+-- pause --
+Drill 5, Microservice boundary.
+
+Q: How do you draw a microservice boundary?-- think --
+
+A: Around a bounded context (D D D), the area where a domain term has a single, unambiguous meaning. "Customer" in shipping (address, preferences) is different from "Customer" in billing (tax Id, payment methods).
+Each becomes its own service, with its own database, communicating via events when they need to stay aligned.
+
+Cross-Q: What about cross-cutting concerns like "Customer" data, do I duplicate?-- think --
+
+A: Yes, deliberately. Each context owns its slice. Shipping holds the address it cares about; billing holds the tax info it cares about. They synchronize via events ("CustomerRegistered," "AddressChanged").
+The duplication is the price of independence; the alternative (shared schema, foreign keys across services) is a distributed monolith.
+
+Cross-Q²: How small is "too small" for a service?-- think --
+
+A: When the operational overhead (deploy, monitor, alert, on-call) exceeds the value of independence. Nano-services, one function per service, dozens of services for what should be one bounded context, multiply the overhead without multiplying the autonomy.
+The 2026 wisdom: start with a modular monolith, extract a service when you have a real reason (scaling pressure, team boundary, tech stack divergence). "Monolith first" beats "microservices everywhere" for most teams.
+
+-- pause --
+Drill 6, Sync versus async between services.
+
+Q: When do you choose sync H T T P or G R P C versus async events?-- think --
+
+A: Sync when the caller can't proceed without the result (auth check, inventory verification before order placement), when freshness is non-negotiable (latest price), when latency budget is tight (<100 milliseconds).
+Async events when multiple consumers care about the same fact (OrderPlaced to email, analytics, search index), when eventual consistency is acceptable, when producer and consumer should be temporally decoupled.
+
+Cross-Q: A chain of three sync calls, A to B to C to D. What's the failure mode?-- think --
+
+A: Latency adds up (3 hops times 50 milliseconds = 150 milliseconds minimum). Any one hop failing fails the whole chain. Partial failure (B answers, C times out) leaves A in an indeterminate state. Operational confusion: when the user sees an error, which service was at fault?
+This is the distributed monolith smell, services are split but coupling is preserved. Mitigations: convert middle hops to async events, denormalize data into A's cache via events, use Saga patterns for orchestrated workflows.
+
+Cross-Q²: Async events solve coupling but introduce the dual-write problem. What is it and how do I fix it?-- think --
+
+A: Dual-write: "save to DB AND publish event" must be atomic. If you save then publish and the broker is down, you have data without notification. If you publish then save and the DB rolls back, consumers act on a non-existent fact.
+Outbox pattern fixes it: in the same DB transaction as your business write, insert an OutboxMessages row with the event payload. A background poller reads outbox rows and publishes them, marking sent. Now publish-or-save is atomic (same transaction), and publish-success is eventually consistent.
+Tools: Wolverine, Capdot NET, MassTransit Outbox.
+
+-- pause --
+Drill 7, G R P C.
+
+Q: When does G R P C win over rest?-- think --
+
+A: Hot internal paths needing <30 milliseconds latency at high throughput. Bi-directional streaming (chat, telemetry, live dashboards). Strict, generated contracts across many languages (Go + Python + dot NET microservices sharing a .proto ).
+H T T P or 2 multiplexing avoiding application-layer head-of-line blocking across streams (a lost TCP segment still stalls every stream, that limit is TCP's). Smaller binary payloads than Jason.
+
+Cross-Q: Why isn't G R P C more popular for public A P Is?-- think --
+
+A: Browser support is awkward (raw G R P C requires H T T P or 2 with trailers, which browsers don't expose; you need G R P C-Web bridges or Connect protocol). Tooling is more rigid (need protoc, codegen step in CI, .proto-as-source-of-truth). Debugging is harder (binary, not curl-able).
+Caching is H T T P-1-style and doesn't compose with the G R P C model. Public A P Is prioritize accessibility; G R P C prioritizes performance, different optimization targets.
+
+Cross-Q²: I have a G R P C service. How do I version the contract?-- think --
+
+A: Two layers. Field-level: never renumber or reuse field tags in .proto, always add new fields with new tag numbers, mark removed fields reserved. Old clients ignore new fields; new clients see defaults for old fields.
+Service-level: when breaking, create package myapp.v2; with a new fully-qualified service name. Run v1 and v2 side by side until migration completes. Avoid breaking changes; the discipline pays off massively in a polyglot environment.
+
+-- pause --
+Drill 8, Service mesh.
+
+Q: What does a service mesh solve that an S D K in each service doesn't?-- think --
+
+A: Cross-cutting concerns at the network layer without changes to each service:
+mutual T L S between services (zero-trust), retry or timeout or circuit-breaker policies, traffic shifting (canary, blue-green) by config, fine-grained authz at the proxy, automatic telemetry (every call traced, every metric collected).
+Move the policy out of code and into the sidecar (Istio, Linkerd) or service network (Consul Connect).
+
+Cross-Q: What does it NOT solve?-- think --
+
+A: Application-level concerns. Business logic, domain validation, structured error handling, saga orchestration, all still your code. The mesh doesn't know what a "valid order" is or which retry codes should trigger a saga rollback.
+It also doesn't help with async or event-bus communication (Kafka, RabbitMQ), those are out-of-mesh. The mesh's value is binary: synchronous calls between services on the same network. Async paths still need outbox, idempotency keys, and replay logic in code.
+
+Cross-Q²: My team is 5 services. Do I need a mesh?-- think --
+
+A: Probably not. For 5 services, configure resilience in code (Polly's AddStandardResilienceHandler ), set up OpenTelemetry, use H T T P S with cert pinning, done. Mesh overhead (Istio sidecar adds ~50MB RAM, ~5 milliseconds p99 latency) buys little.
+Mesh becomes worth it around 20+ services or when policies must change without redeploys. Reach for it because of a real pain, not because the architecture diagram in the conference talk has one.
+
+-- pause --
+Drill 9, Distributed transactions.
+
+Q: How do you handle distributed transactions in microservices, 2PC or saga?-- think --
+
+A: Saga, almost always. Two-phase commit (2PC) requires a transaction coordinator across services, locks resources during the prepare phase, and falls apart when one service is slow or down (the coordinator times out the whole transaction).
+Saga uses a sequence of local transactions with compensating actions for rollback, eventually consistent, no global lock, services stay autonomous.
+
+Cross-Q: Orchestration versus choreography sagas, which?-- think --
+
+A: Orchestration: a saga manager (one service) sends commands to each participant and reacts to their replies. Pros: visible flow, easier debugging. Cons: orchestrator is a coupling hotspot. Choreography: services publish events; other services react. Pros: no central coordinator.
+Cons: business flow is implicit in event subscriptions, debug by reading all the consumers. Orchestration for complex workflows (multi-step ordering); choreography for simple fan-out (notifications, analytics).
+
+Cross-Q²: A saga is mid-flight when a service deploys with a breaking change. What happens?-- think --
+
+A: The saga is in flight in the old message format; the new service deserializes differently or rejects the message. Either the saga gets stuck (compensation step never executes) or the wrong compensation runs.
+Mitigations: (a) version messages and run multiple consumers in parallel during transitions; (b) require all sagas to complete or be force-completed before a breaking deploy; (c) make schema changes additive-only (never break the wire).
+In practice, (c) is the only sustainable answer, break-no-evolve discipline.
+
+-- pause --
+Drill 10, A P I gateway.
+
+Q: What should an A P I gateway do?-- think --
+
+A: T L S termination, authentication (validate J W T), rate limiting, request routing (URL to service), response aggregation (B F F pattern), basic transformations (header rewriting), correlation-ID injection, cross-origin (cores) policy enforcement.
+It's the single ingress point, observable, secured, and where you enforce coarse-grained policies.
+
+Cross-Q: What should NOT be in the gateway?-- think --
+
+A: Business logic (validation, calculation, decisions). Service-specific authz (fine-grained "can this user delete this order?", too contextual). Heavy aggregation (joining N service responses into one, that's a B F F service, not the gateway). Database access (the gateway is stateless edge).
+Each of these belongs in the services themselves; bloating the gateway makes it a deployment bottleneck and a single point of operational failure.
+
+Cross-Q²: YARP versus Ocelot versus Azure A P I Management, quick picks?-- think --
+
+A: YARP: embed-in-your-app reverse proxy, code-driven configuration, lowest overhead, requires you to host. Ocelot: similar feature set, configuration-file driven, slightly older, smaller community.
+Azure APIM / A W S A P I Gateway / Kong: managed services with rich features (dev portal, monetization, policies, transformations) and a price. For small teams: YARP in a dedicated A S P dot NET Core gateway. For enterprise with A P I products: managed.
+For specific needs (transformation-heavy, multi-protocol): Kong or Traefik. Start with YARP, graduate when you hit its limits.
+
+-- pause --
+Drill 11, Bulkhead.
+
+Q: What does the bulkhead pattern isolate?-- think --
+
+A: It limits the number of concurrent calls to a downstream service, isolating one slow dependency from consuming all your threads or connections. Without it, a slow Payment service ties up every thread that's waiting for it, starving requests that don't need Payment.
+With it, only N requests can be in-flight to Payment at any time; the rest fail-fast or queue with a timeout.
+
+Cross-Q: How is bulkhead different from circuit breaker?-- think --
+
+A: Bulkhead limits concurrent volume (only N calls allowed at once); circuit breaker limits failure cascade (after K failures, fast-fail without trying). They complement: bulkhead prevents resource exhaustion under load; circuit breaker prevents pointless retries on a known-broken downstream.
+Polly v8's AddStandardResilienceHandler bundles both, bulkhead caps concurrency, circuit breaker opens on high error rates.
+
+Cross-Q²: How do you size the bulkhead?-- think --
+
+A: As a function of (downstream capacity times your service's share). If Payment can handle 100 requests per second and you're one of four consumers, your bulkhead is ~25 concurrent calls. Too small: your own throughput is capped artificially. Too big: you contribute to overwhelming Payment.
+In practice, monitor and tune, start conservative (10-20), watch p99 latency and error rates, increase gradually. Plus: set a queue length cap so requests fail-fast when bulkhead is saturated rather than queuing for seconds.
+
+-- pause --
+Drill 12, Schema-first versus code-first A P Is.
+
+Q: Schema-first ( .proto / OpenAPI spec) versus code-first (annotations generate spec), which?-- think --
+
+A: Schema-first for polyglot environments (the schema is the contract, generated clients in each language) and A P I-as-product (where the spec is the deliverable, reviewed before code).
+Code-first for single-team services where the A P I exists to serve a U I or another team and evolving with code is faster than maintaining a separate schema file.
+
+Cross-Q: What's the failure mode of code-first?-- think --
+
+A: Schema drift. Annotations get out of sync with reality, [ProducesResponseType(200)] on a handler that also returns 400 in some cases. OpenAPI generation lies. Clients trust the spec. Fix: contract tests that validate spec implementation.
+Or generate the spec from running tests rather than annotations.
+
+Cross-Q²: For dot NET 9+, what's changed about OpenAPI generation?-- think --
+
+A: Microsoft.AspNetCore.OpenApi is now first-class (replacing the Swashbuckle dependency for the common case). app.MapOpenApi() exposes the spec at /openapi or v1.json. The generator reads endpoint metadata, attribute info, and infers schemas from C sharp types.
+Swagger U I is still a separate package (Swashbuckle's U I), but the spec generation is now in-box. For Minimal A P Is with TypedResults, NotFound>, the OpenAPI types are inferred precisely, better than the older runtime-attribute approach.
+
+-- pause --
+Drill 13, Backwards-compatible evolution.
+
+Q: Is A P I evolution always additive only, or can you remove fields safely?-- think --
+
+A: Adding fields is always safe (clients ignore unknown fields). Removing fields breaks clients reading them. Renaming breaks. Changing type breaks (string to int). Changing semantics silently breaks (the field is the same but means something different now).
+The rule of thumb: never remove or change; only add. Mark old fields as deprecated in OpenAPI or protobuf, then sunset them with a major version bump.
+
+Cross-Q: How do you sunset a field?-- think --
+
+A: (1) Add the replacement field. (2) Mark the old field deprecated in spec (OpenAPI: "deprecated": true; protobuf: [deprecated = true] ). (3) Log every read of the old field (track who's still using it). (4) Communicate timeline to clients via the deprecation announcement.
+(5) After all clients have migrated (verified by logs), remove the field in the next major version. Time-budget: typically 6-12 months.
+
+Cross-Q²: Can I make a non-additive change behind a feature flag?-- think --
+
+A: Carefully. Feature flag on the server (route to old or new behavior based on a header or path) is essentially versioning by another name, clients opt into the new behavior. Feature flag on the client is fine (clients gate their own usage).
+The trap: feature flags that change semantics with no client awareness create heisenbug-style failures (some clients see old behavior, some new, hard to reproduce). Use feature flags for additive features; use versioning for breaking changes.
+
+-- pause --
+Drill 14, Health checks.
+
+Q: Liveness versus readiness versus startup probes, what's each for?-- think --
+
+A: Liveness: "is the process alive?", if no, kill and restart it. Checks pure process health, not dependencies. Readiness: "is the process ready to serve traffic?", if no, take out of load balancer. Checks dependencies (DB, cache, downstream services).
+Startup: "is the process done initializing?", used by Kubernetes to skip liveness or readiness checks until startup completes (avoids killing slow-starting apps during warmup).
+
+Cross-Q: Why are liveness and readiness separate?-- think --
+
+A: Because they imply different actions. Liveness failure to restart the pod (process is wedged). Readiness failure to remove from load balancer (process is fine but can't serve; for example, DB is temporarily down).
+If you used one probe, Kubernetes would restart pods every time the DB blinked, destroying healthy instances during a transient backend issue. The separation lets the system shed traffic gracefully without churning healthy processes.
+
+Cross-Q²: What should NOT go in a liveness check?-- think --
+
+A: External dependencies. A liveness check that pings the DB will cascade: DB down to liveness fails on every replica to Kubernetes kills them all to the cluster has no live pods.
+Liveness should check only "is my process able to respond to H T T P at all?", typically just "return 200, I'm here." Database and downstream checks belong in readiness, where the action is "stop receiving new traffic" not "kill yourself."
+
+-- pause --
+Drill 15, Distributed tracing.
+
+Q: How does a trace propagate across H T T P services?-- think --
+
+A: Via the traceparent header (W3C Trace Context standard). The first service generates a trace ID and a span ID, embeds them in traceparent: 00-{trace Id}-{span Id}-01, calls the next service. That service reads the header, creates a child span under the same trace ID, propagates further.
+OpenTelemetry's HttpClient instrumentation does this automatically; A S P dot NET Core's AspNetCoreInstrumentation consumes incoming traceparent and starts the request span.
+
+Cross-Q: What about async events, does trace propagate?-- think --
+
+A: Yes, but you need to thread it manually. The publisher injects traceparent into message headers; the consumer reads and starts a span with the same trace ID. Frameworks (MassTransit, NServiceBus, Wolverine) do this if you enable OpenTelemetry instrumentation.
+Without it, the consumer's work shows as a separate trace, disconnected from the producer's work. Always wire async event instrumentation alongside H T T P, they're the same problem, different transport.
+
+Cross-Q²: What's the cost of sampling 100% traces in production?-- think --
+
+A: For a high-requests per second service, terabytes of telemetry per day. Backend (Jaeger, Tempo, Honeycomb) bills bite hard.
+Solution: head-based sampling (decide at trace start: keep 1%) or tail-based sampling (collect everything in memory, decide at trace end: keep all errors and slow ones, drop fast successes). OpenTelemetry's Collector supports both.
+Most teams use head sampling with 100% for errors and slow paths via dynamic sampling rules. Free-tier observability platforms include sampling out of the box.
+
+-- pause --
+Section 2. Self-Test.
+
+Every helper on Results is declared as returning IResult, so the endpoint's metadata carries no information about which status codes or body shape it can produce.
+To document it you hand-annotate, .Produces().Produces(404), and those annotations are claims sitting next to the code, free to drift from it. That is pitfall 12 (OpenAPI drift) arriving through the back door.
+
+TypedResults.Ok(user) returns the concrete Ok instead, and the implementation type supplies the response-type metadata for OpenAPI on its own, so the Produces call disappears. Microsoft's guidance is explicit that returning TypedResults is preferred to returning Results.
+Tests get the second win: assert on the concrete result type and read .Value off it, rather than casting an IResult or executing it against a fabricated HttpContext.
+
+The cost is at the signature. Because TypedResults.Ok and TypedResults.NotFound return different types, the compiler will not infer a common return type from the two branches, the lambda no longer compiles unless you declare the return type in full: async Task, NotFound>>.
+(Declaring it as Task compiles too, but that erases the static type information again, so you are back to hand-writing .Produces.) Every new status you can return has to be added to that union.
+The verbosity is the mechanism: the statuses now live in the type, which is exactly what makes the endpoint self-describing. Both TypedResults and Results are dot NET 7+.
+
+Ordering is registration order on the way in and reversed on the way out: the code before await next(context) runs first-in-first-out, the code after it runs first-in-last-out.
+So the logging filter registered first is the outermost wrapper, it opens first and closes last, and the validation filter runs inside it. Swap the registrations and validation gets to short-circuit before logging ever sees the request.
+A filter that returns without calling next short-circuits the rest of the chain and the handler entirely.
+
+Why a filter rather than middleware: an endpoint filter runs after routing has selected the endpoint and after parameter binding, so it is handed the already-bound arguments, context.GetArgument(0) is the deserialised, typed object.
+Middleware sits earlier in the pipeline with nothing but HttpContext: parameter binding hasn't run yet, so to validate there you would re-read and re-deserialise the body yourself.
+Middleware placed after UseRouting can see which endpoint was chosen, HttpContext.GetEndpoint(), but then you are hand-rolling the per-endpoint dispatch a filter gives you for free. Filters are also scoped, one endpoint, or one MapGroup subtree, so unrelated requests don't pay for them.
+
+One gotcha: a filter class can take constructor dependencies from D I, but the filter itself is not resolved from the container.
+
+Each refresh opens a new request and abandons the previous connection, but nothing on the server is listening for that. All three queries run to completion.
+Two of them are producing results for a socket no one will read, while holding a pooled database connection and burning real server-side work for the whole duration. The client sees one answer; the server paid three times.
+
+That is the amplification shape behind a lot of outages: the endpoint gets slow, clients retry, retries multiply load on the exact dependency that is already struggling, and the queue never drains. The work is not just wasted, it is actively making recovery harder.
+
+The fix is one parameter, async (IRepo repo, CancellationToken ct) goes to await repo.HeavyQuery(ct).
+In a Minimal A P I CancellationToken is one of the framework-supplied parameter types: no attribute, no registration, it binds to the cancellation token associated with the current request ( HttpContext.RequestAborted ), which is triggered when the connection is aborted.
+Passing it into E F Core or HttpClient lets them abandon the work and hand the connection back.
+
+The discipline is every endpoint and every downstream call, not just the ones you think are slow. The token has to be threaded the whole way down; cancellation stops dead at the first method that accepted the token and didn't pass it on.
+
+Each keeps its own copy, deliberately. "Customer" is not one concept: in Shipping it is name, address, delivery instructions; in Billing it is name, tax Id, billing address, payment methods; in Support it is name, ticket history, satisfaction score.
+Those are three entities that happen to share a word. A bounded context is precisely the region in which a domain term has a single unambiguous meaning, so the boundary is drawn around the meaning, not around the noun.
+
+The shared table is a shared kernel, not microservices. It relocates the coupling to the data layer, where nothing enforces it: Billing adds a NOT NULL column or renames one, and Shipping breaks at runtime, no compiler, no contract, no build failure.
+The two services must now migrate and release together, which means you have paid the full operational tax of splitting (separate deploys, monitoring, tracing, on-call) and kept the coupling of the monolith.
+
+The honest cost of the answer is duplication and drift, and you pay it with events: CustomerRegistered, CustomerAddressChanged, each context updating its own slice. Eventual consistency is the price of independent deployability, and it is the right trade here.
+
+Two corollaries worth saying out loud:
+slice by business capability, never by technical layer (a "U I service" plus a "data service" is just a distributed n-tier app), and don't slice so finely that a service is one table, past that point the per-service deploy, monitor, alert and on-call overhead exceeds the autonomy you bought.
+
+Distributed monolith.
+The diagnostics: latency is additive down the chain, so the user-visible tail is the sum of every hop; availability multiplies down, so any single service being unavailable takes the whole flow with it;
+and partial failure, hop 2 committed, hop 3 timed out, leaves the chain in a state with no transaction to roll back and no single owner of the resulting error.
+You bought the cost of distribution and none of the independence.
+
+Two fixes, and you pick per hop. Take the hop off the critical path by publishing an event, so consumers react on their own schedule and the caller keeps a locally denormalised copy of what it needs.
+Or merge services that genuinely cannot ship separately back together, that coupling is evidence the boundary was drawn in the wrong place. Keep synchronous calls only where the caller truly cannot proceed without the answer, such as an inventory or auth check.
+
+The new problem is the dual-write problem: "commit to my database and publish the event" spans two systems with no shared transaction. Save then publish and the broker is down, the state changed and nobody was told.
+Publish then save and the transaction rolls back, consumers just acted on a fact that never happened.
+
+The fix for that is the outbox pattern: inside the same database transaction as the business write, insert a row into an outbox table carrying the event payload. A separate relay polls unsent rows, publishes them, and marks them sent.
+The business write and the intent to publish are now atomic; delivery becomes at-least-once and eventually consistent, which is why consumers on the other end must be idempotent (dedupe on a message or idempotency key) rather than assuming exactly-once delivery.

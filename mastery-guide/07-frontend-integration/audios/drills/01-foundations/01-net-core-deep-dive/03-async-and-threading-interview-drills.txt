@@ -1,0 +1,446 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Async state machine.
+
+Q: When you write async Task M() { var x = await GetAsync(); return x + 1; }, what does the compiler generate?-- think --
+
+A: A struct-based state machine implementing IAsyncStateMachine. The compiler converts the method body into a MoveNext() method with a state field (initially -1), captured locals as fields, and switch-based dispatch over the states.
+The original method becomes a thin shim that creates the state machine, attaches an AsyncTaskMethodBuilder, and calls Start(ref state Machine), which calls MoveNext synchronously until it hits the first await that isn't completed.
+
+Cross-Q: Why is it a struct and not a class?-- think --
+
+A: To avoid heap allocation in the common "all awaits complete synchronously" case. The state machine starts on the stack as a struct. If an await needs to suspend ( !awaiter.IsCompleted ), the builder boxes the struct onto the heap and schedules the continuation against the boxed copy.
+So the design is "stack-by-default, heap-only-on-suspension", zero allocation when async work completes synchronously (for example, cache hit, immediate completion).
+
+Cross-Q²: How does the state machine handle exceptions?-- think --
+
+A: The MoveNext method wraps the entire switch in a try or catch. Any exception thrown by the body is caught and passed to builder.SetException(ex), which transitions the returned Task to the Faulted state with that exception.
+Awaiting that task re-throws the exception via ExceptionDispatchInfo.Throw (preserving the original stack trace). This is why await errors look like they originated in the awaited method, not in the state machine, the dispatcher restores the original trace.
+
+-- pause --
+Drill 2, ConfigureAwait(false).
+
+Q: When does ConfigureAwait(false) actually matter?-- think --
+
+A: When the call site has a non-null SynchronizationContext and you don't want the continuation to marshal back to it. Concretely: U I threads (WinForms, WPF, MAUI) and legacy A S P dot NET (pre-Core).
+In those, await some Task captures the context and posts the continuation back to it, ConfigureAwait(false) opts out, letting the continuation run on whichever thread completed the work (typically a pool thread).
+
+Cross-Q: When is it a no-op?-- think --
+
+A: A S P dot NET Core, there's no SynchronizationContext on request threads (since dot NET Core 1.0), so there's nothing to capture. The continuation runs on whichever pool thread is available regardless. Also a no-op in console apps, BackgroundServices, G R P C handlers, and most modern workloads.
+Library authors still use it because their code might be called from a U I app one day, but in pure A S P dot NET Core apps, the overhead is zero.
+
+Cross-Q²: My library does await x.ConfigureAwait(false); await y;, bug?-- think --
+
+A: No, that specific pair is safe. After await x.ConfigureAwait(false) the continuation is already running without the original context. The next await y uses the default (capture) behaviour, but there is now nothing to capture, so y 's continuation also completes on a pool thread.
+The genuinely broken shape is the reverse order: await x; await y.ConfigureAwait(false);, the first await captures and marshals you back onto the U I thread, and the second one opting out afterwards doesn't undo that hop or the deadlock exposure it created.
+
+Two caveats that make this less clean than it sounds, and which are the real reason for the rule.
+First, context is only captured when an incomplete Task is awaited, if x happens to complete synchronously, no capture occurred, ConfigureAwait(false) on it did nothing, and you are still on the original context when you reach y.
+Whether that happens can vary with hardware, cache state, and network timing. Second, you generally can't see the whole chain. **So the rule is positional discipline, not cleverness: ConfigureAwait(false) on every await in library code.
+There is no assembly-level attribute to do it for you, enable analyzer CA2007** or use an I L weaver if you want it enforced mechanically.
+
+-- pause --
+Drill 3, Task.Run for I O.
+
+Q: What's wrong with await Task.Run(() goes to http Client.GetStringAsync(url)) ?-- think --
+
+A: You're wasting a thread-pool thread for nothing. Task.Run schedules the lambda onto a pool thread, which then calls GetStringAsync, which is itself async. The pool thread immediately hits an await, gets released, and you've just done an unnecessary thread hop.
+The right code is await http Client.GetStringAsync(url) directly, the I O is already async, no need to wrap.
+
+Cross-Q: When is Task.Run actually appropriate?-- think --
+
+A: For C P U-bound work that you want to offload from the calling thread (typically a U I thread that you don't want to block while computing). Examples: image filtering, parsing a huge Jason document, doing heavy link over an in-memory collection.
+The pattern: synchronous C P U work + you want to free the caller to handle other things. Not for I O, that's already async by design.
+
+Cross-Q²: I've seen Task.Run wrap a sync method that internally does I O. Justified?-- think --
+
+A: Sometimes. If the method is sync-only (a third-party A P I with no async overload) and called from a context where blocking is unacceptable (U I thread, request handler), Task.Run is the escape hatch, it moves the blocking call to a pool thread.
+But every such call ties up a pool thread for the duration; under load you can exhaust the pool. Better long-term: lobby the library to add async A P Is, or wrap with Task.Factory.StartNew(., TaskCreationOptions.LongRunning) so it uses a non-pool thread for genuinely long-running sync work.
+
+-- pause --
+Drill 4, ValueTask rules.
+
+Q: List the four rules for using ValueTask.-- think --
+
+A: (1) Await it at most once, ValueTask may wrap a poolable IValueTaskSource; the source can be reset and reused after the first consumption, so a second await can return stale data. (2) Don't read .Result / .GetAwaiter().GetResult() before it has completed, same reuse issue.
+Note the precise wording: reading .Result on a ValueTask that has already completed is legal and is the whole point of the struct's fast path; the prohibition is on doing it early, not on doing it at all. (3) Don't await concurrently, you can't await the same ValueTask from two threads.
+(4) If you need any of the, convert with .AsTask(), the wrapper allocates but is safe to consume repeatedly.
+
+Cross-Q: Why does ValueTask exist?-- think --
+
+A: To avoid Task allocation when the result is already available synchronously. A common pattern: async ValueTask GetCachedAsync(string key) { if (_cache.TryGetValue(key, out var v)) return v; return await FetchAsync(key); }.
+On a cache hit, no Task object is allocated, the value is wrapped in a stack-resident ValueTask struct. On a cache miss, the async path allocates as normal. For high-frequency calls where the sync path dominates, this avoids garbage collector pressure.
+
+Cross-Q²: Should I make every async method return ValueTask ?-- think --
+
+A: No. Rule of thumb: use ValueTask only when the synchronous-completion path is common AND the call is hot enough that allocation savings matter. For most app-level methods, Task is fine, the allocation is one small object cached by the runtime's AsyncTaskMethodBuilder pool.
+ValueTask adds complexity (the four rules) and bigger struct size (two refs + bookkeeping). Default to Task; switch to ValueTask only when profiling shows allocation as a hot path.
+
+-- pause --
+Drill 5, Deadlock from .Result on U I thread.
+
+Q: Why does someAsyncMethod().Result hang on a U I thread?-- think --
+
+A: The U I thread calls .Result, which blocks waiting for the task to complete. Inside someAsyncMethod, an await captured the U I thread's SynchronizationContext.
+When the awaited operation completes, the continuation gets posted back to the U I thread, but the U I thread is blocked on .Result and can't pump messages. The continuation waits forever; .Result waits forever. Classic deadlock.
+
+Cross-Q: Why doesn't this happen in A S P dot NET Core?-- think --
+
+A: A S P dot NET Core doesn't install a SynchronizationContext on request threads. When the awaited task completes, the continuation isn't posted back to a specific thread, it runs on whatever pool thread completes the I O.
+The original thread is still blocked on .Result, but the work runs to completion on another thread and the result becomes available. No deadlock, but still bad, you've blocked one thread for no reason. Under load, this causes thread-pool starvation.
+
+Cross-Q²: How do I avoid .Result in a method that can't be async (for example, a constructor)?-- think --
+
+A: Three options. (1) Restructure to async factory: replace the constructor with static async Task CreateAsync() and use it. (2) Make the dependency lazy: defer the async work to first use via AsyncLazy or a Task field initialized eagerly.
+(3) ConfigureAwait(false) all the way down then .GetAwaiter().GetResult(), works in A S P dot NET Core, still deadlocks on U I threads if any await missed ConfigureAwait. The first option is the only fully safe one; the others are workarounds.
+
+-- pause --
+Drill 6, Thread pool starvation.
+
+Q: What are the symptoms of thread pool starvation?-- think --
+
+A: Latency spikes correlated with traffic bursts; response times that grow with concurrency even when C P U and memory look fine, low C P U with high latency is the tell.
+In dotnet-counters, dotnet thread pool thread count climbs slowly and steadily (fast to about 2-3 times processor count, then 1-2 threads per second), often with a large dotnet thread pool queue length and a low dotnet thread pool work item count, lots pending, little completing.
+A count that stabilises roughly 3 times processor count also indicates chronic blocking, even though latency may look acceptable while it's steady.
+
+Cross-Q: What causes it?-- think --
+
+A: Blocking calls on pool threads. The classics: .Result, .Wait(), Thread.Sleep, sync DB calls ( SqlConnection.Open without OpenAsync ), sync file I O, sync H T T P calls, lock on a contended object while doing real work. Each blocked thread is unavailable for other tasks until it unblocks.
+The pool grows to compensate, but during the lag the queue swells.
+
+Cross-Q²: What's the fix beyond "make everything async"?-- think --
+
+A: Async all the way down is the fix. Tactical mitigations: (1) ThreadPool.SetMinThreads(worker Threads, completionPortThreads) at startup pre-allocates headroom for a known burst shape.
+(2) Find the blocking calls and convert them, for a continuous problem dotnet-stack report -n dumps thread stacks straight to the console;
+for an intermittent one, dotnet-trace collect -n --clrevents waithandle --clreventlevel verbose captures the WaitHandleWait event (dot NET 9+), which fires on sync-over-async and on lock waits, then read the nettrace in PerfView.
+(3) For legacy sync libraries, move the call off the pool with Task.Factory.StartNew(., TaskCreationOptions.LongRunning). (4) Watch dotnet-counters continuously so you catch regressions rather than incidents.
+Don't crank SetMinThreads to thousands, Microsoft's own docs warn that if too many tasks start at once, all of them appear slow, and that the pool's own algorithm usually does better.
+
+-- pause --
+Drill 7, CancellationToken propagation.
+
+Q: When must you pass a CancellationToken down to a callee?-- think --
+
+A: Anytime the callee does I O, runs a loop, or could take >100 milliseconds. The token is cooperative cancellation: each layer of the call stack must explicitly check or respect it.
+Skipping a layer means cancellation requests stop propagating there, your "cancellable" operation becomes uncancellable past that layer.
+
+Cross-Q: What's the difference between accepting a token and passing it on?-- think --
+
+A: Accepting ( Task M(CancellationToken ct) ) is a contract: callers can cancel you. Passing it on ( await inner Service.GetAsync(ct) ) extends the cancellation to nested work.
+Common bug: accept a token, then call await inner Service.GetAsync() without passing it, the outer work looks cancellable but the inner I O ignores cancellation, so cancellation requests stall waiting for I O that won't bail out. Always pass tokens down.
+
+Cross-Q²: My method does cts.CancelAfter(TimeSpan.FromSeconds(5)) to enforce a timeout. The DB call hangs anyway. Why?-- think --
+
+A: The timeout token is fine, but the DB call must honor the token. Two common failures: (1) you didn't pass the token to ExecuteAsync(ct), the E F Core call doesn't check it.
+(2) The provider doesn't fully support cancellation, older sequel Server providers ignore tokens during connection establishment, only honoring them for query execution.
+Workaround: Task.WhenAny(actual Work, Task.Delay(timeout, ct)), if the work doesn't honor the token, the delay completes first and your method returns. The actual work continues in the background (cancellation isn't free), but your code surfaces the timeout.
+
+-- pause --
+Drill 8, Task.WhenAll exception.
+
+Q: If three tasks in Task.WhenAll throw, what does the await re-throw?-- think --
+
+A: Only the first exception. The returned task's Exception property is an AggregateException containing all of them, but await 's unwrapping logic only re-throws the first inner exception (via ExceptionDispatchInfo ).
+The other exceptions are still there on task.Exception, but you have to inspect them manually after the catch.
+
+Cross-Q: How do you handle all the exceptions?-- think --
+
+A: Two patterns. (1) Don't await the WhenAll, get the returned task, then iterate failed tasks manually:
+csharp.
+var all = Task.WhenAll(tasks);
+try { await all; }.
+catch.
+{.
+var failures = tasks.Where(t goes to t.IsFaulted).Select(t goes to t.Exception!.InnerException!).ToList();
+// handle all.
+}.
+
+(2) Use AggregateException.Handle((ex) goes to {. return true; }) to walk and selectively suppress. Modern code prefers the first pattern, clearer error handling per task.
+
+Cross-Q²: What if I want to fail fast on the first exception and cancel the rest?-- think --
+
+A: Pass a shared CancellationTokenSource to all tasks, then on first failure, call cts.Cancel(). Pattern: use Task.WhenAny to detect first completion, check if it's a failure, cancel others, and observe their completions.
+Or use the newer Parallel.ForEachAsync with a shared cancellation, it stops scheduling new work on first failure (but in-flight work still completes). For "race with cancellation," the manual WhenAny + cancel pattern is most flexible.
+
+-- pause --
+Drill 9, async void.
+
+Q: When is async void acceptable?-- think --
+
+A: Event handlers only. U I event handlers ( button_Click, OnNavigated, et cetera) must match the event delegate signature, which is void. The framework invokes them and doesn't expect a Task back. Everywhere else: async Task.
+
+Cross-Q: What goes wrong with async void outside event handlers?-- think --
+
+A: Three problems. (1) The exception escapes normal handling. Because there is no Task, the exception is raised directly on the SynchronizationContext that was active when the method started, it is never captured onto a Task, so a try or catch around the call site cannot catch it.
+On a U I thread it surfaces through the framework's unhandled-exception path; with no context installed (console, A S P dot NET Core) it's raised on a thread pool thread, and unhandled exceptions on pool threads terminate the process.
+Be precise here: it is not "swallowed", that's the behaviour of an unobserved faulted Task, which is a different bug with different symptoms. (2) No way to await completion, callers can't wait for it or know when it finished.
+(3) No way to know if it succeeded, no Task to check IsFaulted on, and it's correspondingly hard to unit-test.
+
+Cross-Q²: I have a fire-and-forget background operation. async void is convenient. What's the alternative?-- think --
+
+A: Capture and observe the Task explicitly:
+csharp.
+_ = Task.Run(async () goes to {.
+try { await DoWorkAsync(); }.
+catch (Exception ex) { _logger.LogError(ex, "background failed"); }.
+});
+
+The _ discard signals intent; the try or catch contains exceptions; the logger records them. For production code, prefer IHostedService or Channel over fire-and-forget, they give you observability and lifecycle management. async void is for events; everything else is Task.
+
+-- pause --
+Drill 10, Channel versus BlockingCollection.
+
+Q: When would you use Channel over BlockingCollection ?-- think --
+
+A: Almost always in modern code. Channel is async-aware ( WriteAsync / ReadAsync / WaitToReadAsync ), supports structured concurrency ( ReadAllAsync with await foreach ), and integrates with cancellation.
+BlockingCollection is sync-only, its Add / Take methods block threads, which is fatal in async pipelines. BlockingCollection is from dot NET 4.0; Channel is from dot NET Core 2.1 and designed for the async-first world.
+
+Cross-Q: What's the difference between bounded and unbounded channels?-- think --
+
+A: Unbounded, Channel.CreateUnbounded(), accepts arbitrarily many items; producers never block. Risk: if consumers can't keep up, memory grows without limit. Bounded, Channel.CreateBounded(capacity), when full, producers wait via WriteAsync. Backpressure flows upstream.
+Almost always use bounded in production: it forces you to design for slow consumers explicitly.
+
+Cross-Q²: I have multiple producers and one consumer. Channel?-- think --
+
+A: Yes, channels are designed for MPSC (multiple producers, single consumer) and also support MPMC. Channel.CreateBounded(new BoundedChannelOptions(capacity) { SingleReader = true, SingleWriter = false }), telling the channel about your access pattern lets it optimize internal locking.
+For pure MPSC, SingleReader = true is faster than the default. Default reader or writer counts in the options assume multi-reader, multi-writer, set both flags if your pattern is more constrained.
+
+-- pause --
+Drill 11, Parallel.ForEachAsync over Task.WhenAll(items.Select(.)).
+
+Q: When would you use Parallel.ForEachAsync instead of Task.WhenAll(items.Select(async i goes to.)) ?-- think --
+
+A: When you have a large number of items and want to throttle parallelism. Task.WhenAll(items.Select(.)) fires all tasks immediately, for 10,000 URLs, that's 10,000 concurrent H T T P requests. The server explodes, your machine runs out of sockets, or downstream rate limits kick in.
+Parallel.ForEachAsync(items, options, async (i, ct) goes to.) caps concurrency at MaxDegreeOfParallelism (default Environment.ProcessorCount ). It's the right shape for batch I O work in 2026.
+
+Cross-Q: How would you implement throttling without Parallel.ForEachAsync ?-- think --
+
+A: SemaphoreSlim with WaitAsync / Release inside each task body:
+csharp.
+var sem = new SemaphoreSlim(16);
+var tasks = items.Select(async i goes to.
+{.
+await sem.WaitAsync();
+try { return await ProcessAsync(i); }.
+finally { sem.Release(); }.
+});
+var results = await Task.WhenAll(tasks);
+
+Works but is verbose and error-prone. Parallel.ForEachAsync packages the same pattern with cancellation, exception handling, and graceful shutdown built-in. Prefer Parallel.ForEachAsync unless you need the result aggregation that Task.WhenAll provides.
+
+Cross-Q²: I want a list of results from Parallel.ForEachAsync. How?-- think --
+
+A: It doesn't return results, its signature is Task (no T ). Either: (1) write results to a thread-safe collection ( ConcurrentBag or ConcurrentQueue ) inside the body, then read after.
+(2) Use Parallel.ForEachAsync only for fire-and-forget; switch to Task.WhenAll with a SemaphoreSlim if you need ordered results. (3) Use a Channel, write results to it inside ForEachAsync, drain after the parallel call completes. The right choice depends on whether order or throughput dominates.
+
+-- pause --
+Drill 12, lock across await.
+
+Q: Why does the compiler reject lock (obj) { await Foo(); } ?-- think --
+
+A: Because lock is built on Monitor.Enter / Monitor.Exit, which is thread-affine, the same thread that entered must exit. After an await, the continuation may resume on a different thread (pool thread), so the exit would fail with SynchronizationLockException.
+The compiler errors out at compile time with CS1996 to prevent the runtime bug.
+
+Cross-Q: What's the async-safe alternative?-- think --
+
+A: SemaphoreSlim with WaitAsync / Release:
+csharp.
+private static readonly SemaphoreSlim _gate = new(1, 1);
+public async Task FooAsync().
+{.
+await _gate.WaitAsync();
+try { await DoWorkAsync(); }.
+finally { _gate.Release(); }.
+}.
+
+SemaphoreSlim is not thread-affine, any thread can call Release after any other called Wait. The downside: it's not reentrant (a single task calling FooAsync recursively will self-deadlock). Most use cases don't need reentrancy; if you do, you need a custom async-reentrant lock.
+
+Cross-Q²: lock is reentrant; SemaphoreSlim isn't. How do I get reentrant async locking?-- think --
+
+A: There's no built-in. Options: (1) Nito.AsyncEx's AsyncLock provides reentrancy via AsyncLocal<> tracking of holders. (2) Roll your own with a wrapper that tracks the current AsyncLocal depth, release only when depth returns to 0. (3) Restructure to avoid recursion, usually the cleanest answer.
+Reentrant async locks have edge cases (especially with Parallel.ForEachAsync and Task.Run boundaries that may not preserve AsyncLocal ); avoid if you can.
+
+-- pause --
+Drill 13, Reentrant locking.
+
+Q: Is lock reentrant? Is SemaphoreSlim ?-- think --
+
+A: lock is reentrant, Monitor tracks the owning thread and an entry count. The same thread can re-enter the lock; it must call Exit the same number of times to release.
+SemaphoreSlim is not reentrant, each Wait decrements the count; calling Wait twice from the same context decrements twice, and you need two Release calls. A task calling WaitAsync on a semaphore it already holds will deadlock if the count is 1.
+
+Cross-Q: Why would non-reentrant be desirable?-- think --
+
+A: Performance and clarity. Reentrant locks must track the owning thread or task, an extra layer of bookkeeping on every acquire or release.
+Non-reentrant primitives are faster on the hot path and force you to design lock-acquisition flow explicitly (no "oh, this might recursively need the lock" surprises). Most concurrency design patterns (workqueue, producer-consumer, single-writer state machines) don't need reentrancy.
+
+Cross-Q²: I have a method that calls another method, both need the same lock. Reentrant lock makes this trivial. With SemaphoreSlim how?-- think --
+
+A: Refactor: extract a private "I assume the lock is held" helper. Public methods acquire the lock and call the helper; helper methods do work without re-acquiring:
+csharp.
+private async Task DoWorkInternalAsync() { / assume lock held / }.
+
+public async Task PublicA() { await _sem.WaitAsync(); try { await DoWorkInternalAsync(); } finally { _sem.Release(); } }.
+public async Task PublicB() { await _sem.WaitAsync(); try { /. / await DoWorkInternalAsync(); } finally { _sem.Release(); } }.
+
+Each public entry point acquires once; internal helpers assume the contract. More code than reentrant locks, but the lock-ownership flow is explicit and the compiler can analyze it.
+
+-- pause --
+Drill 14, Volatile.Read versus Interlocked.
+
+Q: When do you need Volatile.Read / Volatile.Write versus Interlocked ops?-- think --
+
+A: Volatile provides memory ordering, prevents the compiler or C P U from reordering loads and stores around the volatile op. It's about visibility: ensures a write by one thread is seen by readers in the expected order.
+Interlocked provides atomicity, guarantees that read-modify-write sequences happen as a single uninterruptible operation, plus full memory fence semantics.
+Use Volatile for single-field reads or writes where you just need ordering; use Interlocked when you need to modify atomically (counter, CAS, exchange).
+
+Cross-Q: For a simple bool _ready flag set by one thread and read by another, what's the right primitive?-- think --
+
+A: Volatile.Write(ref _ready, true); and if (Volatile.Read(ref _ready)) {. }. The writer guarantees the write isn't reordered before the prior setup; the reader guarantees it sees the latest value (no register-cached stale value).
+You don't need Interlocked because you're not doing read-modify-write; you're just flagging completion. Or use ManualResetEventSlim for "wait until ready" semantics, handles the ordering for you and adds the blocking primitive.
+
+Cross-Q²: Will the jit honor bool _ready without volatile correctly?-- think --
+
+A: Not guaranteed. Without volatile semantics, the jit can cache the bool in a C P U register inside a tight loop, the loop reads the register, not memory, and never sees the writer's update. The thread spins forever. This is the classic "missing volatile" bug.
+Modern hardware has strong memory models (x86 is mostly TSO), which masks the bug on x86 but exposes it on ARM. Always use Volatile or Interlocked for cross-thread flags, don't rely on the jit not optimizing the read away.
+
+-- pause --
+Drill 15, Thread.Abort.
+
+Q: What happened to Thread.Abort in modern dot NET?-- think --
+
+A: It's gone as a capability, though the method still exists for source compatibility. In dot NET 5 and later, Thread.Abort throws PlatformNotSupportedException, and calling it produces obsoletion diagnostic SYSLIB0006.
+( ThreadAbortException correspondingly only occurs on dot NET Framework.) It worked in dot NET Framework but was always dangerous: it injected an asynchronous exception into the target thread at an arbitrary instruction, potentially leaving locks held, files unflushed, and invariants violated.
+Modern dot NET took the position that cooperative cancellation via CancellationToken is the only safe model.
+
+Cross-Q: I have a third-party library doing C P U work that doesn't accept a CancellationToken. How do I stop it?-- think --
+
+A: You can't, cleanly. Options, in order of preference: (1) Submit a pull request / file a bug to add token support, most maintained libraries accept this quickly. (2) Move the call to a separate process and kill the process to cancel, heavyweight but works.
+(3) Task.WhenAny(work, timeout), your method returns when the timeout elapses, but the work continues consuming C P U in the background until done. Resources leak. (4) AppDomain, gone in dot NET Core+, not an option.
+The right architecture: don't trap yourself with uncancellable long-running operations.
+
+Cross-Q²: Why was Thread.Abort deemed unfixable rather than improved?-- think --
+
+A: Because the failure mode is fundamentally about state corruption, not A P I design. When you inject an exception at an arbitrary instruction, the target thread might be: inside a finalizer, holding a lock, in the middle of a struct copy, in a constructor, deep inside Monitor.Enter.
+The runtime can't reason about which states are recoverable. The dot NET team analyzed many years of Thread.Abort bug reports and concluded: there is no safe way to abort a thread that wasn't designed to be aborted. Cooperative cancellation requires the worker to design for it.
+It's a hard "no" in modern dot NET, accept it and design accordingly.
+
+-- pause --
+Drill 16, IAsyncEnumerable versus Task>.
+
+Q: When would you use IAsyncEnumerable instead of Task> ?-- think --
+
+A: When results are produced over time and the consumer can process each item as it arrives rather than waiting for the full set. Paginated A P I calls, DB cursors, WebSocket messages, file lines. Task> buffers everything before the caller sees anything, high memory, high latency to first item.
+IAsyncEnumerable delivers incrementally at roughly constant memory.
+
+Cross-Q: What does [EnumeratorCancellation] do, and why does it matter?-- think --
+
+A: It marks which parameter receives the token that .WithCancellation(ct) injects at the call site. Without it the token is silently ignored and the stream runs to completion regardless of cancellation, a bug with no compile error and no runtime exception, which is what makes it dangerous:
+csharp.
+public async IAsyncEnumerable StreamAsync(.
+[EnumeratorCancellation] CancellationToken ct = default) {. }.
+
+await foreach (var item in StreamAsync().WithCancellation(ct)) {. }.
+
+Cross-Q²: I'm consuming an IAsyncEnumerable and want to stop early. How?-- think --
+
+A: Two ways. (1) break inside await foreach, the compiler-generated finally calls the enumerator's DisposeAsync, which signals the producer to stop. (2) .WithCancellation(ct) plus cts.Cancel(), the iterator observes the token and throws OperationCanceledException.
+Use break for "I found what I needed"; use cancellation for timeouts and external signals, where the decision comes from outside the loop.
+
+-- pause --
+Drill 17, SemaphoreSlim versus Semaphore.
+
+Q: When do you use Semaphore versus SemaphoreSlim ?-- think --
+
+A: Semaphore when you need cross-process scope, a named system semaphore is an operating system object visible process-wide and can coordinate separate processes.
+SemaphoreSlim for everything else: it's in-process, has a user-mode fast path, and is the only one of the two with an async A P I ( WaitAsync ).
+In async code SemaphoreSlim is almost always the answer, A P I throttling, connection limiting, async mutex. Note the security caveat that applies to any named system object: by default it isn't restricted to the creating user.
+
+Cross-Q: SemaphoreSlim as an async mutex, what's the pattern?-- think --
+
+A: Initialise with count 1: new SemaphoreSlim(1, 1). Callers await _sem.WaitAsync(ct), do the exclusive work, and Release() in a finally. One caller at a time; the rest queue asynchronously without parking a thread.
+This is the standard replacement for lock in async methods, and it works specifically because SemaphoreSlim doesn't enforce thread identity, unlike Mutex, which can only be released by the thread that acquired it.
+
+Cross-Q²: Can SemaphoreSlim deadlock without there being a bug in my logic?-- think --
+
+A: It can deadlock without the bug being visible, which is the honest version of the question. If one logical operation acquires the gate and then calls, transitively, something that acquires the same count-1 gate, the second WaitAsync waits for a release that only the caller it can perform.
+lock would have let this through via reentrancy, so the failure appears the moment you convert lock to SemaphoreSlim. The discipline: one acquire per public entry point, internal helpers assume it's held.
+
+-- pause --
+Drill 18, Progress.
+
+Q: How does Progress marshal reports back to the U I thread?-- think --
+
+A: It captures the SynchronizationContext at construction time, not at report time. Report(value) posts the callback to that captured context.
+The worker just calls progress?.Report(value) and knows nothing about threads; where the callback runs is decided entirely by where the Progress was constructed.
+
+Cross-Q: What happens if Progress is constructed on a background thread with no SynchronizationContext ?-- think --
+
+A: The documented behaviour is that the callbacks are invoked on the ThreadPool, not inline on the reporting thread. So it doesn't "just run synchronously where you called Report "; it hops to a pool thread.
+Two consequences: your callback must be thread-safe, and if it touches U I you'll get a cross-thread exception. Construct it on the U I thread if the callback updates U I. In A S P dot NET Core there's no context at all, so design the callback to be thread-safe by construction.
+
+Cross-Q²: My worker emits about 100 progress reports a second and the U I stutters. Fix?-- think --
+
+A: Throttle. (1) On the worker side, report only every Nth item, or only when a Stopwatch shows enough elapsed time since the last report.
+(2) On the consumer side, since the worker depends on IProgress, not on Progress, you can substitute a ThrottledProgress implementation that coalesces reports and updates at a fixed rate, with no change to the worker.
+Option 2 is the one that shows you understand why the abstraction is an interface.
+
+-- pause --
+Drill 19, IAsyncEnumerable versus Channel.
+
+Q: When would you use IAsyncEnumerable versus Channel for streaming data?-- think --
+
+A: IAsyncEnumerable when producer and consumer are tightly coupled in one logical pipeline, the producer yield return s, the consumer await foreach es, and the producer's pace is driven by the consumer pulling. No extra infrastructure.
+Channel when they are decoupled, different tasks, different lifetimes, possibly different components. The channel sits between them as a buffer; the producer runs at its own pace until the buffer fills, at which point WriteAsync applies backpressure.
+
+Cross-Q: Can I convert an IAsyncEnumerable into a Channel ?-- think --
+
+A: Yes, run a pump task that iterates the enumerable and writes each item to the channel:
+csharp.
+_ = Task.Run(async () goes to {.
+try.
+{.
+await foreach (var item in source.WithCancellation(ct)).
+await channel.Writer.WriteAsync(item, ct);
+channel.Writer.Complete();
+}.
+catch (Exception ex) { channel.Writer.Complete(ex); }.
+});
+
+Note the Complete(ex) overload, completing the writer with the exception is what propagates a producer failure to the consumer's ReadAllAsync loop instead of hanging it.
+This bridge is useful when you have an async-enumerable source but need multi-consumer fan-out, since an async enumerable is single-consumer.
+
+Cross-Q²: Several consumers read from one Channel. Does each consumer see every item?-- think --
+
+A: No, items are distributed, not broadcast. Channel readers compete; each item goes to exactly one consumer, whichever gets there first. That is fan-out as work distribution.
+If you need every consumer to see every item (publish-subscribe), a channel is the wrong primitive: create one channel per consumer and write to all of them, or use TPL Dataflow's BroadcastBlock. The one-line version: channel = work queue; dataflow broadcast = pub or sub.
+
+-- pause --
+Section 2. Self-test.
+
+The compiler generates a struct to avoid a heap allocation in the common case where every await completes synchronously (cache hit, in-memory result). The struct starts on the calling thread's stack. Promotion happens when an await genuinely suspends, awaiter.IsCompleted is false.
+At that point AsyncTaskMethodBuilder boxes the struct (copies it to a heap allocation) and registers the continuation against the boxed copy; from then on MoveNext runs against the heap-resident instance.
+Net result: zero allocation on the fully-synchronous path, one allocation on the first real suspension. This is also why ValueTask pays off exactly where the sync path dominates, both optimisations target the same case.
+
+When (a) the caller doesn't need the whole set before it starts working, streaming to a response body, feeding a pipeline, writing into a Channel; (b) the dataset is large enough that buffering every page into a List meaningfully delays time-to-first-item or strains memory;
+or (c) callers frequently abandon mid-stream, in which case IAsyncEnumerable stops the I O immediately on break or cancellation while Task> has already paid for everything.
+If the caller always needs all pages before doing anything, Task> is simpler and the switch buys nothing, and you'd now owe every caller an [EnumeratorCancellation] conversation.
+
+Parallel.ForEachAsync: idiomatic, handles cancellation and exception propagation cleanly, no semaphore lifetime to manage, but returns Task, not Task, so it produces no results.
+SemaphoreSlim + Task.WhenAll: more code, but returns an array of results in input order, which matters when callers need per-item results or want to compose the array into a further stage. Prefer Parallel.ForEachAsync for side-effecting work (write to DB, call an A P I, no return value).
+Prefer SemaphoreSlim + Task.WhenAll when you need ordered results. If you must collect from ForEachAsync, write into a ConcurrentBag (unordered) or ConcurrentQueue, and be honest that neither restores input order.
+
+No leak: CancellationTokenSource is IDisposable and using var disposes it when the method returns, on every path including the exception path. The pattern is correct and idiomatic. Two improvements a reviewer should raise.
+First, it ignores the caller's cancellation, the method takes no CancellationToken parameter, so a caller who wants to abandon the request can't. Link them: CancellationTokenSource.CreateLinkedTokenSource(caller Token) plus CancelAfter(5000), so either source can cancel.
+Second, if this is library code, add .ConfigureAwait(false). The subtle race people reach for, CTS disposed while the awaiter still holds the token, isn't a real problem here, because the await completes before the using scope ends.
+
+Reject it as a blanket rule. ValueTask only avoids an allocation on the synchronous-completion path. Service methods that always hit a database or network never take that path, they suspend, the state machine boxes, and a Task-equivalent allocation happens anyway.
+So the change buys nothing there while imposing the four-rule contract on every caller: await at most once, don't read .Result early, don't await concurrently, .AsTask() if you need any of that.
+Those rules produce silent bugs (stale or corrupt values from a recycled IValueTaskSource ), not exceptions, which is the worst failure mode to spread across an A P I surface.
+The right approach is evidence-driven: profile, find the methods where the synchronous path is both common and hot, cache-first lookups, lazy loaders, high-frequency serializer or parser infrastructure, and convert only those. Default to Task.

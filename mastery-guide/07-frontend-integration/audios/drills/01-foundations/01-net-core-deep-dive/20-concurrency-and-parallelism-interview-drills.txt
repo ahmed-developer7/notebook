@@ -1,0 +1,414 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Concurrency versus parallelism.
+
+Q: What's the difference between concurrency and parallelism, and how does it map onto dot NET A P Is?-- think --
+
+A: Concurrency is dealing with many things at once, a structuring property. Parallelism is doing many things at once, an execution property. In dot NET, concurrency is async / await: the point is to hold no thread while waiting for I O, and it helps even on a single core.
+Parallelism is the TPL, Parallel.For / ForEach, PLINQ: the point is to put more cores on C P U-bound work, and it does nothing on one core. The practical test is one question: is this work waiting, or is it working?
+
+Cross-Q: A single-threaded Node-style event loop, is that concurrent, parallel, both, neither?-- think --
+
+A: Concurrent, not parallel. It has many operations in flight and interleaves them, which is concurrency by definition, but only one thing executes at a time so there is no parallelism. That example is the cleanest disproof of "concurrency means multithreading".
+The mirror case is also worth naming: a Parallel.For running inside a container limited to one C P U is parallel code executing with zero parallelism.
+
+Cross-Q²: I have a loop that downloads a file, decompresses it, and uploads the result, per item, 5,000 items. Which is it, and what do you use?-- think --
+
+A: It is both, in three stages with different bottlenecks, and that is the tell that one loop is the wrong shape. Download and upload are I O-bound, concurrency, Parallel.ForEachAsync, cap chosen from the remote service's limits.
+Decompression is C P U-bound, parallelism, cap Environment.ProcessorCount. If I write it as a single Parallel.ForEachAsync I have to pick one number that is wrong for two of the three stages: too high and the decompression oversubscribes the cores, too low and the transfers underuse the network.
+The correct structures are either three sequential passes with three degrees of parallelism, or a TPL Dataflow mesh with per-block MaxDegreeOfParallelism. Needing two different degrees of parallelism in one body is the signal you have outgrown a single loop.
+
+-- pause --
+Drill 2, Parallel.ForEach over I O.
+
+Q: Why is Parallel.ForEach usually the wrong tool for I O-bound work?-- think --
+
+A: Four reasons that stack. (1) The body is Action, so there is nowhere to put a Task, you are forced into .Result, .Wait(), or a synchronous A P I, all of which park a pool thread for the whole round trip.
+(2) A parked thread looks like no progress, so the pool injects replacements, and injection is deliberately gradual, your effective concurrency ramps over seconds. (3) MaxDegreeOfParallelism defaults to -1, documented as no limit, so the loop keeps asking for capacity it will immediately block.
+(4) There is one thread pool per process, so the victims are your H T T P endpoints and your health check, not the batch job. The answer is Parallel.ForEachAsync, whose body is Func and therefore holds no thread while awaiting.
+
+Cross-Q: Someone "fixes" it by passing an async lambda to Parallel.ForEach. What happens?-- think --
+
+A: It compiles, and it is worse. The lambda binds to Action, so an async lambda there is async void: the loop treats the delegate as complete the moment it returns at the first await, so Parallel.ForEach finishes almost instantly with all the work still in flight.
+Nothing awaits those state machines, so exceptions are not captured on any Task, with no SynchronizationContext installed they surface on a pool thread, and per Microsoft's thread pool documentation an unhandled exception on a pool thread terminates the process.
+There is no compiler error because async void is a legal Action. This is one of the highest-signal traps in the TPL precisely because the code reads correctly.
+
+Cross-Q²: Is there any case where Parallel.ForEach over I O is defensible?-- think --
+
+A: Yes, and saying so is stronger than the absolutist answer. A console tool or one-shot migration utility, where there is no other traffic in the process to starve and the library you must call genuinely has no async A P I, Parallel.ForEachAsync cannot await a method that does not exist.
+In that case you are trading threads for wall-clock in a process that has nothing else to do, which is a legitimate trade. What makes it defensible is the absence of a shared pool with other consumers. Inside a web host, that condition never holds.
+
+-- pause --
+Drill 3, MaxDegreeOfParallelism.
+
+Q: What does MaxDegreeOfParallelism default to, and what does the default mean?-- think --
+
+A: -1. For Parallel.For and Parallel.ForEach the docs say that means "there is no limit on the number of concurrently running operations", the underlying scheduler decides.
+For Parallel.ForEachAsync, -1 means ProcessorCount, which is also documented on the overloads that take no ParallelOptions:
+"the operation will execute at most ProcessorCount operations in parallel." So the same property has two meanings depending on the method, which is exactly the kind of asymmetry that gets asked about.
+It is also a ceiling, not a target, the docs are explicit that changing it "only limits how many concurrent tasks will be used."
+
+Cross-Q: I set it to Environment.ProcessorCount and my container has a 500m C P U limit. What value do I get, and does it change if the limit is raised at runtime?-- think --
+
+A: You get 1.
+On Linux and macOS for all versions, and on Windows from dot NET 6, Environment.ProcessorCount returns the minimum of the machine's logical processors, the affinity count if the process is affinitised, and "the C P U utilization limit rounded up to the next whole number", 0.5 rounds up to 1.
+And no, raising the limit later has no effect: the docs say the value "is fixed at dot NET runtime startup for the process lifetime. It does not reflect changes in the environment settings while the process is running." A vertical-scale event needs a restart to be observed.
+DOTNET_PROCESSOR_COUNT can override the computed value, which is useful for pinning behaviour in tests and dangerous if someone sets it in a chart and forgets.
+
+Cross-Q²: For an I O loop, should MaxDegreeOfParallelism be ProcessorCount ?-- think --
+
+A: No, and being able to say why is the point. For C P U work the constraint is cores, so ProcessorCount is the right derivation.
+For I O work no core is occupied while waiting, so core count is irrelevant, the constraint is whatever the other side can take: the A P I's documented rate limit, the connection pool size, the egress proxy's concurrency cap, the database's max_connections.
+Deriving an I O cap from ProcessorCount is a category error that happens to look responsible. If I set 24 for an I O loop, I should be able to point at the thing that said 24.
+
+-- pause --
+Drill 4, Aggregation in a parallel loop.
+
+Q: I want to sum a computed value over ten million elements in parallel. How?-- think --
+
+A: The local Init / local Finally overload of Parallel.For. Each participating task gets a private accumulator from local Init, the body returns the updated local rather than mutating a captured variable, and local Finally merges once per task with Interlocked.Add.
+If there are eight tasks, there are eight shared writes total, not ten million.
+
+Cross-Q: Why not just lock (_gate) { total += x; } in the body, the lock is uncontended most of the time, isn't it?-- think --
+
+A: It is contended by construction, that is the whole point of the loop. Every iteration on every core takes and releases the same lock, so the loop is serialised at its narrowest point and you have added lock overhead on top.
+Even switching to Interlocked.Add in the body only removes the lock, not the sharing: the cache line holding total still bounces between cores on every increment, so throughput is bounded by the interconnect rather than by the arithmetic.
+The fix is not a faster synchronisation primitive, it is fewer shared writes.
+
+Cross-Q²: My aggregate is a 256-bucket histogram, and a metrics endpoint has to read it live. local Finally doesn't apply. Now what?-- think --
+
+A: Now the counters must be individually addressable at all times, so merge-at-the-end is genuinely unavailable and I have to deal with the sharing directly.
+256 long s occupy a handful of cache lines, so 32 threads incrementing 256 different counters are still fighting over a small number of lines, false sharing, whose fingerprint is correct, lock-free code that gets slower as you raise the degree of parallelism.
+The fix is padding each counter onto its own line with an explicit-layout struct, which is exactly what the BCL does in ConcurrentQueueSegment 's PaddedHeadAndTail, "to avoid false sharing between producers and consumers".
+Two caveats I'd add unprompted: the line size is platform-dependent, which is why the BCL uses a named constant instead of a literal, and padding inflates the array, so I'd only do it after confirming the negative-scaling signature in a profile.
+
+-- pause --
+Drill 5, PLINQ performance.
+
+Q: I added .AsParallel() to a link query and it got slower. Give me the checklist.-- think --
+
+A: Four things, in order. (1) Is the delegate expensive enough? PLINQ has to partition, schedule, and merge; the docs say "small source collections with trivial delegates are generally not good candidates for PLINQ." A property projection cannot repay that. (2) Did it parallelise at all?
+PLINQ analyses query shape and falls back to sequential for documented patterns, indexed Where / Select / ElementAt after an ordering or filtering operator that rearranged indices, Take / Skip on reordered sources, Zip, Concat, Reverse on non-indexable sources.
+(3) Is there shared state in a delegate? A captured counter or list serialises the query and is a data race besides. (4) What does the terminal operator cost? ToList / ToArray force a merge of every partition; foreach serialises results onto the enumerator thread. ForAll skips the merge entirely.
+
+Cross-Q: What exactly does AsOrdered() cost, and when is it free?-- think --
+
+A: It is never free, and Microsoft's own wording is the safest thing to quote: "There is a cost associated with ordering, but this cost is usually modest." Mechanically, PLINQ must track each element's ordinal index through every downstream operator and reassemble at the merge,
+which means buffering, a partition that finishes early cannot yield until the partitions ahead of it have.
+GroupBy and Join are called out as carrying their own overhead for the same structural reason. Where it is pure waste is when a later OrderBy or a sorting consumer exists, then you paid to preserve an order that gets discarded.
+The mitigation is scoping: AsOrdered() for the stage that needs it, AsUnordered() before the expensive stage that does not.
+
+Cross-Q²: Can I use PLINQ for a batch of H T T P calls if I'm careful?-- think --
+
+A: No. PLINQ is synchronous by design, there is no async operator, no AsParallelAsync, and the delegates return values, not tasks.
+"Careful" would mean .Result or .GetAwaiter().GetResult() inside each delegate, which parks a pool thread per element and reproduces every problem from Drill 2 with worse ergonomics. The correct answer is Parallel.ForEachAsync.
+PLINQ's niche is C P U-bound, side-effect-free, expensive-per-element transformation, and the honest follow-up is that even there, Parallel.ForEach over a partitioner is often simpler to reason about and easier to cap.
+
+-- pause --
+Drill 6, Partitioning.
+
+Q: What is partitioning and why does chunk size decide whether data parallelism helps?-- think --
+
+A: Partitioning is how a data-parallel construct decides who processes which elements. Two strategies.
+Range partitioning splits an indexable source into contiguous index ranges up front, zero synchronisation afterwards, but per the docs "if one thread finishes early,
+it cannot help the other threads finish their work." Chunk partitioning hands each task a chunk on demand and lets it come back for more, inherently load-balancing,
+but "the partitioner does incur the synchronization overhead each time the thread needs to get another chunk," and crucially "the amount of synchronization incurred in these cases is inversely proportional to the size of the chunks." That last sentence is the whole trade-off:
+small chunks balance well and synchronise often; large chunks synchronise rarely and balance badly.
+Pick wrong in either direction and the parallelism is eaten by coordination or by idle cores.
+
+Cross-Q: My source is an array and per-element cost varies by two orders of magnitude. What does PLINQ do by default and how do I fix it?-- think --
+
+A: Exactly the wrong thing: "By default when it is passed an IList or an array, PLINQ always uses range partitioning without load balancing." Equal index ranges with wildly unequal costs means one task grinds while the rest finish and idle.
+The fix is Partitioner.Create(source, load Balance: true) and querying the partitioner instead of the array, the overload table documents which overloads load-balance: the IEnumerable one always does, the array and IList ones do when the boolean is true, and the numeric range overloads never do.
+
+Cross-Q²: Opposite problem, my body is three arithmetic operations and the loop won't scale. Same fix?-- think --
+
+A: No, the opposite fix. Here the body is smaller than the machinery around it: the docs note "the cost of invoking that delegate is about the same as a virtual method call", and at three operations per element the dispatch dominates. Load balancing would make it worse by adding synchronisation.
+The fix is Partitioner.Create(0, source.Length), which yields Tuple ranges, and a plain for inside the body, one delegate invocation per range instead of per element.
+The three-argument overload lets you dictate range Size directly, which the docs recommend "in scenarios where the work per element is so low that even one virtual method call per element has a noticeable impact." Uneven cost to more partitioning. Trivial body to less.
+
+-- pause --
+Drill 7, Channel versus ConcurrentQueue versus Dataflow.
+
+Q: I have producers and consumers. Why not just a ConcurrentQueue ?-- think --
+
+A: Because ConcurrentQueue is a data structure, not a pipeline, and it is missing the two things a pipeline needs.
+First, no awaiting read, the consumer has to poll with TryDequeue plus a Task.Delay, which is simultaneously a latency floor and wasted C P U, and tuning the delay only moves the problem between the two.
+Second, no backpressure, it is unbounded, so when the consumer falls behind, memory grows until the process dies.
+Channel gives you ReadAllAsync (no polling), CreateBounded with a FullMode policy (backpressure), and Writer.Complete() (a real completion signal, so ReadAllAsync ends and shutdown works).
+
+Cross-Q: What are the bounded full modes and how do you choose between them?-- think --
+
+A: Wait blocks the producer until space frees, genuine backpressure, and the right default for anything where losing an item is a business problem. DropWrite discards the incoming item, DropOldest and DropNewest discard from the buffer.
+It is a domain decision, not a performance tuning knob: an order pipeline wants Wait, a diagnostic telemetry feed wants DropOldest because losing the oldest sample beats applying backpressure to production, and a "latest value" gauge is a capacity-1 channel with DropOldest.
+Reaching for Wait by reflex on a log stream is how you end up throttling a critical path to protect a debug feed.
+Worth also knowing: dot NET 9 added Channel.CreateUnboundedPrioritized, which reads lowest-priority-value first, but there is no bounded prioritised variant, so it is priority or backpressure, not both.
+
+Cross-Q²: When would you take the Dataflow NuGet dependency instead?-- think --
+
+A: When the topology is the point, not the queue.
+Four things Dataflow does that Channel will not: per-stage MaxDegreeOfParallelism in one mesh, so a network-bound stage and a C P U-bound stage can each run at their natural rate;
+broadcast via BroadcastBlock, where every linked consumer gets every item, something a channel deliberately does not do, since a channel item goes to exactly one reader; batching via BatchBlock; and completion that propagates along links with PropagateCompletion.
+Two things to flag: it is not distributed with dot NET, the docs say so explicitly, it is the System.Threading.Tasks.Dataflow package, and ExecutionDataflowBlockOptions.MaxDegreeOfParallelism defaults to 1, so every block is serial until you say otherwise.
+"I built a Dataflow pipeline and it isn't parallel" is almost always that default.
+
+-- pause --
+Drill 8, ConcurrentDictionary guarantees.
+
+Q: What does ConcurrentDictionary actually guarantee?-- think --
+
+A: Two things, precisely. Reads are lock-free, the docs say "read operations on the dictionary are performed in a lock-free manner". Writes use fine-grained locking rather than one global lock, so concurrent writers to different keys generally don't serialise. That is it.
+It does not guarantee that compound operations are atomic, that enumeration is a snapshot, or that the delegate you hand to GetOrAdd / AddOrUpdate runs once.
+
+Cross-Q: Walk me through the GetOrAdd factory guarantee. Exactly what can happen?-- think --
+
+A: The docs are quotable here: "the value Factory delegate is called outside the locks to avoid the problems that can arise from executing unknown code under a lock.
+Therefore, GetOrAdd is not atomic with regards to all other operations." And:
+"If you call GetOrAdd simultaneously on different threads, value Factory may be called multiple times, but only one key or value pair will be added to the dictionary." So the dictionary is consistent, one entry, and every caller receives the same value, but your factory is not:
+N concurrent callers on a cold key can run it N times, and N−1 results are silently discarded.
+That is harmless for a pure computation and a resource leak for anything that opens a socket, a file, or a connection, because nothing disposes the losers.
+The fix is ConcurrentDictionary> with LazyThreadSafetyMode.ExecutionAndPublication, the wrapper may be constructed many times, but only the one that wins the insert is ever returned, so only its factory is ever forced.
+
+Cross-Q²: When would you use a plain lock over a Dictionary instead?-- think --
+
+A: Three cases. (1) The invariant spans more than one thing. ConcurrentDictionary makes each operation atomic; it cannot make your transaction atomic.
+If a write must update the map, a counter, and a secondary index together, per-key locking does not help and you get states no single-threaded run could produce. (2) Write-dominated with low contention.
+The concurrent version pays a bucket-and-lock array, more per-entry allocation, and a Count that is no longer a field read; if one or two threads write far more than anyone reads, lock + Dictionary is leaner.
+(3) You need a consistent multi-key read, three TryGetValue calls are three independently-timed observations, whereas one lock makes them one.
+And the fourth thing I would mention: enumeration is documented as not "a moment-in-time snapshot", so anything that needs a coherent view calls ToArray(), which does take the locks.
+
+-- pause --
+Drill 9, Synchronisation choice.
+
+Q: Why can't you hold a lock across an await ?-- think --
+
+A: Because lock over an ordinary object compiles to Monitor.Enter / Monitor.Exit, and Monitor is thread-affine, the thread that entered must be the thread that exits.
+A continuation after an await may resume on a different pool thread, at which point Monitor.Exit would throw SynchronizationLockException. Rather than let you emit code that can hit that, the compiler rejects it outright with CS1996.
+The same restriction applies to System.Threading.Lock in dot NET 9, the language reference says "You can't use the await expression in the body of a lock statement." The replacement is SemaphoreSlim(1, 1) with WaitAsync / Release, which works precisely because a semaphore counts permits, not owners,
+so a continuation on another thread may legally release it.
+
+Cross-Q: What do you lose by switching from lock to SemaphoreSlim(1,1) ?-- think --
+
+A: Reentrancy. lock lets the same thread re-enter and requires a matching number of exits; SemaphoreSlim has no concept of an owner, so a public method that takes the gate and then calls a private helper that takes the same gate waits forever for itself.
+It is not a deadlock between two threads, it is one logical operation deadlocking against itself, which is harder to spot in a stack trace.
+The discipline is acquire exactly once at the public entry point and let internal helpers assume the gate is held, ideally with a naming convention ( FooCore = "gate already held"). You also lose the compiler-generated try / finally, so every WaitAsync needs a hand-written finally { Release(); }.
+
+Cross-Q²: When does ReaderWriterLockSlim lose to a plain lock ?-- think --
+
+A: Mechanism first: ReaderWriterLockSlim maintains reader counts, waiter counts, upgrade state and events, whereas an uncontended Monitor acquire is a thin-lock CAS on the object header.
+So for a critical section of a few instructions, a TryGetValue, a field read, the bookkeeping costs more than the work, and the "many concurrent readers" benefit never materialises because nobody was waiting.
+It also loses when reads and writes are roughly balanced, and any time the state is a keyed map, because ConcurrentDictionary 's read path takes no lock at all.
+There are documented subtleties I'd raise too: the default is NoRecursion; only one thread may hold upgradeable mode at a time; a thread that entered plain read mode may never upgrade, "if two threads in read mode both try to enter write mode, they will deadlock";
+and readers are blocked while writers are queued, a fairness policy that favours writers.
+It earns its keep for genuinely long critical sections over structured state that isn't a dictionary.
+
+-- pause --
+Drill 10, The memory model, part 1.
+
+Q: A worker loops on while (!_stop) and another thread sets _stop = true. Why might the loop never exit?-- think --
+
+A: Two independent reasons, and both should be named. The jit may hoist the read. Nothing inside the loop modifies _stop as far as the optimiser can see, so it can load it once into a register and test the register forever.
+The dot NET memory model spec permits it, "the effects of ordinary reads and writes can be reordered as long as that preserves single-thread consistency", and "adjacent non-volatile reads from the same location can be coalesced", and the Volatile docs state the converse guarantee,
+that volatile accesses "ensure that a value is read or written to memory and not cached (for example, in a processor register)".
+Separately, the hardware may delay visibility. The first reason is the important one for interviews because it is a pure software effect: it will happen on an x64 laptop in Release. "It only breaks on ARM" is a comforting story that a release-mode jit disproves.
+
+Cross-Q: So marking it volatile fixes it. Does volatile make the write immediately visible to the other thread?-- think --
+
+A: No, and the docs say so in a sentence worth memorising: "Even though the volatile write to y on thread 1 occurred before the volatile read of y on thread 2, thread 2 may still see y2 == 0.
+The volatile write to y does not guarantee that a following volatile read of y on a different processor will see the updated value." volatile gives ordering, not promptness.
+Its guarantee is conditional: if you observe the volatile write, you also observe everything that preceded it in program order. It says nothing about when. Anyone describing volatile as "makes writes immediately visible" has the model wrong, and that phrasing is a common interview tell.
+
+Cross-Q²: Two limits of the C sharp volatile keyword and what you use instead?-- think --
+
+A: It cannot be applied to array elements, and it cannot be applied to long / double, the C sharp reference enumerates the permitted types rather than stating a size rule, and says the exclusions exist "because reads and writes to fields of those types can't be guaranteed to be atomic".
+(Worth getting right under cross-examination: it is not a "pointer size or smaller" rule, IntPtr is permitted and long is not, though both are 8 bytes on 64-bit.) Volatile.Read / Volatile.Write cover both, they take the location by ref, so Volatile.Read(ref arr[i]) is fine,
+and per the docs "volatile reads and writes on such 64-bit memory are atomic even on 32-bit processors, unlike regular reads and writes." dot NET 10 also added standalone Volatile.ReadBarrier() and Volatile.WriteBarrier() for when you want the fence without an access.
+And the honest closing: for anything that means "stop", none of this is the right A P I, CancellationToken is, and the runtime handles the publication for you.
+
+-- pause --
+Drill 11, The memory model, part 2.
+
+Q: What does the dot NET memory model actually guarantee?-- think --
+
+A: Four categories.
+Atomicity: "memory accesses to properly aligned data of primitive and Enum types with sizes up to the platform pointer size are always atomic", and managed references are always aligned and atomic, so int, bool, char, enums and references are safe; long / double are not on 32-bit;
+and no multi-field struct is atomic at all.
+Ordinary accesses may be reordered "as long as that preserves single-thread consistency", with unused reads elided and adjacent same-location accesses coalesced.
+Volatile read = acquire ("no read or write that is later in the program order may be speculatively executed ahead of a volatile read") and volatile write = release ("the effects of a volatile write will not be observable before effects of all previous, in program order,
+reads and writes become observable"), and critically, lock acquisition is an acquire and lock release is a release.
+Full fences: Thread.MemoryBarrier and every Interlocked method. The model is deliberately stronger than ECMA-335.
+
+Cross-Q: The spec says "the dot NET runtime does not specify any ordering effects to the instance constructors." Doesn't that make _shared = new Node { Value = 42 } unsafe?-- think --
+
+A: No, and the resolution is the interesting part. The safety does not come from the constructor, it comes from the assignment that publishes the reference.
+The spec states: "Object assignment to a location potentially accessible by other threads is a release with respect to accesses to the instance's fields or elements and metadata." So the write of Value cannot become observable after the write of _shared.
+And on the reading side: "Memory ordering honors data dependency. it is guaranteed that reading of the data will not happen ahead of obtaining the reference." Together those two mean a thread that sees the new reference cannot see an uninitialised object.
+The constructor carrying no ordering of its own is true and irrelevant, because publication is what is being ordered.
+
+Cross-Q²: So is long / double tearing a real risk in code you'd write today?-- think --
+
+A: On 64-bit it is not, for a single aligned field, the platform pointer size covers it. Where it stays real is 32-bit targets, which still exist in some device and legacy scenarios, and that is what Interlocked.Read(ref long) and Volatile.Read(ref long) are for.
+The risk that has not gone away on any platform is structs: decimal, Guid, DateTime in some layouts, and every multi-field value type you write are all larger than a pointer and can therefore be read torn, half old, half new, with no exception and no diagnostic.
+The mitigations are a lock, or boxing the value into an immutable reference type and swapping the reference with Interlocked.Exchange, which brings you back into the atomic-reference guarantee.
+
+-- pause --
+Drill 12, Double-checked locking.
+
+Q: Does double-checked locking need volatile in dot NET?-- think --
+
+A: It depends on what you're testing, and the honest answer distinguishes the two cases.
+If the pattern tests the reference itself, if (_inst == null) { lock { if (_inst == null) _inst = new Singleton();
+} }, it is safe on dot NET without volatile, and the runtime's own memory-model spec ships exactly that code as a correct example, with inline comments noting that taking the lock is an acquire and releasing it is a release.
+The two guarantees underneath are object-assignment-is-a-release and data-dependent-reads-are-ordered.
+If the pattern tests a separate flag, a bool _initialized guarding a _config field written beside it, it is broken without Volatile, because there is no data dependency between the flag and the data for the model to hang ordering on.
+
+Cross-Q: Show me the broken one and explain the failure step by step.-- think --
+
+A: Writer, inside the lock: _config = Load(); then _initialized = true;, two ordinary writes. Reader, on the fast path, takes no lock, so it gets no acquire fence: it does an ordinary read of _initialized, then an ordinary read of _config.
+Those are two different locations with no dependency, and the model permits reordering them because single-threaded you could never tell. So a reader can observe _initialized == true and _config == null and dereference null.
+The fix is a release or acquire pair on the flag: Volatile.Write(ref _initialized, true) after the _config write, so the write of _config cannot become observable after it; and Volatile.Read(ref _initialized) on the fast path, so the read of _config cannot be hoisted it.
+Marking the field volatile does the same for every access. The signature of the bug in production is exactly what you'd predict: rare, load-dependent, machine-dependent, and unreproducible on the developer's box.
+
+Cross-Q²: What would you actually ship?-- think --
+
+A: Lazy with LazyThreadSafetyMode.ExecutionAndPublication, and I'd cite Microsoft's own Volatile documentation, which says the Lazy class "provides a simple way to write lazy initialization code without directly using double-checked locking." It is fewer lines, it is correct by construction,
+and it removes the whole category of question.
+LazyInitializer.EnsureInitialized is the lower-allocation alternative when the Lazy wrapper object itself has been measured to matter.
+The Interlocked.CompareExchange variant that the spec also documents is fine for cheap objects but has the same trade-off as GetOrAdd: it may construct more than one instance and publish only one, so it is wrong for anything that opens a resource.
+
+-- pause --
+Drill 13, False sharing.
+
+Q: A lock-free counter array gets slower as I add threads. Correct results, no contention counters. What is it?-- think --
+
+A: False sharing. Cache coherence operates on cache lines, not variables. If several counters sit inside one line, every write by one core invalidates every other core's copy of that whole line, even though the cores are touching different counters and are logically independent.
+The line ping-pongs across the interconnect on every increment and both cores stall. "False" because the sharing is an artefact of memory layout, not of the program's logic.
+The fingerprint is exactly what was described: correct, lock-free, and negative scaling with degree of parallelism, with nothing to show in lock-contention counters because there is no lock.
+
+Cross-Q: How do you confirm it and how do you fix it?-- think --
+
+A: Confirm with hardware counters, cache-line invalidation events, perf c2c on Linux or VTune's memory-access analysis, plus the simplest experiment: increase the spacing between the counters and see whether the negative scaling inverts.
+Fix by padding each counter onto its own cache line with [StructLayout(LayoutKind.Explicit, Size =. )] and an array of that struct; ref array[i].Value gives you a genuine interior reference so Interlocked.Increment still works.
+The BCL does exactly this and it's the citation I'd give: ConcurrentQueueSegment holds its indices in PaddedHeadAndTail, commented "Padded head and tail indices, to avoid false sharing between producers and consumers", with head and tail separated by a full line and the struct padded at both ends.
+Note it uses a named constant for the size, not a literal, the line size is platform-dependent, so I would not quote a number.
+
+Cross-Q²: When is padding the wrong answer?-- think --
+
+A: Most of the time, because it treats the symptom.
+The cause is that per-thread state was placed in shared memory, and the better fix is usually to stop sharing: Parallel.For 's local Init / local Finally gives each task a private accumulator merged once at the end, so there is nothing to falsely share and no padding needed.
+Padding is the fallback for when the counters must be individually addressable at all times, a live metrics array a scraper reads, a per-shard rate limiter.
+It also has a real cost: padding sixty-four counters to a line each turns a compact array into kilobytes, which is its own cache-footprint problem if anything scans it. And I would never pad read-mostly data, a shared line nobody writes stays valid in every core's cache, which is a benefit.
+
+-- pause --
+Drill 14, Putting it together.
+
+Q: Design the concurrency for a service that ingests CSV uploads: parse each row, validate against a reference table, enrich via an external A P I, and bulk-insert. Files are up to a million rows.-- think --
+
+A: Four stages with three different characters, so I'd resist writing one loop. Parse is C P U-bound and streaming, read with IAsyncEnumerable so a million rows never materialise at once.
+Validate is C P U-bound against an in-memory reference table, which I'd hold as an ImmutableDictionary published with Interlocked.CompareExchange so validators read it with zero synchronisation.
+Enrich is I O-bound, Parallel.ForEachAsync with MaxDegreeOfParallelism derived from the external A P I's documented rate limit, not from ProcessorCount. Insert is I O-bound and batched, chunk into bulk operations, one D I scope per batch.
+Between the stages, bounded Channel s so a fast parser cannot buffer the whole file ahead of a slow enricher.
+
+Cross-Q: Where's the memory-model risk in that design?-- think --
+
+A: Three places.
+(1) The reference table swap:
+if I published it with a plain assignment and validators read it with a plain read, a validator's read could be hoisted out of its loop and it would use a stale table indefinitely, hence Volatile.Read on the load and Interlocked.CompareExchange on the publish, which is a full fence.
+(2) Any shared progress counter for the upload's status endpoint, that is a cross-thread flag and needs Interlocked, and if there is one per shard it is a false-sharing candidate.
+(3) Any "finished" flag used to end a consumer loop, which should not exist at all: Writer.Complete() on the channel and a CancellationToken are the correct signals, and both handle publication properly.
+
+Cross-Q²: How do you decide the degree of parallelism for each stage, and how do you know the design worked?-- think --
+
+A: Each number needs a source, and I should be able to point at it. Parse and validate: Environment.ProcessorCount, which already accounts for container C P U limits and affinity.
+Enrich: the external A P I's rate limit or the egress connection cap, whichever is smaller, never core count, because no core is held while awaiting. Insert: the database's connection pool size.
+For verification I'd watch four things: thread-pool thread count should stay flat under load, not climb (climbing means something is blocking); C P U should approach saturation during parse or validate and stay low during enrich; the channel depths tell me which stage is the bottleneck;
+and end-to-end throughput before and after, measured on production-shaped hardware.
+I would not quote a speedup multiplier, the number depends on core count, per-row cost, and the external A P I's latency, and any figure I gave without measuring would be invented.
+
+-- pause --
+Section 2. Self-Test.
+
+The lambda binds to Action, and an async lambda whose body returns no value is a legal Action, so it becomes async void.
+Parallel.ForEach therefore considers each iteration complete the moment the state machine hits its first await and returns, which means the loop finishes with essentially all the work still in flight.
+Nothing holds a Task, so nothing can await completion or observe faults; with no SynchronizationContext installed the exception is raised on a pool thread, and an unhandled exception on a pool thread terminates the process.
+
+The fix is Parallel.ForEachAsync, whose body parameter is Func, a shape that cannot silently degrade to async void, because the delegate must return something the loop awaits.
+
+It depends on the method, which is the point of the question. The default is -1, and the docs say: "If it is -1, there is no limit on the number of concurrently running operations (with the exception of the ForEachAsync method, where -1 means ProcessorCount )."
+
+So for Parallel.For / Parallel.ForEach the answer is "whatever the scheduler provides, unbounded", the docs add that these methods "will utilize however many threads the underlying scheduler provides,
+so changing MaxDegreeOfParallelism from the default only limits how many concurrent tasks will be used." For Parallel.ForEachAsync the answer is Environment.ProcessorCount,
+stated on the overloads that take no ParallelOptions: "The operation will execute at most ProcessorCount operations in parallel."
+
+Bare GetOrAdd is simpler and allocates one object per entry.
+Its documented behaviour:
+the factory "is called outside the locks to avoid the problems that can arise from executing unknown code under a lock", so under concurrency on a cold key " value Factory may be called multiple times, but only one key or value pair will be added to the dictionary." The dictionary stays consistent;
+the extra objects your factory built are silently discarded.
+
+Harmless for a pure computation. A resource leak for anything that opens a socket, a file, a connection, or registers a callback, nothing disposes the losers, and nothing in your code even knows they existed.
+
+ConcurrentDictionary> with LazyThreadSafetyMode.ExecutionAndPublication costs one extra allocation per entry and one indirection per read, and guarantees the expensive factory runs exactly once:
+the Lazy wrapper may be constructed several times, but only the one that wins the insert is ever returned, so only its factory is ever forced.
+
+Rule: side-effect-free factory to bare GetOrAdd. Factory that acquires a resource to Lazy. Async factory to Lazy>, with an eviction path on failure, because a faulted Task otherwise stays cached forever.
+
+Yes, on dot NET, without volatile, and the runtime's own memory-model spec publishes this exact pattern as a correct example, with inline comments noting that "taking a lock is an acquire" and "releasing a lock is a release".
+
+Two guarantees from that spec carry it. "Object assignment to a location potentially accessible by other threads is a release with respect to accesses to the instance's fields or elements and metadata", so the writes that initialise the object cannot become observable after the write of _inst.
+And "data-dependent reads are ordered", so a thread that reads the reference cannot then read stale contents through it.
+
+Note what does not save it: the same spec says "the dot NET runtime does not specify any ordering effects to the instance constructors." The ordering comes from the publication, not the constructor. That distinction is the whole answer.
+
+Two things worth adding unprompted. This is stronger than ECMA-335 requires and stronger than Java's pre-JSR-133 model, which is why "DCL is broken" lore imported from other ecosystems does not transfer.
+And it is still not what you should ship, Lazy with ExecutionAndPublication is fewer lines, and Microsoft's own Volatile documentation points at it as the way to write lazy initialisation "without directly using double-checked locking".
+
+No. Swap the guard from the reference to a separate flag and both saving guarantees disappear, because there is no longer a data dependency for the model to hang ordering on.
+
+The fast path takes no lock, so it gets no acquire. It performs two ordinary reads of two unrelated locations, and ordinary accesses "can be reordered as long as that preserves single-thread consistency", which reordering these does, since single-threaded nothing could tell the difference.
+A reader can therefore see _initialized == true and _config == null.
+
+The fix is a release or acquire pair on the flag: Volatile.Write(ref _initialized, true) after the _config write (release, write A cannot become observable after it) and Volatile.Read(ref _initialized) on the fast path (acquire, read #2 cannot be hoisted it).
+Marking the field volatile does the same for every access at slightly higher cost.
+
+The production signature is diagnostic in itself: rare, load-dependent, machine-dependent, gone by the time anyone looks, and impossible to reproduce on the developer's laptop.
+
+Cause: false sharing. Cache coherence moves cache lines, not variables. Several long counters sit inside one line, so every increment by one core invalidates every other core's copy of that whole line, even though the cores touch different counters.
+The line ping-pongs across the interconnect on every write. The fingerprint is exactly as described, correct results, no locks, negative scaling, and lock-contention counters show nothing because there is no lock.
+
+Confirmation: hardware counters (cache-line invalidations; perf c2c on Linux, VTune's memory-access analysis on Windows), plus the cheap experiment of spacing the counters further apart and watching the scaling invert.
+
+Fix 1, stop sharing (preferred). Parallel.For 's local Init / local Finally: each task accumulates privately and merges once at the end. Nothing is shared, so nothing can be falsely shared, and no padding is needed.
+
+Fix 2, pad (when the counters must be live and individually addressable). An explicit-layout struct one cache line wide, one per counter; ref array[i].Value still gives Interlocked a real interior reference.
+The BCL does exactly this, ConcurrentQueueSegment 's PaddedHeadAndTail, commented "to avoid false sharing between producers and consumers", and sizes it with a named constant, because the cache line size is platform-dependent. Don't quote a byte count.
+
+Caveat worth volunteering: padding inflates the array, which is its own cache-footprint problem if anything scans it, and read-mostly data should never be padded, a shared line nobody writes stays valid in every core's cache, which is a benefit.
+
+ConcurrentQueue is a thread-safe FIFO and nothing more. No awaiting read, so the consumer must poll, a latency floor plus wasted wakeups, and tuning the delay only trades one for the other. No backpressure, so when the writer falls behind, memory grows until the process is OOM-killed.
+No completion signal, so graceful shutdown is hand-rolled.
+
+Channel fixes all three: Reader.ReadAllAsync for an awaiting read, CreateBounded with an explicit FullMode for backpressure, and Writer.Complete() so the consumer loop actually ends. It is in-box.
+
+TPL Dataflow adds topology, per-block MaxDegreeOfParallelism, BroadcastBlock (every consumer gets every item, which a channel deliberately never does since an item goes to exactly one reader), BatchBlock, joins, and completion that propagates along links.
+It is not distributed with dot NET; it is the System.Threading.Tasks.Dataflow NuGet package, and its MaxDegreeOfParallelism defaults to 1.
+
+Pick Channel, bounded, with a FullMode chosen from the domain: Wait if losing an item is a business problem (the handler then surfaces pressure as 503 Retry-After ), DropOldest if it is diagnostic telemetry where the newest sample matters most.
+Escalate to Dataflow only when a second stage appears that needs its own degree of parallelism.
+
+Four checks, in this order, because each is cheaper than the next.
+
+Did PLINQ parallelise at all?
+It analyses query shape and falls back to sequential by default for documented patterns: indexed Select / Where / SelectMany / ElementAt after an operator that removed or rearranged indices; Take / TakeWhile / Skip / SkipWhile on reordered sources;
+Zip / SequenceEquals, Concat, and Reverse on non-indexable sources.
+"Nothing changed" is most often literally true, nothing changed.
+Is the delegate expensive enough to repay the overhead? Partition + schedule + merge is a fixed cost, and the docs say "small source collections with trivial delegates are generally not good candidates for PLINQ."
+Is there shared state in a delegate? A captured counter or list both serialises the query and is a data race.
+What does the terminal operator cost? ToList / ToArray force a merge; foreach serialises results onto the enumerator thread; ForAll skips the merge entirely.
+
+One shape check to add: if the source is an array or IList, PLINQ uses range partitioning without load balancing by default, so an uneven per-element cost leaves one task grinding while the rest idle, Partitioner.Create(source, load Balance: true) is the switch.

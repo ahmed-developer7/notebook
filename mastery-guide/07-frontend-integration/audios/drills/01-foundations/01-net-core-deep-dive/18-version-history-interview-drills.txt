@@ -1,0 +1,25 @@
+-- pause --
+Section 1. Self-test.
+
+L T S (Long-Term Support) = 3 years of patches; STS (Standard-Term Support) = 18 months. Microsoft alternates them so even-numbered versions (even = L T S: dot NET 6, 8, 10) get the long support window and odd-numbered (dot NET 7, 9, 11) ship as innovation drops with shorter support.
+Production teams skip STS and upgrade L T S-to-L T S every 2 years; teams that need a specific feature (for example, HybridCache shipped in dot NET 9) can take an STS.
+The "STS gap", running dot NET 9 in May 2026 means upgrading to dot NET 10 within weeks or losing patches, is a planning trap; pick L T S unless the STS feature is worth the upgrade tempo.
+
+dot NET 7 is STS, expired May 2024. The team must upgrade. Best path: jump straight to dot NET 10 (current L T S), dot NET 8 is also L T S but expires Nov 2026, only 18 months out.
+The upgrade hops are dot NET 7 to 8 (test) to 9 (test) to 10 if you want incremental confidence, or 7 to 10 if your dependencies allow.
+Multi-step upgrades catch breaking changes more cleanly; direct hops are faster. Either way, do not stay on dot NET 7, no security patches means CVE risk.
+Pre-upgrade checklist: NuGets supporting target TFM, A O T compatibility if relevant, E F Core migration semantics if jumping 7 to 9 ( ExecuteUpdate / ExecuteDelete are dot NET 7+ but their semantics evolved).
+
+NativeAOT wins for: (a) serverless / cold-start sensitive workloads, Azure Functions, A W S Lambda, where jit warm-up burns money; (b) constrained-memory containers where jit's working set is too large; (c) single-file deployments needing minimal binary size;
+(d) scenarios needing zero jit (security or regulatory).
+Loses for: (a) reflection-heavy code paths (older ORMs, I O C containers, legacy serializers); (b) plugin systems loading DLLs at runtime; (c) hot-paths where Tier 1 jit optimizations + Dynamic PGO eventually outperform A O T.
+Trade-off summary: A O T trades startup time + size for build complexity + reflection limits. Default to jit for monoliths; consider A O T for microservices, C L I tools, edge workloads.
+
+No, field requires both the C sharp 14 compiler (Roslyn shipped with the dot NET 10 S D K or versus 17.12+) and a set to 14 or latest.
+The C sharp version is independent of the target framework, so technically you can set latest in a net8.0 project, but field may emit I L that requires runtime support not present in net8.0. The pragmatic answer: feature-by-feature.
+Some C sharp 14 features (records improvements, syntactic sugar) work on older TFMs; others (anything touching the runtime, like Lock ) need the new BCL. Check the language-version reference docs. If it's purely syntactic, bumping works; if it's runtime-bound, you must bump TFM.
+
+The compiler builds the library twice, once for each TFM, producing bin or Debug or net8.0 or Lib.dll and bin or Debug or net10.0 or Lib.dll. Consumers on dot NET 8 reference the first; dot NET 10 consumers the second.
+Inside the source, #if NET10_0_OR_GREATER blocks let you use newer A P Is only when targeting newer TFMs, with fallbacks for older.
+Trade-offs: (+) wide compatibility, one NuGet package serves both L T S audiences; (+) new features available where supported; (−) build is slower (compiles n times), tests must run per TFM, debugging is more complex, NuGet package is larger.
+Use multi-targeting for libraries with broad consumer base (Newtonsoft, Polly, Serilog do this); skip it for application services where you control the runtime.

@@ -1,0 +1,342 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Hub lifecycle.
+
+Q: Walk me through OnConnectedAsync and OnDisconnectedAsync, what's available in each, and what gotchas do they have?-- think --
+
+A: OnConnectedAsync runs after authentication and transport negotiation, Context.ConnectionId is set, Context.User holds the authenticated principal (if any), Context.UserIdentifier is resolved. Use it for presence tracking, auto-joining groups, audit logging. OnDisconnectedAsync(Exception?
+exception) runs on close, exception == null means clean disconnect, non-null means error. Use it to clean up per-connection state and update presence. Always call await base.OnConnectedAsync() / await base.OnDisconnectedAsync(exception).
+
+Cross-Q: A user has three tabs open, closes one. OnDisconnectedAsync fires. Is the user "offline"?-- think --
+
+A: No, they still have two active connections. The "user is offline" decision is per-user, not per-connection. Track a count or HashSet per user; in OnDisconnectedAsync, decrement; only emit UserOffline when the count hits zero.
+Treating disconnect = offline is the classic SignalR bug, produces flickering presence indicators in chat apps.
+
+Cross-Q²: If OnConnectedAsync throws, what happens to the client?-- think --
+
+A: The client receives a disconnection (the connection never completes). On the dot NET client with WithAutomaticReconnect, it will retry per the schedule. The exception propagates to SignalR's logging, be careful with throwing in OnConnectedAsync because reconnect loops can mask the error.
+Wrap fragile logic (DB calls, distributed cache reads) in try or catch and decide whether to abort or continue degraded. A failed connection log line per reconnect attempt floods production logs.
+
+-- pause --
+Drill 2, Groups versus Users versus Clients.All.
+
+Q: Groups, Users, Clients.All, when each?-- think --
+
+A: Group: named bucket of connection IDs you manage explicitly, rooms, tenant scopes, document sessions. Add or remove at runtime. User: all connections of a logged-in user (resolved by Context.UserIdentifier ), spans all their tabs or devices. Auto-tracked by SignalR.
+Clients.All: every connection on the hub, across all servers if backplane is configured, maintenance banners, global broadcasts. Use sparingly; cost scales linearly with total connections.
+
+Cross-Q: A user has 5 tabs. I call Clients.User("u-42").SendAsync(.). How many sockets get the message?-- think --
+
+A: 5. SignalR maintains a user-to-connections mapping internally; targeting a user fans out to every connection owned by that user. This is exactly the behavior you want for "notify the user" semantics (every device or tab they have).
+If you only want one specific tab, target the ConnectionId directly, but that's rarely what you want.
+
+Cross-Q²: I'm broadcasting to a 50k-connection group every second. What's the cost?-- think --
+
+A: 50k frames written per broadcast, per server. Across a Redis backplane: 50k messages published to Redis, 50k forwarded per subscriber server. On a 4-server fleet broadcasting once per second: 200k Redis pub or sub messages per second, plus 50k socket writes per server per second.
+Mitigations: (1) reduce frequency, diff-based updates instead of full snapshots; (2) batch, accumulate messages, send every 100 milliseconds; (3) reduce membership, narrower groups; (4) push identifiers, let clients fetch on demand. Don't underestimate fan-out cost on persistent connections.
+
+-- pause --
+Drill 3, Backplane.
+
+Q: What is a SignalR backplane, when do you need one, and what are the options?-- think --
+
+A: A backplane is the mechanism by which multiple SignalR server instances coordinate fan-out, when Server A calls Clients.All.SendAsync(.), the message must reach connections on Servers B and C too. Without one, multi-instance deployments silently drop fan-out across servers.
+Options: (1) Redis backplane ( AddStackExchangeRedis ), self-hosted, pub or sub; (2) Azure SignalR Service ( AddAzureSignalR ), managed, holds connections too. Single-instance apps don't need a backplane.
+
+Cross-Q: Redis backplane versus Azure SignalR Service, what's the architectural difference?-- think --
+
+A: Redis backplane: your app servers still hold the WebSocket connections. Redis only pub or subs fan-out messages. Your servers scale on socket count. Azure SignalR Service: Azure holds the WebSocket connections. Your servers handle business logic only and push via the service.
+Stateless servers; scale on C P U. Trade-off: Redis is cheaper but you operationally own connection count limits; Azure is more expensive but removes the socket-management burden entirely.
+
+Cross-Q²: I add Redis backplane and Clients.All still doesn't reach all servers. What did I miss?-- think --
+
+A: Common causes: (1) Servers connect to different Redis instances (misconfigured connection string), (2) ChannelPrefix differs between servers (they pub or sub on different channels), (3) Redis pub or sub isn't enabled or is filtered by a proxy,
+(4) Servers' system clocks drift wildly (subtle issue with reconnection ordering).
+Validate by directly running SUBSCRIBE signalr:* on Redis and watching messages flow from Server A, if Server B isn't subscribed there, the bug is upstream.
+
+-- pause --
+Drill 4, Reconnection.
+
+Q: Reconnection, what does SignalR do automatically, and what do you have to do?-- think --
+
+A: With .WithAutomaticReconnect(.), the client retries the connection per a configurable schedule (default 0 seconds, 2 seconds, 10 seconds, 30 seconds). On success the Reconnected event fires with a new ConnectionId.
+SignalR doesn't restore group memberships, in-flight invocations, or per-connection state, you do that.
+Subscribe to Reconnecting, Reconnected, Closed events to show U I state and re-subscribe. After all retries exhaust, the client enters Closed state and you must call StartAsync() again manually.
+
+Cross-Q: A reconnect succeeds. What state is lost server-side, and what do you have to rebuild?-- think --
+
+A: A new ConnectionId is allocated, all group memberships are gone (groups are per-ConnectionId). Any per-connection state stored in D I singletons keyed by ConnectionId is orphaned. Any in-flight InvokeAsync calls are abandoned (their TCS never completes, clients should treat them as failed).
+Rebuild: re-join groups, re-subscribe to streams, reconcile state (refetch what you missed). Idempotency is key, call JoinRoom again, server should handle "already in group" gracefully.
+
+Cross-Q²: Sticky sessions, when are they required, and why does Azure SignalR Service not need them?-- think --
+
+A: With a self-hosted SignalR setup using Long Polling or Server-Sent Events transports, multiple H T T P requests share a "connection", they must hit the same server. Without sticky sessions (load balancer pins client to one backend), polling clients break randomly.
+WebSocket is a single TCP connection so sticky isn't needed once upgraded, but the initial handshake involves multiple requests, so it can still matter. Azure SignalR Service holds the connection itself; your backends are stateless R P C callers and any backend can push via the service.
+Sticky disappears as a requirement.
+
+-- pause --
+Drill 5, Scaling SignalR horizontally.
+
+Q: I need to support 100k concurrent connections. Walk me through the scaling path.-- think --
+
+A: (1) Start single-pod with a reasonable Kestrel config, 10-30k connections per pod is realistic depending on memory and message rate. (2) Past one pod, add Redis backplane and sticky sessions for transport fallback.
+(3) Past ~100k, the operational cost of running Redis + managing pod-level socket caps starts to bite, switch to Azure SignalR Service. (4) Past ~1M, you're sharding the service across regions or using a dedicated event distribution layer (Kafka + custom protocol).
+
+Cross-Q: Why does Azure SignalR Service hold the connections instead of your pods?-- think --
+
+A: To decouple socket count from compute. Holding 100k WebSockets on your A P I pods means each pod must hold tens of thousands of TCP sockets, memory for buffers, and a heartbeat task per socket, even when idle. The pod's C P U could be 5% but its memory is fully consumed.
+Azure SignalR Service takes the connections off your pods entirely; your pods scale on C P U or request rate, not socket count. Trade-off: per-connection cost is a line item in your bill instead of in your infrastructure bill.
+
+Cross-Q²: A connection sends a message; my hub receives it, but the response goes to the wrong client. What happened?-- think --
+
+A: Mostly impossible if you use Clients.Caller.
+But it can happen when (a) you store ConnectionId s in a long-lived cache keyed by user, and reconnections rotate ConnectionIds, old ID points to a dead connection or has been reassigned; (b) you parallelize hub work and accidentally swap connection contexts.
+The defensive pattern: always derive the target from Context.UserIdentifier (stable across reconnects) or pass the target explicitly. Don't cache ConnectionIds, they're ephemeral.
+
+-- pause --
+Drill 6, SignalR versus S S E versus WebSocket.
+
+Q: When would you pick S S E over SignalR?-- think --
+
+A: Pure server-to-client streams with no client to server messaging, feed updates, dashboard tickers, log streaming. S S E runs over H T T P or 1.1 (or H T T P or 2 multiplexed), browsers handle reconnect natively, and there's no protocol negotiation overhead.
+Simpler than SignalR for one-way push: no hub class, no groups infrastructure, no backplane decision. SignalR is the right answer when you need bi-directional R P C, groups, or scale-out abstractions, S S E doesn't have those.
+
+Cross-Q: When is raw WebSocket better than SignalR?-- think --
+
+A: When you have a custom binary protocol you own end-to-end and SignalR's hub framing is overhead, when you need extreme latency control (game engines, trading systems with microsecond budgets), or when you're integrating with an existing WebSocket-based protocol (M Q T T-over-WS, AMQP-over-WS).
+SignalR adds ~5-50 bytes per message of framing and one round-trip of negotiation, for high-frequency tiny messages, that adds up. For most apps, the productivity wins of SignalR (groups, R P C, reconnect, backplane) outweigh the overhead.
+
+Cross-Q²: G R P C streaming versus SignalR, when each?-- think --
+
+A: G R P C streaming: server-to-server, internal microservice communication, language-agnostic via protobuf, fully strongly-typed. Best for backend fan-out where browsers don't connect directly.
+SignalR: browser or mobile or desktop clients connecting to A S P dot NET Core servers, with JS/dot NET or Java or Swift client SDKs handling reconnection and transport fallback.
+Browser support for G R P C requires G R P C-Web (H T T P or 1.1 fallback with protocol bridge) and doesn't support bi-directional streaming.
+For "frontend connecting to backend," SignalR; for "backend services exchanging streams," G R P C.
+
+-- pause --
+Drill 7, Streaming with IAsyncEnumerable.
+
+Q: How does server-to-client streaming work in SignalR with IAsyncEnumerable ?-- think --
+
+A: A hub method returns IAsyncEnumerable. The client calls connection.StreamAsync("MethodName",.) and consumes via await foreach. Each yielded value becomes a SignalR message frame.
+Cancellation is end-to-end, the client cancellation token closes the stream, the server's [EnumeratorCancellation] CancellationToken ct is signalled, the await foreach exits cleanly. Memory bounded, values flow as produced, no buffering required.
+
+Cross-Q: Backpressure, if the client consumes slowly, what happens?-- think --
+
+A: SignalR uses Channels under the hood with a default bounded buffer. If the buffer fills, the server's yield return blocks waiting for room. This propagates backpressure naturally, a slow client slows down the server enumerator.
+Without bounded channels you'd OOM by producing faster than consuming. The buffer size is tunable via HubOptions.StreamBufferCapacity (default 10), set higher for bursty producers, lower for memory-sensitive scenarios.
+
+Cross-Q²: I want to send a 1GB build log via SignalR streaming. Bad idea?-- think --
+
+A: Generally yes. SignalR streaming is for progressive production, the server doesn't have the values yet, they arrive over time.
+For "I have 1GB of data sitting in a file, send it to the client," use H T T P streaming (Range requests, chunked transfer), that's what H T T P is good at, and CDNs or proxies handle it for free.
+SignalR streaming shines for "build is running, emit lines as they're produced, allow cancellation." If the data is already finalized, send a URL and let the client fetch it directly.
+
+-- pause --
+Drill 8, Authentication on hubs.
+
+Q: SignalR + J W T bearer, what's the gotcha with browsers?-- think --
+
+A: Browsers can't set Authorization headers on WebSocket upgrade requests, only on regular H T T P requests.
+SignalR's JS client sends the token as ?access_token= query string instead, and the server's J W T Bearer middleware must be configured to read it from there for hub paths:
+in JwtBearerEvents.OnMessageReceived, check if path.StartsWithSegments("/hubs") and assign ctx.Token = ctx.Request.Query["access_token"].
+Without this, the upgrade is anonymous and [Authorize] rejects it.
+
+Cross-Q: Tokens in the URL are logged in nginx or CloudFront or proxy logs. How dangerous is this?-- think --
+
+A: Tokens in URLs do leak to access logs, referer headers (mitigated by Referrer-Policy ), and browser history. For SignalR specifically: the URL is only used during the upgrade handshake, after upgrade to WebSocket, all data flows in frames (not URLs).
+The token still appears in one access log line per connection. Mitigations: (1) short-lived tokens (15 min) so log retention windows matter less, (2) configure proxies to scrub access_token from logged URLs, (3) Referrer-Policy: no-referrer on the page initiating the connection.
+
+Cross-Q²: A WebSocket connection lives 8 hours. The J W T inside it expires after 15 min. What happens?-- think --
+
+A: The connection stays open, authentication is checked at upgrade, not on every frame. The user remains "authenticated" by the original token long after it would normally have expired.
+For sensitive operations, re-check Context.User validity inside hub methods (for example, call a permission-check that hits a fresh source), or implement periodic forced reconnect (server pushes "please reconnect" every N minutes; client re-handshakes with a fresh token).
+Don't trust long-lived hub connections for high-security ops.
+
+-- pause --
+Drill 9, Client-side reconnect handling.
+
+Q: A client reconnects. What does the client-side code need to do?-- think --
+
+A: (1) Subscribe to Reconnecting event, show "connection lost" U I. (2) Subscribe to Reconnected event, re-join all groups ( connection.invoke("JoinRoom", room Id) ), re-subscribe to streams, optionally re-fetch any missed state from a rest endpoint.
+(3) Subscribe to Closed event, exhausted retries; show "disconnected" U I and offer manual reconnect. (4) Idempotency on the server side: JoinRoom should handle "already a member" without erroring.
+
+Cross-Q: How do you reconcile state on reconnect, what did the client miss?-- think --
+
+A: SignalR doesn't replay missed messages. Two patterns: (1) Refetch on reconnect, call a rest endpoint to get current state, ignoring whatever the client thinks is current. Simple but expensive. (2) Sequence numbers, server stamps each message with a monotonic ID per group or user.
+Client tracks the last received ID; on reconnect, calls /api or messages or since/{last Id} to fetch missed messages. More complex but bandwidth-efficient. For chat apps, sequence numbers; for live dashboards, refetch.
+
+Cross-Q²: The user closes their laptop for 6 hours. On wake, the client reconnects. What's a likely problem?-- think --
+
+A: The reconnect schedule ( 0, 2, 10, 30 seconds ) exhausted hours ago, connection is in Closed state. The client must call StartAsync() explicitly. Failure mode: app silently shows stale data because nobody re-initiated the connection.
+Fix: in Closed handler, attempt full restart with backoff (mark connection dead, show U I, retry every minute or on user action). Pair with visibility detection ( document.visibilitychange ), when tab becomes visible, force a reconnect check.
+
+-- pause --
+Drill 10, Message size limits.
+
+Q: What's the SignalR message size limit, and what happens at the boundary?-- think --
+
+A: Default is 32KB per message ( HubOptions.MaximumReceiveMessageSize ). Configurable up to 1MB by default. Send a larger message to server logs an error and closes the connection with InvalidDataException. Tune via services.AddSignalR(o goes to o.MaximumReceiveMessageSize = 1024 * 1024).
+Streaming with IAsyncEnumerable doesn't have a single-message limit, each yielded value is its own frame, each bound by the per-message limit.
+
+Cross-Q: My large payload is mostly base64'd image data. What do I do?-- think --
+
+A: Don't send blobs through SignalR. Pattern: client uploads image to blob storage (S three or Azure Blob or et cetera), gets back a URL, sends only the URL via SignalR. Other clients receive the URL and fetch directly. Blob storage is built for large objects; SignalR is built for small messages.
+Sending megabytes through SignalR works but pegs your server's memory and bandwidth as a fan-out multiplier (50k subscribers times 5MB = 250GB outbound, at SignalR cost).
+
+Cross-Q²: I increased MaximumReceiveMessageSize to 100MB to support large payloads. What can go wrong?-- think --
+
+A: Memory exhaustion under load, each in-flight large message holds 100MB. 100 concurrent connections sending peaks to 10GB memory pressure to OOM or garbage collector pauses. Plus longer per-message processing blocks the hub's serialized invocation queue.
+Plus malicious clients can send 100MB garbage and saturate your server cheaply. Treat the limit as a security boundary; raise it only when you've also added rate limiting per connection and bounded the buffering. The right answer is almost always "use blob storage and pass URLs."
+
+-- pause --
+Drill 11, Hub method dispatch.
+
+Q: Client calls connection.invoke("SendMessage",.). How does SignalR find and call the right hub method?-- think --
+
+A: SignalR uses reflection at startup to enumerate hub methods, builds a method dispatcher keyed by method name. Method names match case-insensitively by default ( SendMessage, send Message, sendmessage all resolve to the same method).
+Arguments are deserialized from the message payload (Jason or MessagePack) and bound to method parameters by position. Async methods are awaited; the return value is sent back as the invocation result.
+
+Cross-Q: Two methods with the same name but different parameter types, what happens?-- think --
+
+A: SignalR doesn't support method overloading. Hub method registration by name conflicts at startup, the second registration wins or throws (depends on version). Always give hub methods unique names.
+If you need polymorphism, use one method with a union or discriminated type parameter, or expose multiple distinctly-named methods.
+
+Cross-Q²: Case-sensitivity, JS clients use camel Case, dot NET uses PascalCase. Does this work transparently?-- think --
+
+A: Yes, SignalR's method matching is case-insensitive. connection.invoke("send Message",.) from JS resolves to public Task SendMessage(.) in C sharp.
+Symmetrically, Clients.All.SendAsync("receive Message",.) from C sharp fires a JS handler registered as connection.on("receive Message",.) or connection.on("ReceiveMessage",.).
+Conventional naming: C sharp uses PascalCase for server methods, camel Case or PascalCase for client method names in SendAsync calls, pick one and stick to it.
+
+-- pause --
+Drill 12, Strongly-typed hubs.
+
+Q: When is Hub worth the extra interface versus plain Hub ?-- think --
+
+A: Whenever the project will live past prototype. Hub ties server-to-client method names to a compile-checked interface, typos in Clients.All.ReceiveMessage(.) become build errors instead of silent runtime no-ops. Refactor support (Rename across solution), Find Usages, IntelliSense.
+Cost: one interface definition, ~5 extra lines. For any non-trivial project, mandatory. Plain Hub survives only in demos and one-off internal tools.
+
+Cross-Q: The interface is shared between server and client (for example, Blazor Server, dot NET MAUI client). What goes in the shared library?-- think --
+
+A: Only the interfaces, IChatClient (server-to-client methods) and IChatHubServer (client-to-server methods, if you go fully bidirectional with IClientProxy ). DTOs go in the same shared library. The hub implementation and the hub client wiring live in their respective projects.
+This gives you compile-time guarantee that client and server agree on the contract, similar to G R P C's .proto files but in C sharp.
+
+Cross-Q²: Can the client also be strongly-typed in calling server methods?-- think --
+
+A: Partially. The dot NET SignalR client uses dynamic dispatch by default ( connection.InvokeAsync("SendMessage",.) ).
+Source generators ( Microsoft.AspNetCore.SignalR.Client.SourceGenerator, or community ones) generate strongly-typed proxies from a hub interface, connection.GetHubProxy().SendMessageAsync(.).
+For JS clients, you use TypeScript declaration files (manual or generated), the runtime call is still connection.invoke("SendMessage",.) but typed at compile time. End-to-end strong typing is increasingly achievable in 2026 but still requires source-generator setup.
+
+-- pause --
+Drill 13, Connection ID.
+
+Q: What is ConnectionId, how stable is it, and what are the security implications?-- think --
+
+A: A unique opaque identifier per WebSocket connection, regenerated on every reconnect. Not stable across reconnects, same user, new ConnectionId. Generated server-side, returned to the client in the handshake response.
+Security: ConnectionIds are visible to the client and could be leaked via logs or screenshots, treat them as identifiers, not secrets. Authorization should be based on Context.User (authenticated principal), never on ConnectionId alone.
+
+Cross-Q: A junior wants to use ConnectionId as the key for user-specific cached state. What goes wrong?-- think --
+
+A: (1) Reconnect creates a new ConnectionId, cached state is orphaned, the user appears to "lose" their state. (2) A user with 3 tabs has 3 ConnectionIds, state is fragmented. (3) Server restart: all ConnectionIds invalidate; cache is full of stale keys.
+The right key is UserId (or UserIdentifier ), stable across reconnects, aggregates all of a user's connections. Caching by ConnectionId is for connection-specific state (current stream subscriptions, in-flight invocations), and even then, prefer D I-scoped state managed by the hub.
+
+Cross-Q²: An attacker submits another user's ConnectionId in a hub method call. Can they hijack the session?-- think --
+
+A: No, they can't impersonate just by claiming a ConnectionId. SignalR derives Context.ConnectionId from the connection's own server-side state, not from anything the client sends. The attacker can guess a ConnectionId, but their hub method calls still execute under their own connection's context.
+The attack vector would be calling Clients.Client(victim_ConnectionId).EvilMessage(.) from a hub method, which is why hub methods that target specific clients must validate authorization before forwarding (for example, "only the owner or admin can send messages to a connection").
+
+-- pause --
+Drill 14, Performance under high fan-out.
+
+Q: A live dashboard has 10k connected users; you push an update every second. C P U on the SignalR server spikes. What's happening?-- think --
+
+A: 10k frame writes per second times serialization cost times backplane forwarding (if multi-server) times keepalive overhead. Each SendAsync to a group is a serialize + write per connection.
+At 10k connections times 1Hz times 10 milliseconds per frame send (typical for Jason serialization + socket write), you're looking at significant C P U.
+Mitigations: (1) reduce frequency (batch updates, send every 5 seconds instead of 1 second), (2) reduce payload (send diffs not snapshots), (3) use MessagePack instead of Jason (faster serialize, smaller frames), (4) split into smaller groups so most updates only fan out to interested subscribers.
+
+Cross-Q: I switch from Jason to MessagePack. What does that get me?-- think --
+
+A: ~30-50% smaller frame size, ~2-5 times faster serialize or deserialize on the server side, lower allocation pressure (less garbage collector).
+Trade-off: harder to debug (binary frames don't show readable content in network inspectors), client libraries must support MessagePack (JS SignalR client supports it; some custom clients may not), schema evolution requires care (adding fields is fine, removing or renaming is breaking).
+For high-fan-out scenarios, often worth it; for low-volume hubs, Jason is fine.
+
+Cross-Q²: My SignalR pod's C P U is fine, but message latency is rising. Where do I look?-- think --
+
+A: Possible causes: (1) Garbage collection, Jason serialization allocates per message; high allocation rate to gen0 garbage collector frequency rises to message-write latency jitters. Check with dotnet-counters / dotnet-trace.
+(2) TCP buffer backpressure, slow clients fill their socket send buffer; SignalR waits per connection. Fix by tuning MaxParallelInvocationsPerClient or by accepting that slow clients should be disconnected. (3) Backplane latency (Redis under load, network blip).
+(4) Thread pool starvation, sync work in async paths. Use ETW / dotnet-trace to isolate.
+
+-- pause --
+Drill 15, SignalR clients.
+
+Q: SignalR clients available, JS, dot NET, Blazor, Java, Swift. When each?-- think --
+
+A: JavaScript ( @microsoft or signalr ): browsers, React or Vue or Angular SPAs, Node.js servers. dot NET ( Microsoft.AspNetCore.SignalR.Client ): WPF, console apps, dot NET MAUI mobile, background services calling other servers.
+Blazor: both Server (uses SignalR internally for U I sync, you don't write client code) and WebAssembly (uses the JS or dot NET client). Java: Android, J V M-based servers. Swift: iOS native.
+Each official client supports the same hub protocol, you implement the hub once on the server, multiple clients consume.
+
+Cross-Q: Blazor Server uses SignalR for its entire U I sync. What's the implication?-- think --
+
+A: Every Blazor Server page is a SignalR connection. U I events (button clicks) round-trip to the server, server diffs the render tree, sends DOM updates back via SignalR. Implications: (1) latency, every click is a network call (~50-200 milliseconds RTT), unsuitable for high-frequency interactions.
+(2) scale, each user = one SignalR connection, so connection count = concurrent users. (3) backplane requirement, Blazor Server multi-pod must have a SignalR backplane configured. Blazor WebAssembly avoids this, full app runs client-side, SignalR is optional for live updates.
+
+Cross-Q²: TypeScript client, how do you get type-safe connection.on handlers?-- think --
+
+A: Write a TypeScript interface mirroring your server's IChatClient, then a thin wrapper around HubConnection. Or use a generator (for example, TypedSignalR.Client.TypeScript ) that reads the server's hub interface and emits TS types.
+Or define DTOs as TypeScript types in a shared package (if you publish a contracts package) and cast in connection.on("ReceiveMessage",.). The official SignalR TS client doesn't enforce method-name typing, you have to layer it.
+Modern teams adopt code generation or hand-written wrappers for this exact reason.
+
+-- pause --
+Section 2. Self-Test.
+
+It doesn't even resolve, hub types aren't registered in the container, and SignalR's hub activator asks the provider first and falls back to ActivatorUtilities when it gets nothing back.
+"Fixing" that with AddSingleton() makes it worse: Clients, Context and Groups are plain settable properties on Hub that SignalR assigns per dispatched invocation, so on a hand-resolved instance they are still null and the first hub.Clients.Group(.) throws NullReferenceException.
+Microsoft's guidance is blunt, hubs are transient, "don't instantiate a hub directly via dependency injection," and each hub method call executes on a new hub instance. That transience is also why per-connection state stored in a hub field vanishes the moment the method returns.
+
+Fix: inject IHubContext, the long-lived handle. What you give up is caller context, IHubContext exposes only Clients and Groups, so there is no Caller, no Others, no Context.ConnectionId. You name the target yourself: .Group("order:42"), .User(buyer Id), .Client(connection Id).
+
+StartAsync is not one request. The client first POSTs to [hub-url]/negotiate; the server replies with a connection id or token and the available Transports it supports.
+Then the client opens the transport itself, a WebSocket upgrade, an S S E stream, or long polling, in a separate H T T P request, which round-robin happily hands to a pod that has never heard of that connection.
+Long polling is the worst case: every poll is another request that must land on the same pod.
+
+SignalR requires that one server process handle every H T T P request for a given connection, so the fix is sticky sessions (session affinity, ARR affinity on Azure App Service, ip_hash or a sticky cookie on Nginx).
+Microsoft documents exactly three exemptions: a single server in a single process; the Azure SignalR Service, which redirects clients to itself and handles affinity there; or all clients configured for WebSockets only with SkipNegotiation enabled, which removes the separate negotiate request.
+Everything else, Redis backplane included, needs affinity, and SkipNegotiation can't be combined with the Azure service, so those two escape hatches are mutually exclusive. Fallback order, for the record: WebSockets to Server-Sent Events to long polling.
+
+Why either is needed: a server only knows its own connections, so Clients.All across three pods with no backplane reaches only the third of users attached to the pod that sent it. The ticket reads "messages disappear randomly."
+
+Redis ( AddStackExchangeRedis ): your pods still hold every socket. Redis pub or sub forwards each send to the other servers, which deliver to their own local connections.
+Consequences: you scale on connection count even when sending few messages, sticky sessions remain required, and groups are kept in server memory so a restart drops membership.
+It is Microsoft's recommended option for self-hosted infrastructure, and the pragmatic one when latency to an Azure region would be prohibitive.
+
+Azure SignalR Service ( AddAzureSignalR ): clients are redirected to the service on connect, so the service holds the sockets and each app server keeps only a small constant number of connections to it.
+Your servers then scale on messages sent rather than clients connected, sticky sessions stop being a requirement, and it is the documented answer when group membership has to survive a server restart. The cost moves from your infrastructure into a per-unit bill.
+
+Both fall out of one fact: by default a reconnect is a new connection with a new ConnectionId, not a resumed one.
+
+The silence: group membership is per-connection and isn't preserved when a connection reconnects, so the client is in no groups and Clients.Group("room:42") no longer includes it. It genuinely is connected, it just belongs to nothing.
+Rejoin in OnConnectedAsync or in the client's Reconnected handler, and do it unconditionally: adding a connection that is already in the group is safe and throws nothing.
+
+The blink: the old connection closed, so its OnDisconnectedAsync ran, and code that reads one disconnect as "user is offline" broadcasts offline for someone who is already back.
+The same bug fires when a user with three tabs closes one, one user, many simultaneous connections, one per tab or device.
+Keep a per-user set or count keyed on Context.UserIdentifier ( ClaimTypes.NameIdentifier by default, overridable with IUserIdProvider ) and emit UserOffline only when it hits zero.
+The rule: ConnectionId is a send target within one invocation, never the key of anything that must outlive the connection.
+
+The version gate to name before an interviewer does: dot NET 8 added stateful reconnect, the one case where a brief drop is a resumed connection rather than a replaced one. It buffers data on both server and client, ACKs received messages, and replays whatever was sent while the link was down.
+It is off by default and must be opted into at both ends, options.AllowStatefulReconnects = true on MapHub, .WithStatefulReconnect() on the client, so everything is still the default behaviour.
+Group membership is documented as not preserved across a reconnect regardless, so rejoining stays your job either way.
+
+Very little about the client. The send A P I is documented as "does not wait for a response from the receiver", the Task completes when the message has been handed to the transport, not when a browser received it, deserialized it, or ran the handler. The group may have been empty.
+Reading a completed send as delivery confirmation is exactly where "we sent the notification but the user never saw it" comes from.
+
+For a real answer you need client results: ISingleClientProxy.InvokeAsync on Clients.Caller or Clients.Client(connection Id) (also reachable through IHubContext ), with the client returning a value from its .On handler.
+It is single-client by design, there is no "invoke a group and collect the replies", so a group-wide ack is something you model yourself as an explicit client to server call.
+
+Cost: one socket write per member connection (the payload is serialized once per hub protocol and cached, not once per connection), and behind a backplane the message is also published and re-fanned by every other server.
+Levers, in that order: narrow the target, a group per room, not Clients.All, then cut the rate or batch, then send an identifier plus a fetch ("order 42 changed") instead of serializing state on every change.
