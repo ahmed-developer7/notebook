@@ -1,0 +1,766 @@
+-- pause --
+Section 1. Why it matters.
+
+The moment a client depends on your A P I, every change risks breaking it. Versioning is the discipline that lets you evolve without forcing every consumer to upgrade in lockstep. Done well, you can ship breaking changes monthly without the support phone ringing.
+Done poorly, you're stuck supporting v1 forever because customers refuse to migrate.
+
+Why interviewers ask: versioning surfaces real-world experience. Anyone can write a v1 endpoint. Knowing how to add a v2 without breaking v1, communicate the deprecation, and sunset v1 cleanly, that's senior. The seven strategies are the menu; the choice depends on stakeholder constraints.
+
+When NOT to version aggressively: internal-only A P Is with one client team can skip explicit versioning and just coordinate releases. Versioning is for A P Is with consumers you can't directly control.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+1. URI versioning.
+
+Strategy: the version is part of the URL path.
+
+Pros:
+Most discoverable, visible in logs, browser bars, curl commands.
+Routing infrastructure (NGINX, A P I Gateway) can split traffic per version cleanly.
+Easy to test in browser without setting headers.
+
+Cons:
+Pollutes URIs (some rest purists argue resources shouldn't change identity by version).
+Major version bumps create sprawling URL spaces.
+
+dot NET implementation (using Asp.Versioning.Mvc; AddApiExplorer comes from the separate Asp.Versioning.Mvc.ApiExplorer package):
+
+URI versioning is the most common choice for public A P Is (GitHub and Azure both use variants of it).
+
+-- pause --
+2. Content negotiation.
+
+Strategy: version specified in the Accept header via vendor-specific media types.
+
+Pros:
+URIs stay clean (the resource at /orders or 42 is forever the same resource).
+Aligns with HATEOAS thinking.
+
+Cons:
+Hard to test in a browser.
+Operations team can't easily filter logs by version.
+Less discoverable.
+
+dot NET implementation:
+
+Note the mismatch with the example above: MediaTypeApiVersionReader reads a media type parameter (;v set to 2 ), not a version baked into the media type itself.
+The vendor form application or vnd.myapi.v2+json puts the version in the subtype, so MediaTypeApiVersionReader cannot see it, you need a custom IApiVersionReader that parses the subtype. Pick one form and be explicit about which you're implementing.
+
+Common in academic or rest-purist designs; rarely used in practice for consumer-facing A P Is.
+
+-- pause --
+3. Header versioning.
+
+Strategy: version in a custom H T T P header.
+
+Pros:
+Clean URIs.
+Doesn't conflict with content negotiation.
+
+Cons:
+Same downsides as content negotiation (hard to test, less discoverable).
+Requires clients to set headers explicitly.
+
+dot NET implementation:
+
+Used by some enterprise A P Is, Stripe's Stripe-Version header, which overrides the version pinned to the account, is the best-known public example. (Microsoft Graph is not one: it versions by URL path, and /beta/.)
+
+-- pause --
+4. Backward compatibility.
+
+Strategy: within a version, only make non-breaking changes. Add fields, don't remove. Add endpoints, don't change existing ones.
+
+This is the philosophical rule that underpins all versioning strategies, even with v1 or v2 or v3 in URIs, each version must remain stable internally.
+
+What's safe (additive):
+Adding new optional fields to responses.
+Adding new endpoints.
+Adding new optional query parameters.
+Accepting new optional fields in requests (with sensible defaults).
+Loosening validation (for example, max length 100 to 200).
+
+What's breaking:
+Removing fields from responses.
+Renaming fields.
+Changing field types or formats ( int to string, ISO date to epoch).
+Adding required fields to requests.
+Tightening validation (max length 200 to 100).
+Changing default values.
+Changing error response shapes.
+Removing endpoints or status codes.
+
+Rule of thumb: if a 6-month-old client written against v1 would break against your changes, it's breaking. Bump to v2.
+
+-- pause --
+5. Query parameter versioning.
+
+Strategy: version as a query parameter.
+
+Pros:
+Easy to test (browser-friendly).
+Doesn't pollute URIs structurally.
+
+Cons:
+Caching gets complicated (cache key must include the query param).
+Considered "less RESTful" than URI versioning by purists.
+
+dot NET implementation:
+
+Used by Microsoft's Azure Resource Manager A P Is.
+
+-- pause --
+6. Deprecation strategy.
+
+When you ship v2, v1 doesn't disappear. You deprecate it gracefully:
+
+Step 1, announce: publish a deprecation notice with a sunset date (typically 6, 12 months out for public A P Is).
+
+Step 2, header signal: add Deprecation and Sunset headers on every v1 response.
+
+Deprecation was standardised by RFC 9745 (2025). Its value is a structured-field Date (RFC 9651), an @ followed by a Unix timestamp, giving the moment the deprecation took or takes effect; @1780272000 here is 1 June 2026.
+It is not true and not an H T T P-date, both of which appear in older material written against the pre-RFC drafts.
+RFC 9745 also defines the deprecation link relation for pointing at the documentation explaining the change, which is separate from successor-version (RFC 5829) pointing at the replacement resource. Sunset remains an H T T P-date under RFC 8594.
+
+Step 3, telemetry: track v1 usage. Don't sunset until usage hits an acceptable floor.
+
+Step 4, communicate: email key consumers, blog, dev portal banner. Multiple channels.
+
+Step 5, sunset: at the deadline, return 410 Gone for v1 endpoints.
+
+Asp.Versioning.Mvc automatically returns deprecated versions in the api-deprecated-versions response header when configured with ReportApiVersions = true.
+
+-- pause --
+7. Semantic versioning (major or minor or patch).
+
+SemVer ( MAJOR.MINOR.PATCH ):
+MAJOR: breaking change, bump and version-prefix the URL.
+MINOR: backward-compatible additions, same URL, just add fields or endpoints.
+PATCH: backward-compatible bug fixes, invisible to consumers.
+
+For A P Is, you usually expose only the MAJOR version externally ( /v2/ ) because clients only care about breaking-or-not. MINOR and PATCH are tracked internally for changelog or release notes.
+
+Some A P Is expose the full semver, and some replace it entirely with dates.
+Stripe's version identifiers combine a date with a release-train codename, YYYY-MM-DD.trainname, where the named release opens a train and carries the breaking changes, and the dated versions that follow within the same train are additive only.
+Date-based versioning is the variant where each "version" is a snapshot of the A P I on a particular date; the codename is what stops those snapshots multiplying into unbounded parallel shapes.
+
+-- pause --
+8. Versioning minimal A P Is and route groups.
+
+Everything attaches a version to a controller class. Minimal A P Is have no class to decorate, so the unit of versioning moves to the route group, and the package changes from Asp.Versioning.Mvc to Asp.Versioning.Http.
+
+The shape is three steps. You declare a named versioned A P I once with NewVersionedApi("Orders"). You hang one MapGroup off it per version, stamping each group with HasApiVersion, or HasDeprecatedApiVersion for one on its way out.
+Then every endpoint you map into a group inherits that group's version, so no per-endpoint annotation is needed.
+A minimal-A P I analogue of [MapToApiVersion] does exist, Asp.Versioning.Builder supplies MapToApiVersion, HasApiVersion and HasDeprecatedApiVersion as extension methods on the endpoint builder, but in the group model you rarely reach for it:
+the group already carries the version, and mapping the same route into two groups is how you express two versions of the same endpoint.
+Groups are ordinary values, so the v1 group and the v2 group can be built in different files by different people, which is the practical reason teams like this model better than one controller carrying three attributes.
+
+Two groups can share the same path prefix as long as the version arrives some other way, with the default query-string reader, api-version set to 1.0 and api-version set to 2.0 select between them.
+If you want URL-segment versioning, put the placeholder in the group prefix instead, exactly as you would in a controller route template.
+
+The deprecation headers from Section 6 also stop being hand-written.
+ApiVersioningOptions.Policies lets you declare deprecation and sunset as policy, Policies.Deprecate(0.9) and Policies.Sunset(0.9), each with an Effective date and an optional Link carrying a title and content type, and the library emits the headers for every response on that version.
+The 10.0.0 Preview 1 release notes for aspnet-api-versioning list support for the deprecation response header as defined by RFC 9745, so the framework now emits the modern form of the header rather than the pre-RFC one; Sunset (RFC 8594) has been supported for longer.
+
+Per-version OpenAPI is a single call in this model.
+AddApiExplorer puts each A P I description into a version group, AddOpenApi from the Asp.Versioning.OpenApi package wires that into Microsoft.AspNetCore.OpenApi,
+and app.MapOpenApi().WithDocumentPerVersion() emits one document per version, replacing the older pattern of one AddOpenApi("v1") call per version that you had to remember to extend every time you added a version.
+
+In the real world: a team ports a controller-based service to minimal A P Is and the first thing that breaks is their versioning, because they go looking for a class to hang [ApiVersion] on and there isn't one.
+The mental switch is that the group is the version set, you stop asking "which version is this method?" and start asking "which group did I map it into?", and the answer is visible in one place at the top of the file instead of scattered across twenty action methods.
+
+-- pause --
+9. When the version reader is ambiguous.
+
+ApiVersionReader.Combine is usually presented as free flexibility: accept the version from the URL, a header, the query string, or the media type, whichever the client happens to use. It is not free.
+Once four readers are active, a single request can carry four different answers, and the library has to decide what to do about that.
+
+The rule is that repeating the version is fine as long as the values agree. The moment two readers produce different values, the request is rejected with the documented error code AmbiguousApiVersion, H T T P 400, "An A P I version was specified multiple times with different values".
+So a client that has ?api-version set to 1.0 baked into a saved URL, sitting behind a corporate gateway that helpfully injects api-version: 2.0 as a header, gets a 400 for a request that looks perfectly valid at both ends. Nobody who wrote either half sees the conflict.
+
+The second interaction is with AssumeDefaultVersionWhenUnspecified, including in this chapter's own combined-reader sample, which enables the flag and the four readers in the same block. That flag only fires when nothing was read.
+Widening from one reader to four widens what counts as "specified", so a stray header from an intermediary silently switches the request off the default path and onto an explicit version. Combining readers and defaulting the version are individually defensible and jointly very hard to reason about.
+
+It is worth knowing the whole documented error set, because interviewers ask what the client actually sees. ApiVersionUnspecified is 400, "An A P I version is required, but was not specified". InvalidApiVersion is 400, the value was present but not parseable.
+UnsupportedApiVersion uses whatever ApiVersioningOptions.UnsupportedApiVersionStatusCode is set to, which defaults to 400, except that the documentation notes the value is always 404 when versioning by URL segment,
+because an unrecognised segment simply fails to match a route before versioning ever gets a say.
+And the library only produces a problem-details body if problem details are registered; without that, the client receives the bare status code and no explanation at all.
+
+In the real world: an operations team greps the edge logs for 404 seconds to find broken links and finds thousands they cannot explain, because URL-segment versioning collapses "you asked for v3 and we only have v1 and v2" into the same status code as "that URL never existed".
+The fix is not to change the status code, 404 is correct for a route that doesn't exist, it is to register problem details so the response body carries the UnsupportedApiVersion code, and then alert on the body rather than the status.
+
+-- pause --
+
+Section 4 lists "changing error response shapes" as breaking, and then leaves it there. That bullet is the one most teams break repeatedly, because error responses are written ad hoc per endpoint and nobody thinks of them as part of the contract until a client's error handling stops working.
+
+The standard answer is a single error envelope for the whole A P I. RFC 9457, Problem Details for H T T P A P Is (July 2023), obsoletes RFC 7807 and defines that envelope.
+It is served as application or problem+json and has five defined members: type, a URI reference identifying the problem type; title, a short human-readable summary of the type; status, the H T T P status code; detail, a human-readable explanation of this specific occurrence;
+and instance, a URI reference identifying the occurrence.
+
+Two properties of that design are what make it survive version bumps, and they are worth stating explicitly because they are the reason to adopt it rather than invent your own.
+First, type is the stable machine-readable identity of the error, clients branch on the URI, never on the prose, so you can rewrite title and detail freely, translate them, or fix a typo, without touching anyone's code.
+Second, RFC 9457 Section 3.2 permits problem type definitions to extend the object with additional members, and requires that clients "MUST ignore any such extensions that they don't recognize".
+Adding a field to an error is therefore additive by specification, not by convention and not by hoping the client's deserialiser is tolerant. That is a stronger guarantee than you get anywhere else in a Jason A P I.
+RFC 9457 also creates an IANA "H T T P Problem Types" registry, pre-populated with about:blank for problems that carry no semantics beyond the status code.
+
+In A S P dot NET Core, builder.Services.AddProblemDetails() registers the default IProblemDetailsService, and ProblemDetailsOptions.CustomizeProblemDetails is the hook that runs over the problem-details documents the app generates, which is where you attach extension members.
+Microsoft's error-handling documentation is inconsistent about which RFC it points at, parts of the same page still link RFC 7807 while others link 9457.
+It makes no practical difference: the member names and the media type are identical between the two, so the wire format is unaffected, and 9457 is simply the current reference to quote.
+
+One design rule: keep the version out of the type URI. If v1 and v2 emit different type URIs for the same logical failure, every client has to learn a second vocabulary at the bump, and the one part of the contract that could have stayed constant across versions doesn't.
+
+In the real world: a client's retry logic keys off the string "Insufficient funds" because that is all the A P I gave it. Someone fixes the capitalisation in a patch release and the retries stop firing.
+With problem details the same fix is invisible, the client matched on a type URI that nobody touched, and the only thing that changed is what a human reads in the log.
+
+-- pause --
+11. Hyrum's law, the breaks that aren't in the schema.
+
+Hyrum's law, stated by Hyrum Wright and named by Titus Winters: "With a sufficient number of users of an A P I, it does not matter what you promise in the contract:
+all observable behaviors of your system will be depended on by somebody." It is the reason a clean OpenAPI diff is not proof that you shipped a non-breaking change.
+Every one of the following leaves the schema untouched.
+
+Default page size. A client that never sends limit and loops until it gets a short page now makes a different number of calls; a client that assumed one page held everything now silently processes a fraction of the data and reports success.
+
+Default sort order. Ordering that was never documented but happened to be insertion order, because that is what the clustered index gave you. You add an index, or move the read to a replica or a different store, and the order changes.
+Clients that render a list and clients that page through it both notice.
+
+Null versus absent. A field that was always present with the value null starts being omitted. The schema says optional and nullable either way.
+In languages that distinguish "key missing" from "key present, value null", and in merge-patch semantics, where absent means "leave alone" and null means "clear it", those are different instructions.
+
+Numeric formatting and width.
+An amount serialised as 10.00 becoming 10, or an identifier growing past what a Jason number can hold exactly:
+JavaScript's Number.MAX_SAFE_INTEGER is 253 − 1, and any integer ID that crosses it starts round-tripping wrong in every browser client while remaining a perfectly valid integer in the schema.
+
+Timestamp shape. The same instant rendered as Z instead of +00:00, or gaining fractional seconds. Clients that parse properly are fine; clients that string-compare, regex, or slice the first nineteen characters are not, and you will not know which is which.
+
+Latency. Not a data change at all. A call that used to return in a fraction of the time now takes longer because you added a downstream lookup, and clients with a hard-coded timeout begin failing. Nothing in any contract test covers this.
+
+Authorisation scopes. Adding a required scope to an existing endpoint means every access token already issued without that scope stops authorising it. The tokens are still valid; they simply no longer carry what the endpoint now demands.
+The request and response shapes are byte-identical and every client holding an older token breaks at once, arguably the most severe non-schema break there is, because it takes effect the moment you deploy rather than at the next client release.
+
+The defence is in two halves.
+Document what is explicitly not part of the contract, ordering is unspecified unless you pass a sort parameter, identifiers are opaque, page size may change, timestamps are ISO 8601 without a guaranteed rendering, so that depending on it is the client's error rather than yours.
+Then, where you can, make the unspecified behaviour visibly unstable in non-production: if the order genuinely isn't guaranteed, shuffle it in the sandbox, so a client that depends on it finds out during integration rather than after you optimise a query.
+
+In the real world: a security review adds a fine-grained scope to an existing endpoint and it ships as a patch, because nothing in the OpenAPI document changed. Every partner integration starts returning 403 within minutes and none of them can fix it without a token re-issue they have to schedule.
+The migration that would have worked is the same expand-and-contract shape as everywhere else, accept both the old and the new scope, tell holders of the old one they have a deadline, and only then require the new one.
+
+-- pause --
+12. Expand and contract, the database under two live versions.
+
+Two A P I versions usually share one database, and that is where multi-version support actually costs something. You can run two controllers, but you cannot run two schemas.
+
+The pattern is parallel change, better known as expand and contract.
+The bliki entry on martinfowler.com, written by Danilo Sato, not Fowler himself, credits Joshua Kerievsky with first documenting it as a refactoring strategy in 2006 and presenting it in a 2010 talk, and defines it as implementing a backward-incompatible interface change in three phases:
+expand, migrate, contract.
+
+Applied to renaming a column while v1 and v2 are both serving traffic, that becomes four deployments rather than one. Expand: add the new column, nullable, and deploy code that writes both columns and still reads the old one.
+Migrate: backfill the existing rows in batches, so you are not holding a long lock or one enormous transaction. Switch reads: deploy code that reads the new column and still writes both. Contract: stop writing the old column, and only once every running instance is on that code, drop it.
+
+The rule that generates all four steps is one sentence: every deployment must be compatible with the code that was running immediately before it, because during a rolling deploy both versions are live at the same time against the same schema.
+That is exactly the A P I versioning constraint applied one layer down, and it is why the obvious single migration fails, add a NOT NULL column and the code that populates it in one release,
+and the old instances still running insert rows without it and violate the constraint before the deploy finishes.
+Add it nullable, backfill, add the constraint in a later release.
+
+The part that specifically belongs to A P I versioning is when you are allowed to contract. The storage has to be a superset that satisfies every live A P I version, and the old shape cannot be dropped until the A P I version that needs it is sunset.
+So the contract phase is gated on the sunset date from Section 6, not on the merge date of the v2 code. A team that treats the database migration as done when v2 ships has quietly coupled its schema cleanup to a customer-communication deadline it did not plan for.
+
+In the real world: v1 returns a tax-inclusive total and v2 breaks tax out as a separate line, the scenario from Drill 5.
+Storage has to hold the net amount and the tax amount separately, because that is the superset both versions can be projected from, even though no v1 response ever shows them apart.
+Had the original schema stored only the inclusive total, v2 is not a mapping change at all; it is a recomputation of historical orders against the tax rules that applied on each order date, and that is a project rather than a version bump.
+
+-- pause --
+13. Consumer-driven contract testing as a release gate.
+
+The walkthrough at the end of this chapter ships an oasdiff gate that fails a pull request introducing a breaking schema change. That catches shape. It cannot catch two things.
+
+It cannot tell you whether anyone depends on the part that changed, removing a field no consumer reads fails the diff and costs you a version bump you did not need.
+And it cannot see meaning: if status = "Pending" starts being returned for a case that previously returned "Processing", the schema is identical and the diff is clean, while every consumer's branching is now wrong.
+
+Consumer-driven contract testing closes that half, and the mechanism is the thing to be able to explain. Each consumer's own test suite runs against a local stub, and as a by-product records the requests it made and the responses it expected, the pact.
+The consumer publishes that file to a Pact Broker. The provider's build then fetches the pacts, replays each recorded request against the real running provider, and checks that the actual response satisfies the consumer's expectations, publishing the verification result back to the broker.
+The provider's build now fails when it breaks a consumer that actually exists, and stays green when it changes something nobody reads. That is the inverse of what diffing gives you, which is why the two are complementary rather than alternatives.
+
+What turns it from a report into a gate is two broker commands. Before deploying, pact-broker can-i-deploy --pacticipant Foo --version 23 --to-environment production asks whether that version is compatible with the versions of everything else currently in that environment.
+After deploying, pact-broker record-deployment --pacticipant Bar --version 56 --environment production tells the broker what is actually running, so the next can-i-deploy has something true to compare against. Skip the second command and the first one is answering about a fictional environment.
+
+The honest limitation: this only works for consumers who will write and publish pacts, which in practice means internal teams.
+For the third-party integrations in Drill 15, clients you cannot directly upgrade, you have no contract to verify against, and schema diffing plus per-consumer telemetry remains the only signal you get.
+
+In the real world: a provider deletes a field that has been in the response for years. The oasdiff gate fails the build. The pact verification passes, because no consumer records that field in any expectation.
+That combination is exactly the information the team needed, the change is breaking on paper and safe in fact, and the release goes out with a documented exception instead of a version bump that would have forced every internal client to move.
+
+-- pause --
+14. Versioning at the gateway.
+
+The claim that URI versioning routes cleanly at the gateway gets asserted repeatedly and demonstrated rarely. It is worth knowing the mechanism, because it is also the escape hatch when you pick the wrong strategy at launch.
+
+YARP is the dot NET reverse proxy, configured as routes and clusters.
+A route has a Match, some combination of Path, Hosts, Methods, Headers and QueryParameters, a ClusterId naming a set of destinations, an optional Order where lower values win, and a list of Transforms that rewrite the request before it is forwarded. Three versioning jobs fall out of that.
+
+The first is routing each version to its own deployment: /v1/{catch-all} to one cluster, /v2/{catch-all} to another. The versions then scale independently, deploy independently, and the frozen v1 can sit on a smaller cluster that nobody touches.
+
+The second is translating one versioning style into another at the edge. Match on the header, a Headers entry with Name: X-A P I-Version, Values: ["2"] and Mode: ExactHeader, and then apply a PathPrefix transform that rewrites the incoming path into the internal /v2/. form.
+Externally you are offering header versioning; internally every service does URL versioning, and the logs are greppable by version again.
+That is also the migration path when you launched with header versioning and the operations team and the C D N both hate it: stand up both routes at the edge, run them in parallel through the deprecation window, then delete the header route.
+No client is forced to move on your schedule and no service changes at all.
+
+The third is sunsetting without touching the service: at the deadline, the route for the retired version returns 410 at the edge and the v1 deployment is deleted.
+
+What YARP does not give you is a percentage split as a configuration flag.
+Its load-balancing policies choose a destination within a cluster, PowerOfTwoChoices (the default), FirstAlphabetical, Random, RoundRobin and LeastRequests, and none of them is weighted, so you cannot express "5% to v2" by pointing one route at a cluster containing both.
+Route matching is deterministic on request properties. That pushes you towards the canary shape that is better anyway: route a named header, tenant or A P I key to v2, so you know exactly who is exposed and can name them when something breaks.
+If you genuinely need a random split, it is a custom configuration provider or a piece of middleware, not a config line, and saying so in an interview is a better answer than claiming the flag exists.
+
+In the real world: a team launches with header versioning for URL cleanliness and discovers within a quarter that they cannot answer "is this incident only affecting v1 callers?", because their log pipeline drops headers it was never told to keep.
+The wrong fix is asking every client to change their integration.
+The right one is a gateway route that reads the header, rewrites the path, and forwards to a versioned internal URL, after which the version is in the access log of every service behind the edge, and the client-facing change becomes an unhurried deprecation rather than an emergency.
+
+-- pause --
+15. G R P C and Protobuf, versioning by field number.
+
+Protobuf inverts the rest intuitions about what is breaking, because the wire identity of a field is its number, not its name. The proto3 language guide is explicit that a field number "cannot be changed once your message type is in use because it identifies the field in the message wire format".
+
+Two consequences follow, and they are the opposite of the rest answers. Renaming a field is not a wire break, the number is unchanged, so existing serialised bytes still parse.
+It breaks generated code for anyone who regenerates, and it does break the proto3 Jason mapping, which uses names; that is why reserved applies to names as well as numbers. And deleting a field is not the dangerous part, freeing its number is.
+If someone later reuses that number for a field of a different type, old bytes decode into the new field.
+The proto3 guide lists what encoding with one definition and decoding with another can cost: "Developer time lost to debugging, A parse or merge error (best case scenario), Leaked PII or SPII, Data corruption". The mitigation is one line the compiler enforces:
+
+Because additive evolution is this cheap, G R P C services bump major versions far less often than rest ones. When they do, the version goes in the proto package, package orders.v1;.
+That is not a naming convention: the G R P C H T T P or 2 protocol defines the request path as "/" Service-Name "/" {method name}, where Service-Name is the proto package name, if any, followed by the service name.
+So package orders.v2; produces /orders.v2.Orders or GetOrder on the wire, which means v1 and v2 can be hosted by the same process on the same port with no route conflict and no path rewriting, the versioning is structural rather than bolted on.
+
+For CI, buf provides breaking-change detection with four categories, strictest to most lenient: FILE (the default), which detects changes that move generated code between files; PACKAGE, the same check at package granularity; WIRE_JSON, which detects breakage to the binary or Jason encoding;
+and WIRE, binary encoding only.
+Pick the one matching what your consumers actually depend on, FILE when everyone regenerates from your protos, WIRE_JSON when you have Jason transcoding in front, WIRE when only compiled clients ever read the bytes.
+
+In the real world: someone renames status to state in a .proto "for clarity", the same change as this chapter's walkthrough. The Go and C sharp services carry on talking to each other perfectly, because the field number never moved, so the change reviews as harmless.
+The Jason transcoding gateway in front of the mobile app starts emitting state, and the app blanks. That is precisely the case buf 's WIRE_JSON category exists to catch and WIRE does not.
+
+-- pause --
+16. Versioning events and messages.
+
+Every strategy so far ends with a lever you can eventually pull: return 410 and the old version is gone. A published event gives you no such lever.
+A consumer may process a message minutes after it was written or years later during a replay, and in an event-sourced system the stored events are the system of record, so they can never be rewritten. There is no sunset step.
+"You cannot 410 an event that is already in the log" is the sentence to have ready.
+
+Two mechanisms replace it.
+
+Compatibility enforced at publish time. A schema registry checks each new schema against the ones already registered and refuses the incompatible ones, so the break is caught by a producer's build rather than a consumer's pager.
+Confluent Schema Registry's documented compatibility types are BACKWARD (consumers on the new schema can read data written with the latest registered schema, this is the default), BACKWARD_TRANSITIVE (the same, against every previously registered schema),
+FORWARD (consumers on the latest registered schema can read data written with the new one), FORWARD_TRANSITIVE, FULL (both directions, against the latest), FULL_TRANSITIVE (both directions, against all) and NONE, which disables checking entirely.
+The non-transitive modes check only against the latest schema; the transitive ones check against every schema ever registered.
+
+Choosing the mode is really choosing a deployment order, which is the part candidates miss.
+BACKWARD means a new consumer can read old data, so consumers can be upgraded first and producers after, and it is the Confluent default for Kafka specifically because it is what lets you rewind a consumer to the beginning of a topic and still read everything there.
+FORWARD means the old consumers can read the new data, so producers go first. If nobody chooses, you inherit BACKWARD and its consumers-first ordering without having decided it, which is survivable, right up to the release where the team assumed the opposite.
+
+Transformation on read for events already stored. You cannot migrate them, so you convert at deserialisation.
+The event-sourcing term is upcasting; Axon Framework formalises it as an Upcaster chain where each step converts one revision of an event to the next, running on the serialised payload as it is read, so the domain code only ever sees the current shape.
+The dot NET equivalent is a deserialisation step keyed off a revision stamp carried in the stored envelope.
+Which yields the one design decision you must get right on day one: put a version or revision stamp in the envelope from the very first event you publish, because you cannot retrofit one onto events that are already written.
+
+In the real world: an OrderPlaced event where total meant tax-inclusive in revision 1 and tax-exclusive in revision 2. No compatibility check catches it, both are a decimal called total, so every mode from BACKWARD to FULL_TRANSITIVE passes.
+No upcaster can fix it either, because the tax amount it would need was never stored. The only safe moves are a differently named field or a new event type, and that is Hyrum's law and the expand-and-contract rule arriving together in a place where you cannot deprecate your way out.
+
+-- pause --
+Section 3. Common pitfalls.
+
+No version strategy at launch. "We'll add it when we need it", by then, you have unversioned URLs that clients depend on. Version from day one, even if only /v1/.
+Breaking changes within a version. Even one removed field breaks contracts. Bump to v2.
+Versioning everything internally. Most internal services don't need it. Versioning has overhead, apply where consumers can't be coordinated.
+Renaming a field "for clarity". Renames are breaking. Add the new name, deprecate the old, keep both populated, sunset the old eventually.
+No deprecation timeline. "v1 is going away soon" to six months later still no date. Pick a date and stick to it.
+Sunsetting without telemetry. You don't know who's still on v1. Add per-version metrics from day one.
+Versioning by environment ("dev v2 differs from prod v1"). Clients can't tell. Version the contract.
+Mixing strategies inconsistently. Some endpoints versioned by URI, others by header. Pick one (or two consistently) per A P I.
+Bumping the major for cosmetic changes. Adding a field to a response isn't breaking. Don't pollute the URL space.
+Removing v1 with no migration path. v2's response shape is so different that clients can't trivially upgrade. Provide a migration guide and worked examples.
+AssumeDefaultVersionWhenUnspecified = true in production. Means clients that forget the version get whatever you set, which silently changes when you ship v2 as default. Fail explicitly if no version specified.
+Forgetting Swagger / OpenAPI per version. Each version should have its own OpenAPI document. Otherwise consumers see one merged blob.
+
+-- pause --
+Section 4. Interview-ready summary.
+
+Strategies: URI ( /v2/ ), header ( X-A P I-Version: 2 ), query ( ?api-version set to 2 ), content negotiation ( Accept:.;v set to 2 ).
+URI versioning is the practical default for public A P Is.
+Backward compatibility within a version is non-negotiable, only additive changes.
+Deprecation lifecycle: announce to Deprecation: (RFC 9745, @ -prefixed Unix time) + Sunset: headers to telemetry to email or blog to return 410.
+SemVer for internal tracking; expose only MAJOR externally.
+
+Expected interview questions:
+
+"How do you version a rest A P I?", Walk through URI versioning as the default, with mention of header or query alternatives. Discuss when each fits.
+"What's a non-breaking change?", Adding optional fields, adding endpoints, accepting new optional inputs, loosening validation. NOT renaming, NOT removing, NOT changing types.
+"How do you sunset v1?", Announce with sunset date 6+ months out, add Deprecation and Sunset headers, track usage, communicate via multiple channels, return 410 Gone at the deadline.
+"URI versus header versioning, which would you pick?", URI for discoverability, browser testability, gateway routing. Header for URI cleanliness when partners can be relied upon to set headers.
+"What if a client doesn't specify a version?", Two valid answers: (a) reject with 400 "version required", explicit, no surprise; (b) default to v1 (oldest stable), never the latest, so you don't break old clients when shipping v2.
+"How do you support v1 and v2 of the same endpoint?", In A S P dot NET Core: [ApiVersion("1.0")] and [ApiVersion("2.0")] on a controller, [MapToApiVersion] on actions. Or separate controllers per version for major divergence.
+"Is graph Q L versioning different?", graph Q L discourages versioning; use deprecated fields and additive evolution instead. The schema describes everything available; clients pick what they need.
+
+-- pause --
+Section 5. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, URL versus header versus media-type versioning.
+
+Q: Compare URL, header, and media-type versioning. Which would you pick and why?-- think --
+
+A: URL versioning ( /v2 or orders ) is the practical default, visible in logs, browser-testable, easy to route at the gateway, supported by every H T T P client. Header versioning ( X-A P I-Version: 2 ) keeps URLs clean but is invisible to humans browsing logs or pasting curl.
+Media-type versioning ( Accept: application or vnd.acme.v2+json ) is the most RESTful by purist standards, same resource identity across versions, but operations teams hate it because you can't grep request logs by version.
+
+Cross-Q: Stripe famously uses a non-URL approach, dated version snapshots pinned to the account, overridable per request ( Stripe-Version: YYYY-MM-DD.trainname ). What does that buy them that the URL approach doesn't?-- think --
+
+A: Two things. (1) Per-customer migration cadence: each customer pins their A P I version at integration time; new customers get the current shape; existing customers don't get force-migrated when Stripe ships a new shape.
+(2) Many small breaking changes are tolerable because each is one snapshot, not a major-version event, Stripe ships breaking changes monthly without the "v2 launch" drama.
+The cost: server must maintain N parallel response shapes (or transformation layers), and the support burden across versions is higher.
+
+Cross-Q²: Why doesn't every A P I copy Stripe's approach?-- think --
+
+A: Engineering cost. Stripe's versioning system requires transformation layers that turn the latest internal representation into any historical shape, they have a "versioned response" pipeline that's effectively an internal product.
+For an A P I with 5 endpoints and 2 clients you control, it's massive overkill. For an A P I with 200 endpoints and 50K third-party integrations, it's the only humane option.
+The pattern matches scale; choose URL versioning until you have so many consumers that big-bang major bumps become a customer-support catastrophe.
+
+-- pause --
+Drill 2, Breaking versus non-breaking changes.
+
+Q: Give me five changes and rank each as breaking or non-breaking.-- think --
+
+A: (1) Adding an optional field to a response: non-breaking, old clients ignore unknown fields. (2) Adding a required field to a request: breaking, old clients omit it. (3) Renaming a field: breaking in either direction.
+(4) Tightening validation (max length 200 to 100): breaking, old clients sending 150-char values now get 400. (5) Adding a new endpoint: non-breaking, nothing in the existing contract changed.
+
+Cross-Q: Counter-intuitive one: adding a field to a response is non-breaking for H T T P clients, but I've seen it break SDKs. How?-- think --
+
+A: Generated typed SDKs with strict deserialization. NSwag-generated C sharp clients sometimes fail on unknown Jason properties depending on configuration; Java or Kotlin with Jackson throws on the new field, because FAIL_ON_UNKNOWN_PROPERTIES is on by default in a plain ObjectMapper.
+The "H T T P client perspective" is non-breaking; the "typed S D K perspective" depends on the S D K's deserialization tolerance. Standard practice: SDKs ignore unknown properties by default; ensure your codegen configuration sets that explicitly for downstream confidence.
+
+Cross-Q²: Tightening response validation, say, an enum that previously could be any string and now is one of a closed set, is that breaking?-- think --
+
+A: Yes, subtly. Old responses contained values like "PENDING_OVERRIDE" that clients tolerated as strings. New responses still emit only "PENDING"|"COMPLETE"|"CANCELLED" but old clients have a switch statement assuming the prior set of values and fall through to a default "unknown" case.
+The contract narrowed; clients that hard-coded the prior open set now lose information. Treat enum closures as breaking and communicate them in changelogs even if technically "the response is a subset of what we emitted before."
+
+-- pause --
+Drill 3, Deprecation headers (RFC 9745 and RFC 8594).
+
+Q: Explain the standard deprecation signaling, Deprecation, Sunset, and Link headers.-- think --
+
+A: Deprecation: @1780272000 (RFC 9745, 2025) communicates "this endpoint or version is on its way out." The value is a structured-field Date per RFC 9651, an @ followed by a Unix timestamp, for the moment deprecation took or takes effect.
+Watch for this in interviews: the pre-RFC drafts used Deprecation: true or an H T T P-date, and most material still online shows those. Sunset: (RFC 8594), the date the endpoint will return 410 Gone; this one is an H T T P-date.
+Link:; rel="successor-version", the Link field is RFC 8288, the relation type is RFC 5829, points clients at the replacement so they can read the header and route S D K upgrade notifications.
+RFC 9745 adds a second relation, rel="deprecation", whose target is the documentation explaining the change rather than the replacement resource. Modern H T T P clients (Axios with interceptors, dot NET DelegatingHandler ) can surface these headers as warnings in dev logs automatically.
+
+Cross-Q: A client integration ignores headers entirely, partner team built their H T T P layer to throw away headers it doesn't understand. Headers are useless against them. What else?-- think --
+
+A: Layered communication.
+(1) Per-key telemetry: identify which A P I keys / User-Agent strings still call deprecated endpoints; (2) Proactive outreach: email or Slack the top N consumers a defined number of weeks before sunset, with their specific endpoint usage; (3) Dev portal banner on every page mentioning v1 sunset;
+(4) Changelog with prominent deprecation notes per release; (5) Optional brownouts, periodically return 503 for v1 in the final month as a "wake-up call" before the permanent 410.
+Headers alone never reach teams who don't read them.
+
+Cross-Q²: A team wants to use Warning header (RFC 7234) for deprecation notices because it predates Deprecation. Tradeoffs?-- think --
+
+A: Warning was deprecated in RFC 9111 (H T T P caching, June 2022) and removed from the modern H T T P semantics specs. Some legacy intermediaries strip or reorder it. The successor pattern is Deprecation + Sunset + Link.
+There's no downside to including Warning: 299 - "Deprecated" as a fallback for clients reading older spec, but the primary signal should be the modern triple. Pick the standard with active spec maintenance.
+
+-- pause --
+Drill 4, Semver for A P Is.
+
+Q: How does semver (MAJOR.MINOR.PATCH) apply to a wire contract?-- think --
+
+A: MAJOR, breaking change (rename, removal, type change, required-field addition), bump and version-prefix the URL. MINOR, backward-compatible additions (new optional field, new endpoint, looser validation), same URL, document in changelog.
+PATCH, backward-compatible bug fixes (incorrect data, wrong status code, performance), invisible to consumers. For URL versioning, expose only MAJOR externally ( /v2/ ); track MINOR.PATCH internally for the changelog.
+
+Cross-Q: A team versions their A P I as 2.5.3 in the URL ( /v2.5.3 or orders ). What goes wrong?-- think --
+
+A: Three problems. (1) Bumping MINOR or PATCH changes the URL, forcing client URL updates for non-breaking changes, defeats the point of semver. (2) Caching is fragmented per minor version, same content cached under N URLs.
+(3) URL churn breaks bookmark sharing, log analysis ("show me v2.5.x usage" requires regex), and gateway routing config. The discipline: URL captures MAJOR; the running server announces full version in a header like Api-Version: 2.5.3 for diagnostics; changelog tells the story.
+
+Cross-Q²: S D K semver versus A P I semver, when do they diverge?-- think --
+
+A: They almost always diverge. S D K semver tracks the S D K's contract with its language: bumping S D K 4.0.0 might be triggered by an idiomatic refactor (renamed methods, added type-safety) without any underlying A P I change.
+Conversely, A P I 2.0.0 launch needs a new S D K version family ( OrdersClient.V2 ), clients can't depend on both v1 and v2 simultaneously without namespacing. Document the mapping explicitly: S D K changelog says "supports A P I v1.x and v2.x; v2 endpoints in OrdersClient.V2 namespace."
+
+-- pause --
+Drill 5, Multi-version maintenance scope.
+
+Q: You're maintaining v1 and v2. How do you scope what code is kept and what's deleted?-- think --
+
+A: Three layers. (1) URL routing, /v1 or orders and /v2 or orders exist as separate routes. (2) Controller per version, OrdersControllerV1, OrdersControllerV2, or one controller with [MapToApiVersion] per action.
+(3) Shared service layer where business logic is the same; version-specific transformations live in mapping layers ( OrderV1Mapper, OrderV2Mapper ) that translate the shared domain model into the per-version wire format.
+Deletion at sunset: remove the controller route and its mapper; the domain model is untouched.
+
+Cross-Q: The business logic changed between v1 and v2, not just shape, but rules ("v1: tax always included; v2: tax separate line item"). Does the shared-service pattern still hold?-- think --
+
+A: Yes, with a versioned domain operation. The domain service exposes CalculateTotal(Order, TaxBehavior) where TaxBehavior is IncludedInPrice (v1) or SeparateLineItem (v2). The v1 controller passes IncludedInPrice; v2 passes SeparateLineItem.
+Logic differences become parameters to the domain, not duplicated copies of business logic. Avoid forking the service per version unless the divergence is so deep that they're effectively different products.
+
+Cross-Q²: A junior duplicates OrderService to OrderServiceV2 to make the v2 change. Six months later, a bug fix lands in OrderService but not OrderServiceV2. How do you prevent this trajectory?-- think --
+
+A: Three structural fixes. (1) Architecture test: "no class name ending in V1 or V2 or V3 exists the controllers layer", fail the build. (2) Code review checklist: forking a service requires explicit ADR (Architectural Decision Record) explaining why the parametrize-the-domain approach failed.
+(3) Periodic version audit (quarterly): comb the codebase for divergent copies and consolidate or document the divergence reason. The smell is "code duplication driven by versioning, not driven by domain difference."
+
+-- pause --
+Drill 6, Adding a field.
+
+Q: Adding a field is sometimes breaking, sometimes non-breaking. Explain when.-- think --
+
+A: To a response: non-breaking, old clients ignore unknown fields. To a request as optional: non-breaking, old clients omit the field; server uses default. To a request as required: breaking, old clients omit, server returns 400.
+The direction of data flow and the required or optional flag together determine breakage.
+
+Cross-Q: A team adds an "optional" field to the request but the server treats absence as an error in business logic ("field must be present, even if empty"). Effectively breaking?-- think --
+
+A: Yes, the contract is enforced by behavior, not by schema annotation. If the server rejects requests missing the field, it's a required field whatever you call it in the OpenAPI spec.
+The fix is either: (a) make the absence path return a sensible default and document it, or (b) accept that you've introduced a required field and bump the major version. The OpenAPI annotation required: false must match server behavior.
+
+Cross-Q²: Adding an optional response field, when does this break S D K consumers in practice?-- think --
+
+A: Strict deserialization in typed SDKs, but know which ecosystems are actually strict. Jackson is: FAIL_ON_UNKNOWN_PROPERTIES is on by default in a plain ObjectMapper, so an added field throws unless someone disabled it.
+Swift's synthesized Codable is tolerant, but a hand-written init(from:) that enumerates keys can be made strict by accident.
+System.Text.Json is the counter-example and the one interviewers probe:
+it ignores unknown properties by default, and rejecting them is opt-in via JsonSerializerOptions.UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow (dot NET 8+) or the [JsonUnmappedMemberHandling] attribute on the type.
+Don't confuse that with UnknownTypeHandling, which is about how object -typed members deserialize and has nothing to do with extra properties.
+Mitigation: document the S D K's tolerance setting and keep codegen permissive, leave UnmappedMemberHandling at its default Skip for dot NET, and explicitly disable FAIL_ON_UNKNOWN_PROPERTIES for Jackson.
+
+-- pause --
+Drill 7, Renaming a field.
+
+Q: Renaming a field is the canonical "tiny but breaking" change. Walk through how to evolve.-- think --
+
+A: Three-phase migration. (1) Dual-publish: emit both status and state in responses; accept both on requests. Mark the old name deprecated: true on its property in the OpenAPI schema, that is the signal consumers and codegen actually see.
+(2) Wait window: 6+ months of telemetry on usage of the old name. (3) Sunset: announce removal, return 410 or remove the field in a major version bump. Never delete on the day of the rename.
+
+Cross-Q: How do you cleanly emit both status and state from the same C sharp DTO?-- think --
+
+A: One property is the source of truth; the other is a computed alias.
+
+csharp.
+public record OrderResponse(int Id, string State, decimal Total).
+{.
+[Obsolete("Use State; this alias will be removed in v2.")].
+public string Status goes to State;
+}.
+
+The new name is the source of truth; the old name is the computed alias, so deleting the alias at sunset removes the old name and leaves the real property untouched. Both names serialize. Inbound requests use a custom Jason converter that fills State from either the status or the state field.
+The old name has a documented sunset date.
+
+Be clear about what [Obsolete] does and doesn't do: it is a C sharp compile-time attribute that warns code compiling against this assembly. It is invisible on the wire, doesn't change serialization, and an H T T P client never sees it.
+The consumer-facing signal is deprecated: true on the old property in the published OpenAPI schema, plus the Deprecation / Sunset headers on the response.
+
+Cross-Q²: Six months in, telemetry shows 12% of traffic still uses the old name. What do you do?-- think --
+
+A: Investigate the top callers, likely S D K versions that ship with the old field name hard-coded.
+Options: (1) ship updated S D K versions and ramp adoption via depandabot / changelog outreach; (2) extend the deprecation window by 3 months with explicit notice;
+(3) introduce gradual brownouts (for example, return 503 for 1% of requests using the old name, ramping to 100%) so client teams notice in dashboards before the hard sunset.
+The trap is "we said 6 months; pull the trigger no matter what", telemetry-driven sunsets respect actual adoption, scheduled sunsets respect the calendar, and the right answer is "calendar with telemetry as override."
+
+-- pause --
+Drill 8, Adding a new endpoint.
+
+Q: Is adding a new endpoint always non-breaking?-- think --
+
+A: For H T T P clients, yes, clients who never call it are unaffected. For S D K consumers, almost always yes (the new method just appears in the S D K).
+The edge cases: (1) The new endpoint conflicts with a wildcard route consumed by clients (rare, app.MapGet("/orders/{anything}") ); (2) The new endpoint changes server behavior in a way visible to other endpoints (for example, adds a foreign key constraint that affects another endpoint's writes);
+(3) Quota or rate limit shifts because the new endpoint shares a bucket with existing endpoints.
+
+Cross-Q: A team adds /orders/{id}/cancel and discovers older client SDKs generated against the old spec don't know about it. Is that breakage?-- think --
+
+A: No, the old S D K has no method to call the new endpoint, but old S D K calls to existing endpoints work unchanged. The S D K just needs regeneration to pick up the new method. This is normal evolution; document the new endpoint in the changelog and the next S D K release notes.
+
+Cross-Q²: When does adding an endpoint break a client?-- think --
+
+A: When the endpoint name collides with an existing route in a path-priority sense. Example: existing /orders/{id:int} for integer ID; new /orders or recent (a literal segment).
+Most routers prefer literal segments over parameter segments, so /orders or 42 still hits the parametric route, but if you defined /orders/{recent} ambiguously you're in trouble. Test the route table after every addition.
+A S P dot NET Core's route registration will warn on ambiguity at startup if MapControllers() finds conflict, but custom minimal A P I ordering can mask it.
+
+-- pause --
+Drill 9, graph Q L versioning.
+
+Q: Does A P I versioning apply to graph Q L?-- think --
+
+A: Not in the URL or version-number sense. graph Q L's design assumption is additive evolution: the schema describes everything available; clients query only the fields they need; new fields don't break old queries; removed fields require coordinated deprecation.
+There's typically one graph Q L endpoint ( /graphql ) and one schema, evolving over time with @deprecated directives marking fields on the way out.
+
+Cross-Q: A breaking change in graph Q L, say, changing a field's type from Int! to String!, happens occasionally. How is that handled without a v2 endpoint?-- think --
+
+A: Three patterns. (1) Add the new field under a new name ( statusV2: String! ), deprecate the old, give clients time to migrate, eventually remove the old. (2) For very disruptive changes, ship a schema patch with a hard cutover date communicated weeks in advance.
+(3) Some teams version the schema document (different /graphql or v2 endpoint) only for changes that can't be expressed as additive, rare. graph Q L's @deprecated directive is the workhorse.
+
+Cross-Q²: graph Q L's "client picks fields" model means you don't break clients by adding fields, but you can break clients by adding resolvers that fail on data they don't expect to be queried. How?-- think --
+
+A: Field-level overhead. If a new field's resolver hits a slow downstream service, clients who happen to query that field (perhaps because their query selects a fragment containing it) see latency spike.
+Worse: a new resolver that throws under certain data conditions adds the field to the graph Q L errors array, which strict clients treat as request failure even though other fields succeeded.
+Mitigation: feature flags on new fields ( @include(if: $clientOptIn) ), conservative resolver-level error handling (return null + add to errors, not throw), and per-field telemetry so you see new resolver perf separately from the request average.
+
+-- pause --
+Drill 10, Downstream library impact (S D K breaking changes).
+
+Q: You bump the A P I to v2 cleanly. Your generated TypeScript S D K now has different method signatures. Is that an S D K breaking change?-- think --
+
+A: Yes, and it's an expected one, but it must be communicated as such. Bump the S D K major version ( @acme or orders-sdk@2.0.0 ) when you regenerate for A P I v2. Consumers can pin v1 of the S D K to keep calling A P I v1 endpoints; v2 of the S D K targets v2 of the A P I.
+Don't ship A P I v2 changes in a minor S D K version, that's how S D K consumers get woken up at 2 AM.
+
+Cross-Q: A team has both A P I v1 and v2 in production simultaneously, and an S D K that supports both. Compatibility matrix design?-- think --
+
+A: Two patterns. (1) Single S D K with versioned namespaces: OrdersClient.V1.GetOrder(.) and OrdersClient.V2.GetOrder(.), same npm or NuGet package, two A P I surfaces. Consumers import the version they target.
+(2) Separate S D K packages per A P I major version: @acme or orders-sdk-v1 and @acme or orders-sdk-v2, clearer ownership, easier to deprecate one. Document a compatibility matrix: "S D K 1.x to A P I v1 only; S D K 2.x to A P I v1 and v2; S D K 3.x to A P I v2 only."
+
+Cross-Q²: The S D K uses a refresh-token flow that calls /auth or refresh. You move that endpoint behind a new path in v2. S D K breaks across the board. How would the design have prevented this?-- think --
+
+A: Auth endpoints should be versioned independently of resource endpoints, or pinned at the S D K level rather than tracking the latest A P I version. Many A P Is explicitly keep auth at /auth/. without /v1/ prefix because auth flow rarely changes and breaking it breaks every other call.
+If you do version auth, the S D K should expose an explicit auth-endpoint config so consumers can stay on v1 auth while their resource calls migrate to v2. Coupling is the trap.
+
+-- pause --
+Drill 11, ApiVersion attribute in dot NET.
+
+Q: Walk me through [ApiVersion] and the Asp.Versioning.* packages in dot NET.-- think --
+
+A: Asp.Versioning.Mvc (or Asp.Versioning.Http for minimal A P Is) is the canonical package. You decorate the controller with [ApiVersion("1.0")] and [ApiVersion("2.0")], then individual actions with [MapToApiVersion("1.0")] or [MapToApiVersion("2.0")].
+Configure the version reader ( UrlSegmentApiVersionReader, HeaderApiVersionReader, QueryStringApiVersionReader, MediaTypeApiVersionReader ) in AddApiVersioning(.). ReportApiVersions = true adds api-supported-versions and api-deprecated-versions headers automatically.
+
+Cross-Q: A team sets AssumeDefaultVersionWhenUnspecified = true so unversioned requests get a fallback. What can go wrong?-- think --
+
+A: When you ship v2 and change the default, clients that never specified a version get the new shape silently, exactly the breakage they were avoiding by not specifying.
+Two safer options: (a) reject unversioned requests with 400 "version required"; (b) pin the default to the oldest stable version (v1 forever), so unversioned clients are stuck but stable. Never let "default" mean "latest."
+
+Cross-Q²: Swagger / OpenAPI generation per version, what's the standard setup with AddApiExplorer ?-- think --
+
+A: Two pieces, and it helps to keep them separate. The versioning side: after AddApiVersioning(.), chain .AddApiExplorer(opts goes to { opts.GroupNameFormat = "'v'V"; opts.SubstituteApiVersionInUrl = true; }) from Asp.Versioning.Mvc.ApiExplorer.
+That doesn't emit any documents, it puts each A P I description into a group named v1, v2,. and substitutes the version placeholder in route templates so the docs show concrete URLs instead of v{version:api Version}. The document-generation side then creates one document per group.
+Which generator that is depends on your dot NET version:
+Swashbuckle was the template default for years and serves /swagger or v1 or swagger.json, but from dot NET 9 the web A P I templates ship Microsoft.AspNetCore.OpenApi instead, one AddOpenApi(document Name) call per document plus MapOpenApi(), with the v1 document served at /openapi or v1.json.
+Either way, name the documents from the version descriptions rather than hard-coding them, so a new [ApiVersion] doesn't silently go undocumented. Consumers can then pull the per-version spec and generate per-version SDKs.
+
+-- pause --
+Drill 12, Conditional requests and versioning.
+
+Q: Conditional requests use ETag / If-None-Match for cache validation. How do they interact with versioning?-- think --
+
+A: ETags are computed over the response body. The same resource at v1 and v2 has different bodies (added fields, renamed fields), so the ETags must differ, otherwise a v1 client with a cached ETag would get 304 Not Modified against v2's actual-different content.
+Two approaches: (1) embed the version in the ETag computation ( etag = hash(version, body) ); (2) maintain separate cache namespaces per version so ETags never cross.
+
+Cross-Q: A team uses URL versioning ( /v1 or orders or 42 versus /v2 or orders or 42 ) so the URLs are different and the cache naturally separates. Are there still gotchas?-- think --
+
+A: Yes, intermediate caches (C D N, reverse proxies) might be configured to ignore the version path segment for cache-key purposes, or to canonicalize URLs. Verify the Cache-Control + Vary header behavior end-to-end.
+Also: a client upgrading from v1 to v2 has stale v1 cache entries it should evict; document that SDKs should clear their H T T P cache on A P I version change.
+
+Cross-Q²: A client uses If-Match for optimistic concurrency on writes ( PUT /orders or 42 with If-Match: "etag-xyz" ). What happens during version migration?-- think --
+
+A: ETags from v1 reads aren't valid for v2 writes (different body computation). A client that GETs v1, then PUTs v2 with the v1 ETag, will get 412 Precondition Failed. Standard advice: re-read at the target version before writing.
+S D K can encapsulate this: client.V2.UpdateOrder first GETs from v2 to refresh the ETag before issuing the PUT. The migration path needs explicit attention to read-modify-write cycles spanning versions.
+
+-- pause --
+Drill 13, Versioning versus feature flags.
+
+Q: When do you use versioning versus feature flags for evolving behavior?-- think --
+
+A: Versioning is for contract changes, the wire shape, the semantics of an endpoint, breaking-change events. Feature flags are for implementation changes, turn a new algorithm on for 1% of traffic, dark-launch a new dependency, A or B test a U X behavior, with no change in the A P I contract.
+The signal: if external clients need to write different code to handle the change, version it; if it's the same contract with different internals, flag it.
+
+Cross-Q: A team wants to add a new response field but ramp it to 10% of clients first via feature flag. Reasonable?-- think --
+
+A: Risky. A response that includes the field for some clients and omits it for others creates a contract that's neither v1 nor v2, clients can't rely on whether the field exists.
+Better: ship the field always (it's additive, non-breaking), but feature-flag the backing logic (the new calculation) so the field is null or 0 for clients in the 90% bucket and populated for the 10%. Contract is stable; backing logic ramps.
+
+Cross-Q²: A feature flag controls whether a deprecated endpoint returns 410 Gone or still works. Is this versioning or feature flagging?-- think --
+
+A: Versioning expressed as a flag, and acceptable for a defined transition window. Pattern: flag defaults to "still works" everywhere, then flip to "410" in non-production environments for a week, then production for an hour as a brownout, then permanently 410.
+The flag is an operational lever for the sunset event; the underlying versioning decision (sunset v1) is fixed. Don't use the flag as ongoing toggling, that's contract chaos.
+
+-- pause --
+Drill 14, Removing an endpoint.
+
+Q: Process for removing an endpoint that's been live for 3 years.-- think --
+
+A: Six-step playbook. (1) Identify replacement (v2 endpoint, deprecation notice with successor link). (2) Telemetry: per-caller usage of the doomed endpoint for at least 3 months. (3) Announce: changelog, dev portal banner, emails to top callers, 6-12 months advance for public A P Is.
+(4) Headers: Deprecation: @ + Sunset: + Link: on every response. (5) Final notice 30 days out, emails to remaining callers identified by telemetry. (6) Sunset: return 410 Gone with a body explaining the replacement, or 301 redirect if the URL is compatible.
+
+Cross-Q: A few stragglers are still calling v1 the day before sunset. Do you push the date?-- think --
+
+A: Judgment call based on who they are and what they're doing. If they're an internal team that simply forgot, push by a week, send a stern reminder, keep the schedule visible.
+If they're external partners who've ignored 12 months of notice, sunset on schedule; their failure to migrate is not a reason to indefinitely extend.
+The exception: critical-business-impact stragglers (a major customer's prod) get a private extension contract with a hard new date, not an open-ended grace period. Each extension undermines the credibility of every future deprecation.
+
+Cross-Q²: After sunset, an attacker probes /v1 or orders, should the response be 410 Gone, 404 Not Found, or 301 Redirect to v2?-- think --
+
+A: 410 Gone is the semantically correct answer, "this resource is permanently gone, intentionally." 404 implies "we don't recognize this URL," which can confuse clients into retrying.
+301 redirects can be useful if the v2 URL has a compatible response shape (rare, usually breaking changes are why you removed it) and you want to ease the transition for the longest tail.
+Combined: 410 with a body explaining the migration and linking to v2 docs is the most useful response for legitimate clients still on v1.
+
+-- pause --
+Drill 15, Backwards compatibility for clients you don't control.
+
+Q: You have third-party clients you can't directly upgrade. How do you ship breaking changes?-- think --
+
+A: Three principles. (1) Keep the old version running as long as it has paying users, never delete a major version that has revenue. (2) Build the new major version alongside, not in place, clients migrate at their own pace.
+(3) Telemetry-driven sunset: only retire when usage falls a defined floor (for example, 0.1% of traffic, or zero paying customers in the past 30 days). The combination means breaking changes become a parallel universe rather than a replacement universe.
+
+Cross-Q: One major customer pays you 30% of your revenue and refuses to migrate from v1. They're effectively holding the A P I hostage. What's the playbook?-- think --
+
+A: This is a business problem dressed as a technical problem.
+Options: (a) negotiate a contract with the customer that gates v1 maintenance behind their paying for it (dedicated support tier); (b) provide migration consulting / engineering hours to unblock them;
+(c) keep v1 running as a frozen legacy that doesn't get new features, and document its limitations openly so internal teams know the cost; (d) deprecate features within v1 incrementally to push migration without a hard cutover.
+The mistake is treating it as "we'll wait", without explicit cost attribution, v1 maintenance becomes free hostage-rent.
+
+Cross-Q²: How do you avoid getting into this situation in the first place?-- think --
+
+A: Versioning contract terms upfront. Standard S L A language: "We commit to supporting the current major version and the immediately previous major version.
+Older versions enter end-of-life status with at least 12 months' notice." Customers signing up know the maintenance window; pricing reflects support commitment. The legal or business framework gives engineering license to sunset; without it, every deprecation is a customer-success battle.
+Larger A P I providers (Twilio, Stripe, A W S) have explicit deprecation policies linked from their pricing pages exactly to make this dynamic clear before contracts are signed.
+
+-- pause --
+Section 6. Cheat Sheet.
+
+URI versioning ( /v2 or orders ) is the practical default, visible in logs, gateway-routable, browser-testable.
+Within a version, only additive changes, adding fields, endpoints, optional params. Anything else = bump.
+Rename = breaking, keep both names populated, deprecate the old, sunset later.
+Deprecation lifecycle: announce to Deprecation: @ (RFC 9745) + Sunset headers to telemetry to emails to 410 Gone.
+Asp.Versioning.Mvc is the canonical dot NET package; supports URI or header or query or media-type readers.
+ReportApiVersions = true emits api-supported-versions and api-deprecated-versions headers.
+AssumeDefaultVersionWhenUnspecified is dangerous in prod, clients silently get a new "default" on bumps.
+Expose only MAJOR externally ( /v2/ ); track MINOR or PATCH internally for changelog.
+Stripe-style date versioning ( YYYY-MM-DD.trainname, date plus release-train codename) is the alternative for fast-evolving A P Is with snapshots; breaking changes land only in the named train opener.
+graph Q L deviates: schema evolution via @deprecated, no URL versioning.
+
+-- pause --
+Section 7. Walkthrough, Silent breakage from a "tiny rename".
+
+Problem: A backend dev renamed Order.status to Order.state "for clarity" in a pull request and shipped it as a patch release without a major bump. Within an hour, three partner integrations and the iOS app started returning blank order screens. Support phone melts.
+
+Diagnosis: Run curl in Postman, response shows state: "Pending" instead of status: "Pending". Diff the OpenAPI spec from the previous release ( oasdiff base.yaml head.yaml ), flags the rename as a breaking change.
+Check the iOS crash logs in App Center: NSCocoaErrorDomain decode failures because the Swift model declares let status: String. The version stayed v1 but the contract broke, clients written 6 months ago against v1 have no signal that the field name changed.
+
+Fix: Immediate rollback of the rename. Then for the real migration: dual-publish both fields in v1, deprecate the old one, ship the new shape as v2. Add a CI gate using oasdiff to fail pull requests that introduce breaking changes without a version bump:
+
+In code:
+
+[Obsolete] only warns C sharp code compiling against this assembly, it never reaches an H T T P client. Mark the old property deprecated: true in the published OpenAPI schema so consumers and their codegen see it too.
+
+Add Deprecation: @1780272000 and Sunset: Thu, 31 Dec 2026 23:59:59 GMT headers on v1 responses, pointing to v2 via Link:; rel="successor-version".
+
+Why it works: The contract test now catches the change at pull request time, before merge. Clients that read either field continue to work through the deprecation window. The Sunset header drives partner migration planning rather than ambushing them.
+
+-- pause --
+Section 8. Self-test.
+
+No, if the server treats absence as the existing default behavior. Yes, if the server now validates that the field is present or has a non-default value. The principle: a 6-month-old client unaware of the new field must continue to succeed unchanged.
+Testing rule: pin a copy of the old Postman collection / Pact contract and run it against the new server in CI.
+
+When (a) the A P I is consumed by libraries that already set Accept for content negotiation, (b) URL stability matters for caching at intermediaries that don't include Accept in cache key by default, or (c) you're building a hypermedia A P I where each resource has a stable identity across versions.
+In practice, header versioning loses on discoverability, engineers can't paste a v2 URL into a browser, gateway routing config gets ugly, ops can't grep logs by URL prefix. Pick URI unless you have a specific argument for the header path.
+
+Imagine you ship v2 and change the default. Clients that never specified a version get the new shape silently, exactly the breakage clients-without-version-strategy were trying to dodge.
+Two safer options: (a) reject unversioned requests with 400 "version required" so clients fail fast and explicitly, or (b) pin the default to the oldest stable version (v1 forever), so unversioned clients are stable but stuck. Never let "default" mean "latest."
+
+Dated versioning makes every A P I change a "version" snapshot pinned to the account at integration time, the server preserves the response shape that was current then. Pro: no big breaking-version events; per-customer migration.
+Con: server must maintain N parallel response shapes indefinitely, transformation layers between versions, and onboarding-doc complexity.
+Stripe caps that N by grouping versions into named release trains ( .acacia, .basil, and the trains that followed):
+breaking changes land only when a new train opens, and dated versions within a train are additive, so the number of genuinely distinct shapes tracks the number of trains rather than the number of dated releases.
+For most A P Is, MAJOR-bumped URIs is simpler.
+
+(1) Dual-publish docs with side-by-side migration examples; (2) Emit Deprecation: @ + Sunset: + Link:; rel="successor-version" on every v1 response so client teams see deprecation in their H T T P libraries automatically;
+(3) Track per-client v1 usage telemetry (by A P I key or User-Agent ), proactively email the top 10 holdouts a month before sunset with their specific endpoint usage.
+The combination beats blanket emails; deprecation only works when teams see real signal.
