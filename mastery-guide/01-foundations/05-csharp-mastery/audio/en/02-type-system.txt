@@ -1,0 +1,1090 @@
+-- pause --
+Section 1. Why it matters.
+
+The single deepest fork in C sharp semantics is value type versus reference type.
+Get this wrong and you write code that allocates on a path you believed was allocation-free, mutates state you thought was a copy, fails equality checks for opaque reasons, or boxes inside a hot loop and pays garbage collector pressure for nothing.
+
+Modern C sharp (C sharp 10, 14) added five new tools to the type-system toolbox: record, record struct, readonly struct, ref struct, and primary constructors. Each is a precise answer to a long-standing pain point.
+Knowing which to reach for, and why, separates engineers who guess from engineers who decide.
+
+this session is also the foundation for everything in 09-memory-and-performance.md. Span is a ref struct. ArrayPool returns reference-typed arrays. string.Create builds strings without allocation. None of those click without the type-system mental model first.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+Value versus reference types, the foundational divide.
+
+Every C sharp type is either a value type or a reference type. The choice changes how the variable behaves under assignment, parameter passing, equality, and garbage collection.
+
+Value types include all the numeric primitives, bool, char, all struct s, all enum s, and tuples. The variable is the value:
+
+Reference types include class, interface, delegate, string, object, arrays, and record (default). The variable holds a reference to a heap-allocated object:
+
+This single distinction drives most "why is my code behaving weirdly" questions.
+
+Storage, Where declared (often stack or inline in a containing object), Heap (always); reference is where declared.
+Default value, All-zero bits, null.
+Assignment, Copies the bits, Copies the reference.
+Equality ( == ), Bit-equality (or operator overload), Reference identity (unless overridden, string and record override).
+Generics with default(T), Zero value, null.
+Pass by value, Full copy, Reference copy (object shared).
+Pass by ref, Caller's storage referenced, Caller's reference variable referenced.
+Lifetime, Bound to scope, Until last reference + garbage collector.
+Inheritance, Cannot inherit (sealed implicitly), Single inheritance + multiple interfaces.
+Boxing, Yes (when stored as object / interface), N or A.
+
+-- pause --
+Value versus reference, the full story (semantics, identity, equality).
+
+The previous table is the "what". This section is the "so what", six independent dimensions where the value or reference choice changes program behavior. Senior interviewers don't ask "value versus reference"; they ask "two instances of Money(100, USD), are they equal? Identical?
+Hashable?" and expect you to spell out which mechanism applies.
+
+Dimension 1, Storage location.
+
+"Value type goes on the stack" is the lie everyone learns. The truth: a value lives wherever its containing storage lives.
+
+Dimension 2, Assignment semantics.
+
+Dimension 3, Parameter passing.
+
+(default), Copy of bits passed, Copy of reference passed; object shared.
+ref, Caller's storage referenced, Caller's reference variable referenced, callee can reassign.
+out, Same as ref but callee must assign, Same as ref but callee must assign.
+in, Read-only reference (no copy, no mutation), Same but rarely meaningful (reference is already small).
+
+Dimension 4, Default value.
+
+Dimension 5, Identity versus equality.
+
+This is the subtle one. "Identity" = "are these the same object?" "Equality" = "do they represent the same value?" For reference types they're different concepts; for value types identity isn't even well-defined.
+
+Dimension 6, Lifetime and garbage collection.
+
+Value types in stack frames die when the frame returns, no garbage collector involvement, zero cost. Reference types live on the heap and are tracked by garbage collector; cleanup happens at the next gen-0 collection (or later if the object survives).
+Value types as fields of reference types live with their container, same lifetime as the heap object.
+
+The senior takeaway. "Value versus reference" is not one decision, it's six independent behaviors that align in the value-type versus reference-type choice.
+When a behavior diverges from the default (for example, you want a class with value equality), reach for the right tool: record for "reference type with value equality"; struct for "value type with reference-comparable behavior" (you implement IEquatable explicitly); class for "identity matters";
+readonly record struct for "small immutable value with value equality."
+
+-- pause --
+Stack versus heap (and why it's a half-truth).
+
+The most common shorthand: "value types live on the stack, reference types live on the heap." This is mostly wrong as stated, and getting it precisely right matters for performance reasoning.
+
+The accurate rule: a value-type value lives wherever its containing storage lives.
+
+A local int x = 5;, its containing storage is the method's stack frame, so the int lives on the stack.
+A field class Order { int Total; }, Total is inline inside the Order heap object. The int lives on the heap.
+An int[] arr, array elements live on the heap (the array is a heap object), even though int is a value type.
+A Lazy cached field, same; on the heap.
+
+Reference types are always on the heap, and the reference itself lives wherever it's declared (stack for locals, heap for fields).
+
+For deeper coverage of how the garbage collector manages heap objects, see dot NET Fundamentals, Garbage Collection.
+
+-- pause --
+Boxing and unboxing.
+
+When a value type is assigned to a reference-typed slot ( object, an interface, or a generic parameter without value-type constraint), the runtime boxes it: allocates a heap object, copies the value into it, and returns a reference. Unboxing copies back.
+
+Generics do not box. This is worth stating flatly because the half-remembered version of it causes bad decisions. The C L R instantiates generic code per value type, so List stores int[] and Dictionary stores Guid s inline.
+A T that happens to be a struct is never wrapped in an object just because it flowed through a generic.
+Boxing enters only when the value crosses into something typed as object, dynamic, or an interface variable, and, crucially, when a struct method call has to dispatch to a base implementation the struct did not override.
+
+The mechanism you should be able to name: constrained. callvirt. When you call an interface method on a value type, the I L the compiler emits decides whether you allocate:
+
+Be precise about which stage does what, because it is the same I L-versus-native-code distinction as the __Canon discussion later in this session: the compiler emits constrained. !!T once, and the jit is what knows T is Sq. (Decode the I L of ViaConstraint and the constrained.
+token resolves to T, not to Sq.)
+
+where T: IShape is the constraint to reach for: it is guaranteed allocation-free, where the interface-typed parameter is only allocation-free if the jit can prove the box never escapes.
+Modern CoreCLR often can, dot NET 9's escape analysis will stack-allocate a non-escaping box, so a small ViaInterface(sq) that gets inlined can measure zero.
+Do not rely on it: the moment the box crosses a call the jit cannot see through, it is a real 24-byte heap object again, and the constraint version never has that failure mode.
+The same rule explains a subtler case: sq.ToString() allocates if Sq does not override ToString(), because the call has to reach ValueType.ToString(), which takes an object receiver, so the struct is boxed to supply one.
+Override ToString(), Equals, and GetHashCode on any struct you intend to print, compare, or hash, and those calls stop allocating.
+
+Common unintentional boxing:
+
+How to spot boxing: look for object, non-generic collections ( ArrayList, Hashtable ), interface invocations on a value type via interface-typed variable, and params object[] A P Is.
+The only way to be certain is the box opcode in the I L, string concatenation with + is the classic false positive, since Roslyn calls ToString() on a value-type operand rather than boxing it.
+
+Cost: each box is a heap object. On 64-bit CoreCLR an object carries two pointer-sized words of header, the sync-block index and the method-table pointer, and the runtime enforces a 24-byte minimum object size, so a boxed int occupies 24 bytes: 16 of header, 4 of payload, 4 of padding.
+The value itself is almost never the expensive part.
+
+An allocation ledger you can reproduce. The point of this table is not the numbers, it is the zeros: which constructs allocate at all.
+Every row was measured with garbage collector.GetAllocatedBytesForCurrentThread() around a warmed-up loop on dot NET 9, x64, Release, with DOTNET_TieredCompilation set to 0 so the jit's optimizing tier is what runs.
+Reproduce it before you quote it, tier-0 code has not yet applied the devirtualizations, so the same measurement taken during warm-up reports allocations that steady-state code does not make.
+The last three rows depend on how long the resulting string is; they were taken with i a four-digit int, so "x set to 1234" is six characters.
+
+object o = i; ( int to object ), 24, one box; 16 header + 4 payload + 4 padding.
+ViaInterface(sq), IShape parameter, 24, or 0 if the box does not escape, the struct is boxed to become an IShape, but see the note under the table.
+ViaConstraint(sq), where T: IShape, 0, constrained. callvirt, resolved to a direct call.
+sq.ToString(), struct with no ToString override, 24, boxed to reach ValueType.ToString().
+sq.ToString(), struct with ToString override, 0, direct call on the struct.
+foreach over List typed as List, 0, List.Enumerator is a struct, used by value.
+foreach over the same list typed as IEnumerable, 40, the enumerator struct is boxed to satisfy the interface.
+dict.TryGetValue(key), struct key without IEquatable, 72, three boxes per lookup, see the struct-equality section.
+dict.TryGetValue(key), readonly record struct key, 0, strongly-typed Equals / GetHashCode, no object in sight.
+"x=" + i, 72, no box, see below; a throwaway "1234" string (32) plus the result string (40).
+$"x={i}", 40, the result string only, DefaultInterpolatedStringHandler formats into a pooled buffer.
+string.Format("x={0}", i), 64, one box (24) plus the result string (40), no array; see.
+
+The ViaInterface row is the one to be careful with, and it is a good lesson in not trusting a single measurement. Written naively, a small method the jit inlines, it measures 0, not 24, on dot NET 9. CoreCLR's escape analysis proved the box never leaves the method and stack-allocated it.
+Force the box to escape (put [MethodImpl(MethodImplOptions.NoInlining)] on the callee, or hand it to anything the jit cannot see through) and the 24 bytes come back.
+So the honest statement is not "an interface parameter costs a box" but "an interface parameter may cost a box, at the jit's discretion, and you find out by measuring the shape you actually shipped". The where T: IShape row is 0 unconditionally, that is the difference worth relying on.
+
+Two more rows deserve to be memorised because they are invisible in code review. The foreach pair is the same list iterated twice: returning IEnumerable from a method instead of the concrete type costs a boxed enumerator at every call site, forever.
+And the "x=" + i versus $"x={i}" pair is why the interpolation advice is real rather than cosmetic, but not for the reason usually given, so this is worth getting right:
+
+"x=" + i does not box. Roslyn lowers string + by calling the operand's ToString() and then string.Concat(string, string). Dump the I L and there is no box opcode.
+What it costs is the intermediate string that ToString() returns and immediately throws away, which is why it is still ~1.8 times the interpolated version, and why the advice survives its usual justification being wrong.
+(Single-digit values measure lower because int.ToString() returns a cached string for them. The lowering also depends on the operand's type overriding ToString(), which every primitive does; a struct that does not override it stays boxed here.)
+string.Format("x={0}", i) allocates no params object[], string.Format has non- params overloads for one, two, and three arguments, so the one-argument call is a single box plus the result string.
+What it does not do on a current runtime is start allocating an array at the fourth argument: dot NET 9 added public static string Format(string format, params ReadOnlySpan args), and C sharp 13 prefers that params-span overload and stack-allocates the span.
+string.Format("{0}{1}{2}{3}", i, i, i, i) measures 152 bytes = four boxes (96) + the sixteen-character result string (56), with no object[] anywhere. Force the array, string.Format("{0}{1}{2}{3}", new object[] { i, i, i, i }), and it measures 208, the extra 56 being the array.
+The boxes are the real cost at every argument count; the array is an artifact of the older overload set, and quoting it as current is a good way to be corrected by anyone who has run the measurement since dot NET 9.
+
+In the real world: an ingestion A P I that accepted device telemetry started showing gen-0 collections dominating its flame graph after a release that "only added logging".
+The added line was logger.LogInformation("Reading accepted {Tag}", tag), where tag was a struct ReadingTag { long DeviceId; int Sequence; }, a struct chosen deliberately, months earlier, to keep the hot path allocation-free.
+The logging extension methods take params object?[] args, so every call allocated an object[] and boxed the struct into it, on every accepted reading, at full ingest rate,
+and it did so even when the Information level was filtered out at the sink because the array and the box are built by the caller before ILogger.Log ever decides to discard them.
+The team's first instinct was to make ReadingTag a class, which would have removed the box and kept the array.
+The actual fix was the source-generated [LoggerMessage] partial method, which emits a strongly-typed Log(ILogger, long, int) overload and an IsEnabled guard, taking the line to zero allocations.
+The transferable lesson is that a struct only stays allocation-free while every A P I it touches is generic; one params object[] boundary anywhere in the path undoes the entire design, and logging is the boundary people forget because it does not look like data flow.
+
+-- pause --
+Structs.
+
+A struct is a value type with most of the syntactic conveniences of a class.
+
+Rules:
+All fields default to zero on new T().
+Cannot inherit from another type (except implicitly System.ValueType ).
+Can implement interfaces (but invoking through an interface-typed variable boxes, see above).
+No parameterless constructor with body until C sharp 10 (now allowed, but called only with explicit new(), not on default-initialization).
+
+Where the "16 bytes" rule actually comes from. Interviewers ask for this number and then ask where it comes from; the second question is the real one. It is a bullet in the Framework Design Guidelines, reproduced on Microsoft Learn as Choosing Between Class and Struct:
+
+AVOID defining a struct unless the type has all of the following characteristics:
+It logically represents a single value, similar to primitive types ( int, double, et cetera).
+It has an instance size under 16 bytes.
+It is immutable.
+It will not have to be boxed frequently.
+
+Two things a senior candidate should add.
+First, that page carries Microsoft's own note that the content was published in 2008 and "some of the information on this page may be out-of-date", 16 bytes is a design-guideline heuristic, not a runtime threshold, and nothing in the jit changes behaviour at byte 17.
+Second, the four bullets are an AND, and the last two carry more weight than the size one. A 12-byte struct that gets boxed on every call is worse than a 40-byte readonly struct that never leaves a generic pipeline. Size is the bullet people quote because it is the only one with a number in it.
+
+The mechanism underneath the heuristic is that a struct is copied on every assignment, every by-value argument, and every return, and the jit can only make those copies free while it can hold the fields in registers.
+Small structs get promoted, the jit replaces the struct variable with independent variables for its fields, so "the copy" becomes a couple of register moves or disappears entirely. Once the struct is too large or too field-heavy for that, it lives in memory and every copy becomes a real block copy.
+That is the cliff the guideline is gesturing at, and it is why measuring beats guessing at the boundary.
+
+You can check what a struct actually costs rather than counting fields by hand:
+
+Padding surprises people: struct Padded { byte A; int B; } measures 8 bytes, not 5, because B must sit on a 4-byte boundary. That padding is not merely wasted space, the next section shows it silently changes how the struct hashes.
+
+record struct (C sharp 10) gives you value semantics + auto-generated equality/ with / ToString (covered below).
+
+In the real world: a market-data adapter modelled its quote as struct Quote { decimal Bid; decimal Ask; long Timestamp; int SymbolId;
+}, 48 bytes by Unsafe.SizeOf(), three times the guideline, and a reviewer opened a pull request to convert it to a class on exactly that basis, citing the 16-byte bullet.
+The author pushed back with the rest of the bullet list: quotes are immutable, they are never boxed because the whole pipeline is generic over T, and they arrive in the millions, stored in a Quote[] ring buffer where a class would mean one heap object per quote plus a pointer chase per read.
+The struct stayed. What the review did produce was a real change: the adapter had a readonly Quote _last field and read _last.Timestamp through a non- readonly property, so every read copied all 48 bytes defensively (the next-but-one section explains why).
+Marking the type readonly struct removed that. The useful outcome was that the size guideline, treated as a rule, would have produced the wrong change; treated as a prompt to look at copies and boxes, it found the right one.
+
+-- pause --
+Struct equality, what ValueType.Equals and GetHashCode actually do.
+
+Everyone repeats that the default struct Equals "uses reflection and is slow". That is half the story, the half that matters less. The whole story is in ValueType.cs in dotnet or runtime, which is under 200 lines end to end, and it contains a trap that silently destroys hash distribution.
+
+ValueType.Equals(object) has two paths. The runtime asks one question, CanCompareBitsOrUseFastGetHashCode, and branches:
+
+The predicate is documented in a comment directly its declaration in that same file, and it is the sentence to memorise:
+
+"Return true if the valuetype does not contain pointer, is tightly packed, does not have floating point number field and does not override Equals method."
+
+So a struct falls off the fast path if any of the following is true:
+
+Contains a reference field, struct K { string Name; int V; }, the bits of a reference say nothing about the referent's equality.
+Is not tightly packed, struct P { byte A; int B; }, the 3 padding bytes are undefined; comparing them would compare garbage.
+Contains a float or double, struct Pt3 { double X, Y, Z; }, -0.0 and +0.0 are equal but have different bits; NaN != NaN.
+Contains a field whose own type overrides Equals, struct H { MyStruct M; }, that type's Equals may disagree with its bits, so bitwise comparison would skip it.
+
+On the slow path, FieldInfo.GetValue returns object, so every field of both operands is boxed on every comparison, and that is on top of the two boxes already spent getting there, because Equals(object) needs an object receiver and an object argument.
+
+GetHashCode is where it turns from slow into wrong. The same predicate gates it, but the fallback is not "hash every field more slowly". The source comment states the algorithm outright:
+
+"Our algorithm for returning the hashcode is a little bit complex. We look for the first non-static field and get its hashcode. If the type has no non-static fields, we return the hashcode of the type."
+
+The runtime mixes the method-table pointer into the hash unconditionally, hash Code.Add((IntPtr)pMT) runs before the CanCompareBitsOrUseFastGetHashCode branch, so it happens on both paths and is not what distinguishes them.
+What the branch decides is the payload: on the fast path the runtime hashes all the instance bytes; off it, it hashes exactly one field. Every other field is ignored. That is not a performance characteristic, it is a correctness cliff for anything you use as a dictionary or HashSet key:
+
+One thousand distinct values, one distinct hash code. Only S is hashed; N never participates.
+Put that struct in a Dictionary and every entry lands in one bucket, the dictionary degrades to a linear scan, and the symptom is a lookup that gets slower as the cache grows warmer, which reads like a memory leak rather than a hashing bug.
+
+The padding row of the table has the same effect and is far easier to trip over, because nothing in the declaration hints at it:
+
+Reordering two fields, putting the byte last so the struct packs, changes the hash from one-field to all-fields. No compiler warning, no test failure, just a different distribution.
+
+EqualityComparer.Default is the other half of the mechanism. Generic collections never call Equals(object) directly; they go through EqualityComparer.Default, and which comparer you get is decided once per T by ComparerHelpers.CreateDefaultEqualityComparer in dotnet or runtime.
+The rule, in order: string gets a dedicated StringEqualityComparer; a T that implements IEquatable gets GenericEqualityComparer;
+Nullable gets NullableEqualityComparer (the source explains that Nullable deliberately does not implement IEquatable "because that would add an extra interface call per comparison"); enums get EnumEqualityComparer, which the source says is "specialized to avoid boxing";
+everything else falls through to ObjectEqualityComparer, which calls Equals(object) and therefore boxes.
+
+That single dispatch decision is the 72-bytes-per-lookup row in the boxing ledger, versus zero for the readonly record struct.
+
+So the rule is not "override Equals for speed", it is:
+
+Implement IEquatable on every struct, this is what gets you off ObjectEqualityComparer and out of boxing.
+Override Equals(object) and GetHashCode to stay consistent with it, and overload == / !=.
+Or write four fewer lines and declare a record struct, which generates all of the from the declared members. Microsoft Learn states the distinction plainly: "for a struct, the implementation is in ValueType.Equals(Object) and relies on reflection.
+For records, the implementation is compiler synthesized and uses the declared data members."
+
+The analyzer for step 1 is CA1815, "Override equals and operator equals on value types" (category: Performance). Note the gotcha in its own documentation: it is not enabled by default in dot NET 10, so a codebase can be full of violations with a clean build.
+Turn it on in .editorconfig if you ship structs.
+
+In the real world: a multi-tenant rate limiter keyed its counters on struct BucketKey { string TenantId; int RouteId; long WindowStart; }, a struct, chosen for the usual good reason that keys are created per request and should not allocate. It was fine in load tests, which ran one tenant.
+In production the p99 on the limiter climbed steadily through the day and reset overnight, and the profile showed time inside Dictionary.FindValue rather than anywhere anyone had written code.
+The struct has a reference field, so it was on the slow path, so only TenantId was hashed: every route and every window for a given tenant collided into a single bucket, and the bucket grew all day as windows accumulated.
+The load test never saw it because with one tenant and one route there was nothing to collide with. Adding: IEquatable with a hand-written GetHashCode over all three fields fixed it, and converting the type to a readonly record struct would have fixed it without the hand-writing.
+The lesson that generalises past this bug: for any struct used as a key, the default GetHashCode is not merely slow, it may be reading one field, and the only load test that can reveal it is one with realistic key diversity rather than realistic key volume.
+
+-- pause --
+Mutating a struct, where the compiler hands you a copy.
+
+"Structs should be immutable" is advice; the interesting part is what the compiler does when you ignore it.
+C sharp will not let you mutate through an expression that produced a copy, because the mutation would be silently discarded, so it turns a class of logic bugs into compile errors, but only where it can see them.
+
+The asymmetry between arr[0] and list[0] is the part worth being able to explain, because it looks arbitrary and is not. An array indexer is a language construct that produces a storage location, the I L is an address computation, so arr[0] is a variable you can write through.
+A List indexer is a property, and a property getter returns a value; the copy it hands back has nowhere to live after the statement, so assigning into it is rejected rather than silently thrown away. Same-looking syntax, different category of expression.
+
+Two ways out when you genuinely want in-place mutation of struct elements:
+
+Both are in System.Runtime.InteropServices and both carry the same documented constraint: do not add or remove items while the ref / Span is alive, because a resize reallocates the backing array and leaves your reference pointing at the old one.
+They are the right tool for a genuine hot path, a per-element counter update over a large List, and the wrong tool for tidying up ordinary code, where extract-modify-reassign is clearer:
+
+In the real world: an order-matching service kept per-instrument state in List where BookLevel was a mutable struct, and the increment levels[i].Quantity += size; would not compile. The developer on the ticket did the fastest thing that made it compile and changed BookLevel from a struct to a class.
+The code worked and the change looked like a one-word diff.
+What it actually did was turn a contiguous array of levels into an array of pointers to individually allocated objects:
+every level became a separate heap allocation with a header, the book no longer fit in cache the way it had, and a nightly rebuild that had allocated almost nothing began producing a gen-2 sized wave of small objects.
+It was caught two months later when someone asked why the service's memory graph had a new sawtooth. The correct one-line fix had been CollectionsMarshal.AsSpan(levels)[i].Quantity += size;.
+The generalisable point is that CS1612 is a question, not a verdict, it is asking "did you mean to mutate the copy?", and changing the type's category to silence it changes the memory layout of everything that holds one.
+
+-- pause --
+readonly struct and readonly members, defensive copy elimination.
+
+A readonly struct is a struct where every field is implicitly readonly and the compiler proves no method mutates this. This unlocks an optimization that's invisible until you measure it: defensive copies on in parameters and readonly field access disappear.
+
+The problem readonly struct solves.
+
+The defensive copy happens every call, silently, and its size is the size of the struct.
+Multiply that by your call rate to get the stack traffic you are paying for nothing, the arithmetic is yours to do against your own numbers, because the only figure that means anything here is the one from your profiler.
+
+Fix option 1: mark individual methods readonly.
+
+Now _c.Get() skips the defensive copy. _c.Inc() is still a compile error because _c is readonly.
+
+Fix option 2: mark the entire struct readonly.
+
+Every field is implicitly readonly. Every method is implicitly readonly. The compiler treats the entire struct as a non-mutating value. No defensive copies anywhere.
+
+Comparison:
+
+Fields can be reassigned?.
+Methods can mutate this ?.
+Defensive copy on in param?, maps to, (unless method is readonly ).
+Defensive copy on readonly field access?, maps to, (unless method is readonly ).
+Use case, Mutable POD types, builders, Immutable values, geometric primitives, Money.
+
+in parameter interaction.
+
+The combination (in MoneyR m) is the canonical "pass a small immutable value cheaply" idiom. The in says "by reference, read-only"; the readonly says "the type itself can't mutate." Together: zero copies, zero mutations, perfect for value-object passing in hot paths.
+
+Senior rule: any struct meant to be immutable should be declared readonly struct. The runtime cost of skipping it is silent and easy to miss in profiles. The development cost of adding it is zero. Just do it.
+
+How to actually find defensive copies.
+They do not appear as allocations, so an allocation profiler will not show them, they are stack traffic, and in a C P U profile they surface as unexplained time inside a trivial property getter, or as memcpy / CORINFO_HELP_MEMCPY where no copying is written in the source.
+Two cheaper checks first: paste the type into sharplab.io and look for a stloc of the struct before the call in the I L, or simply grep for structs larger than a machine word that are held in readonly fields or passed by in and are missing the readonly modifier on the type.
+That grep is a better use of an afternoon than a profiling session, because the fix is unconditional, there is no case where an immutable struct is worse off being declared readonly.
+
+In the real world: a pricing library exposed readonly Curve _curve; as a field on a long-lived calculator, where Curve was a 48-byte struct holding a few decimal s and a date.
+A discounting loop called _curve.RateAt(t) a few million times per valuation, and the valuation was consistently slower than an equivalent prototype that had held the same data in locals, a gap nobody could explain from the source, because the two versions computed identical arithmetic.
+The allocation profiler was clean, which sent the investigation toward the maths for a week.
+What was happening: RateAt was not marked readonly, _curve was a readonly field, so the compiler emitted a full 48-byte copy of _curve onto the stack before every one of those calls to protect the field from a mutation that RateAt never performed.
+Adding readonly to the struct declaration was a seven-character diff.
+The durable lesson is about which tool answers which question:
+defensive copies never allocate, so they are invisible to exactly the tool people reach for first, and the reliable way to find them is to read the declarations, readonly field or in parameter, plus a non- readonly member, rather than to hunt for them in a profile.
+
+-- pause --
+Records, value-equality reference types.
+
+record (C sharp 9) is a reference type (default) that gets value-based equality, immutability, and concise syntax for free.
+
+Why use records:
+DTOs / A P I contract types (immutable by design).
+Value objects in D D D.
+Snapshot or event types in C Q R S or event sourcing.
+
+When NOT to use records: when the type has identity beyond its data, for example, an Order with a primary key and methods that mutate state should remain a class.
+
+Inheritance with records:
+
+Record equality respects the runtime type, Circle not equal to Square even with same color.
+
+The mechanism behind that: EqualityContract. Interviewers who know records ask how the runtime type gets into the comparison, because Equals is comparing fields and the fields are identical. The answer is a synthesized property:
+
+The generated Equals compares EqualityContract before it compares any data. Because the property is virtual, both sides answer with their runtime type, so a Circle and a Square disagree at the first check even when every field matches.
+Per Microsoft Learn: "If the base type of a record is object, this property is virtual.
+If the base type is another record type, this property is an override." Two consequences worth stating unprompted, EqualityContract exists only on record class, not on record struct (a struct has no derived types to disambiguate),
+and you may declare it yourself if you want a hierarchy whose members compare across types.
+
+The full list of what the compiler writes for you, so you can answer "what does record actually generate":
+
+override bool Equals(object?), maps to, you may not declare it yourself, compile error.
+virtual / sealed bool Equals(R? other), maps to, this is the IEquatable implementation; you may write it.
+Equals(Base? other) when derived from a record, maps to, you may not declare it.
+override int GetHashCode(), maps to, you may write it, and must, if you write Equals(R?).
+operator == / operator !=, maps to, you may not declare them.
+protected virtual Type EqualityContract, maps to, record class only.
+protected virtual bool PrintMembers(StringBuilder), maps to, private on a record struct; you may write it.
+override string ToString(), maps to, calls PrintMembers; you may write it, and may seal it.
+a clone method + a copy constructor, maps to, record class only; the clone method's real name is compiler-generated and unspeakable, so you cannot call, override, or declare it.
+Deconstruct, maps to, positional records only, and it ignores non-positional properties.
+
+Note the asymmetry that catches people: a record struct gets no copy constructor and no clone method. with on a record struct is a plain value copy followed by field assignments, which is why it costs no allocation.
+
+Trap 1, with is a shallow copy, and so is record equality. The synthesized Equals calls Equals on each member, and for an array member that is reference equality:
+
+This bites hardest where records look most attractive: a DTO with a string[], List, or byte[] member is not value-equal in the way "value equality" led you to expect, and a with expression on it hands the copy a reference to the same collection, so mutating one instance's array mutates the other's.
+Microsoft Learn calls this shallow immutability: "After initialization, you can't change the value of value-type properties or the reference of reference-type properties.
+However, the data that a reference-type property refers to can be changed." Use an immutable collection type ( ImmutableArray, ReadOnlyMemory ) if the record's equality is load-bearing.
+
+Trap 2, an initialized computed property survives with unchanged. with copies the object and then assigns the properties you listed; it does not re-run initializers. So this is correct:
+
+and this is a bug that Microsoft Learn documents with the output to prove it:
+
+Anything derived from other members must be a computed property, not an initialized one, or with will carry a stale value into the copy, and because Distance participates in the generated Equals and GetHashCode, the stale value also corrupts equality.
+
+Trap 3, records are the wrong shape for E F Core entities. This is not a style opinion; the E F Core team's requirement is stated on the records page: "Entity Framework Core depends on reference equality to ensure that it uses only one instance of an entity type for what is conceptually one entity.
+For this reason, records and record structs aren't appropriate for use as entity types in Entity Framework Core." The same page notes E F Core "doesn't support updating with immutable entity types."
+
+In the real world: a payments service used record PaymentRequest(string IdempotencyKey, decimal Amount, string[] Tags) as the value in an in-memory idempotency cache, and compared the incoming request against the cached one to decide "same request,
+replay the stored response" versus "different request, reject as a key collision".
+It behaved correctly for a year.
+Then a client library started reusing one string[] instance across the requests it built in a batch, a perfectly reasonable thing for a client to do, and two genuinely different payments in the same batch began comparing as equal on the Tags member,
+because record equality on an array is reference equality and both records pointed at the same array.
+Different amounts still separated them, so the failure only surfaced for two same-amount payments to different destinations in one batch: the second was answered with the first's stored response.
+Changing string[] to ImmutableArray fixed the comparison, and a regression test now asserts that two records built from equal-but-distinct collections compare equal.
+What generalises is the framing: record gives you value equality over the members as they define equality, not structural equality over the object graph, and any member that is a mutable collection quietly reverts that member to reference semantics.
+
+In the real world: a team modelled their E F Core entities as records to get free ToString and equality in tests, and the first symptom was not a crash but duplicate INSERT s.
+Two lookups that returned "the same" customer produced two tracked entities that the change tracker treated as one, and, in the reverse direction, an entity re-fetched after a property change no longer matched its tracked identity.
+They had made the change deliberately, on the reasoning that a Customer with the same column values is the same customer. That reasoning is right for a value object and wrong for an entity: an entity's identity is its key, and it must survive its data changing.
+The fix was class for anything with a primary key, record for the request or response DTOs and domain value objects around them, which is the line the type system was asking them to draw all along.
+Microsoft's own guidance is unambiguous, records "aren't appropriate for use as entity types in Entity Framework Core", and the tell in any codebase is a record with an Id property.
+
+-- pause --
+Record structs.
+
+C sharp 10 added record struct, a value type with the same auto-generated equality / with / ToString surface:
+
+readonly record struct is the strongest form: value type, immutable, value equality, no defensive copies. Excellent for small geometric / domain values.
+
+class, Reference, Yes, Reference.
+record (= record class ), Reference, init -only by default, Value, compiler-synthesized.
+struct, Value, Yes, Value, via ValueType.Equals, bitwise or reflection, and boxes either way.
+record struct, Value, Yes (mutable by default), Value, compiler-synthesized, IEquatable.
+readonly record struct, Value, No, Value, compiler-synthesized, IEquatable.
+readonly struct, Value, No, Value, via ValueType.Equals, same caveats as struct.
+
+The struct rows are the reason the record struct rows exist: see Struct equality for which of the two ValueType.Equals paths you land on and why the fallback hashes a single field.
+
+-- pause --
+record struct versus record class versus class, picking the right shape.
+
+Six type forms, one decision matrix. this showed mechanics; this section answers "I have a new type to model, which do I reach for?"
+
+The four common shapes:
+
+class, Reference, Identity, Mutable, Heap, Entities with identity, services, mutable models.
+record (= record class ), Reference, Value, init -only by default, Heap, DTOs, A P I contracts, event payloads.
+record struct, Value, Value, Mutable by default, Stack or inline, Hot-path value bundles, dictionary keys.
+readonly record struct, Value, Value, Immutable, Stack or inline, Small immutable values ( Money, Coord, DateRange ).
+
+Performance characteristics:
+
+Decision flowchart:
+
+Worked examples:
+
+User (DB row, has Id ), class, Identity matters; reference equality is correct semantics.
+CreateUserRequest (A P I body), record, Immutable contract, value equality for tests.
+OrderPlacedEvent (event-sourced), record, Immutable history; value equality for replay.
+Money(amount, currency), readonly record struct, Small, immutable, used everywhere.
+(int X, int Y) (transient pair), tuple (X, Y), Throwaway transport.
+Coordinate(double, double) (named), readonly record struct, Named, immutable, hot path.
+HttpClient, class, Mutable state (handlers, connection pool), identity-based.
+DbContext derived, class, Framework requires; mutable state.
+Span, ref struct, Stack-only; can hold managed pointers.
+Memory, readonly struct, Cousin of Span; can be field of class, can cross await.
+
+Immutability defaults:
+
+record (positional): properties are init -only. with creates new instances.
+record struct (positional): properties are get; set;, mutable by default. Use readonly record struct for immutability.
+class: no defaults. You write init / set explicitly per property.
+struct: same as class, explicit per field.
+
+This is the most-cited "gotcha": record struct is mutable by default, despite record (= record class ) being init -only by default. Microsoft Learn states it directly: "Positional properties are immutable in a record class and a readonly record struct.
+They're mutable in a record struct." The reasoning: record struct is meant for cases where you want a value-typed bag with value equality but can still mutate per-field. If you want immutability, add readonly: readonly record struct.
+
+In the real world: a team standardised on "value objects are record struct " and wrote record struct DateRange(DateOnly From, DateOnly To), using it as a key in a Dictionary. Months later a bug report said schedules "disappeared" after an admin edited a range.
+The edit path did range.To = new End;, legal, because a positional record struct generates get; set;, on a variable that had already been used as a dictionary key.
+Be precise about the mechanism, because it differs from the class-key version of this bug: the dictionary stored a copy of the struct, so mutating the local changed nothing inside the dictionary and corrupted no bucket.
+The entry simply stayed filed under the old range, the code no longer held that value, and every lookup with the edited range missed. The entry is orphaned rather than corrupted, which is worse to diagnose, because the dictionary is internally consistent and Count still looks right.
+Adding readonly to the declaration turned that line into a compile error and the whole class of bug went away.
+Worth being able to say why the default is what it is rather than just calling it a wart:
+record class is init -only because reference-typed data models are usually shared, while record struct follows the struct default of mutable fields, the language kept each family's own convention rather than making record mean one thing.
+The operational rule that follows is simply that readonly record struct should be what you type by reflex, and plain record struct should be the one that needs a justification in review.
+
+-- pause --
+ref struct, stack-only types.
+
+A ref struct is a value type that the compiler forbids from ever being heap-allocated. This restriction is what makes Span safe.
+
+Restrictions on ref struct:
+Cannot be a field of a non- ref struct class or struct.
+Cannot be boxed (that is, assigned to object, an interface, or dynamic ).
+Cannot be used as a generic type argument, unless the type parameter opts in with C sharp 13's allows ref struct constraint.
+Cannot be captured by a lambda or local function.
+Cannot be preserved across an await or a yield return, but since C sharp 13, it may be declared and used inside an async method or iterator up to that point.
+Cannot be a parameter of an async method at all.
+
+In exchange, ref struct types can hold pointers / ref T fields safely, the compiler proves they never escape to the heap. Span and ReadOnlySpan are the canonical examples; both are ref struct s. Deep dive in 09-memory-and-performance.md.
+
+What C sharp 13 changed, and why it is worth knowing precisely. Three of the restrictions were absolute before C sharp 13 and are now conditional.
+Get the old list right in an interview and you sound current as of 2022; get the boundary right and you sound like someone who has shipped on dot NET 9 or later.
+
+allows ref struct anti-constraint, maps to, void M(T t) where T: allows ref struct permits M>(. ). It is an anti-constraint: it removes the implicit "T is not a ref struct" rule, so inside M you may do less with T, not more.
+Attempting it on an older language version gives "Feature 'allows ref struct constraint' is not available in C sharp 12.0. Please use language version 13.0 or greater.".
+ref struct may implement interfaces, maps to, ref struct R: IDisposable {. } now compiles. The conversion still does not: IDisposable d = r; is CS0029, because that conversion is a box.
+The interface is usable through a generic constraint, not through an interface-typed variable, which is the same constrained. callvirt mechanism from the boxing section.
+ref and ref struct locals in async and iterators, maps to, Legal as long as the value does not live across the suspension point.
+Crossing one is CS4007: "Instance of type 'System.Span and lt;int and gt;' cannot be preserved across 'await' or 'yield' boundary." Parameters are still forbidden outright: CS4012: "Parameters of type 'Span and lt;int and gt;' cannot be declared in async methods or async lambda expressions.".
+
+The practical effect is that Span is now usable for the synchronous stretches of an async method without extracting a helper, which removes the most common reason people used to reach for Memory when they did not actually need it.
+
+-- pause --
+ref struct, Span, and Memory, the stack-only family.
+
+Span is the poster child for ref struct. Understanding why it had to be a ref struct, and what its Memory cousin gives up to be more flexible, is a senior-interview staple.
+
+Why Span is a ref struct.
+
+Span holds a managed pointer (a byref, I L T and ) into arbitrary memory:
+
+ref T _reference is a ref field, a C sharp 11 feature added to the language largely so that Span could stop expressing this with an internal ByReference intrinsic and say it in ordinary C sharp.
+A ref field is the thing that forces the enclosing type to be a ref struct: the compiler's ref-safety analysis has to prove the referent outlives the reference, and it can only do that for storage it can see the lifetime of, which excludes the heap.
+
+The pointer can point into any of:
+A heap-allocated array ( new int[100].AsSpan() ).
+A stack-allocated buffer ( stackalloc int[100] ).
+Native memory ( Marshal.AllocHGlobal ).
+
+If a Span ever escaped to the heap, as a field of a class, an async state machine, or a closure, disaster:
+
+Pointing at the stack: the underlying stack frame returns. The pointer dangles into reclaimed memory. Reads see arbitrary garbage.
+Pointing at the heap: the garbage collector compacts and moves the array. Without garbage collector awareness of the pointer, it's now pointing into the middle of some other object.
+Pointing at unmanaged: the unmanaged memory could be freed. Use-after-free.
+
+By marking Span a ref struct, the compiler statically forbids any of those escapes. The restrictions are not arbitrary, they're exactly the set of operations that would let a Span outlive its source.
+
+The restrictions, with reasoning. The exact diagnostic codes are given because "it doesn't compile" is a weaker answer than naming the error, and because several of them are commonly misquoted (these were checked against the Roslyn compiler on dot NET 9, C sharp 13):
+
+Restriction 5 is the one to update in your head. The old blanket rule " Span cannot appear in an async method" was true through C sharp 12 and is now too strong: the compiler tracks whether the value is live at the suspension point, and only objects then.
+A parameter is always live at every suspension point in the method, which is why restriction 6 survives unchanged.
+
+Memory, the heap-friendly cousin.
+
+Memory exists for the cases where you genuinely need to pass span-like data across await, into async methods, or store as a class field. It pays for that flexibility by not holding a raw pointer, instead it holds a reference to an IMemoryOwner (or wraps an array) and a length.
+
+Span versus Memory cheatsheet:
+
+Stack or heap?, Stack-only ( ref struct ), Can live anywhere.
+Holds, Managed pointer + length, Object reference + index + length.
+Can be field of a class?.
+Can cross await ?.
+Can be lambda-captured?.
+Backed by stackalloc ?.
+Backed by string ?, ( ReadOnlySpan ), ( ReadOnlyMemory ).
+Indexer perf, Fastest (managed pointer math), Slightly slower (object indirection).
+
+The typical async pipeline pattern:
+
+This pattern, Memory at A P I boundaries, Span at the leaf computation, is how high-perf dot NET libraries (Kestrel, System.Text.Json, Microsoft.Data.SqlClient ) thread allocation-free data through async pipelines.
+
+In the real world: a file-ingest endpoint parsed uploaded CSVs with a hand-written ReadOnlySpan splitter, which was genuinely allocation-free and genuinely fast.
+The requirement then changed to stream the file rather than buffer it, which meant an await in the middle of the parse loop, and the whole method stopped compiling.
+The first attempt was to make the parser Span -free by going back to string.Split, which restored compilation and reintroduced an allocation per line per upload.
+The second attempt was better and is the pattern to know: the method signature took Memory, the await ReadNextChunkAsync() happened at that level, and each chunk was handed to a synchronous static void ParseChunk(ReadOnlySpan chunk) that did the span work and returned before the next suspension.
+Nothing crossed an await, so nothing had to. The framing worth carrying into an interview is that Span and Memory are not competitors, Memory is what you store and pass across suspensions, Span is what you compute with, and the conversion memory.Span is the boundary between the two.
+Note also that C sharp 13 relaxed this: a Span local that is dead by the time you reach the await is now legal in an async method, so the extraction is only forced when the value genuinely has to survive the suspension.
+
+-- pause --
+Closures, how a local becomes a heap field.
+
+This section sits in the type-system file for a reason that is easy to miss: a lambda that captures a variable causes the compiler to synthesize a class, move the variable into it as a field, and heap-allocate it. Capture is a type-system operation.
+It is also the mechanism that explains why ref struct cannot be captured, and the source of the single most reliable trick question about loops.
+
+What the compiler generates. Given:
+
+the compiler emits roughly:
+
+Enqueue now allocates one display class per call, and id and attempt are fields of a heap object, not stack slots, even though int is a value type.
+This is the cleanest demonstration in the language that "value type" says nothing about storage location: the same int attempt local is a stack slot in a method with no lambda and a heap field in a method with one.
+
+Three consequences follow directly:
+
+Capturing this keeps the whole object alive. Using any instance field inside a lambda captures this, not the field. An event handler or a cached Func<> that touches one int field can root an entire object graph, a common cause of "why is this controller still in the heap dump".
+All captures in a scope share one display class. Capturing one long-lived variable and one short-lived one in the same scope keeps both alive for as long as the longest-lived lambda.
+ref struct cannot be captured, because the capture is a heap field, and a ref struct cannot be a heap field. That is restriction 4 in the previous section, not a separate rule.
+
+Two ways to prove no capture happened: a static lambda (C sharp 9) makes the compiler reject any capture at compile time, and a lambda that captures nothing is cached in a static field by the compiler rather than allocated per call.
+
+The modifier is strict about this as well:
+a static lambda that calls an instance method is CS8821, "A static anonymous function cannot contain a reference to 'this' or 'base'", which is the point of the modifier, since calling an instance method is exactly what silently captures the enclosing object.
+
+The loop-variable question. This one has a version gate that catches people who learned it before C sharp 5:
+
+foreach was fixed in C sharp 5; for was deliberately not, because in a for loop i is genuinely one variable that the loop mutates, changing it would have broken code that relies on that.
+So the fix in a for loop is yours to write: copy into a loop-body local, which gets its own display class per iteration.
+
+In the real world: a nightly reconciliation job fanned out over partitions with for (int i = 0; i Reconcile(partitions[i]))); followed by await Task.WhenAll(tasks).
+It threw ArgumentOutOfRangeException on some nights and completed cleanly on others, which sent everyone hunting for a race in Reconcile. There was no race in Reconcile.
+All the lambdas shared one i, the loop usually finished before the first task ran, and every task then read i == partitions.Count, out of range.
+On the nights it "passed", the thread pool had happened to start a task early enough to read an in-range value, so the job silently reconciled the same partition several times and skipped the rest; the exception was the lucky outcome because it was the only one that told anybody.
+Two lines changed: int index = i; inside the loop body, and, better, the loop became foreach (var partition in partitions), which gets a fresh variable per iteration for free.
+The lesson generalises past closures: an intermittent failure whose frequency tracks how fast the loop is, rather than what the data contains, is a capture bug, and the reason it is intermittent is that the bug is a race between the loop finishing and the pool dequeuing.
+
+-- pause --
+readonly, immutability primitives.
+
+Several flavors of readonly, each with a different scope:
+
+readonly field:
+
+readonly struct (C sharp 7.2):
+
+All fields must be readonly; cannot mutate. Key benefit: when passed by in, the compiler knows the callee can't mutate, so no defensive copy is needed.
+
+readonly member on a struct (C sharp 8):
+
+Marks an individual method or property as non-mutating. Useful for incrementally hardening a partially-mutable struct.
+
+init accessor (C sharp 9):
+
+init allows assignment during object initialization but disallows mutation thereafter. Records use init by default.
+
+required (C sharp 11):
+
+Forces caller to set the property in the object initializer or constructor. Combined with init, gives "constructor-style" required arguments without writing a constructor.
+
+-- pause --
+default(T), semantics across value types, reference types, and generics.
+
+default(T) produces the "zero value" of any type. In non-generic code that's mostly intuitive; in generic code with an unconstrained T, it's the source of a half-dozen subtle bugs.
+
+Behavior table:
+
+int, long, byte, decimal,., maps to, 0.
+bool, maps to, false.
+char, maps to, '\0'.
+float, double, maps to, 0.0.
+Any enum, maps to, the value 0 (whether or not it has a name).
+DateTime, maps to, 0001-01-01 00:00:00 UTC.
+Any reference type ( string, object, class, interface, delegate), maps to, null.
+Any struct, maps to, all fields recursively set to their default(T).
+Nullable ( int? ), maps to, A Nullable with HasValue == false.
+T? for reference type T (when nullable enabled), maps to, null (same as plain T ).
+
+Short-hand:
+
+Generic code with unconstrained T:
+
+This is why generic code can be tricky to reason about: default(T) could be null, 0, or new T() -equivalent depending on T. Code that does if (item == default(T)) works for int and string but for value types calls bitwise-equality (often slow via reflection unless you implement IEquatable ).
+
+The "should I compare to default?" trap:
+
+T? for value types versus reference types (with NRT enabled):
+
+In generic code, T? has the unique property of meaning two different things at runtime, Nullable for value types, T (with compiler annotation) for reference types. The compiler erases the? for the value-type case differently than for reference types.
+This is why generic constraints often need where T: struct or where T: class to make T? unambiguous.
+
+Default not equal to "uninitialized." For locals, you must still satisfy definite-assignment:
+
+The distinction is that definite assignment is a compile-time rule about locals, while zero-initialization is a runtime guarantee about heap allocations.
+default(int) is 0 either way; the compiler simply refuses to let you rely on that for a local you never wrote to, because reading an unwritten local is almost always a bug rather than an intent.
+
+-- pause --
+Generic type identity at runtime, open versus closed generics.
+
+A subtle but high-yield interview topic: at runtime, List and List are different types. Specifically, they share no runtime identity, no instance, no typeof() token. This is unlike Java erasure where both are simply List at runtime.
+
+The C L R generic model: every concrete generic instantiation is a separate type at runtime. The C L R specializes the I L per- T for value types and shares code for reference types, but the Type objects are always distinct.
+
+Closed versus open generics:
+
+You can construct a closed type from an open one via reflection:
+
+Why this matters in practice:
+
+D I containers register closed types ( services.AddScoped, UserRepo>() ) or open types ( services.AddScoped(typeof(IRepo<>), typeof(GenericRepo<>)) ).
+The open registration says "for any T, construct GenericRepo when asked for IRepo." The container constructs the closed type via MakeGenericType at resolve time.
+
+Caching keyed by Type works because closed types are uniquely-identified, ConcurrentDictionary keyed by typeof(MyHandler) is safe.
+
+Reflection over inheritance distinguishes open and closed. typeof(MyList).BaseType returns List (closed); typeof(List<>).BaseType is object (the open List inherits from object, generic args matter).
+
+Generic constraints are checked per closure. where T: new() is verified when MyClass is constructed, not at the open-type definition.
+
+Per- T jit code (the implementation detail):
+
+The distinction between I L and native code matters here, and mixing them up is a giveaway. There is exactly one List in the assembly's I L regardless of how you use it.
+What multiplies is the jit's output: heavy use of List and List puts two specialized native bodies in the process, while List, List, and List share a single __Canon body between them.
+Code sharing is also why the shared body needs a hidden generic-context argument to recover the real T when it must do something type-specific (allocate a T[], call typeof(T) ), a small cost that the value-type specializations do not pay.
+
+Two practical consequences: generic code over many distinct value types grows native code size and jit time (relevant to startup, and the reason A O T scenarios care about which instantiations are reachable), and generic code over reference types is essentially free to fan out.
+
+In the real world: a message-dispatch layer resolved handlers with typeof(IHandler<>).MakeGenericType(message.GetType()) on every message, then service Provider.GetRequiredService(closed Type), then MethodInfo.Invoke. Correct, and used by a lot of production code.
+Under load its C P U profile was dominated not by the handlers but by RuntimeType.MakeGenericType and reflection invocation.
+The fix was not to abandon open generics, the open registration services.AddScoped(typeof(IHandler<>), typeof(EfHandler<>)) is exactly the right shape, but to stop repeating the resolution work per message:
+a ConcurrentDictionary> cached one compiled delegate per closed message type, built once via MakeGenericType on first sight.
+This is safe precisely because closed generic types have stable runtime identity, typeof(Handler) is the same Type object every time you construct it, so it is a sound dictionary key.
+The reusable insight is that " MakeGenericType is slow" is the wrong conclusion; the right one is that it is a construction step whose result is a stable, cacheable identity, so it belongs on a cold path, not a hot one.
+
+Type.GetGenericTypeDefinition() retrieves the open type from a closed one, useful for "register one handler for all Message ":
+
+-- pause --
+Nullable value types versus nullable reference types.
+
+Two completely different mechanisms with similar? syntax.
+
+Nullable value type ( int?, DateTime? ), runtime feature since C sharp 2.0. It's syntactic sugar for Nullable, a struct with a HasValue flag.
+
+int? is a different type from int. They don't unify; you must check / unwrap.
+
+Nullable reference type ( string?, Order? ), compile-time only feature, since C sharp 8. Enabled per-project ( enable in .csproj ) or per-file ( #nullable enable ).
+
+The runtime treats string and string? as the same type,? is a hint to the compiler's flow analysis. There is no runtime null check unless you write one.
+
+Lifted operators, and the asymmetry nobody expects. Nullable gets lifted versions of T 's operators, and the lifting rule is not uniform. Relational operators (, = ) return false whenever either operand is null; equality operators ( ==, != ) are two-valued and answer normally:
+
+The trap is the middle pair. In ordinary arithmetic !(a > b) and a 5 is NULL and the row is discarded, while C sharp's a != 5 is true and the row is kept, the same predicate written the same way filters differently on the two sides of an E F Core query boundary.
+
+Nullable does not satisfy where T: struct.
+The constraint means non-nullable value type, so M(. ) against void M(T t) where T: struct is CS0453: "The type 'int?' must be a non-nullable value type in order to use it as parameter 'T'." This is why generic A P Is that want to accept both usually declare two overloads, one constrained where T:
+struct taking T?
+and one where T: class. Nullable also cannot nest, there is no int??, because T in Nullable is itself constrained to a non-nullable value type.
+
+Layout, if asked: int? measures 8 bytes ( Unsafe.SizeOf() ), a bool flag, the int, and padding to alignment. It is a struct, so a List stores those 8-byte values inline with no per-element allocation.
+
+Deep dive in 07-nullability-and-pattern-matching.md.
+
+-- pause --
+Tuples, value tuples versus Tuple.
+
+Two tuple mechanisms; one is dead, one is alive.
+
+Tuple (legacy, dot NET 4.0), reference type, properties named Item1, Item2. Avoid for new code.
+
+ValueTuple (C sharp 7+), value type, supports field naming, deconstruction, equality.
+
+Use value tuples for transient multi-value returns. For long-lived data structures, prefer a record or record struct, the names survive across files and the type is searchable.
+
+The detail that makes the "transient" advice concrete: tuple element names are not part of the runtime type.
+(int X, int Y) and (int A, int B) are both ValueTuple; the names live in metadata (a TupleElementNamesAttribute on the signature) purely so the compiler can offer them, and they are erased from the value itself.
+So a tuple crossing a reflection, serialization, or dynamic boundary loses its names, System.Text.Json serializing a (int X, int Y) sees the public fields Item1 and Item2, not X and Y. That single fact rules tuples out of every A P I contract, which is a cleaner reason than "they're less readable".
+
+In the real world: an internal endpoint returned (decimal Total, int Count) from a controller action because the tuple was already the shape the service layer returned and it saved defining a type. The Jason that reached the client was {}, an empty object, with a 200 status.
+System.Text.Json serializes public properties by default, and ValueTuple has none: Item1 and Item2 are public fields, and the names Total and Count never existed at runtime at all.
+Someone "fixed" it by setting IncludeFields = true on the serializer options, globally, which produced {"item1":123.45,"item2":7}, still not the names anyone wanted, and also began serializing public fields on every other type in the application,
+including a couple that had deliberately kept fields out of their contract.
+Replacing the tuple with record TotalsResponse(decimal Total, int Count) fixed the endpoint and let the global option be reverted.
+The general rule this leaves you with: a tuple is a compile-time convenience whose element names do not survive to runtime, so the moment a value crosses a serialization, reflection, or dynamic boundary, it needs a real type.
+
+-- pause --
+Choosing class versus struct versus record.
+
+A decision rule you can apply quickly:
+
+Sizing heuristic for structs: past a handful of fields, the jit can no longer keep the value in registers, so every assignment, argument and return becomes a real block copy, at that point a class copies one pointer instead.
+Treat the 16-byte figure from the Framework Design Guidelines as the prompt to check, not the answer: the two bullets that decide it in practice are "is it immutable?" and "will it be boxed?", and past the boundary the only honest answer is a benchmark of the actual usage pattern.
+
+In the real world: a geospatial service represented a coordinate as class Coordinate { public double Lat, Lng; } because it had been written that way years earlier, and a proximity query allocated one per point over a few hundred thousand points per request.
+The team converted it to readonly record struct Coordinate(double Lat, double Lng), 16 bytes, immutable, value equality, and the allocation profile for the endpoint went almost flat. The part worth reporting in an interview is what came after: a later change added a string?
+PlaceName to the same type for a display feature, taking it to 24 bytes with a reference field, and the two consequences arrived silently.
+The struct now contains a pointer, so Coordinate used as a dictionary key fell off the bitwise-equality fast path, except that it was a record struct, so the compiler-generated IEquatable was already there and nothing broke.
+Had it been a plain struct, the same three-word diff would have degraded every dictionary keyed on it.
+The reason the change was safe is the reason to prefer readonly record struct over struct as the default shape for value objects: it makes the type robust against exactly the kind of field addition that reviewers do not think of as a semantic change.
+
+-- pause --
+Section 3. Code and diagrams.
+
+Where a struct comparison actually goes. This is the dispatch every Dictionary, HashSet, Contains, and Distinct call over a struct key walks through. The two leaves on the right are the ones that allocate.
+
+The single edge that decides everything is the leftmost one: T: IEquatable.
+Everything on the right half of the diagram, the boxes, the reflection, the one-field hash, is what you get for omitting six lines of interface implementation, or for typing struct where readonly record struct would have done.
+
+Boxing in the wild:
+
+Defensive copy, the silent struct cost:
+
+Closures, before and after lowering. The same demonstration for the other way a value type ends up on the heap:
+
+-- pause --
+Section 4. Common pitfalls.
+
+Mutating a struct through a List or Dictionary indexer. list[0].Value = 5; and my Dict["key"].Value = 5; both fail with CS1612: "Cannot modify the return value of. " when the element type is a struct.
+An indexer is a property, and its getter returns a copy that has nowhere to live, so the mutation would be discarded, the compiler refuses rather than silently losing it. arr[0].Value = 5; on an array does compile, because an array indexer produces a storage location rather than a value.
+Fix by extract-modify-reassign, or CollectionsMarshal.AsSpan(list)[0].Value = 5; on a genuine hot path.
+record for entities. A record User(int Id, string Name) has value equality, two users with the same Id+Name are == even if they're different rows or have different audit info.
+Microsoft Learn is explicit that this makes records unsuitable as E F Core entity types, because change tracking depends on reference equality. For DB-backed entities, use a class (or override Equals to compare only on Id ).
+Assuming string + boxes, and missing what it actually costs. "x = " + x where x is int does not box on modern Roslyn: the compiler emits x.ToString() followed by string.Concat(string, string).
+It still allocates the intermediate string it then discards, so $"x = {x}" is genuinely cheaper, the handler's AppendFormatted formats into a pooled buffer and allocates only the result.
+string.Format("x = {0}", x) does box (one box per argument), but on dot NET 9+ with C sharp 13 it allocates no object[] at any argument count: Format has non- params overloads for one, two, and three arguments and a params ReadOnlySpan overload beyond that, which the compiler stack-allocates.
+The boxes are the cost; the array is only there if you pass an object[] yourself.
+A struct that doesn't implement IEquatable. EqualityComparer.Default then resolves to ObjectEqualityComparer, so every dictionary or HashSet operation boxes both operands and goes through ValueType.Equals.
+Worse, if the struct has a reference field, a float / double, or internal padding, the default GetHashCode hashes one field and ignores the rest. Implement IEquatable, or declare a record struct and let the compiler do it. Enable CA1815, it is not on by default.
+Adding a ref struct field to a class. CS8345. ref struct types can only live on the stack; classes are heap-allocated. If you need to escape a ref struct, you generally can't, that's the whole point. Use Memory where you need to store or await.
+Missing init versus set. public string Name { get; set; } allows mutation forever. init allows it during construction only. record class and readonly record struct use init automatically; plain record struct and class don't.
+required without a parameterless constructor accessible to the caller. If your class has only a non-parameterless constructor, the constructor must set the required member or the caller can't instantiate it (deadlock).
+Either provide a parameterless ctor or pass the required value through the existing one.
+Nullable value type versus nullable reference type confusion. int? x = null is a runtime distinction (different type). string? s = null is a compile-time hint (same type). Don't expect string? to behave like int? at runtime, there's no HasValue.
+Tuple instead of ValueTuple. Old code uses Tuple.Create(1, 2); new code should use (1, 2). They are different types. And tuple element names are erased at runtime, so never return a tuple from anything that gets serialized.
+Treating dynamic like var. dynamic defers type checking to runtime, no IntelliSense, no compile-time errors, and every member access goes through a DLR call site instead of a direct call. Use only for COM interop, Jason traversal, or DLR scenarios.
+Mutating a struct after using it as a dictionary key. A record struct is mutable by default, so key.Field = x; compiles. The dictionary holds a copy, so the mutation changes only your variable: the entry stays filed under the original value and every lookup with the edited key misses.
+The entry is orphaned, not corrupted, which makes it harder to spot than the reference-type version of this bug. Declare value objects readonly record struct.
+Assuming record equality is structural all the way down. The generated Equals calls Equals on each member, so an int[], List, or byte[] member compares by reference. with is likewise a shallow copy and hands the copy the same collection instance. Use ImmutableArray when a record's equality matters.
+A computed property initialized instead of calculated.
+public double Total { get; } = Qty Price; inside a record is copied verbatim by with, not recomputed, so r with { Qty = 2 } carries the old Total, and because Total participates in the generated Equals / GetHashCode, the stale value poisons equality too. Write goes to Qty Price instead.
+ReferenceEquals on value types. It compiles, boxes both arguments, and returns false unconditionally. The analyzer rule is CA2013.
+Quoting the pre-C sharp 13 ref struct rules. Since C sharp 13, a Span local is legal in an async method or iterator as long as it isn't live across the await / yield (CS4007 if it is), ref struct types can implement interfaces, and allows ref struct lets them be generic arguments.
+Parameters of ref struct type in async methods are still CS4012.
+
+-- pause --
+Section 5. Interview-ready summary.
+
+Value types (struct, primitive, enum, tuple), copy on assignment, default to zero, no null, equality compares the members.
+Reference types (class, interface, delegate, string, array, record), copy the reference, default to null, equality is identity (unless overridden).
+Stack versus heap, value types live where their containing storage lives. Stack is one place that storage might be; the heap is another (as a field in a class, an array element, or a variable captured by a lambda).
+Boxing = wrapping a value type into a heap object so it can be treated as object. 24 bytes for a boxed int on x64 (16 header + payload + padding). Triggered by object / dynamic /interface-typed variables, params object[], and struct methods that fall through to ValueType / object.
+Eliminated by generics, where T: IFace emits a constrained. callvirt and does not box where an IFace parameter does.
+Default struct equality, ValueType.Equals compares bits when the struct has no reference field, no padding, no float / double; otherwise it reflects over fields and boxes each one. Default GetHashCode on that slow path hashes one field. Implement IEquatable or use record struct.
+Closures, a captured local becomes a field of a compiler-generated heap object. for shares one variable across all iterations ( 3,3,3 ); foreach gets a fresh one per iteration (C sharp 5+). static lambdas make capture a compile error.
+record = reference type with value equality + with expression + auto-generated boilerplate. record struct = value type version, mutable by default. readonly record struct = small, immutable, value-equality value type, the geometric-primitive workhorse.
+Record equality is shallow: an array member compares by reference, and with copies the reference.
+ref struct = a value type that the compiler forbids from heap allocation. Span or ReadOnlySpan are ref structs.
+They can't be class fields, can't be boxed, can't be captured, and can't be preserved across an await / yield, though since C sharp 13 they may appear in an async method or iterator up to that point, and may implement interfaces.
+readonly flavors: readonly field (assigned only in ctor); readonly struct (whole struct can't mutate); readonly member (one method can't mutate); init accessor (set during construction only); required (caller must set).
+Nullable value type ( int? ), runtime; different type. Nullable reference type ( string? ), compile-time hint; same type at runtime.
+Decision rule: identity to class; small immutable to readonly record struct; DTO or event to record; default to class.
+
+-- pause --
+Section 6. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Value versus reference, what's on the stack, really.
+
+Q: "Value types live on the stack, reference types live on the heap." True or false?-- think --
+
+A: Mostly false as stated. The accurate rule: a value-type value lives wherever its containing storage lives. A local int lives on the stack. A field int Order.Id lives inline on the heap, because the Order lives on the heap. An array element int[] arr lives on the heap.
+The stack is one place a value might be stored; it's not the definition of value-typed.
+
+Cross-Q: So where's the reference itself stored?-- think --
+
+A: The reference (a pointer-sized handle) lives wherever it was declared. If it's a local var o = new Order(), the reference is on the stack and the Order is on the heap.
+If it's a field class C { Order O; }, both the reference ( O ) and the target object live on the heap, the reference inline in C, the target as a separate heap allocation.
+
+Cross-Q²: What about Span s = stackalloc int[10]; var c = new Container(); c.Data = s;, what would happen if that compiled?-- think --
+
+A: It doesn't compile, Container.Data (if it's a normal class field) can't be Span because Span is a ref struct. If it did compile, the Container (heap object) would outlive the stack frame where stackalloc int[10] was allocated, leaving a dangling pointer to reclaimed stack memory.
+The next stack frame to overwrite that memory would corrupt the span. This is exactly the bug the ref struct restriction prevents at compile time, the language refuses to let Span escape its stack scope.
+
+-- pause --
+Drill 2, Why Span is a ref struct.
+
+Q: Why is Span declared as a ref struct ?-- think --
+
+A: Because it holds a managed pointer, a byref into arbitrary memory (heap, stack, or unmanaged).
+If Span escaped to the heap, the garbage collector could move the underlying array out from under it (heap source), the stack frame could return and free the memory (stack source), or unmanaged memory could be freed (unmanaged source).
+Marking it ref struct makes the compiler statically prove the span stays on the stack, exactly the lifetime the underlying pointer needs.
+
+Cross-Q: What can't I do with a ref struct ?-- think --
+
+A: Six restrictions, and three of them moved in C sharp 13, so give the current boundary. (1) Can't be a field of a non- ref struct class or struct, CS8345. (2) Can't be boxed; assigning to object or to an interface variable is CS0029.
+Since C sharp 13 a ref struct may declare that it implements an interface, but the conversion to it is still the box, so it's usable only through a generic constraint. (3) Can't be a generic type argument unless the type parameter says allows ref struct (C sharp 13), CS9244 otherwise.
+(4) Can't be captured by a lambda or local function, CS8175, because a capture becomes a field of a heap-allocated display class. (5) Since C sharp 13 it may be a local in an async method or iterator; what's forbidden is being live across the await / yield, CS4007.
+(6) Can never be a parameter of an async method, CS4012, because a parameter is live at every suspension point by definition. Each restriction closes one specific route by which the span could outlive its source.
+
+Cross-Q²: How does Memory solve those problems?-- think --
+
+A: Memory is a readonly struct (not ref struct ), it holds an object reference (to an array, MemoryManager, or string) plus an index and length, NOT a raw pointer. So the garbage collector can track it normally. Memory can be a field of a class, can cross await, can be captured.
+The trade-off: it's slightly less efficient (an extra indirection through the object reference) and you can't stackalloc into it. The typical pattern is Memory at A P I boundaries (async, fields, lambdas) and Span at the leaf computation, accessed via Memory.Span.
+
+-- pause --
+Drill 3, readonly struct and defensive copy elimination.
+
+Q: I have public struct Counter { public int Value; public int Get() goes to Value; } and I pass it as in Counter c, then call c.Get(). Does the compiler copy c ?-- think --
+
+A: Yes, silently. Get() is non- readonly, so the compiler doesn't know whether it mutates. Since in c is read-only by contract, the compiler emits a defensive copy of c on the stack and calls Get() on the copy. The "avoid the copy" perf benefit of in is destroyed.
+
+Cross-Q: How do you fix it?-- think --
+
+A: Two options. (1) Annotate the method: public readonly int Get() goes to Value;, the compiler proves no mutation, skips the defensive copy.
+(2) Convert the whole struct: public readonly struct Counter, every field is implicitly readonly, every method is implicitly readonly, no defensive copies anywhere. Option 2 is cleaner for types that should be immutable.
+
+Cross-Q²: What's the cost of not fixing it, in practice?-- think --
+
+A: One stack copy per method call, sized to the struct, so the cost scales with sizeof(struct) times call rate, and you should quote your own profiler rather than a number from a guide.
+Give the shape instead: it never allocates, so it is invisible to an allocation profiler and to every functional test; it shows up in a C P U profile as time in memcpy or as unexplained cost inside a trivial getter. For business logic called a few thousand times per request it is nothing.
+For numerical kernels, geometry primitives, or financial calculators looping millions of times it is measurable. The honest close is: profile before claiming a win, but apply the fix regardless, because readonly on an already-immutable struct has no downside to trade off against.
+
+-- pause --
+Drill 4, Boxing Nullable, what's on the heap?.
+
+Q: int? x = 5; object o = x;, what's stored in the box?-- think --
+
+A: An int with value 5, NOT a Nullable. The C L R has special-case boxing for nullable value types: if HasValue is true, it boxes the underlying value; if HasValue is false, it boxes to null (no allocation). So (int?)5 boxes to a heap int -box; (int?)null boxes to the actual null reference.
+
+Cross-Q: How do you unbox it back?-- think --
+
+A: int? y = (int?)o;, the C L R's special unboxing handles both cases. If o is null, y becomes a Nullable with HasValue == false. If o is an int -box, y becomes Nullable with HasValue == true and the value.
+The symmetry is intentional, boxing or unboxing Nullable round-trips correctly even though the boxed form drops the HasValue flag.
+
+Cross-Q²: What's the implication for Dictionary ?-- think --
+
+A: Subtle. Dictionary uses int? as the key type. Lookups compare with EqualityComparer.Default.Equals(.), no boxing on the hot path. But if you cast (int?)5 to object and use that as a key in Dictionary, you box once at insertion.
+Two boxes containing the same value are different references but value-equal, so the dictionary's hash + equals lookup still works correctly, at the cost of an allocation per insert. Always prefer typed dictionaries ( Dictionary ) over Dictionary for value-typed keys.
+
+-- pause --
+Drill 5, default(T) for unconstrained generic.
+
+Q: In public T MakeDefault() goes to default(T);, what do you get back for T = int, T = string, T = Point ?-- think --
+
+A: 0 for int, null for string, new Point(0, 0) for Point (a struct with all fields zero). default(T) produces the all-zeros bit pattern, which means 0 for numerics, null for references, and a struct with all-zero fields for value types.
+
+Cross-Q: How does default(T) == default(T) behave for an unconstrained generic?-- think --
+
+A: Compile error, == is not defined for an unconstrained T. To compare you must use EqualityComparer.Default.Equals(a, b) or constrain T: IEquatable and call a.Equals(b).
+The reason: == is a static operator that needs to be defined per-type at compile time; generics can't dispatch to it unless the constraint provides one (C sharp 11+ static abstract members partially solve this).
+
+Cross-Q²: What's the difference between default(T) and new T() in generic code?-- think --
+
+A: default(T) works for any T, produces all-zeros. new T() requires the where T: new() constraint and invokes the parameterless constructor.
+For a value type they often produce the same value (the parameterless constructor of a struct zeroes all fields), but a record struct with a custom parameterless ctor could differ from default(T). For a reference type, default(T) is null and new T() is a fresh object, completely different.
+Rule of thumb: use default(T) for "empty value", new T() for "fresh instance."
+
+-- pause --
+Drill 6, typeof(List) != typeof(List).
+
+Q: At runtime, is typeof(List) == typeof(List) ?-- think --
+
+A: No, different closed generic types are different System.Type objects. The C L R generic model preserves type identity per closure, unlike Java which erases generics at runtime to a single raw type.
+
+Cross-Q: What does typeof(List).GetGenericTypeDefinition() return?-- think --
+
+A: The open generic typeof(List<>), the unbound List definition. Both typeof(List) and typeof(List) share the same open definition. This is how D I containers register one open type and resolve any closed instantiation: services.AddScoped(typeof(IRepository<>), typeof(EfRepository<>)).
+
+Cross-Q²: What's the jit-level difference between List and List ?-- think --
+
+A: For value-typed T (like int ), the jit compiles a separate specialized machine-code body, List uses int[] backing storage, int -typed everywhere, no boxing.
+For reference-typed T (like string, object, MyClass ), the runtime shares one body, compiled against an internal placeholder type called System.__Canon, since every reference is the same size and shape at the metal.
+Be precise about which artifact multiplies: the I L is written once either way, there is one List in the assembly. It is the native code that scales with the number of distinct value-type instantiations.
+So heavy generic use over reference types is essentially free; heavy use over many distinct value types grows native code size and jit time, which is why A O T and startup-sensitive scenarios care about which instantiations are reachable.
+The shared __Canon body also carries a hidden generic-context argument so it can recover the real T when it must (allocating a T[], evaluating typeof(T) ), a small cost the specialized bodies don't pay.
+
+-- pause --
+Drill 7, Open versus closed generic types.
+
+Q: What's the difference between typeof(List<>) and typeof(List) ?-- think --
+
+A: List<> is the open (unbound) generic, the type definition where T is still a placeholder. List is a closed generic, T has been bound to int.
+Open types can't be instantiated ( new List<>() is a compile error); you must close them first via List<>.MakeGenericType(typeof(int)) or write new List().
+
+Cross-Q: Can you have a partially-closed generic like Dictionary ?-- think --
+
+A: No, C sharp syntax doesn't allow it. You can construct it via reflection ( typeof(Dictionary).MakeGenericType(typeof(int), typeof(string)) ), but in source code you either fully close it ( Dictionary ) or leave all parameters open ( Dictionary ).
+The C L R supports partial closure internally but the C sharp language exposes only the two extremes.
+
+Cross-Q²: Why would you reach for MakeGenericType at runtime?-- think --
+
+A: Three scenarios. (1) D I containers resolving open registrations, IRepository to EfRepository requires constructing the closed EfRepository at resolve time. (2) Jason / serializers that need to deserialize a List where TItem is known only at runtime.
+(3) Mediator or handler patterns, IMessageHandler resolved by reflection over registered handler types. In each case you have the open generic + the closed type argument, you call MakeGenericType, and you reflect on the result.
+
+-- pause --
+Drill 8, dynamic versus object at runtime.
+
+Q: What's the difference between object o = 5; and dynamic d = 5; ?-- think --
+
+A: o = 5 is a normal boxed int, o has static type object and member access requires casting ( ((int)o) ).
+d = 5 is also a boxed int at runtime, but d has static type dynamic, the compiler skips type-checking on member access and emits DLR (Dynamic Language Runtime) call sites that resolve members at runtime.
+
+Cross-Q: What does d.NotARealMethod() do at compile time and at runtime?-- think --
+
+A: Compile time: nothing, dynamic skips member checking. The compiler emits a DLR call site. Runtime: the DLR introspects the actual type of d ( int ), discovers there's no NotARealMethod, and throws RuntimeBinderException.
+With object, the same code would be a compile error: "CS1061: 'object' does not contain a definition for 'NotARealMethod'." dynamic defers all binding to runtime.
+
+Cross-Q²: What's the perf cost of dynamic member access versus object access + cast?-- think --
+
+A: Give the mechanism, not a multiplier, an interviewer who wants a number wants to see whether you'll invent one. object + cast compiles to a castclass / unbox and then a direct call: a few instructions, resolved at compile time.
+dynamic compiles to a DLR call site, a CallSite object created and cached in a static field, which on first use runs the binder (a full member-resolution pass, using the same overload-resolution logic the compiler would have run, at runtime) and produces a delegate.
+Subsequent calls hit a polymorphic inline cache keyed on the argument's runtime type, so a repeated call on the same type is much cheaper than the first but still a delegate invocation through a call site rather than a direct call.
+It also allocates: the call site, the binder, and the argument boxes. For COM interop, Jason traversal, and Python or JS interop, that machinery is exactly what you want. For application code, almost never; reach for object + pattern matching ( if (o is int n) ) or generics with constraints.
+
+-- pause --
+Drill 9, record struct equality versus struct equality.
+
+Q: Two struct Point { public int X, Y; } instances with the same X and Y, are they equal?-- think --
+
+A: Yes, ValueType.Equals gives every struct member-wise equality for free. The interesting question is how. The runtime asks CanCompareBitsOrUseFastGetHashCode: if the struct has no reference field, no padding, and no float / double, it does a raw byte comparison of the instance data.
+Point qualifies, so this pair compares bitwise. Otherwise it falls back to reflecting over the fields with FieldInfo.GetValue, which boxes every field of both operands on every call. Either way you pay two boxes just to reach Equals(object).
+The fix is to implement IEquatable, or declare record struct Point(int X, int Y), which generates a strongly-typed Equals, GetHashCode, and ==.
+
+Cross-Q: What's the difference in generated code between struct and record struct ?-- think --
+
+A: record struct auto-generates: Equals(T) (strongly typed, no reflection, no boxing), Equals(object), GetHashCode combining all declared data members, == and !=, ToString (prints Point { X = 1, Y = 2 } ) built on a private PrintMembers, Deconstruct for the positional parameters,
+a parameterless constructor that zeroes every field, and the IEquatable interface itself.
+That last one is the load-bearing item: it is what makes EqualityComparer.Default resolve to GenericEqualityComparer instead of the boxing ObjectEqualityComparer. Plain struct generates none of it.
+Note what record struct does not get, unlike record class: no copy constructor, no clone method, no EqualityContract, with on a struct is a value copy plus field assignments, and there are no derived types to disambiguate.
+
+Cross-Q²: When would I use struct over record struct ?-- think --
+
+A: When you want explicit control over equality semantics, for example, a struct with a transient cache field that shouldn't participate in equality, or one where two instances should be equal based on a subset of fields (the canonical form is "DB-row struct with metadata; equal-by-ID only").
+record struct always uses all declared data members for equality. But note that "plain struct " is not the alternative there, the alternative is a plain struct that implements IEquatable by hand.
+Choosing struct and writing no equality code isn't opting out of record struct 's equality, it's opting into ValueType 's, which is both slower and, if the struct has a reference field or padding, hashes a single field.
+For "pure value bundle, all members define identity," record struct is strictly better than struct.
+
+-- pause --
+Drill 10, Identity of value-type instances.
+
+Q: int a = 5; int b = 5;, is a the same instance as b ?-- think --
+
+A: Trick question. Value types don't have instance identity, only values. Each variable holds its own copy of the bits. a and b are two independent storage locations both containing 5.
+There's no ReferenceEquals semantics for value types (calling ReferenceEquals(a, b) boxes both, two distinct boxes, and returns false ).
+
+Cross-Q: What does ReferenceEquals(boxA, boxB) return for object boxA = 5; object boxB = 5; ?-- think --
+
+A: False. Each box is a separate heap allocation, distinct objects despite holding the same value. C sharp does not intern boxed integers (unlike Java's Integer.value Of cache for -128.127 ). Every box is a fresh allocation.
+This is a common boxing-cost trap: code that compares boxed value types by reference always returns false for distinct sources.
+
+Cross-Q²: How do you intern a boxed value type if you really need reference equality?-- think --
+
+A: You don't, and the question reveals a design problem.
+The right answer is "compare by value ( Equals / == )" or "don't box in the first place (use generics)." If you genuinely need a shared instance per value (for example, for a pool), use a Dictionary cache and GetOrAdd to return the existing box.
+But that's hand-rolled interning for a niche case; the default position is "boxing creates fresh objects every time, plan accordingly."
+
+-- pause --
+Drill 11, (int, int) tuple, value type or class?.
+
+Q: Is (int X, int Y) a value type or reference type?-- think --
+
+A: Value type, it's syntactic sugar for System.ValueTuple, a struct. So (int, int) p = (1, 2) is stack-allocated, copied on assignment, and follows value semantics. The named fields ( p.X, p.Y ) are just field names on the ValueTuple struct.
+
+Cross-Q: What's System.Tuple then?-- think --
+
+A: The original tuple type from dot NET 4.0, a reference type (class) with members named Item1, Item2. Effectively obsolete. Modern C sharp tuples (C sharp 7+) are ValueTuple s.
+The two types are not interchangeable: Tuple and (int,int) (= ValueTuple ) are different types, with different equality, different allocation behavior, and different runtime cost. Use ValueTuple (the (.) syntax) for everything new; System.Tuple is legacy.
+
+Cross-Q²: When should I use a tuple versus a record?-- think --
+
+A: Tuple for transient multi-value returns inside a method, especially when the receiver immediately deconstructs: var (min, max) = FindRange();. Record for named, reusable, long-lived data structures that travel through your codebase.
+The named-tuple fields don't survive across files, (int X, int Y) in one method is the same runtime type as (int A, int B) in another, only the local names differ. Records preserve names everywhere and are searchable in the IDE.
+
+-- pause --
+Drill 12, Why can't a struct have a parameterless constructor (pre-C sharp 10)?.
+
+Q: Why couldn't struct have a parameterless constructor before C sharp 10?-- think --
+
+A: Because the C L R has always supported "default-initialization" of structs via default(T) and array allocation, new int[10] zeroes 10 int s without invoking any constructor.
+If a user-defined parameterless constructor existed, it would be skipped in those default-init scenarios, leading to invariant-breaking states. The design decision: forbid parameterless ctors, so default(T) and array-of-T have well-defined behavior (all-zero).
+
+Cross-Q: What changed in C sharp 10?-- think --
+
+A: C sharp 10 added user-defined parameterless ctors for structs, but with the caveat that they're invoked only through explicit new T(). Default-init ( default(T), new T[N], struct as field auto-init) still uses the all-zero behavior and skips the user constructor.
+So a struct can now provide a non-zero default via new(), but you can't trust that constructor to always run.
+
+Cross-Q²: What's the implication for field initializers in a struct?-- think --
+
+A: They only run when an explicit constructor (parameterless or otherwise) is called. default(T) and array-init skip field initializers. So struct S { int X = 5; } will have S.X == 5 only for new S(); default(S).X == 0 and new S[1][0].X == 0.
+The senior takeaway: do NOT rely on struct field initializers as invariants. They're an ergonomic for the explicit- new path only; the all-zero path is always reachable.
+
+-- pause --
+Section 7. Cheat Sheet.
+
+Value type: struct, primitive, enum, tuple, copied on assignment, no null, bitwise default.
+Reference type: class, interface, delegate, string, record, array, copies the pointer.
+Stack versus heap: storage location, not type, a struct field of a class lives on the heap.
+Boxing: value type to object allocates a heap wrapper (24 bytes for an int on x64); check I L for the box opcode. IFace parameter boxes; where T: IFace does not.
+Struct equality: ValueType.Equals = bitwise if no ref field, no padding, no float / double; else reflection + a box per field. Default GetHashCode on that path hashes one field. Implement IEquatable.
+Closure: a captured local becomes a field of a synthesized heap class. for to one shared variable; foreach to one per iteration. static lambda = capture is a compile error.
+record: reference type + value equality + with expression, DTO-shaped.
+record struct: value type with auto Equals / GetHashCode / ToString /deconstruct.
+readonly struct: whole struct immutable; defensive copies elided in in /method calls.
+ref struct: stack-only; cannot be field of class, cannot box, cannot cross await.
+int?: runtime Nullable (boxes when cast to object ); string?: compile-time hint only.
+Decision rule: identity to class; small immutable to readonly record struct; DTO to record.
+
+-- pause --
+Section 8. Walkthrough, Boxing storm in a hot loop.
+
+Problem: A pricing engine's throughput collapsed after a release. Same hardware, same input rate, but the service now spends most of its C P U time in the garbage collector and its allocation rate, visible as the gen-0 gc count and alloc rate counters, is an order of magnitude the previous build.
+(Deliberately no absolute figures here: the shape you are diagnosing is "allocation rate is high and rising with load, and almost all of it is primitives", which is what identifies a boxing storm. The numbers are whatever your counters say.)
+
+Diagnosis, three steps, in this order.
+
+Confirm it's allocation, not work. dotnet-counters monitor --counters System.Runtime and watch alloc-rate, gen-0-gc-count, and time-in-gc. High allocation rate with rising time-in-gc and a flat gen-2 heap size means short-lived garbage, not a leak.
+Find out what is being allocated. dotnet-trace collect --providers Microsoft-Windows-DotNETRuntime:0x1:5 (garbage collector keyword, Verbose level) captures allocation-sampled events; open the trace in PerfView or Visual Studio and sort the allocation stacks by type.
+The signature of a boxing storm is that the top allocated types are System.Int32, System.Decimal, System.Double, or your own struct names, value types cannot be allocated on the heap by any means other than boxing, so their presence in an allocation profile is the finding.
+Attribute it to call sites. The allocation stacks give you the methods.
+Then read them for the four shapes from the boxing ledger:
+a non-generic collection ( ArrayList, Hashtable ), a composite-formatting or params object[] A P I ( string.Format, the ILogger extension methods), an interface-typed parameter or field holding a struct, and a Dictionary whose key is a struct without IEquatable.
+
+Fix: replace each boxing source with its generic equivalent. (1) ArrayList to List. (2) string.Format("Trade {0}", id) to $"Trade {id}", whose handler has a generic AppendFormatted. (3) Dictionary to Dictionary with TradeKey implementing IEquatable.
+(4) Where a struct is passed as an interface, change the method to where T: IFace so the call becomes a constrained. callvirt.
+
+Why it works: a generic collection's storage is T[], value types live inline in the array, with no per-element object wrapper.
+Removing the box removes one heap allocation per item; removing enough of them takes the allocation rate the threshold at which gen-0 collections were firing often enough to dominate the pipeline's C P U.
+
+How to keep it fixed: an allocation regression is invisible in functional tests, so encode it.
+A BenchmarkDotNet benchmark with [MemoryDiagnoser] reports Allocated per operation, and asserting that it is 0 on the hot path turns "we fixed the boxing" into a test that fails when someone reintroduces it. That assertion is durable in a way a timing assertion never is.
+
+-- pause --
+Section 9. Self-test.
+
+Span holds a managed pointer (a byref ) into arbitrary memory, heap, stack, or unmanaged.
+If a Span escaped to the heap (as a class field), the garbage collector could move the underlying array while the span still pointed into the old location, or a stackalloc -backed span could outlive its stack frame, both unsafe. Marking it ref struct tells the compiler: stack-only.
+You can't box it, can't store it as a class field, can't capture it in a lambda or iterator or async method. The restrictions are exactly what makes the span safe.
+
+Records have value equality generated from all positional fields, two User(1, "Ada") instances are Equals and have the same GetHashCode. The dictionary treats them as the same key.
+Fix options: (1) make User a class with default reference equality, distinct instances are distinct keys; (2) override Equals / GetHashCode on a class to compare only on identity ( Id ); (3) key the dictionary by int (the user's Id) instead of the user object.
+For DB-backed entities, prefer a class with identity equality.
+
+Wins: small ( at most 16-24 bytes), immutable, equality-by-value types, Money, Coordinate, DateRange. Stack-allocated, no garbage collector pressure, defensive copies elided due to readonly.
+Loses when (a) the struct is large, copying it on every method call is costlier than passing a reference; (b) you store many instances in collections of object or interfaces that box; (c) you need polymorphism, structs don't participate in inheritance.
+Rough rule: under ~16 bytes, immutable, and equality-comparable to readonly record struct; otherwise lean record or class.
+
+Prints 5. The assignment object o = x boxes x, allocates a heap object containing the value 5. The local x and the boxed object are now independent. Mutating x = 10 only changes the stack slot; the box still holds 5. Boxing is a snapshot.
+This demonstrates why boxing is expensive (heap alloc + copy) and why it can cause subtle bugs when you assume reference semantics: the boxed value is conceptually a different object from the source variable.
+
+await causes the compiler to lower the method into a state machine, and any local that is live across the suspension point becomes a field on a generated type. A ref struct can't be such a field, it's stack-only by design, so the lowering can't be performed.
+
+Be precise about when it fails, because this is a C sharp 13 version gate. Through C sharp 12, merely declaring a ref struct local anywhere in an async method was an error (CS4012).
+Since C sharp 13, the feature "ref and unsafe in async and iterator methods" allows the declaration, and the compiler only objects when the value is actually still needed after the suspension:
+CS4007, "Instance of type 'AsyncContext' cannot be preserved across 'await' or 'yield' boundary." A ref struct parameter is still rejected outright with CS4012, because a parameter is live at every suspension point in the method.
+
+Fix options: (1) let the ref struct die before the await, on C sharp 13+ this now just compiles; (2) extract the work into a synchronous helper called before or after the await;
+(3) if the data must survive the suspension, hold it as Memory (or a normal struct or class) and take .Span on each side of the await.

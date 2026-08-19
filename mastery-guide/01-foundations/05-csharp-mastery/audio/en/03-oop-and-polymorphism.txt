@@ -1,0 +1,1209 @@
+-- pause --
+Section 1. Why it matters.
+
+C sharp is a multi-paradigm language but its OOP model is the most established. Every framework you'll touch (A S P dot NET Core middleware, E F Core conventions, MediatR handlers, x Unit fixtures) is built around classes, inheritance, and interfaces.
+Senior interview questions often probe not "what is inheritance" but "when would you choose abstract over interface?", a judgment call that requires understanding both deeply.
+
+C sharp 8 added default interface methods. C sharp 11 added static abstract members and made interfaces effectively a substitute for abstract classes in many cases. C sharp 12 added primary constructors for classes.
+The OOP surface looks different in 2026 than it did in 2018; this session covers what's current and what each tool is genuinely for.
+
+In the real world: the OOP question that separates candidates at senior level is almost never "what is polymorphism". It is a follow-up to something the candidate volunteered.
+Somebody says "we used an interface so it's testable", and the interviewer asks what happens when the base class already implemented that interface non-virtually and the derived class used new.
+Or somebody says "we sealed it for performance" and the interviewer asks what the jit actually does differently. Ten years of writing C sharp daily gets you to the first answer comfortably; it does not get you to the second, because nothing in day-to-day work forces you to look.
+That gap is what this page is for, every section has a mechanism underneath it that a cross-question can reach in two moves.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+Classes, the OOP workhorse.
+
+A class is a reference type. It has fields, properties, methods, events, constructors, and finalizers, and it can inherit from one base class and implement any number of interfaces.
+
+Property forms:
+
+Access modifiers:
+public, accessible everywhere.
+internal, accessible within the same assembly.
+protected, accessible within the type and its subclasses.
+private, accessible only within the type (the default for class members).
+protected internal, protected OR internal (more permissive).
+private protected (C sharp 7.2), protected AND internal (more restrictive, subclasses in the same assembly).
+file (C sharp 11), visible only within the file (useful for source-generators avoiding name collisions).
+
+-- pause --
+Constructors and chaining.
+
+Constructors initialize an object. A class can have multiple constructors, and one constructor can chain to another (or to a base) using: this(.) /: base(.).
+
+Static constructors:
+
+Static constructors run lazily on first use, are guaranteed to run exactly once, and are thread-safe by the runtime. Throwing in a static constructor disables the type for the rest of the process, be careful.
+
+Generic types get one static constructor run per closed type. Cache and Cache are distinct runtime types with distinct static fields, so the static constructor runs once for each.
+This surprises people who use a static field on a generic type as a process-wide singleton, it is a singleton per type argument, which is sometimes exactly what you want (a per- T cached MethodInfo, a per- T compiled expression) and sometimes a silent multiplication of state you thought was shared.
+
+In the real world: a service read its connection string in a static constructor so the work happened "once, at startup". It did, until the day a config provider was slow to warm and the first read threw.
+The static constructor wrapped it in TypeInitializationException, and from that moment every request that touched the type threw the same exception, forever, with a stack trace pointing at a line of config code that had long since started working.
+Restarting the pod fixed it, which is why it was filed as a transient blip three times before anyone read the exception type.
+The rule that comes out of this is narrow and worth memorising: a static constructor is the one place in C sharp where a single failure is permanently unrecoverable, so it must contain no I O, no configuration access, and nothing that can throw on a bad day.
+
+-- pause --
+Constructor execution order, the full picture.
+
+The exact ordering when new DerivedDog("Rex") executes is a classic interview cross-questioning target. Memorize it.
+
+The full rule (top-down through the inheritance chain):
+
+Memory allocation, the runtime allocates space for the most-derived type (method-table pointer + all fields, base + derived), and zeroes every field.
+Field initializers (the = value on field declarations) run in order from the most-derived class down to object. A class's own field initializers run before it invokes its base constructor, which is why the derived class's initializers run first overall.
+Base constructor chain,: base(.) chains run before the current ctor body. Constructor bodies therefore run bottom-up: object to Animal to Dog.
+Constructor body of the current type runs.
+After all that, the new expression returns the fully-constructed reference.
+
+The two halves run in opposite directions, and that is the whole trick: field initializers run top-down (derived first); constructor bodies run bottom-up (base first).
+
+Precise per-class order (for one class in the chain):
+This class's field initializers (in source order).
+Base ctor (which recursively does its field initializers, then its base ctor, et cetera).
+This class's ctor body.
+
+Why this order surprises people: derived field initializers run before the base ctor body, but the derived ctor body runs after it. So a virtual call made from the base constructor sees derived fields that had initializers but not derived fields assigned in the derived constructor body.
+That half-initialized window is the heart of the "no virtual call from constructor" anti-pattern.
+
+The this(.) exception nobody remembers. A constructor runs the field initializers only if it does not chain to another constructor of the same class.: base(.) still runs them;: this(.) does not, the constructor at the end of the this chain runs them exactly once, so they are never executed twice.
+
+The rule exists so that side effects in initializers (allocating a backing collection, registering with a pool, incrementing a counter) happen exactly once per object no matter how deep the this chain is.
+The interview version of the question is "how many times does new() run if I construct through a three-deep: this(.) chain?", once, in the constructor at the end of the chain.
+
+In the real world: the reason the base-constructor-calls-virtual bug reads as intermittent is this exact split. A ReportGeneratorBase called Configure() from its constructor; PdfGenerator overrode it and touched two fields.
+One of them had a field initializer ( = new List() ) and was fine, because initializers run before the base constructor. The other was assigned in PdfGenerator 's constructor body and was null, because bodies run after.
+So the override worked for months on the code path that only used the first field, and threw a NullReferenceException the week someone added a line touching the second, and the change that "caused" it was a one-line addition to a method that had nothing to do with construction.
+Half-initialised is worse than uninitialised precisely because it looks like it works.
+
+Static constructors interleaved:
+A static ctor for a type runs the first time that type is touched (instance creation, static-field access, static-method call).
+For new Dog(): Animal 's static ctor runs first (because constructing Dog triggers loading Animal 's metadata), then Dog 's static ctor, then instance construction proceeds.
+Static ctors are guaranteed thread-safe by the runtime (BeforeFieldInit semantics aside), but if a static ctor throws, the type becomes unusable for the rest of the process. TypeInitializationException is the wrapper.
+A generic type's static ctor runs once per closed type, Cache and Cache each get their own run and their own static fields.
+
+The "no virtual call from ctor" anti-pattern (this is why the cross-questioning matters):
+
+The derived Render() is dispatched (because the vtable for Circle is wired up at object allocation, before any ctor runs), but the derived field _radius is still its default value 0.0. Never call virtual methods from constructors. Lint rule: CA2214.
+
+-- pause --
+Primary constructors (C sharp 12).
+
+C sharp 12 added primary constructors for classes, mirroring records. Parameters declared on the class header are in scope for the entire body and act as captured-by-the-class state.
+
+Important nuances:
+Primary-ctor parameters are not properties. They're implicit private fields the compiler synthesizes only for parameters that are actually captured by methods.
+They are mutable, you can write repo = new Repo; from any method (this is rarely a good idea).
+If you need a property, declare one explicitly: public IRepo Repo { get; } = repo;.
+Combine well with D I, most services in modern A S P dot NET Core can be expressed as one-liners.
+
+In the real world: the primary-constructor pattern that costs a team a debugging session is capture-plus-mutation in a class registered as a singleton.
+public class TokenCache(IHttpClientFactory http) looks immutable, but http is a mutable field in every practical sense, and a helper method that reassigned it "temporarily" for a retry path left a singleton pointing at a disposed scope's factory.
+There is no readonly you can put on a primary-constructor parameter and no analyzer in the default rule set that objects. The convention that removes the whole class of problem is one line of ceremony: private readonly IHttpClientFactory _http = http; on any type whose lifetime outlives a request.
+Save the bare captured form for scoped and transient services where nobody can hold the instance long enough for it to matter.
+
+-- pause --
+Inheritance,: base.
+
+C sharp supports single inheritance (only one base class) and multiple interface implementation.
+
+Why no multiple class inheritance: C plus plus has it; the diamond problem (two parents share a common ancestor) creates ambiguity that C sharp sidestepped from day one.
+Multiple interface implementation handles most of the use cases without the ambiguity, and default interface methods (C sharp 8) cover most of the remaining ones.
+
+-- pause --
+virtual / override / new / sealed.
+
+These four keywords control method dispatch.
+
+virtual, base-class method that subclasses may override. Dispatched at runtime via the type's vtable.
+
+override, subclass method that replaces a virtual (or abstract ) base member. Same name, signature, and accessibility.
+
+new, hides a base member rather than overriding. The runtime dispatches based on the static type of the variable, not the runtime type. Almost always wrong; the compiler warns when you forget new.
+
+sealed, when applied to a class, prevents inheritance. When applied to an override method, prevents further override.
+
+new is rarely the right tool. Mostly you want override. The compiler-required new keyword exists so that adding a virtual method to a base class in a future version doesn't silently break the meaning of subclass methods that happened to have the same name.
+
+In the real world: this is the fragile base class problem and it arrives as a NuGet upgrade. A team had class OrderProcessor: ProcessorBase with its own public void Validate(), a private-in-spirit helper that happened to have an obvious name.
+A minor version of the base library added public virtual void Validate() to ProcessorBase and started calling it from the base pipeline. The build produced CS0114 ("hides inherited member. add the override keyword.
+Otherwise add the new keyword"), which is a warning, and the CI log had hundreds of warnings from generated code, so it scrolled past.
+The derived Validate was now hiding a method the base was calling on itself, the base's own Validate ran, the derived checks never did, and orders that should have been rejected went through for two weeks. The whole defect lives in the gap between "warning" and "error".
+CS0114;CS0108 in the project file, or a clean warning baseline so a new one is visible, is the control, and it is worth being able to name that trade-off in an interview, because "why is hiding a warning and not an error?" has a real answer:
+making it an error would mean any base library could break your compile by adding a method.
+
+abstract override, re-abstracting a virtual member. An abstract class partway down a hierarchy can take a base implementation away and force every concrete descendant to supply one:
+
+The interface equivalent, re-abstraction of a default interface method, is covered under Default interface methods.
+
+base.Method() is a non-virtual call. Inside an override, base.Render() compiles to call (not callvirt ) against the base's implementation, the only way in C sharp to reach a specific implementation rather than the most-derived one.
+The consequence worth knowing: you cannot reach a grandparent implementation. base.base does not exist, and there is no syntax for it; if Derived.M needs GrandBase.M 's logic and Base.M overrode it, the grandparent has to expose a protected non-virtual helper that both overrides call.
+
+-- pause --
+Covariant return types (C sharp 9, requires dot NET 5+ runtime).
+
+Since C sharp 9 an override may return a more derived type than the member it overrides, and a read-only property override may declare a more derived type. This removes the standard workaround of inventing a second differently-named method.
+
+The gates are two, and they are different gates: the language gate is C sharp 9; the runtime gate is dot NET 5, because the C L R had to learn to unify a MethodImpl slot whose signature no longer matches the base.
+Targeting an older runtime gives CS8830 ("target runtime doesn't support covariant return types"), not a language-version error.
+The compiler marks such overrides with System.Runtime.CompilerServices.PreserveBaseOverridesAttribute, whose documented job is to ensure "that any virtual call to the method, whether it uses the base signature or derived signature of the method, executes the most derived override."
+
+The restrictions are real and interviewers know them: covariant returns work on class virtual methods and read-only properties only.
+They are not supported for interface members or for methods on value types, and they do not apply to set / init accessors (that direction would be unsound, a setter is an input position, so it would need contravariance).
+
+In the real world: this is the feature that kills the CreateBuilder() / CreateTypedBuilder() twin-method pattern.
+A configuration library had abstract class BuilderBase { public abstract BuilderBase WithRetry(int n); }, so every fluent chain on a derived builder collapsed to the base type after the first call and every caller ended in a cast.
+The pre-C sharp-9 fix was a generic self-type ( class Builder where TSelf: Builder ), which works and which every reviewer has to re-derive from scratch each time they read it.
+Covariant returns replace the whole apparatus with one keyword change per override, but only for classes, so a library whose fluent surface is an interface still needs the self-type generic. Knowing which of the two you're looking at is the difference between a five-minute change and a redesign.
+
+-- pause --
+Method dispatch, vtable internals.
+
+The mechanism behind virtual / override / new. Every reference type has a method table (vtable), an array of function pointers. Each class lays out its vtable starting with the same slots as its base, then appends its own.
+
+Three dispatch flavors in I L:
+
+animal.Speak() (animal is Animal ), callvirt Animal:Speak, Looks up slot in runtime type's vtable.
+animal.NonVirtualMethod(), call Animal:NonVirtualMethod, Direct call, no vtable lookup.
+new Animal().Move(), callvirt Animal:Move (still!), callvirt is also used for null-checking, even on non-virtual instance calls.
+((Animal)d).Move() where Dog new s Move, Dispatches via Animal 's slot, new doesn't add to base's slot, so Animal.Move() runs.
+d.Move() where d is Dog, Move is new, Dispatches via Dog 's separate slot, Dog.Move() runs.
+
+override semantics: replaces the slot inherited from the base. Calls through any reference (base or derived) dispatch via the same slot, so the derived implementation wins.
+
+new semantics: introduces a separate slot with the same name. The base's slot is unchanged. Calls through a Base reference hit the base's slot (base's implementation); calls through a Derived reference hit the derived's new slot (derived's implementation).
+This is why new causes the dispatch ambiguity, static type of the variable decides which slot is used.
+
+sealed override, locks an override so further derived classes can't override it again. The jit can then treat it as final, enabling devirtualization (replace the virtual call with a direct call). Same trick applies to a sealed class, all virtual calls on it can be devirtualized.
+
+Modern devirtualization (dot NET 7+):
+Sealed types or methods to the jit knows the target is final, so it can emit a direct call and consider inlining it.
+Whole-program analysis in Native A O T to the compiler sees the closed set of types in the program, so anything with no overriding implementation anywhere in it can be treated as final.
+Dynamic PGO (Profile-Guided Optimization, on by default since dot NET 8), instruments hot call sites, observes which concrete type actually arrives, and emits a guarded devirtualization:
+a type check against the common case with a direct (often inlined) call on the hit path, and the ordinary dispatch on the miss path.
+Note the shape of the win: it does not remove the check, it replaces an indirect call with a predictable compare-and-branch plus inlinable code.
+
+The compiler warnings (CS0114 and CS0108), and they are two different warnings, which is worth knowing precisely:
+If the hidden base member is virtual or abstract or override, you get CS0114: "'D.M()' hides inherited member 'B.M()'. To make the current member override that implementation, add the override keyword. Otherwise add the new keyword."
+If the hidden base member is non-virtual, you get CS0108: "'D.M()' hides inherited member 'B.M()'. Use the new keyword if hiding was intended."
+
+Either way it compiles and is treated as new implicitly. Never ignore these, make the intent explicit.
+
+-- pause --
+Interface dispatch is not a vtable lookup, it is Virtual Stub Dispatch.
+
+This is the single deepest thing on this page and the one most candidates get wrong, because the mental model everyone carries ("interfaces cost an extra hop through an interface map") describes neither what CoreCLR does nor why interface calls are cheap in the common case.
+
+A class vtable works because every derived class lays out its base's slots at the same indices, so Speak is always at slot 0.
+Interfaces destroy that property: a type implements several unrelated interfaces, each with its own numbering, and no single linear layout can give every interface a fixed slot in every implementing type.
+CoreCLR solves it with Virtual Stub Dispatch (VSD), the call site is patched at runtime with progressively better stubs rather than resolved by a table walk.
+
+The three stubs, per the CoreCLR Book of the Runtime:
+
+Lookup stub, Cold start, "These stubs are the first to be assigned to an interface dispatch call site, and are created when the jit compiles an interface call site." Passes token + type to the generic resolver.
+Dispatch stub, Monomorphic fast path, "Takes the type (MethodTable) of the object being invoked and compares it with its cached type, and upon success jumps to its cached target." A compare and a jump, that is the whole cost when one type dominates.
+Resolve stub, Polymorphic path, "Use the key pair to resolve the target in a global cache, where token is known at jit time and type is determined at call time." On a global-cache miss it calls the generic resolver.
+
+Two behaviours follow that change how you reason about performance:
+
+Demotion. "When a dispatch stub fails frequently enough, the call site is deemed to be polymorphic and the resolve stub will back patch the call site to point directly to the resolve stub." The site stops paying for an inline cache that keeps missing.
+Re-promotion. "At sync points (currently the end of a garbage collector), polymorphic sites will be randomly promoted back to monomorphic call sites", the runtime periodically re-tests its assumption that a site is hopeless.
+
+The senior conclusion: the cost of an interface call is not a property of interfaces, it is a property of the call site.
+A site that sees one concrete type (monomorphic) is a compare and a jump; a site that sees two or three is where dynamic PGO's guarded devirtualization earns its keep; a site that sees dozens (megamorphic) falls back to the global resolve cache and never gets inlined.
+"Should I use an abstract class instead of an interface for speed?" is the wrong question. "How many concrete types reach this call site?" is the right one, and it is answerable by reading your own D I registrations.
+
+In the real world: a rules engine dispatched every inbound event through IRule.Evaluate(context) over a list that had grown to a few hundred registered rule types, in a loop that ran per message.
+Someone proposed converting IRule to an abstract base class "because interface calls are slower", which would have been a week of work across three repositories for no benefit, the site was megamorphic either way,
+and an abstract base would have moved it from a resolve-stub lookup to an equally unpredictable vtable indirect.
+What actually moved the number was changing the shape of the loop: index the rules by event type up front so each message touches the handful of rules that could match, which turned one megamorphic site into several sites each seeing one or two types.
+Same interface, same classes, same Evaluate method. The dispatch mechanism was never the problem; the number of distinct types arriving at one call site was.
+
+In the real world: the sealed keyword is the cheapest performance change in dot NET and the one most codebases have never applied. A serialization hot path spent its time in virtual ToString() and Equals calls on internal DTO types that nobody had ever subclassed and nobody ever would.
+Adding sealed to those classes is a mechanical change an analyzer will find for you, CA1852 Seal internal types, introduced in dot NET 7, flags every type "not accessible outside its assembly and has no subtypes within its containing assembly".
+It is not enabled by default (you set dotnet_diagnostic.CA1852.severity yourself), and it goes quiet entirely if the assembly uses InternalsVisibleTo unless you set ignore_internalsvisibleto = true, which is why most teams have never seen it fire.
+The fix is documented as non-breaking because the scope is internal types, and that scope is the point: sealing a public type is a permanent A P I commitment you cannot walk back in a minor version.
+
+-- pause --
+Boxing, value types, and interfaces.
+
+Value types ( struct ) can implement interfaces, but the moment you call an interface method through the interface reference, the runtime boxes the value type, copies it onto the heap and wraps it in an object header.
+This is one of the silent perf killers in hot loops, and a classic interview cross-question.
+
+The key rule: boxing happens at the point of conversion to the interface type, not at the call site. If you can keep the value typed as the struct (or as T constrained to the interface), you avoid the box.
+
+-- pause --
+The mechanism behind path 3: the constrained. I L prefix.
+
+Path 3 is not magic and it is not "the jit is clever". It is a specific I L prefix, constrained., emitted by the C sharp compiler in front of callvirt whenever the receiver is a type parameter.
+Its documented behaviour, per the C L I opcode reference, is a three-way rule evaluated once the concrete type is known:
+
+"If this Type is a reference type then ptr is dereferenced and passed as the 'this' pointer to the callvirt of method.", ordinary virtual or interface dispatch.
+"If this Type is a value type and this Type implements method then ptr is passed unmodified as the 'this' pointer to a call method instruction.", direct call, by managed pointer, no box, no copy.
+"If this Type is a value type and this Type does not implement method then ptr is dereferenced, boxed, and passed as the 'this' pointer to the callvirt."
+
+That third bullet is the one to remember, because the docs are explicit about when it fires:
+"This last case can occur only when method was defined on Object, ValueType, or Enum and not overridden by this Type." In other words, a struct that does not override ToString(), Equals(object) or GetHashCode() gets boxed on every such call from generic code.
+That is why the BCL's own value types ( Int32, DateTime, Guid,. ) override all three, and why a struct you intend to put in a Dictionary or a HashSet should override Equals and GetHashCode, not only for correctness, but to keep the constrained call out of the boxing branch.
+It compounds with what the inherited implementation actually does:
+Microsoft Learn describes ValueType.Equals(Object) as calling " Object.Equals(Object) on each field of the current instance and obj ", and advises that "particularly if your value type contains fields that are reference types, you should override the Equals(Object) method.
+This can improve performance." So the un-overridden path costs you a box on the receiver, a box on the argument (the parameter is object ), and a per-field virtual Equals on top.
+
+The docs also give the versioning rationale, which is a good cross-question answer:
+without constrained., "different I L must be emitted depending on whether or not a value type overrides a method of System.Object", so adding or removing an override later would silently change the meaning of already-compiled callers.
+
+IComparable versus IComparable:
+IComparable.CompareTo(object), non-generic; argument is object, so passing a struct boxes it.
+IComparable.CompareTo(T), generic; argument is T, no box for value types.
+BCL collections like List.Sort() use the generic version when available, that's why List.Sort() is fast.
+
+using over a struct that implements IDisposable, interesting subtle case:
+
+Modern C sharp 8+ using var declarations preserve the struct type to no box. Old using ((IDisposable)x) patterns box; avoid them.
+
+Identity gotcha: each box produces a new heap object. Reference equality between two boxes of the same struct value is false, even though the underlying values are equal.
+
+In the real world: the boxing everybody eventually meets is the List enumerator. List.GetEnumerator() returns public struct Enumerator, and foreach over a variable typed as List binds to it directly, no allocation per loop.
+Change the field's type to IEnumerable "for testability" and foreach now goes through IEnumerable.GetEnumerator(), which returns IEnumerator, the struct is boxed, once per loop.
+On a request path that iterates a small list a few times per call, that is a steady drip of Gen 0 garbage traceable to a type annotation nobody thought was a performance decision.
+(The runtime source has a small mercy here: the explicit implementation returns a cached SZGenericArrayEnumerator.Empty when Count == 0, so empty-list iteration does not allocate.) The general shape:
+widening a field to its interface type moves value-type work onto the heap, and the diff that does it looks like a design improvement.
+
+-- pause --
+The reference-type caveat on generic constraints.
+
+The standard senior takeaway is "prefer where T: IFoo over a parameter typed IFoo ". It is good advice, but the reason people give for it is only half true, and interviewers push on exactly this.
+
+CoreCLR shares generic code across reference-type instantiations.
+Per the runtime's shared-generics design doc, code sharing "is currently only supported for instantiations over reference types because they all have the same size or properties or layout", while "for instantiations over primitive types or value types,
+the runtime will generate separate code bodies for each instantiation." Every reference-type T runs the same canonical body, compiled for __Canon, and reaches type-specific information through a runtime generic dictionary.
+
+The consequence:
+
+A struct ( Money ), maps to, Dedicated jit'd body; constrained. resolves to a direct call; no box; inlinable.
+A class ( Order ), maps to, Shared __Canon body; the call is a real interface dispatch, subject to VSD and PGO like any other.
+
+So the generic constraint's guaranteed win is for value types: no boxing, direct calls, per-instantiation specialization. For reference types the constraint buys you type safety and A P I clarity, which are excellent reasons, but not a free devirtualization.
+Saying "generic constraints make it a direct call" without the qualifier is the kind of half-right answer a cross-question is designed to find.
+
+Senior takeaway: prefer generic methods with interface constraints ( where T: IFoo ) over methods that take IFoo directly, for value types it eliminates the box outright, and for reference types it costs nothing and reads better.
+
+-- pause --
+Abstract classes versus interfaces.
+
+The classic dot NET interview question, "abstract class or interface?", has a deceptively simple framing. Both define contracts; both can have default implementations (since C sharp 8); both can mandate static members (since C sharp 11).
+The real question isn't "which feature does which" but "is this behavior, capability, or both?"
+
+Behavior with shared state, abstract class (state demands inheritance).
+Pure capability, interface (capabilities are orthogonal to type identity).
+Capability with shared default behavior, interface with default methods (since C sharp 8).
+Multiple capabilities on one type, multiple interfaces (only interfaces compose).
+
+Everything else is downstream of that question.
+
+-- pause --
+Comparison table.
+
+Instance fields / mutable state, Yes, No (only static since DIM).
+Constructors, Yes, No.
+Access modifiers on members, Yes, Yes (since C sharp 8).
+Can be instantiated, No, No.
+Inheritance, Single, Multiple.
+Default method implementations, Yes (virtual / non-virtual), Yes (since C sharp 8, DIM).
+static abstract members, Indirectly via abstract base, Yes (since C sharp 11).
+Memory per instance, Method-table pointer (already present on every object), No extra per-instance cost; interface data hangs off the type.
+Dispatch mechanism, Vtable slot, fixed index, one indirection, Virtual Stub Dispatch, stub-cached, cost depends on how many types reach the call site.
+Generic constraint usage, where T: BaseFoo, where T: IFoo (much more common).
+Versioning, adding member, Source-breaking unless virtual w/ body, Source-breaking unless default body.
+Diamond problem, Avoided (single inheritance), Possible w/ DIM; resolved by explicit impl.
+Reflection cost, Equivalent, Equivalent.
+
+-- pause --
+When to choose abstract class.
+
+The base needs to hold state (fields, properties with backing values, captured dependencies).
+You want a template method pattern, base orchestrates, subclasses fill in specific steps.
+The "is-a" relationship is structural and mandatory (an Entity is an entity, it has an Id, equality semantics, domain events).
+You want to lock down extension with sealed / internal patterns in a single hierarchy.
+The implementers are closely related; they share more than just the contract.
+
+-- pause --
+When to choose interface.
+
+You're expressing a capability, IDisposable, IComparable, IEnumerable. Implementations are unrelated.
+A type needs to satisfy multiple contracts ( Stream is IDisposable, IAsyncDisposable, et cetera).
+You're designing an extension point with implementations across assemblies you don't control.
+You want evolution-friendly public A P Is (add new members with default bodies).
+You need polymorphic statics, static abstract operators or factory methods (since C sharp 11).
+The implementing types are unrelated and share only the contract.
+
+Modern guidance: prefer interfaces for contracts; reach for abstract classes only when shared state genuinely demands it. Records, primary constructors, and default interface methods have made simple-base-class scenarios less compelling than they were in 2018.
+
+In the real world: the abstract base class that costs the most is the one that was right when it was written.
+A ControllerBase -style internal ServiceBase starts with a logger and a ct helper, and every reviewer who needs something in two services adds it there because that is where shared things go.
+Three years later it has a DbContext, an IMemoryCache, a Guid CorrelationId, and a protected virtual OnBeforeExecute that four of the nineteen subclasses override. Every unit test now constructs a database context to test a class that does arithmetic.
+Nothing about that trajectory is a bad decision at the point it is made, the base class is the path of least resistance for every individual change, which is exactly why the aggregate is bad.
+The review question that prevents it is not "is this shared?" but "will every subclass need this?", and the honest answer is usually no, at which point the thing being shared belongs in a component the two services that need it can hold.
+
+-- pause --
+6 worked examples, same problem, both ways.
+
+1. Logger, interface wins.
+
+Why: a logger is a capability. Console / Serilog / Seq loggers have nothing structurally in common; an abstract base just blocks them from inheriting from anything else.
+
+2. Repository, interface for the contract; abstract base for shared sequel (optional).
+
+Why: callers depend on the interface (testable, swappable). The base class is an implementation detail of the EF version, Mongo or in-memory implementations skip it.
+
+3. Domain entity, abstract base wins.
+
+Why: the Id field, the events list, and the equality logic are state. Interfaces can't hold instance state. This is the canonical "abstract class earns its keep" scenario.
+
+4. H T T P handler, depends on the framework.
+
+Why: MediatR's handler is pure capability + generic dispatch, interface. Razor Pages needs to inject framework state, abstract base. Minimal A P Is sidestep both with delegate-based handlers, the most modern shape.
+
+5. Validation, FluentValidation's abstract base.
+
+Why: RuleFor(.) mutates internal state inside AbstractValidator. An interface couldn't hold that state. Confirmed: state-heavy DSL to abstract base.
+
+6. Strategy / Plugin, interface.
+
+Why: gateways are interchangeable behaviors with no shared state and no kinship between Stripe and PayPal SDKs. Trying to extract a PaymentGatewayBase to share code would force unnatural coupling.
+
+-- pause --
+Performance, when it actually matters.
+
+Rank these by mechanism, not by invented nanosecond figures, the numbers depend on the C P U, the call site's type distribution, and whether the body inlines, and a candidate who quotes a multiplier will be asked where it came from.
+
+Direct method call (non-virtual), call to a known address, Nothing; usually inlined.
+Virtual call through abstract base, Load method-table pointer to fixed vtable slot to indirect call, One dependent load; not inlinable unless devirtualized.
+Interface call, Virtual Stub Dispatch (see above), How many concrete types reach this call site.
+Generic-constrained call, T = struct, constrained. to direct call on a dedicated jit'd body, Nothing; inlinable.
+Generic-constrained call, T = class, Shared __Canon body to ordinary interface or virtual dispatch, Same as an interface call.
+Sealed class / sealed override, jit proves the target is final to direct call, Nothing; inlinable.
+
+For the overwhelming majority of application code this ranking is irrelevant, the work inside the method dwarfs the dispatch. It starts mattering in hot loops running millions of iterations per second: math libraries, parsers, serializers, game loops.
+The levers, in order of effort: sealed on concrete internal types, generic constraints where the type argument is a struct, and restructuring so that hot call sites see few concrete types rather than many.
+
+Dynamic PGO (on by default since dot NET 8) narrows the gap by profiling which concrete type actually arrives at a call site and emitting a guarded direct call for it.
+It helps most where a site is monomorphic or nearly so, and cannot help a genuinely megamorphic site, which is the same conclusion the VSD section reaches from the other direction.
+
+-- pause --
+Versioning trade-offs, library-author perspective.
+
+Add abstract method, Breaks all subclasses, Breaks all implementers.
+Add virtual method with body, No break, N or A.
+Add member with default body, No break (use virtual ), No break (use default ), since C sharp 8.
+Add static abstract member, N or A, Breaks all implementers.
+Remove member, Breaks consumers, Breaks consumers.
+Change signature, Breaks consumers, Breaks consumers.
+
+Library-author rule: when shipping a public A P I you'll evolve over years, prefer interface + default methods over abstract base. You can add new members with default implementations later without breaking downstream code.
+
+Application-author rule: internal abstract classes are fine; you control all the subclasses, so the break-on-add risk is contained.
+
+In the real world: the versioning table understates one row. "Add member with default body, no break" is true at the compile level and can still be a behaviour break at the semantic level, and that is the failure mode teams actually hit.
+An IAuditSink gained bool ShouldAudit(Operation op) goes to true; with a default that made sense for the library's own sinks.
+Three consumers had sinks that were only ever meant to receive a subset of operations, they had been filtering upstream, at the registration site, and the new default quietly opted them into everything, so audit volume tripled overnight and one downstream store hit its retention quota.
+Nothing failed to compile and nothing threw.
+A default implementation is a decision you are making on behalf of code you have never seen, which is why the safest defaults are the ones that preserve existing behaviour (here: throw, or return the most conservative answer) rather than the ones that are most useful.
+
+-- pause --
+Common mistakes (8 senior interview red flags).
+
+IDisposable on contracts that don't manage resources, bloats the contract; consumers wonder why they need using.
+Marker interface like ITransactional with no members, use an attribute (queryable via reflection, no method-table overhead).
+God-base abstract class, accumulating concerns into one base because "subclasses might need this." Splits cleanly into composition.
+Type-switching on interfaces ( if (x is IFoo f). ), usually a sign you should have added the behavior to the contract polymorphically.
+new() constraint just to call a constructor in generic code, static abstract factory method (C sharp 11+) is cleaner.
+DIM calling this.OtherMethod(), couples the default to implementer state in subtle ways; document the assumption or avoid.
+Mixing virtual and abstract without intent, abstract = "must override, no default." virtual = "has default, can override." Make the choice deliberate.
+Inheritance for helper sharing, if a base class exists just to give subclasses helper methods, extension methods or composition are usually cleaner.
+
+-- pause --
+Multi-interface composition.
+
+Interfaces compose freely; abstract classes can't:
+
+The BCL is built on this pattern: pick one structural base if needed, then layer capabilities. This is why senior code review feedback often says "split this base class into two interfaces", to free types to implement them à la carte. Cross-link: Interface Segregation Principle in solid Principles.
+
+-- pause --
+Final decision matrix.
+
+Express a capability, "can do X", maps to, Interface.
+Multiple unrelated types share one contract, maps to, Interface.
+Shared default behavior, no state, maps to, Interface + default methods (C sharp 8+).
+Shared state + skeleton (template method), maps to, Abstract class.
+"Is-a" relationship is structural / mandatory, maps to, Abstract class.
+Polymorphic operators or factories, maps to, Interface + static abstract (C sharp 11+).
+Public-A P I evolution-friendly, maps to, Interface + default methods.
+Locking down a closed hierarchy, maps to, Abstract class (with sealed / internal ).
+Plugin / extension point across assemblies, maps to, Interface.
+Marker (no members, just a tag), maps to, Attribute, NOT an interface.
+State-heavy DSL (FluentValidation, builders), maps to, Abstract class.
+Generic constraint for "any type with method X", maps to, Interface.
+
+-- pause --
+What to remember.
+
+Interface for capability. Abstract class for shared state + skeleton. Default interface methods to evolve a public A P I without breaking. static abstract when you need polymorphic statics. Composition over deep inheritance, always.
+
+-- pause --
+Default interface methods (C sharp 8).
+
+Interfaces can have default member implementations:
+
+Why this matters: before C sharp 8, adding a method to a public interface was a breaking change for every existing implementer. With default methods, you can ship an evolved interface without breaking consumers, they pick up the default until they choose to override.
+
+Caveat: default interface methods are only callable through the interface, not through the implementing class. Microsoft's own tutorial states the rule flatly: "the SampleCustomer class doesn't inherit members from its interfaces. That rule hasn't changed.
+In order to call any method declared and implemented in the interface, the variable must be the type of the interface."
+
+In the real world: the reason this rule bites is that it splits implementers from consumers, and only one of them notices.
+A platform team added TryGetCorrelationId(out string id) to a widely-used IRequestContext with a sensible default, shipped it as a minor version, and nothing broke, that half worked exactly as advertised. What they did not anticipate was every consumer that held the concrete type.
+Internal call sites written as var ctx = new HttpRequestContext(); ctx.TryGetCorrelationId(.) did not compile, and the fix in each place was to change a variable's type, dozens of one-line changes across the solution that read like unrelated churn in the pull request.
+A default interface method is a non-breaking change for implementers and a source-visible change for anyone holding the concrete type. If your own code uses var over concrete types, you are that consumer.
+
+-- pause --
+The modifier rules nobody reads.
+
+Interface members are not "just methods with bodies". The C sharp 8 default interface methods feature specification defines a small set of rules that produce most of the surprises (all quotes are from its "Modifiers in interfaces" section):
+
+A member with a body is implicitly virtual. "An interface member whose declaration includes a body is a virtual member unless the sealed or private modifier is used." You do not write virtual, and you cannot make it non-virtual by omission.
+sealed makes it non-virtual. "A non-virtual member may be declared using the sealed keyword." This is the tool for a helper that implementers must not replace.
+private implies sealed, "It is an error for a private or sealed function member of an interface to have no body. A private function member may not have the modifier sealed." A private interface method is an implementation detail of the other default members and cannot be overridden.
+Access modifiers are allowed on interface members, and static members (fields, methods, properties) are permitted.
+"The default access level for all interface members is public." (Note the separate rule for the class side: an explicit interface member implementation may carry no modifiers at all, so writing public on one is CS0106.)
+
+That last line is the pattern from Microsoft's DIM tutorial and it is the answer to "how do implementers reuse the default's logic instead of reimplementing it": move the body into a protected static helper on the interface, have the default member call it, and let overriders call it too.
+
+-- pause --
+Re-abstraction, taking a default away.
+
+A derived interface can revoke a default it inherits, forcing implementers to supply one:
+
+The syntax is explicit-implementation form with abstract and no body. It is the interface analogue of abstract override on a class, and it exists for exactly the case, the default is right for the base contract and actively wrong for a specialisation of it.
+
+-- pause --
+The diamond rule, stated precisely.
+
+The page's mental model should be the spec's, not "two same-named methods clash". Every type needs a unique most specific implementation for each virtual interface member it inherits.
+One implementation is more specific than another if the type declaring it contains the other's declaring type among its direct or indirect interfaces (or if one is a class and the other an interface, classes win).
+
+The practical reading:
+
+Microsoft's own guidance on CS8705 names the shape:
+it "typically occurs with diamond inheritance patterns where a class implements multiple interfaces that each provide default implementations for the same member." The same member, a member inherited from a shared base interface, is the load-bearing phrase.
+Two unrelated interfaces each declaring their own Save() never produce this error.
+
+In the real world: the diamond arrives during a library split, never during design.
+A single IMessageHandler with a default HandleAsync that logged-and-swallowed got carved into IRetryableHandler and IDeadLetterHandler for two different teams, each of which overrode the default for its own semantics. Neither team's code broke.
+The break landed on the one consumer that legitimately needed both behaviours, in a different repository, at upgrade time, a CS8705 on a class declaration whose own file had not changed in a year. The fix was one method on the class, which is fine; the lesson is where the cost fell.
+Default implementations move the ambiguity from the library authors, who understand the semantics, to the consumer, who has to invent a tiebreak. Re-abstracting in each derived interface rather than overriding would have turned a confusing error at the consumer into a clear one at each implementer.
+
+-- pause --
+The runtime gate.
+
+Default interface methods are one of the few C sharp 8 features that needed runtime support, not just compiler support, the C L R had to learn to resolve a call to a member with no implementation in the class.
+They require dot NET Core 3.0 / dot NET Standard 2.1 or later; targeting dot NET Framework produces CS8701 "target runtime doesn't support default interface implementation". Worth knowing if any of your solution still multi-targets net48.
+
+-- pause --
+Explicit interface implementation.
+
+When a class implements multiple interfaces with the same member name, or when the implementing class wants to hide an interface member from its public surface, explicit implementation disambiguates:
+
+Use explicit implementation when:
+Two interfaces share a method name with different semantics.
+You want callers to opt into using the interface rather than calling on the concrete type (often a deliberate A P I choice).
+The interface name is wrong for your domain. The language specification uses exactly this example: a class implementing a file abstraction exposes a Close() member that reads naturally to its callers, and implements IDisposable.Dispose() explicitly by delegating to it.
+
+An explicit implementation cannot be overridden.
+The spec is blunt: "It is a compile-time error for an explicit interface member implementation to include any modifiers other than extern or async." No virtual, no abstract, no override, no access modifier, try one and you get CS0106 "The modifier is not valid for this item".
+So a derived class has no way to change it, which is either the point (you are locking the contract) or a wall you hit later. (The one place abstract is legal in explicit-implementation form is inside a derived interface, where it means re-abstraction, see.
+The rule quoted here is the class or struct rule.)
+
+The standard escape hatch, and the shape of the BCL's own dispose pattern, is to make the explicit implementation a one-line forwarder to a protected virtual method:
+
+-- pause --
+Interface mapping is separate from virtual dispatch, the two gotchas.
+
+This is the highest-value pair of facts in this section, because both are counterintuitive, both are spelled out in the language specification, and both come up as cross-questions.
+
+Gotcha 1, new does not change the interface mapping. If a base class implements an interface member with a non-virtual method, that mapping is fixed. A derived class that hides it with new changes what class-typed references see and nothing else. The spec's own example:
+
+The spec's wording: the derived Paint "hides the Paint method in Control, but it does not alter the mapping of Control.Paint onto IControl.Paint." And, generally:
+"Without explicitly re-implementing an interface, a derived class cannot in any way alter the interface mappings it inherits from its base classes."
+
+The fix is one keyword, make the base method virtual and override it, because "when an interface method is mapped onto a virtual method in a class, it is possible for derived classes to override the virtual method and alter the implementation of the interface."
+
+Gotcha 2, interface re-implementation. A derived class can alter the mapping, by naming the interface again in its own base list.
+Per the spec: "A class that inherits an interface implementation is permitted to re-implement the interface by including it in the base class list," and "the inherited interface mapping has no effect whatsoever on the interface mapping established for the re-implementation."
+
+The mapping is rebuilt from scratch for MyControl, using its own members plus any inherited public or explicit members that still match.
+Two things follow: re-implementation is the only supported way to take over an interface a base class implemented non-virtually,
+and "a re-implementation of an interface is also implicitly a re-implementation of all of the interface's base interfaces", so re-listing a derived interface silently reshuffles the base interfaces too.
+
+In the real world: this is the bug that produces "the framework isn't calling my code". A base HandlerBase implemented IDisposable with a plain public void Dispose(), non-virtual, because nobody thought about it.
+A derived handler that owned a SqlConnection added public new void Dispose() (CS0108 asked for new, the base member was not virtual, so override was never on the table, and the warning went away). Direct calls in tests worked, because tests held the derived type.
+Production held IDisposable, the D I container disposes through the interface, so the base Dispose ran and the connections leaked until the pool was exhausted, hours later, under load, with an error message about connection timeouts that pointed at the database.
+The single-keyword fix ( virtual on the base, override on the derived) is invisible in a diff; the reason to know this rule is that new on a method that participates in an interface mapping should read as a defect on sight.
+
+-- pause --
+Static abstract members (C sharp 11).
+
+C sharp 11 introduced static abstract members in interfaces, a member can be static abstract, requiring each implementing type to provide its own static implementation. This unlocks generic math.
+
+The BCL ships INumber, IAdditionOperators, IParsable, ISpanParsable and friends as the constraints to reach for when you need generic numeric or parsing code. Deep dive in 04-generics-and-variance.md.
+
+The dispatch model is different from everything else on this page, and this is the cross-question.
+The C sharp language reference for the interface keyword is explicit: "The static virtual and static abstract methods declared in interfaces don't have a runtime dispatch mechanism analogous to virtual or abstract methods declared in classes.
+Instead, the compiler uses type information available at compile time." There is no vtable slot for a static member and nothing to look up on an instance, you cannot call T.Zero through an IAddable reference, only through a type parameter constrained to the interface.
+That is why the self-referencing constraint where T: IAddable is not decoration: it is the only channel through which the member is reachable.
+
+The shared-generics caveat from the boxing section applies here too. For T = a struct, the jit compiles a dedicated body and T.Zero becomes a direct call.
+For T = a class, the body is shared over __Canon and the target is reached through the runtime generic dictionary, still correct, still fast, but not the "zero-cost, fully monomorphised" story that gets told about generic math. Generic math is a value-type story first.
+
+In the real world: the honest use case for static abstract in a line-of-business codebase is not arithmetic, it is parsing and construction in generic infrastructure.
+A team had twelve TryParse -style value objects ( OrderNumber, Sku, Iban,. ) and a generic minimal-A P I binder that needed "any type that knows how to build itself from a string".
+Before C sharp 11 that meant either a new() constraint plus an instance Initialize method, or a static registry of Func populated by reflection at startup, the second of which fails at runtime, in production, when someone adds a thirteenth type and forgets to register it.
+where T: IParsable moves that failure to the compiler. The win is not speed; it is that "you forgot to wire it up" stops being a runtime concept.
+
+-- pause --
+Equality, GetHashCode, and the records angle.
+
+Equality is a senior-interview minefield. The wrong implementation silently breaks Dictionary, HashSet, Distinct(), E F Core's change tracker, and any link operator that uses default equality. The full picture:
+
+The four equality A P Is:
+
+object.Equals(object), virtual on object; the foundation. Default for reference types: reference equality ( ReferenceEquals ). Override for value semantics.
+object.GetHashCode(), virtual on object; must be consistent with Equals. Default for reference types: based on object identity (heap address-ish).
+IEquatable, generic, strongly-typed Equals(T). Avoids boxing for value types and disambiguates from object.Equals. BCL collections check for it.
+operator ==, overloadable for both reference and value types. Default for ref types: reference equality; for value types: not generated by default (must overload or use records).
+
+The contract (memorize this; interviewers hammer it):
+
+Manual implementation (the pre-records pattern):
+
+That's ~15 lines to do equality right manually. Records generate all of this automatically.
+
+Records (C sharp 9+), equality for free:
+
+Records auto-generate:
+Equals(object) + Equals(T) (implements IEquatable ).
+GetHashCode() based on all properties.
+op_Equality / op_Inequality.
+ToString() showing all properties.
+with expression support (clones with overrides).
+Deconstructor ( var (amount, currency) = money; ).
+
+Record class versus record struct:
+record class (the default with record keyword), reference type, heap-allocated, but with value equality semantics.
+record struct (C sharp 10+), value type, stack-friendly, also with value equality semantics. Best for small DTOs.
+readonly record struct, immutable value type, perfect for keys.
+
+Reference equality, object.ReferenceEquals(a, b) bypasses any override and checks "are these the same heap object?" Useful for:
+Cache key identity checks ("is this the exact instance I cached?")
+Avoiding infinite recursion in Equals overrides on circular graphs.
+
+The mutability trap:
+
+Rule: any object used as a dictionary key MUST be immutable for the duration of its membership. Records make this trivially safe (records are immutable by default).
+
+In the real world: the mutable-key bug does not present as a lookup failure, it presents as a leak. An in-process cache keyed on a domain object worked for a year because nothing mutated the key.
+Then a feature let users rename a tenant, the rename path updated the same instance that was sitting in the dictionary, and from that moment every lookup for that tenant missed and inserted a fresh entry.
+Reads still returned correct data, the cache was doing its job, just never hitting, so the only symptom was a working-set graph that climbed all week and dropped on every deploy. The dictionary was the last place anyone looked, because the dictionary was not throwing.
+Two habits close this permanently: key on a readonly record struct or a primitive rather than an entity, and treat GetHashCode over a settable property as a code-review defect regardless of what the current callers do.
+
+Common mistakes:
+Override Equals but forget GetHashCode to compiler warning CS0659. Listen to it.
+Override == but forget Equals to same operator, divergent results in link.
+GetHashCode based on mutable fields to corrupted hashtables.
+Implement IEquatable but not override object.Equals to boxing path uses default reference equality; non-boxed path uses your logic. Subtle inconsistency.
+RuntimeHelpers.GetHashCode(obj), bypasses override; returns identity hash. Use only when you specifically need identity-based hashing (for example, conditional weak table keys).
+
+Senior takeaway: in 2026, use record types for any "value-shaped" reference type, DTOs, query results, value objects. Records eliminate ~15 lines of correct-but-tedious equality plumbing per class.
+
+-- pause --
+Liskov Substitution in code.
+
+The principle (Barbara Liskov, 1987): if S is a subtype of T, then objects of type T should be replaceable with objects of type S without breaking the program. In English: derived classes shouldn't change the meaning of the base class's contract.
+
+Classic violation #1, Rectangle or Square:
+
+The StretchAndCheck method works on every Rectangle but fails on Square, Square strengthens the precondition that width and height move together. LSP violation.
+
+Fix: don't model Square as a subtype of Rectangle. They share an abstract IShape (with Area ), but Square and Rectangle are siblings.
+
+Classic violation #2, Bird or Penguin:
+
+The Bird contract implies "this method works." Penguin weakens the contract by throwing. LSP violation.
+
+Fix: split capability from inheritance. IFlyer interface is implemented by Eagle and Pigeon but not Penguin. Or: rename Fly to AttemptFly and document that it may throw, but that's lipstick on the violation.
+
+Contract weakening anti-pattern (general form):
+Derived class strengthens preconditions (accepts fewer inputs than base).
+Derived class weakens postconditions (returns less / weaker results than base).
+Derived class throws new exception types the base didn't declare.
+Derived class mutates state the base wouldn't have.
+
+In the real world: Penguin.Fly() is a teaching example; the production version is NotSupportedException in an override, and it is everywhere. A PaymentGateway base declared Task RefundAsync(.) because three of the four gateways supported refunds, and the fourth threw.
+Every caller acquired an if (gateway is not ManualBankTransferGateway) check, which is a type test wearing a polymorphism costume, and the day a fifth gateway was added without refunds, the checks were in eleven places and nine of them were updated.
+The tell that this is an LSP violation rather than an inconvenience: the base class's contract is only true for some of its subtypes, so callers cannot be written against the base.
+The repair is not a better exception; it is splitting IRefundable out so the type system carries the information the if was carrying.
+The BCL, notably, does not take its own advice here, Stream.Seek throws on a network stream and you are expected to check CanSeek, which is a fair interview answer as long as you can also say why the capability-flag pattern is the weaker of the two designs.
+
+A real-world LSP-friendly design, IEnumerable covariance:
+
+This works because IEnumerable is IEnumerable, T only appears in output positions. Returning Dog where Animal is expected is safe (every Dog is an Animal).
+List is invariant (T appears in input positions: Add(T) ), so List is NOT assignable to List, preventing the unsafe animals.Add(new Cat()) scenario. LSP at the type-system level.
+
+Cross-link: solid, Liskov Substitution Principle for the full essay treatment.
+
+-- pause --
+Reflection-based instantiation.
+
+Reflection-based factories ( IServiceProvider, Jason deserializers, ORMs, plugin loaders) instantiate types at runtime. Several rules and edge cases come up in senior interviews:
+
+Activator.CreateInstance, what works and what doesn't:
+
+ConstructorInfo.Invoke, more control:
+
+Common bug: GetConstructor returns null when the signature doesn't match, common after a ctor change in upstream code that breaks reflection-based factories silently. Always null-check and throw a clear error.
+
+In the real world: reflection-based instantiation is where "add a constructor parameter" becomes a runtime failure.
+A plugin host resolved handler types with Activator.CreateInstance(type), the parameterless overload, and every plugin was written with a parameterless constructor because that was the documented rule.
+A plugin author later added a constructor taking an ILogger, which removed the implicit parameterless one, and the host threw MissingMethodException naming the plugin type with no hint about why.
+The instructive part is what the fix was not: adding non Public: true (there was no private ctor to find) or catching and skipping (which silently drops plugins).
+It was switching the host to ActivatorUtilities.CreateInstance(service Provider, type) from Microsoft.Extensions.DependencyInjection.Abstractions,
+which resolves constructor parameters from the container and turns "you must have a parameterless constructor" into "you may ask for anything registered".
+If you own a plugin host, that one A P I is the difference between a rule plugin authors must remember and a rule the framework enforces.
+
+Generic new() constraint:
+
+Under the hood, new T() in a generic method uses Activator.CreateInstance(). Modern jit specializes per concrete T, so the cost is near-zero for reference types.
+
+D I containers ( Microsoft.Extensions.DependencyInjection ):
+Uses constructor reflection + parameter resolution.
+Picks the constructor with the most parameters it can satisfy from the container.
+Cannot instantiate abstract types or interfaces directly, they must be registered against a concrete implementation:
+
+Cannot resolve types with private constructors unless registered as factory functions:
+
+Cross-question gotcha: "Why can't D I just call Activator.CreateInstance(typeof(IRepository)) ?" Because interfaces have no implementation, there's nothing to allocate. Reflection has the same constraint. The container must be told which concrete type to use.
+
+Type.IsAbstract / Type.IsInterface, runtime checks to avoid the MissingMethodException:
+
+-- pause --
+Composition versus Inheritance, the senior verdict.
+
+The principle: favor composition over inheritance. Gang of Four (1994), still true in 2026. Inheritance creates tight coupling between base and derived; composition lets behavior vary at runtime and across types that don't share an "is-a" relationship.
+
+When inheritance IS the right tool:
+Genuine "is-a" relationship with shared state, domain Entity, A S P dot NET Core PageModel, E F Core's DbContext.
+Framework-mandated bases (Razor Pages, M V C controllers).
+Sealed final-form hierarchies with no extension needs (for example, D D D value objects).
+
+When composition wins (the 95% case):
+"Has-a" / "uses-a" / "depends-on" relationships.
+Behavior that should be swappable at runtime (Strategy pattern).
+Behavior shared across unrelated types (for example, logging, caching, retry).
+Anything that might need to vary independently from the type hierarchy.
+
+Worked refactor, inheritance to composition:
+
+Before (inheritance-heavy):
+
+After (composition):
+
+The senior signal: when you see a hierarchy more than 2 levels deep, ask "could this be composition?" Almost always yes. The Decorator pattern is the canonical example of composition replacing inheritance.
+
+In the real world: the refactor is not hypothetical, it is what Microsoft.Extensions.Logging and HttpClient both look like, and the reason is worth being able to say out loud.
+HttpClient does not have RetryingHttpClient and LoggingHttpClient subclasses; it takes a HttpMessageHandler, and handlers chain via DelegatingHandler, so retry, logging, auth headers and circuit-breaking compose in any order without a single new subclass.
+An inheritance design would need one class per combination, and the combinations are the product of the options, not the sum.
+That is the concrete version of "composition scales, inheritance multiplies": every capability you add by composition is one new type; every capability you add by inheritance is one new type per existing branch of the hierarchy.
+The interview version of this question is usually "why does AddHttpClient return a builder you attach handlers to instead of a client you subclass?", and this is the answer.
+
+The exceptions (when not to compose):
+The "wrapper" composition would just be ceremony, for example, a DomainEntity is meaningfully a kind of entity; making HasId a separate component is over-engineering.
+Framework requires you inherit (you can't avoid PageModel if you're using Razor Pages).
+Performance: composition adds one indirection per call; in microsecond-sensitive code, inheritance may marginally win (rare in modern dot NET).
+
+Cross-link: Design Patterns, Decorator, Strategy, Composite all replace inheritance with composition.
+
+-- pause --
+Polymorphism patterns.
+
+C sharp OOP gives you many ways to express "different behavior under the same call." The five most common in real code:
+
+Virtual override ( Speak() in the example above), straight inheritance dispatch.
+Strategy pattern, inject an interface, swap implementations at runtime.
+
+Template method, abstract class defines the skeleton; subclasses fill in steps.
+
+Pattern matching dispatch, type switch over a closed set of subtypes (often records).
+
+Static abstract / generic dispatch, compile-time monomorphization, no virtual call cost. Used for high-perf code (numeric algorithms, parsers).
+
+Each fits a niche. For new code, prefer strategy for runtime variation, pattern matching for closed hierarchies (especially with records), and template method when shared scaffolding genuinely justifies an abstract class.
+
+In the real world: the choice between (1) virtual override and (4) pattern-matching dispatch is really a choice about where you want to be forced to change code, and it decides which kind of change is cheap for the next five years.
+Virtual dispatch makes adding a type cheap (write a new subclass, nothing else moves) and adding an operation expensive (touch every subclass).
+Pattern matching over a hierarchy inverts it: adding an operation is one new switch, adding a type means finding every switch, and here C sharp gives you less help than people assume.
+C sharp 14 has no closed or sealed-hierarchy exhaustiveness for classes (discriminated unions remain a language proposal),
+so the compiler cannot prove a switch over Shape is exhaustive and will emit CS8509 (the switch expression does not handle all possible values of its input type) whether or not you have covered every subtype.
+The practical discipline is therefore a _ goes to throw new UnreachableException() arm, a runtime failure that is loud and immediate, rather than a compiler guarantee that does not exist. So the question to ask about a domain is which axis actually grows.
+Payment methods keep being added and the operations are stable to virtual dispatch. A parsed expression tree has a fixed set of node types and grows new passes forever to pattern matching. Getting this backwards isn't a bug, it's a tax you pay on every feature.
+
+-- pause --
+Section 3. Code and diagrams.
+
+Diamond avoided via interfaces:
+
+Interface mapping versus hiding, where the arrows actually point:
+
+The interface mapping always points at a slot, not at a method body. If the slot is non-virtual, the mapping is nailed to one implementation forever; if the slot is virtual, overriding it moves the interface too.
+
+Where an interface call actually goes (CoreCLR, Virtual Stub Dispatch):
+
+-- pause --
+Section 4. Common pitfalls.
+
+Forgetting override. Without it, the compiler warns and your method hides the base; the polymorphism you expected silently doesn't happen. Always explicit override or new.
+Calling virtual methods from a constructor. During base-class construction, the runtime type is the derived class but its fields aren't initialized yet. The virtual call dispatches to the derived override, which may use uninitialized fields. Avoid.
+Sealing too early. Sealing a class is a backward-compat decision; if a future caller needs to subclass, you've blocked them. Default to sealed only for types that genuinely shouldn't be extended (records, value-like classes).
+Public fields instead of properties. Hard to evolve. Adding validation, lazy loading, or notifications later requires changing every caller. Always use properties.
+Overriding Equals without GetHashCode. A type with a custom Equals but default GetHashCode breaks dictionaries, hash sets, et cetera Always override both (or neither).
+Treating an interface like a base class. Default interface methods are virtual (a body without sealed or private makes them so), but they are not members of the implementing class, they're only invokable through an interface-typed reference.
+If you need the member on the class's own surface, the class must declare it.
+Multiple inheritance of state via interfaces with default methods. It's tempting to put a default method that uses an abstract property, but interfaces cannot have backing instance state.
+The implementing class still owns all state; a static field in an interface is shared across every implementer in the process, which is almost never what the author meant.
+Primary constructor parameters captured by surprise. If you write public class S(IRepo repo) { / never use repo / }, the compiler doesn't allocate a backing field. But adding public IRepo Repo goes to repo; later silently introduces a hidden field.
+For clarity in shared code, declare explicit properties: public IRepo Repo { get; } = repo;.
+Mutating primary-ctor parameters. They're mutable variables, not read-only fields. repo = null; from anywhere in the class compiles. Treat them as readonly by convention or assign to a readonly field.
+static abstract member without a corresponding generic constraint. Static abstracts are only callable through generic code with the constraint where T: ITheInterface.
+There is no runtime dispatch for them, the compiler resolves them from the type argument, so without the constraint the member is simply unreachable. Pair them.
+new on a method that participates in an interface mapping. If the base implements the interface member non-virtually, new in the derived class changes what class-typed callers see and leaves the interface mapping pointing at the base.
+Every framework that calls you through the interface, D I disposal, serializers, the A S P dot NET Core pipeline, keeps running the base implementation. Make the base member virtual and override it, or re-implement the interface on the derived class.
+Explicit interface implementations that later need an extension point. They cannot carry virtual, so no derived class can change them.
+If there is any chance a subclass needs to participate, forward from the explicit implementation to a protected virtual method on day one, retrofitting it is a breaking change for anyone who was calling through the interface.
+Assuming a generic constraint devirtualizes for reference types. Reference-type instantiations share one __Canon body; only value-type instantiations get a dedicated, specialized one.
+where T: IFoo removes boxing and improves the A P I, but for T = SomeClass the call is still a normal interface dispatch.
+Reaching for an abstract base class to make a call site faster. The cost of a dispatch is a property of the call site's type distribution, not of the interface keyword. If a site is megamorphic, a vtable indirection is no more predictable than a resolve-stub lookup.
+Change the shape of the dispatch (partition by key, cache a delegate, specialize the hot type) rather than the declaration keyword.
+
+-- pause --
+Section 5. Interview-ready summary.
+
+C sharp supports single class inheritance + multiple interface implementation.
+virtual / override = polymorphic dispatch via vtable. new hides, almost always wrong.
+Abstract class = state + shared skeleton + single inheritance. Interface = capability + multiple inheritance + (since C sharp 8) default methods.
+Default interface methods (C sharp 8) let you evolve interfaces without breaking implementers; only callable through the interface type.
+Static abstract members (C sharp 11) enable generic math via constraints like where T: INumber.
+Primary constructors for classes (C sharp 12), class-header parameters captured by methods; not auto-properties; mutable; idiomatic for D I services.
+required (C sharp 11) forces caller to set in object initializer or constructor; works with init for "required immutable."
+Five polymorphism patterns: virtual override, strategy (inject interface), template method (abstract class skeleton), pattern matching (records + switch), static abstract / generic.
+Override Equals? Override GetHashCode. Always together.
+Covariant returns (C sharp 9 language gate, dot NET 5 runtime gate): an override may return a more derived type; classes and read-only properties only, never interfaces or value types.
+Interface dispatch is Virtual Stub Dispatch, not a table walk. Cost is a property of how many concrete types reach the call site, not of the interface keyword.
+Interface mapping not equal to virtual dispatch. new cannot change a mapping the base established non-virtually; only virtual / override or re-implementing the interface can.
+Explicit interface implementations take no modifiers other than extern / async, so they can never be overridden, forward to a protected virtual if you want an extension point.
+constrained. is the mechanism behind non-boxing generic calls on structs, and it does box when the struct doesn't override the object / ValueType member being called.
+Generic constraints specialize for value types only. Reference-type instantiations share a __Canon body, so where T: IFoo over classes is still an ordinary interface dispatch.
+
+-- pause --
+Section 6. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Abstract class versus interface.
+
+Q: When would you choose an abstract class over an interface?-- think --
+
+A: When the contract needs to hold instance state (fields, mutable properties, captured dependencies) or share template-method skeleton logic across implementers that share a structural "is-a" relationship.
+
+Cross-Q: Since C sharp 11 added static abstract and C sharp 8 added default interface methods, can't interfaces do everything abstract classes can now?-- think --
+
+A: Almost. Interfaces still cannot hold instance state, only static fields via DIM. Abstract classes can hold instance fields and have constructors that initialize them.
+For state-carrying contracts (domain Entity with Id and domain-events list, framework-mandated bases like PageModel ), abstract class is still the right answer. Everything else is interface territory.
+
+Cross-Q²: If two interfaces both define a default Log() method and a class implements both, which one runs?-- think --
+
+A: It depends on whether they are the same member, and the trap is to answer "CS8705" reflexively.
+If IReader and IWriter are unrelated and each declares its own Log(), there are two distinct members, each with exactly one implementation, it compiles fine, and the caller picks by which interface reference it holds: ((IReader)x).Log() versus ((IWriter)x).Log().
+x.Log() on the class doesn't compile at all, because default members are never on the class's surface. CS8705 requires a real diamond: one member declared on a shared base interface, overridden by two derived interfaces, neither of which is more specific than the other.
+Then you must supply the most specific implementation yourself, and a class implementation always wins over an interface one.
+
+-- pause --
+Drill 2, Constructor execution order.
+
+Q: In new Dog("Rex") where Dog: Animal: object, what's the exact execution order?-- think --
+
+A: Memory allocation to Dog 's field initializers to Animal 's field initializers to object 's ctor body to Animal 's ctor body to Dog 's ctor body.
+
+Cross-Q: If Animal 's ctor calls a virtual method Render() that Dog overrides, and Dog 's Render() reads a field that Dog 's ctor body would initialize, what happens?-- think --
+
+A: Dog.Render() runs (the vtable was wired up at allocation), but the field is at its default value because Dog 's ctor body hasn't run yet. This is the "no virtual call from constructor" anti-pattern, flagged by CA2214.
+The standard fix: don't call virtuals from ctors; initialize in a protected virtual OnInitialized() that callers invoke after construction.
+
+Cross-Q²: What if Animal has a static constructor that throws?-- think --
+
+A: First access to Animal triggers the static ctor; the throw becomes TypeInitializationException. Worse: the type is marked broken for the rest of the AppDomain, every subsequent attempt to use it (including subclassing Dog ) throws immediately.
+Static-ctor exceptions are unrecoverable, which is why static-ctor logic must be bulletproof (no I O, no config access, no allocation that could OOM).
+
+-- pause --
+Drill 3, Virtual dispatch.
+
+Q: Walk me through Animal a = new Dog(); a.Speak(); where Animal.Speak is virtual and Dog overrides it.-- think --
+
+A: The I L emits callvirt Animal:Speak. At runtime, the jit looks up the Speak slot in the runtime type's vtable, which for Dog points to Dog.Speak. So Dog.Speak() runs, even through an Animal reference. That's polymorphism.
+
+Cross-Q: What changes if Dog uses new void Speak() instead of override ?-- think --
+
+A: new introduces a separate slot in Dog 's vtable, not replacing the inherited slot. Calling a.Speak() (through Animal reference) dispatches via Animal 's slot to Animal.Speak. Calling ((Dog)a).Speak() dispatches via Dog 's separate slot to Dog.Speak.
+This is why new causes "which one runs?" ambiguity, the answer depends on the variable's static type, not the object's runtime type.
+
+Cross-Q²: If I sealed override Speak() in Dog, what does the jit do?-- think --
+
+A: The jit knows no further class can override Speak(), so it can devirtualize the call, replace callvirt with a direct call Dog:Speak.
+The dispatch saving is the smaller half; the larger half is that a direct call to a known target becomes a candidate for inlining, after which constant propagation and dead-code elimination can work across what used to be a call boundary.
+That's why the payoff is impossible to state as a fixed number: it depends entirely on whether the body inlines and what the optimizer can then prove. Same trick applies to sealed class Dog, every virtual call through a Dog -typed reference can be devirtualized.
+
+-- pause --
+Drill 4, Boxing on value types.
+
+Q: Does this code box? Money m = new Money(); IComparable c = m; c.CompareTo(.).-- think --
+
+A: Yes. The assignment IComparable c = m boxes m, copies the struct to a new heap object wrapped in an object header. Subsequent c.CompareTo is a virtual interface call on the boxed object.
+
+Cross-Q: How would you call CompareTo on a value type without boxing?-- think --
+
+A: Two ways. (1) Call it through the struct type directly: m.CompareTo(other), direct call, no box.
+(2) Pass through a generic method with an interface constraint: static int Cmp(T a, T b) where T: IComparable goes to a.CompareTo(b);, the jit specializes per concrete T, so for T = Money it generates a Money-specific method with no box.
+
+Cross-Q²: Why does List.Sort() not box, but ArrayList.Sort() does?-- think --
+
+A: List is List specialized for int. Its Sort() uses Comparer.Default, which in turn uses IComparable.CompareTo(int), non-boxing generic interface call. ArrayList stores object references, so every element is already boxed when added.
+Its Sort() uses the non-generic IComparable.CompareTo(object), which works on the boxed values. List is one of the strongest reasons to never use ArrayList in modern dot NET.
+
+-- pause --
+Drill 5, Equality.
+
+Q: When should you override Equals on a class?-- think --
+
+A: When the class represents a "value", equal-by-content rather than equal-by-identity. Examples: money, dates, value objects, immutable DTOs.
+For "entity" classes (Person with Id), reference equality is usually correct because two Person(Id set to 42) instances should be considered the same entity but you want to know if they're the same object reference.
+
+Cross-Q: What's the GetHashCode contract?-- think --
+
+A: Equal objects MUST have equal hash codes. Unequal objects SHOULD have different hash codes (not required, but improves dictionary perf). Hash code MUST NOT change while the object is in a hash-based collection (mutating a key after Add corrupts the dictionary, entry becomes "lost").
+Implement GetHashCode from the same fields as Equals.
+
+Cross-Q²: I Add a mutable object as a Dictionary key, then mutate a field that participates in GetHashCode. What happens to the entry?-- think --
+
+A: It's still in the dictionary (count is unchanged) but TryGetValue with the same reference now returns false, the entry is in the bucket for the old hash code, but the lookup goes to the new bucket.
+The entry is leaked (memory held, never findable, never collected as long as the dictionary lives). Rule: dictionary keys must be immutable. Records and readonly record struct make this trivially safe.
+
+-- pause --
+Drill 6, Liskov Substitution.
+
+Q: What's a Liskov violation in Square: Rectangle ?-- think --
+
+A: Rectangle 's contract allows width and height to vary independently. Square strengthens the precondition by forcing them to move together. Code that worked on every Rectangle (for example, r.Width = 5; r.Height = 10; assert(r.Area == 50) ) fails when given a Square.
+
+Cross-Q: How would you fix it?-- think --
+
+A: Don't model Square as a subtype of Rectangle. They share an abstraction ( IShape with Area ), but they're siblings, not parent-and-child. Mathematically a square is a rectangle, but mathematically immutable squares; in code, mutable squares break the rectangle contract.
+The taxonomy of the real world doesn't always map to the type hierarchy that works in code.
+
+Cross-Q²: Why does C sharp even let you compile Square: Rectangle with the broken behavior?-- think --
+
+A: The compiler enforces type compatibility (every Square IS a Rectangle -shaped reference), not semantic correctness. Liskov violations are semantic, about the contract intent, not the type signature. No compiler can catch them in general (would require full theorem proving).
+The defense is design review + integration tests that exercise base-class contracts on derived instances.
+
+-- pause --
+Drill 7, Reflection instantiation.
+
+Q: Can Activator.CreateInstance(typeof(IRepository)) create an instance?-- think --
+
+A: No, it throws MissingMethodException. Interfaces have no implementation, so there's nothing to allocate. Same for Activator.CreateInstance(typeof(AbstractEntity)), abstract classes can't be instantiated either.
+
+Cross-Q: How does A S P dot NET Core's D I container then resolve IRepository ?-- think --
+
+A: The container is told which concrete type to use: services.AddScoped().
+When something asks for IRepository, the container looks up the registered concrete type, reflects on its constructors, picks the one with the most resolvable parameters, recursively resolves each parameter, and calls the chosen ctor.
+
+Cross-Q²: I have a class with a private ctor used by a static factory Create(). Can D I resolve it?-- think --
+
+A: Not by default, D I's reflection-based resolution requires a public ctor. You either (a) make the ctor public, (b) register a factory: services.AddScoped(_ goes to Locked.Create());, or (c) use ActivatorUtilities.CreateInstance which can be configured to honor non-public ctors via BindingFlags.
+The factory approach is most idiomatic and keeps the ctor private.
+
+-- pause --
+Drill 8, Generic variance.
+
+Q: Why is IEnumerable assignable to IEnumerable but List isn't to List ?-- think --
+
+A: IEnumerable is covariant, T only appears in output positions (the Current property). Returning Dog where Animal is expected is safe (every Dog is an Animal). List is invariant, T also appears in input positions ( Add(T) ).
+If List were assignable to List, you could Add(new Cat()) through the Animal -typed reference. Type safety breaks. Compiler refuses.
+
+Cross-Q: When would you use in T (contravariance)?-- think --
+
+A: For interfaces that consume T only: IComparer, Action, predicates. An IComparer can compare any two Animals, including Dogs. So IComparer is assignable to IComparer (contravariance: more general accepted where more specific is expected). The opposite of out /covariance.
+
+Cross-Q²: Arrays in C sharp are covariant, Dog[] is assignable to Animal[]. Is that safe?-- think --
+
+A: No, and it's the classic dot NET design wart. Animal[] a = new Dog[10]; a[0] = new Cat(); compiles but throws ArrayTypeMismatchException at runtime. Java has the same issue.
+Modern dot NET added generics specifically to avoid it, generic collections ( List, IList ) are invariant, which is why List to List is correctly rejected at compile time.
+
+-- pause --
+Drill 9, sealed.
+
+Q: What does sealed override mean?-- think --
+
+A: It overrides a virtual method and locks it, no further class in the chain can override it again. The class itself can still be subclassed; only that one method is final.
+
+Cross-Q: Why would the jit care about that keyword?-- think --
+
+A: Because once the jit knows no override is possible, it can devirtualize, replace the callvirt with a direct call, and potentially inline the method body. Without sealed, the jit must assume any subclass could override and use vtable lookup.
+
+Cross-Q²: How would you quantify the win in a hot loop calling a virtual method a hundred million times?-- think --
+
+A: By measuring it with BenchmarkDotNet on the actual workload, and saying that is the correct answer, not a dodge, because the honest components don't compose into a number.
+One indirect call is removed (cheap on its own, and well branch-predicted when the site is monomorphic), plus whatever the optimizer gains once the target is known and the body inlines, which can be large, or exactly zero for a method the jit declines to inline.
+Anyone quoting a fixed multiplier is quoting a microbenchmark of a method body that isn't yours. Dynamic PGO (on by default since dot NET 8) already does much of this speculatively without sealed; explicit sealed makes it unconditional and free.
+The one claim you can make without measuring is that it never makes things slower.
+
+-- pause --
+Drill 10, Static constructors.
+
+Q: When does the static constructor for Dog run, given Dog: Animal ?-- think --
+
+A: Lazily, the first time Dog is touched: instance creation, static-field access, or static-method call. The runtime guarantees it runs exactly once per AppDomain and is thread-safe.
+
+Cross-Q: Does Animal 's static ctor run before Dog 's when I write new Dog() ?-- think --
+
+A: Generally yes, Animal 's static ctor runs the first time anything triggers loading Animal 's type info, which happens when constructing Dog (the runtime needs the base type's metadata).
+The exact order depends on the beforefieldinit attribute: types without an explicit static ctor get optimized lazy initialization (might run later); types with an explicit static ctor run before any access.
+
+Cross-Q²: A static ctor throws. What's recoverable?-- think --
+
+A: Nothing. The exception is wrapped in TypeInitializationException and the type is permanently broken for the rest of the AppDomain, every subsequent attempt to use it ( new, static access, even reflection on its members) re-throws the same TypeInitializationException.
+There is no A P I to "retry" the static ctor. This is why static ctors must be bulletproof, no I O, no config access, no allocation paths that could OOM.
+
+-- pause --
+Drill 11, Default interface methods conflict.
+
+Q: If IReader and IBackup both have a default method void Save() goes to.; and class Repo: IReader, IBackup doesn't override it, what happens?-- think --
+
+A: It compiles. This is the trap in the question, two unrelated interfaces declaring Save() are two distinct members, each with exactly one implementation, so there is nothing to disambiguate. ((IReader)r).Save() runs IReader 's default and ((IBackup)r).Save() runs IBackup 's.
+The only thing that doesn't work is r.Save(), because default members never appear on the implementing class's surface.
+
+Cross-Q: Then what actually produces CS8705?-- think --
+
+A: A genuine diamond, one member, inherited from a shared base interface, with two competing overrides:
+csharp.
+public interface IStore { void Save() goes to Console.WriteLine("base"); }.
+public interface ILocal: IStore { void IStore.Save() goes to Console.WriteLine("local"); }.
+public interface IRemote: IStore { void IStore.Save() goes to Console.WriteLine("remote"); }.
+public class Hybrid: ILocal, IRemote { } // CS8705, no most specific implementation.
+
+The rule is "every virtual interface member needs a unique most specific implementation", where one implementation is more specific if its declaring type has the other's declaring type among its interfaces. ILocal and IRemote are siblings, so neither wins.
+The fix: implement it on Hybrid itself, a class implementation always beats an interface one.
+
+Cross-Q²: Why didn't C sharp inherit C plus plus's "use the leftmost ancestor" rule?-- think --
+
+A: C sharp was designed (1999-2001) explicitly to avoid C plus plus's implicit-resolution pitfalls. The diamond problem in C plus plus is one of the most-cited reasons to avoid multiple inheritance.
+C sharp instead defines a partial order (most-specific-implementation) and errors when it isn't a total order for a given member, forcing the author to pick.
+The trade-off is a small amount of friction in DIM scenarios for a large amount of clarity, and note that it's the consumer who pays that friction, which is the design argument for re-abstracting rather than overriding in derived interfaces.
+
+-- pause --
+Drill 12, Records.
+
+Q: What does record change about equality?-- think --
+
+A: Records auto-generate Equals, GetHashCode, and == for value semantics, two records with the same property values are equal, regardless of reference.
+For record class it's still a reference type with these auto-generated overrides; for record struct it's a value type with the same auto-generated semantics.
+
+Cross-Q: How does the with expression work?-- think --
+
+A: var b = a with { Amount = 20 }; clones a and applies the property changes to the clone. Mechanically: the compiler generates a protected $() method that does a memberwise copy via a synthesized copy ctor, then assigns the listed properties. The original a is unchanged (non-destructive mutation).
+
+Cross-Q²: What's the difference between record class and record struct ?-- think --
+
+A: record class is a reference type with value-semantic equality (heap-allocated, but == compares contents). record struct is a value type with value-semantic equality (stack-friendly, but copied on assignment).
+Use record class for general DTOs and value objects; use record struct (especially readonly record struct ) for small high-frequency values used as dictionary keys or in hot loops.
+Tie-breaker: if you're passing it around a lot through interfaces (boxing), prefer record class; if you're putting it in arrays or lists by value, prefer record struct.
+
+-- pause --
+Drill 13, The vtable.
+
+Q: What's a vtable?-- think --
+
+A: A method table, an array of function pointers, that the runtime uses to resolve virtual method calls. Each class has one; derived classes inherit slots from the base and add their own.
+
+Cross-Q: Where does the runtime store the vtable pointer?-- think --
+
+A: In every object's header (the few bytes preceding the object's fields on the heap). On a 64-bit runtime, each object has ~16 bytes of header: 8 bytes sync block + 8 bytes method table pointer (which points to the vtable + type metadata).
+That's why every reference type allocation has a minimum ~24-byte footprint even for empty classes, header + a pointer + alignment.
+
+Cross-Q²: How does new void Foo() (hiding) affect the vtable?-- think --
+
+A: It adds a separate slot to the derived class's vtable for the hidden method, leaving the inherited slot untouched. The base's Foo is still at slot N (inherited); the derived's Foo lands at slot N+M (new).
+Dispatch through the base reference uses slot N to base method; dispatch through the derived reference uses slot N+M to derived method. This is why new causes "which one runs?" to depend on the static type of the variable.
+
+-- pause --
+Drill 14, Composition versus inheritance.
+
+Q: When would you refactor an inheritance hierarchy to composition?-- think --
+
+A: When you find yourself wanting "two parents," when the hierarchy is more than 2 levels deep, when you need runtime-swappable behavior, or when a subclass uses only a fraction of the base's contract. Symptoms: cast-tests, NotImplementedException overrides, "is-a" relationships that feel forced.
+
+Cross-Q: Show me a 3-level inheritance refactored to composition.-- think --
+
+A: Logger to Decorator or Strategy. class LoggerBase { abstract WriteRaw(); Info() goes to WriteRaw(.); } to class ConsoleLogger: LoggerBase, FileLogger: LoggerBase. Composition version: interface IWriter { Write(); } + class Logger(IWriter w) + CompositeWriter to multiplex.
+Result: you can log to both console AND file simultaneously, which the inheritance version couldn't express.
+
+Cross-Q²: When is inheritance still the right call?-- think --
+
+A: Three places: (1) framework-mandated bases (Razor Pages PageModel, E F Core DbContext ), (2) genuine state-carrying "is-a" relationships (domain Entity with Id and equality), and (3) closed hierarchies sealed at the leaves (D D D value objects). Everything else: prefer composition.
+
+-- pause --
+Drill 15, Modern C sharp changes.
+
+Q: How do records, primary constructors, and static abstract change OOP interview answers from 2018?-- think --
+
+A: Records reduce the need to manually write Equals / GetHashCode / == for value-shaped types, fewer custom equality bugs. Primary constructors collapse boilerplate D I registration into one-liners.
+static abstract allows interfaces to require static members (operators, factories), which historically forced an abstract base class. Combined: fewer reasons to reach for abstract classes; "interface for capability, abstract class only for shared instance state" is now the default guidance.
+
+Cross-Q: With record class, record struct, primary constructors, init setters, and required members, when would you still write a plain class with explicit ctors?-- think --
+
+A: When the type has meaningful behavior (methods beyond data carriers), when it manages mutable state intentionally, when equality should be reference-based (entities with identity), or when you need fine-grained ctor logic (validation, normalization, side effects in the ctor).
+Pure data carriers, records. Mutable state with logic, class. Identity-based entities, class with Id -based Equals.
+
+Cross-Q²: Does using records prevent the need for IEquatable ?-- think --
+
+A: No, records implement IEquatable for you. The generated Equals(T) IS the IEquatable implementation. That's part of why records are the right choice in 2026 for value-typed reference equality: you get the strongly-typed non-boxing path automatically.
+
+-- pause --
+Drill 16, Interface dispatch mechanism.
+
+Q: An interface call and a virtual call through an abstract base, which is faster, and why?-- think --
+
+A: Wrong framing, and saying so is the answer. A virtual call is a fixed vtable slot: one dependent load, then an indirect call.
+An interface call in CoreCLR uses Virtual Stub Dispatch, the call site is patched with a dispatch stub that caches one MethodTable and its target, so when a single concrete type dominates the site it is a compare and a jump.
+The cost is a property of the call site, not the keyword: monomorphic sites are cheap either way, megamorphic sites are unpredictable either way.
+
+Cross-Q: Why can't interfaces just use vtable slots like classes do?-- think --
+
+A: Because slot numbering can't be made consistent. A class vtable works because every derived type lays its base's slots out at the same indices.
+A type implements several unrelated interfaces, each numbering its own members from zero, and no single linear layout gives every interface a fixed index in every implementing type. VSD sidesteps the layout problem by resolving pairs at runtime and caching the answer at the call site.
+
+Cross-Q²: What happens to a call site that sees fifty different concrete types?-- think --
+
+A: The dispatch stub's cached type keeps missing.
+Per the CoreCLR design doc, "when a dispatch stub fails frequently enough, the call site is deemed to be polymorphic and the resolve stub will back patch the call site to point directly to the resolve stub", so it stops trying the inline cache and goes straight to the global resolve cache.
+It isn't permanent: "at sync points (currently the end of a garbage collector), polymorphic sites will be randomly promoted back to monomorphic call sites", so the runtime periodically re-tests its own assumption.
+Practically: a megamorphic site never inlines and dynamic PGO can't help it, so the fix is to split it into several sites that each see few types.
+
+-- pause --
+Drill 17, Interface mapping versus hiding.
+
+Q: class Base: IWork { public void Do() {} } and class Derived: Base { public new void Do() {} }. What does ((IWork)new Derived()).Do() call?-- think --
+
+A: Base.Do. The interface mapping was established when Base declared IWork, and it maps IWork.Do onto the non-virtual Base.Do.
+The spec is explicit: "without explicitly re-implementing an interface, a derived class cannot in any way alter the interface mappings it inherits from its base classes." new changes what class-typed references see and nothing else.
+
+Cross-Q: Give me two ways to make Derived.Do the one the interface calls.-- think --
+
+A: (1) Make Base.Do virtual and override it in Derived, "when an interface method is mapped onto a virtual method in a class, it is possible for derived classes to override the virtual method and alter the implementation of the interface." (2) Re-implement the interface: write class Derived:
+Base, IWork, which rebuilds the mapping from scratch for Derived using its own members.
+Option 1 is what you want in almost every case; option 2 is the escape hatch when you don't own Base.
+
+Cross-Q²: Where does this bite in production?-- think --
+
+A: Anywhere a framework holds you by the interface rather than the class, D I container disposal ( IDisposable / IAsyncDisposable ), serializers, comparers, the A S P dot NET Core middleware pipeline.
+Your tests hold the concrete type and pass; production holds the interface and silently runs the base implementation. new on a method that participates in an interface mapping should read as a defect on sight.
+
+-- pause --
+Drill 18, Covariant returns.
+
+Q: Can an override return a more derived type than the method it overrides?-- think --
+
+A: Yes, since C sharp 9, for methods and for read-only properties. public override Invoice Clone() overriding public virtual Document Clone() compiles, and callers statically receive Invoice with no cast.
+
+Cross-Q: What are the gates, and are they the same gate?-- think --
+
+A: No, two different gates, which is the point of the question. The language gate is C sharp 9.
+The runtime gate is dot NET 5, because the type loader had to learn to unify a MethodImpl slot whose signature no longer matches the base member;
+the compiler marks such overrides with PreserveBaseOverridesAttribute so that "any virtual call to the method, whether it uses the base signature or derived signature, executes the most derived override".
+Targeting an older runtime with C sharp 9 gives CS8830, a runtime support error, not a language-version error.
+
+Cross-Q²: Does it work on interfaces?-- think --
+
+A: No. The feature is restricted to virtual methods and read-only properties on reference types, the runtime design doc says it "will only be applicable to methods on reference types.
+Methods on interfaces and value types will not be supported." So a fluent A P I whose surface is an interface still needs the old self-referencing-generic workaround ( interface IBuilder where TSelf: IBuilder ).
+It also doesn't apply to set / init accessors, and shouldn't: a setter is an input position, so covariance there would be unsound.
+
+-- pause --
+Section 7. Cheat Sheet.
+
+C sharp inheritance: single base class, many interfaces, no diamond problem at the class level.
+virtual / override: vtable dispatch; new hides (warning without it) and breaks polymorphism.
+sealed class: no further subclassing; enables jit devirtualization.
+abstract class: state + skeleton; one base; interface: capability; many.
+DIM (C sharp 8): default interface method, callable only via interface reference.
+static abstract (C sharp 11): unlocks generic math via where T: INumber.
+Primary ctor (C sharp 12): header params captured into methods; not auto-properties.
+required (C sharp 11): caller must set in object initializer or pass via [SetsRequiredMembers] ctor.
+Equals + GetHashCode: override together; mismatch breaks Dictionary / HashSet.
+Covariant returns (C sharp 9 + dot NET 5): classes and read-only properties only; not interfaces, not structs; CS8830 = runtime too old.
+VSD: interface calls are stub-cached per call site, lookup to dispatch (monomorphic cache) to resolve (global cache). Megamorphic sites never inline.
+Interface mapping is fixed by the class that declares the interface. new won't move it; virtual + override or re-implementation will.
+sealed interface member = non-virtual default; abstract void IBase.M(); in a derived interface = re-abstraction.
+CS8705 needs a real diamond, one member from a shared base interface with two sibling overrides. Two unrelated same-named defaults compile fine.
+Smell: if (x is Derived) in many branches, switch to virtual or pattern dispatch.
+Smell: new on a method whose signature matches an interface member, near-certain defect.
+
+-- pause --
+Section 8. Walkthrough, Virtual call from base constructor.
+
+Problem: A ReportGenerator base class calls BuildHeader() (virtual) in its constructor. The new PdfReportGenerator subclass overrides BuildHeader() to use a _logoBytes field initialized in its own constructor.
+In production, PDFs occasionally render with a blank header and the logs show NullReferenceException deep inside BuildHeader.
+
+Diagnosis: Repro by running the constructor under a debugger with first-chance exceptions enabled ( Debug to Exceptions to Common Language Runtime Exceptions ).
+The stack shows PdfReportGenerator.BuildHeader accessing _logoBytes while this.GetType() == typeof(PdfReportGenerator) but _logoBytes is null. Roslyn analyzer CA2214 ( Do not call overridable methods in constructors ) would have flagged this at compile time.
+Inspect the I L: the base ctor calls the virtual method, dispatch lands on the override, but the derived field initializers (which run after base ctor returns) haven't executed yet.
+
+Fix: Three options. (1) Mark BuildHeader non-virtual or seal it on the path called from the ctor. (2) Move the call out of the constructor into an Initialize() method or a factory static Create(.). (3) Mark the base class sealed if subclassing isn't required.
+
+Why it works: In C sharp, the runtime type is set at the start of base construction so virtual calls dispatch to the most-derived override, but derived field initializers and constructor body run after base ctor returns.
+Calling virtuals before fields are initialized is the canonical fragile-base-class trap.
+
+-- pause --
+Section 9. Self-test.
+
+Choose abstract class when you need: (a) shared state, fields, constructors, finalizers; interfaces still cannot hold instance state; (b) one canonical lifecycle ( protected virtual void OnInitialize ); (c) constructor coordination ( base(.) chaining).
+Default interface methods provide behavior sharing for evolution but require an interface-typed reference to invoke. Abstract classes also still beat interfaces for protected visibility, interfaces only have public members.
+Trade-off: a class can extend exactly one abstract base, but implement many interfaces.
+
+Primary-constructor parameters in classes (C sharp 12) are captured into a hidden compiler-generated field only when used by an instance member. They're not properties, not auto-fields with public or protected access, they're locals scoped to the type body.
+They're invisible across partial-class files unless you explicitly project them: public IDb Db { get; } = db;. The compiler emits a backing field with an unspeakable name that callers cannot reach.
+For D I services where you want explicit visibility, declare an explicit private readonly IDb _db = db; field.
+
+When the operation logically belongs to the type not an instance, parsers ( T.Parse(string) ), constants ( T.Zero, T.One ), factories. Without static abstract, generic code couldn't say "any T that knows how to parse itself." With it, where T: IParseable lets you write T.Parse(s) in generic code.
+Trade-off: you lose polymorphism, there's no "vtable" for static methods, so each generic instantiation dispatches at compile time, growing I L. Use sparingly: mostly numeric types and parser libraries.
+
+Prints A. B.M is declared new, not override, it hides A.M rather than overriding it. The vtable slot for M still points at A.M for any instance whose declared type is A. Calling through an A reference uses the vtable; calling through a B reference uses the hidden B.M directly.
+This is exactly the "fragile base class" problem new was designed to mitigate at the language level, and it's almost always a bug. Senior code review rule: every new modifier on a method needs justification.
+
+(1) Abstract base, one inheritance slot consumed; great for plugins that share lifecycle or state; rigid (can't compose). (2) Interface, composable (multiple plugins can wear multiple "hats"); no shared state; ideal for capability-style plugins.
+(3) Generic with static abstract, type-level dispatch, zero runtime overhead, but each plugin variant generates its own jit'd code (I L bloat) and can't be discovered at runtime by reflection alone.
+Choose: interfaces by default; abstract base when sharing skeleton; static abstract for generic-math or parser-style plugins where the operation belongs to the type itself.
