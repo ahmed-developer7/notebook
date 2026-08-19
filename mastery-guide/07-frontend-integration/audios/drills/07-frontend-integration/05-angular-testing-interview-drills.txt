@@ -1,0 +1,445 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, TestBed.configureTestingModule.
+
+Q: What does TestBed.configureTestingModule set up, and why do you need it?-- think --
+A: It builds the test's D I scope and compilation scope, an environment injector plus the set of components, directives and pipes available for compilation.
+Without it Angular has no context to resolve inject(), no injector to instantiate a component against, and no way to compile a template that references another component.
+
+Cross-Q: Why do standalone components use imports rather than declarations ?-- think --
+A: declarations belongs to the NgModule model: a component is declared by exactly one module, which supplies its compilation scope. A standalone component carries its own compilation scope in its own imports, so from the outside it behaves like a module, you import it.
+Mixing them up gives you "Component X is standalone, and cannot be declared in an NgModule".
+
+Cross-Q²: You need to replace one child component of a standalone component under test. How, without NO_ERRORS_SCHEMA ?-- think --
+A: TestBed.override Component(Parent, { remove: { imports: [RealChild] }, add: { imports: [StubChild] } }). The stub keeps the same selector and input names, so a typo in the parent's template still fails compilation, which is exactly what NO_ERRORS_SCHEMA would have swallowed.
+override Provider is the equivalent tool when the thing you need to replace came in through a provideX() feature rather than an import.
+
+-- pause --
+Drill 2, ComponentFixture.detect Changes.
+
+Q: When do you call fixture.detect Changes() and what happens if you skip it?-- think --
+A: In a zone-based test it runs a change-detection pass over the fixture: first call also runs ngOnInit and does the initial render. Skip it and the instance exists but the template has never rendered, so DOM queries return null.
+In a zoneless test the modern equivalent is await fixture.when Stable(), which lets Angular's scheduler do the same work the way the application would.
+
+Cross-Q: Under zoneless, why is await fixture.when Stable() preferred over detect Changes() ?-- think --
+A: Because detect Changes() forces a pass regardless of whether anything marked the view dirty. That masks the bug zoneless is designed to expose: a component that mutates state without a change notification renders correctly in the test and never renders in production.
+when Stable() only completes work Angular actually scheduled, so the test fails when the notification is missing. The docs recommend the switch while admitting it is rarely worth converting an existing suite wholesale.
+
+Cross-Q²: What is fixture.autoDetectChanges() and how did it change?-- think --
+A: It enables automatic view synchronisation "as it would in an application", and also runs one detection pass immediately. The boolean overload ( autoDetectChanges(true|false) ) is deprecated in favour of the zero-argument form.
+The old objection, that auto-detection made tests non-deterministic, is much weaker under zoneless, because synchronisation now happens only in response to explicit notifications rather than to any async activity in the zone.
+In a zoneless suite, autoDetectChanges() plus await when Stable() is close to the real application's behaviour.
+
+-- pause --
+Drill 3, Shallow versus deep rendering and NO_ERRORS_SCHEMA.
+
+Q: What is the difference between shallow and deep component rendering in tests?-- think --
+A: Shallow renders only the component under test, with children stubbed or ignored, fast, isolated, insensitive to child internals. Deep renders the real child tree, so it catches integration mistakes: a wrong selector, a missing input binding, a child whose required input was never supplied.
+
+Cross-Q: What does NO_ERRORS_SCHEMA do, and what is its trade-off?-- think --
+A: It tells the compiler to ignore unknown elements and unknown attributes rather than erroring. It removes stubbing boilerplate, at the price of turning selector typos into silent no-renders: compiles, nothing appears, the test asserting the parent's output still passes.
+It also hides missing required inputs. The correction most people get wrong here: errorOnUnknownElements and errorOnUnknownProperties default to false in TestModuleMetadata, unknown elements and property bindings log NG0304 or NG0303 rather than throwing.
+So the safe behaviour is something you opt into, not something you inherit, and enabling both in your global test setup is the one-line replacement for the NO_ERRORS_SCHEMA habit.
+
+Cross-Q²: So what is the correct way to stub a child in 2026?-- think --
+A: TestBed.override Component swapping the real child for a hand-written stub with the same selector and inputs, that keeps compilation strict.
+If you want it generated, ng-mocks ' MockComponent(RealComponent) is the mature community option, and it derives the stub from the real component's metadata so renames break the test.
+What you should not reach for is a mythical createSpyObject from @angular or testing or an OverrideModule in the CDK, neither exists; if you see them in old notes, they are wrong.
+
+-- pause --
+Drill 4, fake Async, tick, and flush Microtasks.
+
+Q: What does fake Async do, and when do you need tick() versus flush Microtasks() ?-- think --
+A: fake Async runs the test body in a Zone whose timer A P Is are replaced by a virtual clock and queue. tick(milliseconds) advances the clock, running macrotasks due in that window and draining microtasks around them.
+flush Microtasks() drains only the microtask queue (promises, queue Microtask ) without advancing time. flush() runs macrotasks until the queue empties and returns the elapsed virtual time; discardPeriodicTasks() throws away outstanding intervals.
+
+Cross-Q: What happens if a timer is still queued when the block ends, and can you change that?-- think --
+A: Historically it threw N timer(s) still in the queue, which existed to stop a leaked set Interval infecting later tests.
+The flush option controls it, true drains the macrotask queue after the body, false throws on pending timers, and the default flipped: the opt-in fake Async(fn, {flush: true}) arrived with Angular 18.2 / zone.js 0.14, and from zone.js 0.15 the flush is automatic.
+So a trailing flush() / discardPeriodicTasks() in a current suite is usually vestigial, and the leaked-interval warning is no longer free.
+The other throw, Error: Cannot make XHRs from within a fake async test, is unchanged and is arguably the most useful thing fake Async does, it is the only Angular A P I that reliably catches a unit test about to hit the network.
+
+Cross-Q²: Your app is zoneless. What is left of all this?-- think --
+A: Nothing, fake Async, tick, flush, flush Microtasks, discardPeriodicTasks and waitForAsync are all zone.js constructs, and the fake Async A P I reference says outright that it requires Zone.js and cannot be used with the Vitest runner.
+The migration guide documents zone.js or plugins or vitest-patch in test polyfills as a bridge while recommending native async plus Vitest fake timers.
+The conversion buckets are: promise or H T T P tests to await fixture.when Stable(); timer and debounce tests to vi.useFakeTimers() with await vi.advanceTimersByTimeAsync(n); RxJS-timing tests to TestScheduler.run().
+
+-- pause --
+Drill 5, SpyObj versus HttpClientTestingModule.
+
+Q: When do you use a service spy versus HttpTestingController to mock H T T P?-- think --
+A: A service spy replaces your whole service, so nothing it runs. HttpTestingController (via provideHttpClientTesting() ) replaces only HttpBackend, so the real service, the real HttpClient, and the real interceptor chain all execute and you assert on the outgoing request.
+Default to the controller; reach for a service spy only when the service's contract is small and independently tested.
+
+Cross-Q: Why must provideHttpClient() come before provideHttpClientTesting(), and why call verify() ?-- think --
+A: provideHttpClientTesting() overwrites part of the client's configuration, specifically the backend, so it must be applied after the client is configured; reversed, you get real network attempts that manifest as CI timeouts.
+verify() asserts nothing is outstanding, which converts a request leaking into a later spec from an order-dependent mystery into a deterministic failure in the test that caused it. It is also how you assert absence: proving a cache prevented a fetch.
+
+Cross-Q²: How do you test retry logic, and what is the difference between flush(null, {status: 500}) and req.error(.) ?-- think --
+A: Each retry attempt is a new request. Because plain retry() is sequential, match(url) returns one at a time, you flush an error, then expect One the next attempt. With retry({count, delay}) the delay is a timer, so you advance Vitest fake timers between attempts.
+flush(body, {status: 500}) means "the server answered with a 500" ( HttpErrorResponse.status === 500 ); req.error(new ProgressEvent('network error')) means there was no answer at all ( status === 0 ), D N S failure, connection reset, cores rejection.
+Retry-on-5xx and offline handling are different branches and most suites only ever exercise the first.
+
+-- pause --
+Drill 6, Testing OnPush components.
+
+Q: Why do OnPush components require special handling in tests?-- think --
+A: Historically, OnPush skipped change detection unless an input reference changed, a bound event fired, an async pipe emitted, or markForCheck() was called. So component.prop = x; fixture.detect Changes() re-rendered under Default and did nothing under OnPush.
+As of v22 this is no longer a special case, OnPush is the default strategy, and ChangeDetectionStrategy.Default is deprecated in favour of Eager.
+
+Cross-Q: With signals, does OnPush still need special handling?-- think --
+A: No. A signal read in a template registers that view as a consumer, so writing the signal marks the view dirty automatically, count.set(5) followed by await fixture.when Stable() renders correctly under OnPush. That is the main ergonomic argument for signals over BehaviorSubject + markForCheck().
+The caveat: this only holds for signals read in the template or in a template-reachable computed. A signal read only inside a method still marks nothing.
+
+Cross-Q²: A team upgrades to v22 and a third of their screens stop updating. What happened, and how do you triage?-- think --
+A: OnPush became the default for any component with an undefined change Detection.
+Those components were already broken, they were mutating shared arrays in place or updating fields from inside a bare .subscribe() without markForCheck(), and Default was re-checking everything on every event and hiding it.
+Triage: take the upgrade migration's escape hatch ( change Detection: ChangeDetectionStrategy.Eager ) to get green, then fix by category, anything read by a template becomes a signal or an async pipe, mutations become replacements, and delete Eager per component as you go.
+Under zoneless the same class of bug surfaces in tests as ExpressionChangedAfterItHasBeenCheckedError, and the docs are explicit that you fix the component, not the test.
+
+-- pause --
+Drill 7, RouterTestingModule and navigation testing.
+
+Q: How do you test route navigation in an Angular component test?-- think --
+A: Not with RouterTestingModule, it is deprecated, and its main value (fakes for Location / LocationStrategy ) is largely unnecessary because MockPlatformLocation is provided in TestBed by default.
+The modern setup is provide Router(routes) in the providers, then RouterTestingHarness.create() and await harness.navigateByUrl('/orders or 7', OrderDetail), which navigates for real and returns the activated component instance.
+provideLocationMocks() from @angular or common or testing is there if you specifically want the location fakes.
+
+Cross-Q: Why does the Angular routing guide say "Do not mock Angular Router"?-- think --
+A: Because a mocked Router reduces every navigation assertion to expect(navigate).toHaveBeenCalledWith(['/login']), which passes whether or not /login exists, whether or not a guard on it redirects again, whether or not the navigation is cancelled by a resolver,
+and whether or not the route is even reachable given the guard order.
+The real router with a real route table turns all of those into observable outcomes: assert router.url or the activated component.
+
+Cross-Q²: How do you prove a component reacts to a route parameter change rather than just reading it once?-- think --
+A: Navigate twice to the same route with different params, /orders or 7 then /orders or 8, and assert the rendered output changed.
+The router reuses the component instance when only the params differ, so a component that reads route snapshot param Map in its constructor passes the first navigation and fails the second.
+This is the standard bug and the standard test; with withComponentInputBinding() and signal inputs it mostly disappears, but the test is still the cheapest proof.
+
+-- pause --
+Drill 8, Testing NgRx with MockStore and override Selector.
+
+Q: What is MockStore and when do you use it over the real store?-- think --
+A: provideMockStore({ initial State }) from @ngrx or store or testing gives a store whose state you set directly, with no reducers running. Use it for component tests: you care what the component renders from a given state and what it dispatches, not how the state got there.
+Use the real store when you are testing reducer + selector composition, or an integration flow across an effect.
+
+Cross-Q: What does override Selector do, and what must you remember with it?-- think --
+A: It forces a selector to emit a fixed value regardless of state, decoupling the component test from the state shape.
+Two things to remember: call store.refresh State() to push the override to existing subscribers, and call store.reset Selectors() in teardown, because selector memoisation is module-scoped and an override can leak into another spec.
+
+Cross-Q²: Why would you never use override Selector when testing a selector, and what do you use instead?-- think --
+A: Because it replaces the projection logic, you would be asserting on your own mock. For a selector, call selector.projector(.) directly with the outputs of its input selectors, in order, not the state slice, which is the usual mistake.
+That tests the real projection, bypasses memoisation entirely, and needs no store.
+If you are testing an @ngrx or signals store instead, the equivalent question is whether you need unprotected from @ngrx or signals or testing to poke at state: if you do, you are testing internals rather than the store's A P I.
+
+-- pause --
+Drill 9, Testing H T T P interceptors.
+
+Q: How do you test an Angular H T T P interceptor?-- think --
+A: Configure provideHttpClient(with Interceptors([my Interceptor])) plus provideHttpClientTesting(), inject HttpClient and HttpTestingController, issue a request, and assert on the intercepted req.request, headers, URL, body, params, then flush and assert any response transformation.
+Testing it that way keeps the real chain, which matters because interceptor order is part of the behaviour.
+
+Cross-Q: Can you unit-test a functional interceptor by calling it directly, and what do you have to do?-- think --
+A: Yes, inside TestBed.runInInjectionContext(() goes to my Interceptor(req, next Spy)), because HttpInterceptorFn bodies call inject() and calling them outside an injection context throws "inject() must be called from an injection context. ". It gives you a very fast test of the transformation.
+What it cannot test is registration and ordering, and those are where the real bugs are: interceptors run in array order outbound and reverse order inbound, and with Interceptors functional interceptors run before withInterceptorsFromDi class-based ones.
+An auth interceptor placed after a retry interceptor retries with the stale token, and no isolated test of either can see it.
+
+Cross-Q²: How do you test refresh-on-401 correctly?-- think --
+A: With concurrency, because the bug is concurrency. Fire three requests, flush all three with 401, then assert http Testing.expect One('/api or refresh'), that single assertion is the whole test, because it fails if the interceptor fired three refreshes.
+Then match the three retried requests by their new Authorization header and flush them. A single-request test passes on a broken implementation, and the production symptom is users being logged out en masse when a rotating-refresh-token backend detects reuse.
+
+-- pause --
+Drill 10, Angular CDK component harnesses.
+
+Q: What is an Angular CDK component harness, and why is it preferred over raw DOM queries?-- think --
+A: A class extending ComponentHarness (from @angular or cdk or testing ) that exposes a component's behaviour as an async semantic A P I, await select.click Options({text: 'Savings'}) instead of a chain of class selectors.
+It is preferred for three reasons: the harness is a versioned public A P I maintained alongside the component while the DOM is not; harness methods automatically run change detection before reads and after interactions, which removes a whole class of missing-await bugs;
+and the same harness runs under TestbedHarnessEnvironment in unit tests and SeleniumWebDriverHarnessEnvironment in end-to-end tests.
+
+Cross-Q: How do you load one, and what is the classic mistake?-- think --
+A: TestbedHarnessEnvironment.loader(fixture) gives a HarnessLoader rooted at the fixture; then loader.get Harness(MatSelectHarness.with({selector: '.'})). Also available: getAllHarnesses, getHarnessAtIndex, count Harnesses, has Harness, getChildLoader, getAllChildLoaders.
+The classic mistake is using that loader for anything rendered in the CDK overlay, dialogs, menus, select panels, tooltips, snack bars, which are siblings of the fixture host, not descendants. For those you need TestbedHarnessEnvironment.documentRootLoader(fixture).
+
+Cross-Q²: How would you write one for your own component, and what is parallel() for?-- think --
+A: Extend ComponentHarness, set static host Selector, and build element accessors with locator For (throws if absent), locatorForOptional (returns null ) and locatorForAll. Add a static with(options) returning a HarnessPredicate so callers can filter.
+ContentContainerComponentHarness is the base when the component projects content and you want child loaders scoped inside it. parallel() batches several harness operations so the environment does one stabilisation pass instead of one per call, meaningful when a test fetches a dozen row harnesses.
+Where finer control is needed, manualChangeDetection() turns off the automatic stabilisation so you can observe a mid-flight state.
+
+-- pause --
+Drill 11, Karma versus Jest versus Vitest for Angular.
+
+Q: What is the current state of Angular test runners?-- think --
+A: Vitest is the default for new Angular C L I projects, via the @angular or build:unit-test builder with jsdom (or happy-dom if installed). Karma is no longer the default but is still supported, and @angular or build:karma still exists.
+Jest works via community presets but has no first-party builder.
+Web Test Runner was explored by the Angular team and never became the default.
+
+Cross-Q: Get the history right, who deprecated Karma, and when did Vitest become first-party?-- think --
+A: Karma deprecated itself: the karma-runner README says "Karma is deprecated and is not accepting new features or general bug fixes", a 2023 decision by its own maintainers, who committed to security fixes until 12 months after Angular C L I's Web Test Runner support went stable.
+Angular did not deprecate it in v15 and did not remove it from ng new in v17, it stayed the default until v21.
+On the Vitest side, AnalogJS pioneered it as a community project, but the first-party path is the C L I's @angular or build:unit-test builder, which was experimental in v20 and became the default in v21. And do not quote a speed multiplier, there is no citable universal figure.
+
+Cross-Q²: What breaks in a Karma to Vitest migration that the schematic will not fix?-- think --
+A: Four buckets. (1) jasmine.createSpyObj has no direct equivalent, you write plain objects of vi.fn(). (2) jasmine-marbles stops working entirely because its matchers are Jasmine-registered; move to TestScheduler from rxjs or testing or rxjs-marbles.
+(3) fake Async / tick need zone.js or plugins or vitest-patch in test polyfills as a bridge, then conversion.
+(4) jsdom gaps: no layout, so getBoundingClientRect() returns zeros and ResizeObserver / IntersectionObserver are missing, overlay positioning, virtual scroll and @defer (on viewport) specs must move to browser mode with @vitest or browser-playwright.
+The schematic handles fit / xit, spy On to vi.spy On, jasmine.any to expect.any and friends; the four are the actual cost.
+
+-- pause --
+Drill 12, Testing signals versus observables.
+
+Q: How does testing Angular signals differ from testing RxJS observables?-- think --
+A: Signals are pull-based and synchronous, read with () and assert. Observables are push-based, so you subscribe, use firstValueFrom, or use marbles when timing matters.
+But "signals make tests trivial" is an overstatement: computed() is lazy and memoised so a test that writes and never reads has verified nothing; equality functions decide whether anything propagates; untracked() reads register no dependency;
+and getting a signal's value into the DOM still requires synchronisation.
+
+Cross-Q: A component does to Signal(service.orders$). How do you test loading and error states, and what is the trap?-- think --
+A: Provide the service with a Subject, create the signal inside TestBed.runInInjectionContext (or let the component do it), then push values or errors and await fixture.when Stable() between steps.
+The trap is the initial value: without initial Value and without require Sync: true, to Signal returns T | undefined, and a test that always pushes a value before reading never exercises the undefined branch, which is the branch that renders on first paint in production and throws on order.total.
+
+Cross-Q²: What happens to a computed() when a dependency throws, and how does that differ from an Observable?-- think --
+A: The error is captured and re-thrown to whoever reads the computed, it propagates on the next read rather than to a subscription's error callback, and unlike an errored Observable the computed is not permanently dead: fix the dependency and the next read recomputes.
+In a test that means the throw lands in your test body, so you assert it with expect(() goes to total()).to Throw() rather than an error handler. Observables terminate on error; signals do not have a terminal state at all, which is one of the deeper semantic differences between the two models.
+
+-- pause --
+Drill 13, Testing reactive forms.
+
+Q: How do you test reactive form validation?-- think --
+A: Get the FormGroup off the component, set values through controls, and assert on errors, valid and status.
+Prefer form controls email set Value(.) over form.get('email')!.set Value(.): it is typed, needs no non-null assertion, and fails to compile if the control is renamed, the string lookup silently returns null.
+
+Cross-Q: set Value versus patch Value in a test, which and why?-- think --
+A: set Value requires a value for every control and throws on a missing key, so it fails when someone adds a field, which is often exactly what you want a payload test to do.
+patch Value silently ignores missing and unknown keys, so patch Value({ emial: 'x' }) and patch Value({ renamedAwayField: 'x' }) both pass while asserting nothing. Use patch Value for convenience in setup, set Value in any test whose point is the completeness of the payload.
+
+Cross-Q²: What form behaviour has burned production teams and belongs in a test?-- think --
+A: form.value omits disabled controls; getRawValue() does not. A field disabled by business logic vanishes from the submitted payload, the dot NET model binder binds null, and an update silently erases stored data with no error anywhere. The test is: disable a control, submit, assert the payload.
+Second: async validators leave the control in pending with valid === false, so a test asserting valid is false mid-check is asserting nothing, settle the validator first.
+Third, for Signal Forms specifically, valid() requires no errors and no pending validators while invalid() is true on errors regardless of pending, so they are not opposites and both are false during an async check.
+
+-- pause --
+Drill 14, Testing guards and resolvers.
+
+Q: How do you unit-test a functional route guard?-- think --
+A: CanActivateFn is a plain function that calls inject() internally, so there is no class to instantiate and calling it bare throws.
+Either wrap the call, TestBed.runInInjectionContext(() goes to auth Guard(route, state)), with mocked dependencies, or navigate for real with RouterTestingHarness against a provide Router route table that has the guard attached.
+
+Cross-Q: Which of those two, and why?-- think --
+A: Both, for different jobs. runInInjectionContext gives you a fast table of authorisation cases, roles, tiers, feature flags, but forces you to fabricate ActivatedRouteSnapshot and RouterStateSnapshot, and a hand-built snapshot drifts from the real one silently.
+The harness test is slower but proves the guard is actually wired into the route config, and the most common guard bug is not wrong logic, it is a guard attached to the wrong route, or attached with can Activate where can Match was needed.
+
+Cross-Q²: Why does can Activate versus can Match matter, and how would a test tell them apart?-- think --
+A: can Activate runs after the route has matched, so a lazy chunk is already downloaded before the guard denies access, the "admin bundle is in the browser's cache and network log" finding that shows up in security reviews.
+can Match runs during matching, so the chunk is never fetched and a second route with the same path can match instead. A test that only asserts the final URL cannot distinguish them; a test with two routes on the same path that asserts which component activated can.
+And the honest addendum: neither is authorisation. The dot NET side must enforce the role on every endpoint, because the client can always call the A P I directly.
+
+-- pause --
+Drill 15, Code coverage targets.
+
+Q: What percentage of code coverage is "enough"?-- think --
+A: There is no defensible universal number, and quoting one is a trap. Coverage measures execution, not verification, a test with no assertions covers everything it touches.
+The two legitimate uses are as a ratchet (the number may not go down) and as a finder (which branches in guards, interceptors and services are dark?).
+What you should say instead of a target is which code you consider non-negotiable: authorisation logic, money and date arithmetic, error and retry paths, and anything with a concurrency story.
+
+Cross-Q: Why can 100 % line coverage still miss bugs?-- think --
+A: Line coverage records that a line executed, not that every branch in it ran, return active? filter(.): [] is one line and two paths.
+Branch coverage helps and still does not check correctness: it cannot see a missing assertion, an unexercised error path that is technically covered by a happy-path call, or a wrong expectation.
+And it says nothing about the code you never wrote, the null case you did not handle has no line to cover.
+
+Cross-Q²: How do you set a coverage policy that does not become theatre?-- think --
+A: Start from the current number rather than an aspiration, forbid regressions, and exclude generated code, barrel files and environment configs so the metric is about code someone wrote.
+Then add the rule that actually works and cannot be gamed: every bug fix ships with a test that fails on the parent commit. That guarantees coverage grows exactly where bugs actually occurred, which is a much better prior than uniform coverage.
+If your gate is being met by expect(component).toBeTruthy() specs, which cover the constructor, every field initialiser and the whole template after one detect Changes(), the gate is measuring your team's willingness to satisfy it, not the code.
+
+-- pause --
+Drill 16, Testing zoneless components.
+
+Q: Your application is zoneless. What changes in a component test?-- think --
+A: The synchronisation trigger changes. Under zone.js, any completed async work told Angular to re-check; without it, only explicit notifications do, a signal write, markForCheck(), an output emission, an async pipe emission.
+So tests stop relying on "something happened, therefore Angular ran" and instead await fixture.when Stable(), which completes only the work Angular actually scheduled. TestBed.tick() is the synchronous equivalent when you are not holding a fixture.
+
+Cross-Q: A legacy project's app is zoneless but its tests still behave like zone tests. Why, and how do you fix it?-- think --
+A: Because TestBed "uses Zone-based change detection by default when zone.js is loaded via the polyfills", if the project still lists zone.js in its test polyfills, the tests get zone behaviour even though production does not.
+Add provideZonelessChangeDetection() to the test providers (or, better, to the providers File ) so the test matches production. Otherwise the only environment capable of catching a missing change notification is production itself.
+
+Cross-Q²: After forcing zoneless, a batch of tests fails with ExpressionChangedAfterItHasBeenCheckedError. What is the right response?-- think --
+A: Fix the components, not the tests. Under zoneless, TestBed enforces OnPush -compatible behaviour, and this error means a template value changed without a corresponding change notification, the component was relying on a second, unrequested check to pick up a late mutation.
+The docs say explicitly to update the component rather than work around it in the test. Typical causes: mutating a bound array in place, writing to a field from inside a bare .subscribe(), or setting state in a lifecycle hook that runs after the first check.
+The fix is a signal, an async pipe, or an immutable update, and it is the same fix v22's OnPush default demands anyway.
+
+-- pause --
+Drill 17, Testing effect() and afterEveryRender.
+
+Q: Why does an effect() not run when you write the signal it depends on?-- think --
+A: Because writing a signal schedules the effect; it does not execute it. Effects run as part of Angular's synchronisation pass. In an application something schedules that pass; in a test nothing does, so you call TestBed.tick().
+
+Cross-Q: TestBed.flush Effects() is deprecated in favour of TestBed.tick(). Is that just a rename?-- think --
+A: No, and the difference matters. flush Effects() ran root effects only. TestBed.tick() runs the whole synchronisation process, change detection, root effects, view effects, render callbacks, in the order the application would.
+So a test that passed under flush Effects() may have been asserting an ordering that never occurs in production, and some tests correctly start failing when you migrate. It also fixes the case where an effect was created with a component's injector rather than the root one.
+
+Cross-Q²: When should you refuse to write the effect at all, and what happened to after Render ?-- think --
+A: Most effects in a codebase should not exist: derived state is computed(), state synced from other state is linked Signal(), and data fetching is resource() / http Resource(), which also gives you cancellation, which an effect cannot.
+What survives the filter is genuinely side-effecting: logging, analytics, storage, imperative third-party calls; test those by asserting on a fake collaborator.
+On the render hooks: after Render() was renamed afterEveryRender() in v20 with no backwards-compatible alias, so v16, v19 code fails to compile after the upgrade; both originally landed in 16.2, and afterNextRender() kept its name. If a spec references after Render, the codebase predates v20.
+
+-- pause --
+Drill 18, Testing resource() and http Resource().
+
+Q: How do you test a component that loads data with http Resource ?-- think --
+A: provideHttpClient() then provideHttpClientTesting(); create the resource (or the component); TestBed.tick() so the resource's request is actually issued; http Testing.expect One(url).flush(body);
+then await TestBed.inject(ApplicationRef).when Stable() so the response propagates into the resource's signals; then assert value(), status() and has Value().
+
+Cross-Q: Why TestBed.tick() before expect One, and why ApplicationRef.when Stable() rather than fixture.when Stable() ?-- think --
+A: Because a resource fires eagerly, unlike HttpClient, which is cold until subscribed, a resource issues its request when its params computation settles during synchronisation. Without the tick there is no request and expect One fails with "found none", which sends people hunting for a URL typo.
+And fixture.when Stable() has a known gap where it does not resolve with a pending resource / rx Resource (angular or angular#60742), so awaiting the ApplicationRef is the pattern that holds.
+
+Cross-Q²: How would you prove that changing the params aborts the in-flight request?-- think --
+A: Issue the first request and deliberately do not flush it, change the params signal, TestBed.tick(), then flush the second request, and let http Testing.verify() in teardown do the assertion. verify() fails if the first request is still outstanding, so a passing test is proof it was cancelled.
+That is about as close as a TestBed test gets to testing a race, and it is the concrete reason http Resource replaced fetch-in-an-effect: the abort is structural rather than something the developer had to implement.
+Also know the status vocabulary you can assert on: 'idle' | 'loading' | 'reloading' | 'resolved' | 'error' | 'local', 'reloading' and 'local' are states an is Loading() assertion cannot distinguish.
+
+-- pause --
+Drill 19, Signal inputs, outputs and model in tests.
+
+Q: How do you set an input on a component whose inputs are input() signals?-- think --
+A: fixture.component Ref.set Input('name', value). Direct assignment does not compile: input() returns a read-only InputSignal. set Input also applies input transforms, so input(0, {transform: number Attribute}) given '5' stores 5.
+
+Cross-Q: What does create Component(Cmp, { bindings: [.] }) give you that set Input does not?-- think --
+A: A live binding. input Binding('order Id', some Signal) takes a signal or getter and re-propagates whenever it changes, which is how a real parent drives a child; set Input is a one-shot imperative write.
+When the behaviour under test is reactivity to a changing input, a computed that should recompute, a resource that should refetch, the binding form reproduces production and set Input merely simulates it. The siblings are output Binding(name, handler) and twoWayBinding(name, writable Signal).
+
+Cross-Q²: How do you test an output() and a model(), and what should you not do?-- think --
+A: Do not spy On(cmp.saved, 'emit'), output() returns an OutputEmitterRef, not an EventEmitter, so that asserts your component called its own method and is invariant to whether anything is listening.
+Instead listen: output Binding('saved', v goes to captured.push(v)) at creation, or cmp saved subscribe(.).
+For model(), bind with twoWayBinding('status', parent Signal) and test both directions, a child status.set('published') should update the parent signal, and a parent write should be visible in the child's template.
+Signal queries ( view Child, content Children ) are stable since v19 and are undefined until the view exists, so read them after the first synchronisation; view Child.required() throws instead, which is the better failure.
+
+-- pause --
+Drill 20, Marble testing in an Angular suite.
+
+Q: When is marble testing the right tool in an Angular project?-- think --
+A: When the behaviour under test is timing or subscription order: debounce windows, retry backoff, switch Map cancellation, combine Latest emission timing. For "action in, action out" effect tests, marbles are ceremony, an async / await test with a real faked backend is shorter and exercises more.
+
+Cross-Q: jasmine-marbles or TestScheduler, which, and why does it suddenly matter?-- think --
+A: TestScheduler from rxjs or testing, because jasmine-marbles is a Jasmine library: it registers custom Jasmine matchers ( toBeObservable ) and hooks Jasmine's lifecycle. Under Vitest those matchers do not exist, so a Karma to Vitest migration turns every marble spec red at once.
+TestScheduler.run() takes your own assertion callback, so it is framework-agnostic; rxjs-marbles is the middle option if you want the hot / cold ergonomics with adapters.
+
+Cross-Q²: A marble test is flaky. What is the usual cause, and what does v22 change about it?-- think --
+A: Promises. TestScheduler virtualises RxJS's schedulers, not the microtask queue, so anything routed through a Promise ( from(promise), async / await inside the code under test, fetch ) escapes virtual time.
+v22 makes fetch the default HttpClient backend, deprecating with Fetch(), which pushes more Angular H T T P code onto promise-based plumbing than before, so a suite that was stable on XHR can start drifting after the upgrade.
+The other thing to know:
+inside run() one frame is 1 virtual millisecond, outside it the legacy factor of 10 applies, and expect Subscriptions, not expect Observable, is what proves a cancellation, because emitted values alone cannot distinguish switch Map from merge Map when responses happen to arrive in order.
+
+-- pause --
+Drill 21, What a TestBed test structurally cannot see.
+
+Q: Name three production failures that no TestBed test can ever reproduce.-- think --
+A: A cores rejection, an OPTIONS preflight (existence or cost), and anything cookie-related, SameSite, Secure, domain scope, Set-Cookie from the A P I. Also: redirects, compression, and the actual output of System.Text.Json.
+provideHttpClientTesting() replaces HttpBackend, so the browser's transport layer never runs.
+
+Cross-Q: Your unit tests and E2E tests both pass, and moving the SPA to a C D N made the app slower. How do you get a test that would have caught it?-- think --
+A: The failure is one layer every existing test. Every authenticated cross-origin request now pays a preflight, and the busiest screen made fourteen of them, invisible to the A P I's own metrics because they counted only GET s, and invisible to E2E because it ran against a same-origin dev proxy.
+The test that catches it is a Playwright assertion on page.on('request') counts against the real deployed origin: "this screen issues no more than N cross-origin requests". The general rule is to own a test at the layer where the failure occurs, not to add more at the layer where it does not.
+
+Cross-Q²: SSR is added to a cookie-authenticated app and logged-in users see a flash of the signed-out layout. Why did no test catch it, and what would?-- think --
+A: Because the server has no browser: no document.cookie, no automatic credential attachment, no local Storage. Component tests run in jsdom, which has all of those, so the guard-less local Storage.get Item('token') that returns null on the server returns a value in the test.
+Detection needs a test that actually runs the server render, an E2E that does a hard navigation (not a client-side route change) while authenticated and asserts the server-returned HTML contains the signed-in layout.
+The fix is in production code: forward the incoming request's cookies through the REQUEST token, and abstract browser-only A P Is behind an injectable so the server implementation is a substitution rather than a typeof window check.
+
+-- pause --
+Drill 22, What to mock.
+
+Q: You are testing a component that displays orders fetched from a dot NET A P I. What do you mock?-- think --
+A: The transport, and nothing it. provideHttpClient(with Interceptors([.real ones])) plus provideHttpClientTesting(), then assert the outgoing request and flush a response.
+That keeps the service's URL construction, params, headers, error mapping and the whole interceptor chain real, every layer you mock HttpBackend is a layer you have stopped testing.
+
+Cross-Q: Give four mechanisms by which an over-mocked suite goes green while the app is broken.-- think --
+A: (1) The mock encodes an assumption, not an observation, you wrote the response shape you believed the A P I returns, so a shape mismatch is unfalsifiable. (2) The mock does not age; the A P I evolves and the literal in the spec file does not, and no one owns it.
+(3) Mocks are synchronous and always succeed, so loading states, cancellation, out-of-order responses and failure paths are unreachable.
+(4) Mocking removes the wiring, so you prove the component calls a service but not that the real one is provided, correctly scoped, or that D I resolves at all, which is the failure that produces a white screen.
+
+Cross-Q²: Rank the mocking options, and name what you always mock and never mock.-- think --
+A: Best to worst: the real thing (pure functions, mappers, reducers, never mock these); a working in-memory fake that enforces its own invariants; the transport stub ( HttpTestingController, page.route() ); a small stub with canned returns;
+a spy asserting calls (acceptable only when the call is the behaviour, analytics, navigation, fire-and-forget commands); and a fifteen-method createSpyObj, which is a smell about the component's dependency count.
+Never mock: the Router, your reducers, pure functions, or HttpClient itself. Always mock: wall-clock time, randomness, UUID generation, and anything that costs money or sends a message.
+And when your mock grows complex enough to have its own bugs, stop calling it a mock, it is a second implementation, and it needs its own tests.
+
+-- pause --
+Drill 23, Testing Signal Forms.
+
+Q: How do you test a Signal Form?-- think --
+A: form(model) wraps a WritableSignal and returns a FieldTree, using the model as the source of truth rather than keeping a copy. So the test is: set the model signal, then read the field's signals, login Form.email().valid(), .errors(), .touched().
+No subscriptions, no updateValueAndValidity(), no dual source of truth. Signal Forms became stable in v22 after being experimental in v21, so say which version you are talking about.
+
+Cross-Q: valid() and invalid(), are they opposites?-- think --
+A: No, and this is the detail that catches people. valid() is true when there are no validation errors and no pending validators; invalid() is true when there are validation errors regardless of pending validators. During an async check, a username-availability call, both are false.
+A test asserting valid() is false and concluding "the validator rejected" is wrong; assert pending() first, settle the async work, then assert the resolved state. The same trap exists in reactive forms, where a pending control is neither valid nor invalid.
+
+Cross-Q²: How do you test a cross-field rule, and how does this compare to reactive forms?-- think --
+A: In Signal Forms the errors live on the field they were attached to, and error Summary() on an ancestor aggregates the field's errors and its descendants', whereas errors() is the field's own only.
+So a cross-field rule is asserted with form().error Summary() without needing to know which child carried it. In reactive forms the equivalent validator hangs off the FormGroup and you assert form.errors?.['password Mismatch'], remembering to also test that the error clears.
+The broader comparison worth making: reactive forms keep a parallel copy of the data in the control tree, which is the root of the form.value -omits-disabled-controls problem and of every "the model and the form disagree" bug; Signal Forms do not maintain a copy at all.
+
+-- pause --
+Drill 24, Testing @defer and the deployment-shaped bugs.
+
+Q: How do you test a @defer block's placeholder, loading and error states?-- think --
+A: deferBlockBehavior already defaults to manual, so triggers do not fire in a TestBed test, create the fixture, get the blocks with await fixture.getDeferBlocks(), and drive each state with await block.render(DeferBlockState.Placeholder | Loading | Complete | Error).
+Stating DeferBlockBehavior.Manual explicitly documents the intent; DeferBlockBehavior.Playthrough is the opt-in when you want the real triggers.
+While you are in that config, note animations Enabled also defaults to false, so anything gated on a leave animation completing behaves differently here than in the browser.
+
+Cross-Q: What bug does that catch that a normal component test cannot?-- think --
+A: @defer fails open. If anything outside the block holds a reference to a component inside it, a view Child(), an import used in a value position, the compiler cannot exclude it from the eager chunk, so the deferral silently does nothing and the application still works perfectly.
+There is no error and no failing test; the only symptom is a bundle that did not shrink. A test asserting that the placeholder renders before any trigger fires is the cheapest ongoing signal that the block is still genuinely deferred.
+v22 making incremental hydration the default increases how much of a real application sits inside these blocks.
+
+Cross-Q²: Your E2E suite is flaky. Rank the causes and say what you would change first.-- think --
+A: In order of how often it is actually the cause: (1) shared test data mutated by parallel workers, fix by having each test create data keyed by worker index and timestamp, or by isolating the database per run with Testcontainers;
+(2) waiting on time instead of state, replace waitForTimeout with waitForResponse for A P I-dependent assertions and expect(locator).toBeVisible() for U I ones; (3) structural selectors, move to getByRole / getByLabel, which also doubles as an accessibility assertion;
+(4) animations and non-deterministic content in screenshots, animations: 'disabled' and mask.
+Framework-level retries are a stopgap that hides all four; if you enable them, alert on the retry rate so the flake stays visible.
+
+-- pause --
+Section 2. Self-test.
+
+vi.useFakeTimers() before the interaction, then await vi.advanceTimersByTimeAsync(300), the async variant, so the microtask queue drains between timers and any promise-based continuation actually progresses. Assert with expect None before the window elapses and expect One after.
+fake Async is zone.js machinery: its A P I reference says it requires Zone.js and cannot be used with the Vitest runner. If you must keep it during a migration, zone.js or plugins or vitest-patch in the test polyfills is the documented bridge.
+
+Because writing a signal schedules the effect rather than running it, effects execute as part of Angular's synchronisation pass, and in a test nothing schedules that pass. TestBed.tick() performs it.
+Note that TestBed.flush Effects() is deprecated and is not an equivalent: it ran root effects only, while tick() runs the whole synchronisation in production order, so migrating occasionally reveals tests that were asserting an ordering the application never produces.
+
+A resource fires eagerly, but only during synchronisation, and nothing has synchronised yet. Call TestBed.tick() first, then expect One(.).flush(body), then await TestBed.inject(ApplicationRef).when Stable() before asserting the resource's signals.
+fixture.when Stable() is not sufficient here: there is a known issue where it does not resolve with a pending resource / rx Resource.
+
+The controller replaces only HttpBackend, leaving the real service, HttpClient and the whole interceptor chain in play, so you test URL construction, params, headers, error mapping, auth attachment and interceptor order, and the test correctly breaks when the endpoint changes.
+A service spy is faster to set up and decouples the component from backend URLs, but it stops testing every layer beneath it, and it encodes an assumed response shape that never ages. Default to the controller; use a service spy only when the service's contract is small and independently tested.
+
+cores rejection, the OPTIONS preflight (both its existence and its latency cost), and anything cookie-related, SameSite, Secure, domain scope, Set-Cookie from the A P I. Also redirects, compression, and the real output of System.Text.Json.
+All of them live HttpBackend, which provideHttpClientTesting() replaces. They are Playwright-layer concerns, and the general rule is to own a test at the layer where the failure occurs.
+
+Three reasons. The harness is a versioned public A P I maintained by the component's authors, while the DOM structure is not a contract anybody keeps.
+Harness methods automatically run change detection before reads and after interactions, so a whole class of missing-await bugs disappears, which matters more under zoneless, where the synchronisation boundaries moved.
+And the same harness runs in TestbedHarnessEnvironment and SeleniumWebDriverHarnessEnvironment, so the interaction vocabulary is written once and reused across the pyramid. Remember documentRootLoader for anything in the CDK overlay.
+
+fixture.component Ref.set Input('name', value), direct assignment does not compile because input() returns a read-only InputSignal. set Input also applies input transforms.
+When the behaviour under test is reactivity to a changing input, prefer TestBed.create Component(Cmp, { bindings: [input Binding('name', some Signal)] }), which keeps the binding live the way a real parent would.
+
+Because the bug is concurrency, and one request has none: a per-request refresh and a single-flight refresh are indistinguishable with one 401 in flight. Fire three requests, flush all three with 401, then expect One('/api or refresh'), that assertion fails on the broken implementation.
+The production symptom of getting it wrong is mass logouts, because a backend with refresh-token rotation treats the second presentation of a rotated token as reuse and revokes the family.
+
+Karma deprecated itself, its README says it "is deprecated and is not accepting new features or general bug fixes", as a 2023 decision by its own maintainers. Angular kept it as the default until v21, when Vitest became the default via @angular or build:unit-test (experimental in v20).
+Angular still supports Karma today. Do not claim Angular deprecated Karma in v15, that Vitest became first-party in v18 via AnalogJS, or any speed multiplier over Karma, none of the three is accurate or citable.
+
+jsdom implements the DOM but not layout. getBoundingClientRect() returns zeros, IntersectionObserver and ResizeObserver are absent, CSS is parsed but not applied, scrollIntoView is a no-op, Canvas and WebGL are missing, and animations do not run.
+Anything depending on size, position or visibility must move to browsers: ["chromium"] with @vitest or browser-playwright: CDK overlay positioning, virtual scroll, sticky headers, and @defer (on viewport).
+
+valid() is true only when there are no errors and no pending validators; invalid() is true when there are errors regardless of pending validators. During an async validation both are false.
+A test that asserts valid() is false and concludes the validator rejected is asserting nothing, check pending(), settle the async work, then assert the resolved state. The equivalent trap exists in reactive forms, where a pending control is neither valid nor invalid.
+
+Stop treating coverage as a target.
+Use it as a ratchet (it may not go down) and as a finder (which branches in guards, interceptors and services are dark?), exclude generated and barrel files so it measures written code, and add the rule that cannot be gamed: every bug fix ships with a test that fails on the parent commit.
+That grows coverage exactly where bugs actually occur. If the gate is being satisfied by expect(component).toBeTruthy() specs, which execute the constructor, every field initialiser and the entire template after one synchronisation, the gate is measuring compliance, not quality.

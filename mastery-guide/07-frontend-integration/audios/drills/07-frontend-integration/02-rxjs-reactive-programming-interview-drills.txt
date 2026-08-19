@@ -1,0 +1,334 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+Q: What is the difference between Observable, Subject, BehaviorSubject, and ReplaySubject?-- think --
+A: Observable is a lazy unicast producer, each subscriber gets its own execution. Subject is both Observable and Observer; hot (multicast), no initial value, late subscribers miss past values.
+BehaviorSubject is a Subject with a current value, late subscribers immediately receive the latest emission; use for "current state." ReplaySubject(n) buffers the last N emissions and replays them to any new subscriber regardless of when they subscribe.
+
+Cross-Q: You use a plain Subject as an event bus. A component subscribes after the first event fires. What does it receive?-- think --
+A: Nothing from before the subscription. Subject has no buffer. The component only sees events emitted after it subscribes. If the component needs the latest state, switch to BehaviorSubject. If it needs recent history (for example, last 5 messages in a chat), use ReplaySubject(5).
+
+Cross-Q²: A service exposes a BehaviorSubject directly ( public cart$ = new BehaviorSubject([]) ). What is wrong with this, and how do you fix it?-- think --
+A: External callers can call cart$.next([]), bypassing the service's validation and mutation logic. Expose cart$.as Observable() for reading, and provide explicit mutation methods ( add(), remove() ) that call next() internally. The subject itself stays private.
+
+-- pause --
+Drill 2, Cold versus hot observables.
+
+Q: What makes an Observable cold versus hot, and why does it matter in practice?-- think --
+A: Cold: the producer function runs fresh per subscriber, each subscriber gets its own execution. Every HttpClient.get() is cold; subscribing twice fires two H T T P requests. Hot: a shared producer; subscribers see the same emissions from the point they subscribe.
+DOM events, WebSocket messages, and Subjects are hot, they emit regardless of subscriber count.
+
+Cross-Q: You want multiple components to share one H T T P response. How do you turn a cold Observable hot?-- think --
+A: Pipe with share Replay({ buffer Size: 1, ref Count: false }). The first subscriber triggers the H T T P call; subsequent subscribers get the cached last emission immediately.
+ref Count: false keeps the cache alive when subscribers drop to zero; ref Count: true re-fetches when subscriber count drops to zero and someone subscribes again.
+
+Cross-Q²: share Replay with ref Count: false is used to cache an auth token H T T P call. The token expires. How does the cache invalidate?-- think --
+A: It doesn't automatically, share Replay with ref Count: false holds the value indefinitely.
+You must either switch to ref Count: true (re-fetches on new subscription after last unsub) or build manual invalidation: hold a reference to the Observable, reset it to null on token expiry, and reassign a new http.get(.).pipe(share Replay(1)).
+Alternatively, use a BehaviorSubject to hold the token and update it imperatively.
+
+-- pause --
+Drill 3, switch Map versus merge Map versus concat Map versus exhaust Map.
+
+Q: Walk me through all four higher-order mapping operators and their use cases.-- think --
+A: switch Map, on each outer emission, cancel the in-flight inner and start a new one. Use for search-as-you-type; only the latest request matters. merge Map ( flat Map ), run all inners concurrently; no cancellation. Use for independent parallel operations (track multiple clicks).
+concat Map, queue inners; start the next only after the previous completes. Use for order-sensitive sequential operations (save edits). exhaust Map, ignore new outer values while an inner is running. Use for non-idempotent actions (login button, payment submit).
+
+Cross-Q: You use merge Map for a save operation. Two saves overlap. What can go wrong?-- think --
+A: Race condition, both H T T P requests are in-flight simultaneously; the server may process them out of order. The second response could overwrite the first's result, or the server could reject the concurrent write.
+Use concat Map for ordered writes or exhaust Map if you want to ignore additional save triggers while one is pending.
+
+Cross-Q²: switch Map is used for an H T T P POST (order submission). The user types quickly and triggers a cancellation. Has the cancelled request actually been cancelled on the server?-- think --
+A: RxJS cancels by unsubscribing from the inner Observable, and Angular's H T T P backend tears the request down: the fetch backend, the default since v22, which is why with Fetch() is now deprecated as removable, calls abort() on its AbortController;
+the XHR backend ( provideHttpClient(with Xhr()), still needed for upload progress) calls xhr.abort().
+So the browser really does abandon the request.
+Whether the server stops is a different question: in A S P dot NET Core a client disconnect trips HttpContext.RequestAborted, which is what a CancellationToken parameter binds to, if the handler threads that token into E F Core and downstream calls, the work stops;
+if it ignores it (the common case), the write commits and you have simply thrown away the response.
+Which is the whole argument for exhaust Map on writes plus a server-side idempotency key.
+
+-- pause --
+Drill 4, combine Latest versus fork Join versus zip.
+
+Q: When do you use combine Latest, fork Join, and zip, and how do they differ in emission timing?-- think --
+A: combine Latest([a$, b$]), emits whenever ANY source emits, pairing with the latest of the others. Requires all to have emitted at least once. Ideal for reactive form state, filter combinations. fork Join([a$, b$]), emits exactly once when ALL sources complete, with their last values.
+Ideal for parallel H T T P calls where you need all results together. zip(a$, b$), pairs values index-for-index: first emission of A with first of B, second with second. Rarely used except for sequential pairing.
+
+Cross-Q: combine Latest doesn't emit initially even though both sources are BehaviorSubjects. Why?-- think --
+A: This shouldn't happen with BehaviorSubjects, they emit their current value synchronously on subscription, satisfying combine Latest 's "all must have emitted once" condition. If you see this, one "source" is actually a cold Observable that hasn't emitted.
+Fix: start With(initial Value) on cold sources before passing to combine Latest.
+
+Cross-Q²: You have three H T T P calls using fork Join. One fails with a 404. What happens to the other two?-- think --
+A: fork Join propagates the error immediately, cancelling (unsubscribing) the remaining inner Observables. The combined Observable errors; you never get results from the other two.
+To handle partial failures gracefully, wrap each inner with catch Error(err goes to of(null)) so failures produce a null value rather than terminating the join.
+
+-- pause --
+Drill 5, take Until versus takeUntilDestroyed.
+
+Q: What is the difference between take Until and takeUntilDestroyed for subscription cleanup?-- think --
+A: take Until(notifier$) is a generic operator, completes the source when notifier$ emits. Used with a Subject destroyed in ngOnDestroy. Verbose: requires a destroy Subject field, next() + complete() calls.
+takeUntilDestroyed() (Angular 16+, from @angular or core or rxjs-interop ) uses DestroyRef internally, automatically completes when the injection context (component, directive) is destroyed. Cleaner; no boilerplate.
+
+Cross-Q: takeUntilDestroyed() is called inside ngOnInit rather than in the constructor. What happens?-- think --
+A: It throws, this is not a warning.
+With no argument, takeUntilDestroyed() calls assertInInjectionContext and then inject(DestroyRef); ngOnInit is a lifecycle hook, not an injection context, so you get NG0203:
+"takeUntilDestroyed() can only be used within an injection context such as a constructor, a factory function, a field initializer, or a function used with runInInjectionContext ".
+The two correct shapes are (a) call it in a field initializer or the constructor, or (b) capture private destroy Ref = inject(DestroyRef) as a field and call takeUntilDestroyed(this.destroy Ref) wherever you like.
+Also worth knowing: if the DestroyRef has already been destroyed, the notifier emits synchronously and the source is never subscribed at all.
+
+Cross-Q²: You have a subscription in a service (not a component). Can takeUntilDestroyed be used there?-- think --
+A: Yes if the service is provided at component level ( providers: [MyService] on the component). The DestroyRef it captures is the component's, the subscription completes when the component is destroyed.
+For provided In: 'root' services (app lifetime), takeUntilDestroyed is meaningless since the service is never destroyed. Use first(), take(1), or explicit unsubscribe() for one-shot operations in root services.
+
+-- pause --
+Drill 6, debounce Time versus throttle Time versus audit Time.
+
+Q: What is the difference between debounce Time, throttle Time, and audit Time?-- think --
+A: debounce Time(milliseconds), waits for milliseconds silence; emits the last value after no new values for milliseconds. Resets timer on each emission. Use for search-as-you-type (emit only after user stops typing). throttle Time(milliseconds), emits immediately, then silences for milliseconds.
+Use for rate-limiting scroll or resize events (emit first, ignore flood). audit Time(milliseconds), waits milliseconds after the first emission in a window, then emits the latest. Similar to throttle but emits at the END of the window with the most recent value.
+
+Cross-Q: A user types "hello world", 11 keystrokes in 500 milliseconds. debounce Time(300) is applied. How many emissions reach the downstream operator?-- think --
+A: One, the value "hello world" emitted 300 milliseconds after the last keystroke. Each keystroke resets the timer. The first 10 keystrokes are discarded because new values arrive before the timer fires.
+
+Cross-Q²: You use throttle Time(1000) for a scroll handler that updates a sticky header's position. The user scrolls quickly for 3 seconds, then stops. The header's final position is wrong. Why?-- think --
+A: throttle Time (default leading set to true, trailing set to false) emits at the start of each window and discards all trailing values. The last scroll position after the user stops may never emit if it falls in a silent window.
+Fix: throttle Time(1000, async Scheduler, { leading: true, trailing: true }) to also emit the final value after the window ends, or use audit Time(100) for a "emit latest every 100 milliseconds" pattern.
+
+-- pause --
+Drill 7, share versus share Replay.
+
+Q: What is the difference between share and share Replay?-- think --
+A: share() is the RxJS 7 replacement for the old multicast(() goes to new Subject()), ref Count() pairing, and it is fully configurable:
+connector (default () goes to new Subject() ), resetOnError, resetOnComplete and resetOnRefCountZero, all defaulting to true and all able to take a notifier factory instead of a boolean.
+It multicasts to active subscribers; if all unsubscribe and a new one subscribes later, the source is re-subscribed from scratch (no replay).
+share Replay(n) is literally share with a ReplaySubject(n) connector plus resetOnError: true, resetOnComplete: false and resetOnRefCountZero: ref Count, which is why a completed source keeps replaying forever while a failed one goes cold and lets the next subscriber retry.
+Use share for hot streams where late subscribers don't need history; share Replay(1) to de-duplicate concurrent subscribers to an H T T P call.
+
+Cross-Q: share Replay({ buffer Size: 1, ref Count: true }) versus share Replay(1), what is the difference?-- think --
+A: share Replay(1) is equivalent to share Replay({ buffer Size: 1, ref Count: false }). With ref Count: false, the source stays subscribed even when all subscribers unsubscribe, the cache is kept forever.
+With ref Count: true, the source is torn down when subscriber count drops to zero; the next subscription re-triggers the source. Prefer ref Count: true to avoid dangling subscriptions and stale caches.
+
+Cross-Q²: Two components subscribe to the same share Replay(1) H T T P Observable. Both unsubscribe (user navigates away). A third component later subscribes. Does it get the cached value or re-fetch?-- think --
+A: With ref Count: false, gets the cached value, no re-fetch. With ref Count: true, the source was torn down when the second subscriber left; the third subscription re-triggers the H T T P call. Choose based on whether staleness or extra H T T P calls are the greater concern.
+
+-- pause --
+Drill 8, catch Error versus retry versus retry When.
+
+Q: What is the difference between catch Error, retry, and retry When in error handling?-- think --
+A: catch Error(fn), intercepts the error and replaces the stream with a fallback Observable (or re-throws). The original stream is terminated; downstream receives the fallback's emissions instead.
+retry(n), resubscribes to the source Observable on error, up to n times; useful for transient network failures.
+retry When, custom retry logic driven by a notifier Observable; deprecated, with the source note saying it will be removed "in v9 or v10", and replaced by the retry({ count, delay, resetOnSuccess }) config that landed in RxJS 7.3. Note the delay callback is invoked with a 1-based retry count.
+
+Cross-Q: Where you place catch Error matters critically. Explain the difference between catching at the outer versus inner level in a switch Map chain.-- think --
+A: Outer catch: search Term$.pipe(switch Map(t goes to api.search(t)), catch Error(err goes to of([]))), the first search failure terminates the entire search stream; no further searches are possible.
+Inner catch: search Term$.pipe(switch Map(t goes to api.search(t).pipe(catch Error(err goes to of([]))))), each search error is isolated; the outer stream continues; subsequent searches still work. Always catch errors at the innermost level when the outer stream must survive.
+
+Cross-Q²: retry({ count: 3 }) retries 3 times and then errors. The caller doesn't catch the error. What happens in Angular?-- think --
+A: The error propagates to the subscriber's error callback. If there is none, RxJS reports it through config.onUnhandledError, which by default rethrows on a fresh call stack, so it surfaces as a global error, not at your subscribe() line.
+The Observable is terminated: no more values, no complete, and the teardown has already run.
+What happens in a template depends on the bridge: the async pipe routes the error to Angular's application ErrorHandler and keeps rendering its last value (it does not silently swap in undefined ), while to Signal stores the error and rethrows it every time the signal is read,
+so it detonates during template evaluation at whichever consumer reads it.
+Either way the stream is finished. Always pair retry with a terminal catch Error, and prefer an error-shaped value (or rx Resource 's error() ) over a fallback that pretends the call succeeded.
+
+-- pause --
+Drill 9, Marble testing with TestScheduler.
+
+Q: What is marble testing and what problem does TestScheduler solve?-- think --
+A: Marble testing lets you write RxJS tests using ASCII timeline strings (marbles) to describe Observable behavior over virtual time.
+TestScheduler from rxjs or testing controls time, debounce Time, delay, timer all respect virtual time, so you can test time-based operators synchronously without real set Timeout waits.
+
+Cross-Q: Write the marble syntax for testing that debounce Time(300) on input "abc" (three quick emissions, one after 400 milliseconds silence) emits exactly once.-- think --
+A: Inside run() you do not pass the scheduler to the operator, debounce Time(300) picks up virtual time automatically, because run() delegates RxJS's internal timer providers. The test is:
+
+typescript.
+scheduler.run(({ cold, expect Observable }) goes to {.
+const source = cold('abc 400 milliseconds |'); // a@0, b@1, c@2, complete@403.
+expect Observable(source.pipe(debounce Time(300))).to Be('302 milliseconds c 100 milliseconds |');
+});
+
+Read the expectation out loud: nothing for 302 frames, then c, then the source's completion at 403. Only c survives because each of a and b reset the timer one frame later.
+Note the frame arithmetic that trips everyone up, an emission character advances time by one frame itself, so c at frame 2 debounces to 302, not 300.
+
+Cross-Q²: A marble test passes locally but fails in CI where the C P U is slower. What is the cause and fix?-- think --
+A: Wall-clock speed cannot affect a TestScheduler.run() test, virtual time is deterministic and the whole block runs synchronously. So the failure means something in the test is not on virtual time.
+run() delegates RxJS's own providers ( set Timeout, set Interval, set Immediate, requestAnimationFrame, Date.now, performance.now ), it does not virtualise the microtask queue.
+Anything that goes through a Promise escapes: from(promise), an async function inside the code under test, a real fetch, an un-mocked HttpClient.
+The fix is to keep the unit under test Observable-all-the-way (mock at the Observable boundary, not the Promise boundary) and to test Promise-based code with async / await instead.
+A second, less common cause: mixing TestScheduler with fake Async / tick or a framework's fake timers, which gives you two clocks fighting over the same callbacks.
+
+-- pause --
+Drill 10, Scheduler types.
+
+Q: What are RxJS schedulers and when would you use async Scheduler versus queue Scheduler versus animationFrameScheduler?-- think --
+A: Schedulers control when Observable emissions and operator callbacks are executed. async Scheduler, defers work with set Timeout(fn, delay); good for non-urgent background work, avoids blocking the call stack.
+queue Scheduler, executes synchronously in a queue (FIFO); used for recursion prevention in synchronous pipelines. animationFrameScheduler, schedules work via requestAnimationFrame; ideal for DOM updates that should sync with the browser paint cycle (smooth animations, canvas updates).
+
+Cross-Q: observe On(async Scheduler) versus subscribe On(async Scheduler), what is the difference?-- think --
+A: subscribe On controls on which scheduler the subscription setup runs (the producer). observe On controls on which scheduler values are delivered to the next operator or subscriber (the consumer).
+For moving work off the main thread context: observe On(async Scheduler) defers downstream processing to a set Timeout. For starting a slow producer asynchronously: subscribe On(async Scheduler).
+
+Cross-Q²: You have a scan accumulating 10,000 values emitted synchronously. The U I freezes. How do you fix it using schedulers?-- think --
+A: Be careful with the framing first:
+observe On(async Scheduler) does not move work off the main thread and does not reduce the work, it schedules each downstream delivery through set Interval / set Timeout, that is as macrotasks (not microtasks), so the browser can paint and handle input between them.
+That converts one long block into 10,000 small ones, which fixes "the tab is frozen" but makes total wall-clock time worse and, under zone-based change detection, can trigger 10,000 change-detection passes.
+The better answers in order: reshape the stream so the U I never sees 10,000 emissions ( buffer Time(16), audit Time(16), or a scan that accumulates and a separate throttled read for the template); only then consider observe On for yielding;
+and if the computation is genuinely expensive rather than merely frequent, put it in a Web Worker and let the stream carry the results back.
+
+-- pause --
+Drill 11, scan versus reduce.
+
+Q: What is the difference between scan and reduce in RxJS?-- think --
+A: scan(reducer, seed), like Array.reduce but emits the accumulated value after every emission. The stream stays open; each new value triggers a new accumulated result. reduce(reducer, seed), accumulates all values and emits the final result only on complete.
+If the source never completes, reduce never emits. Use scan for running totals, Redux-style state updates, and live aggregation. Use reduce for batch summarization of a finite stream.
+
+Cross-Q: Show how scan implements a simple Redux-style state store.-- think --
+A: const state$ = actions$.pipe(scan((state, action) goes to reducer(state, action), initial State), start With(initial State), share Replay(1)). Each action dispatched to actions$ triggers scan, which applies the reducer and emits the new state.
+All components subscribing to state$ get current and future states. This is conceptually what NgRx does internally.
+
+Cross-Q²: A scan accumulates items in an array. You push items but the template doesn't update because you mutated the array with push() instead of spreading. Why does this happen, and how does it relate to RxJS?-- think --
+A: RxJS itself doesn't care, scan emits the same array reference you returned from the reducer. Angular's change detection (or signal comparison) checks the reference. If you push() into an existing array and return the same reference, nothing detects a change.
+Always return a new array: [.acc, new Item]. This is the pure reducer contract; mutation in scan is the same bug as mutation in Redux reducers.
+
+-- pause --
+Drill 12, Higher-order observable flattening strategies.
+
+Q: What is a higher-order Observable and why do you need a flattening operator?-- think --
+A: A higher-order Observable is an Observable that emits Observables, Observable>. Without flattening, you'd have to subscribe inside a subscribe (nested subscribes, the anti-pattern).
+Flattening operators ( switch Map, merge Map, concat Map, exhaust Map ) merge the inner Observables back into a single output stream. They take a projection function (outer Value) goes to Observable and handle the inner subscriptions automatically.
+
+Cross-Q: merge All versus merge Map, what is the difference?-- think --
+A: merge Map(project) is equivalent to map(project) + merge All(). merge All() operates on an already-higher-order Observable (you've already done the map ); merge Map combines both steps. Same relationship for switch Map = map + switch All, concat Map = map + concat All.
+The combined form ( switch Map, et cetera) is almost always preferred, cleaner and the intent is explicit.
+
+Cross-Q²: You nest switch Map inside switch Map. When does the inner-inner Observable get cancelled?-- think --
+A: When the inner switch Map 's source emits a new value, it cancels the inner-inner Observable. When the outer switch Map 's source emits a new value, it cancels the entire inner Observable chain including its inner-inner subscriptions. Cancellation cascades inward.
+This is useful for multi-level search (select category to select subcategory to fetch products): each level's new selection cancels the downstream request tree.
+
+-- pause --
+Drill 13, RxJS with Angular: async pipe versus manual subscribe.
+
+Q: Why is the async pipe preferred over manual subscribe in Angular components?-- think --
+A: async pipe subscribes when the template renders and unsubscribes when the component is destroyed, automatic lifecycle management, no memory leaks. It also calls markForCheck() on each emission, making it compatible with OnPush change detection.
+Manual subscribe() requires you to hold the Subscription, call unsubscribe() in ngOnDestroy, and manually handle change detection if on OnPush. More code, more surface for mistakes.
+
+Cross-Q: A component subscribes to an Observable in ngOnInit and updates a local field. With OnPush, the template doesn't update. Why?-- think --
+A: OnPush only checks the component when inputs change, events occur, or markForCheck() / detect Changes() is called. A bare .subscribe() callback updates a field but doesn't tell Angular to check the component.
+Fix: inject ChangeDetectorRef and call this.cdr.markForCheck() inside the subscribe callback, or use the async pipe which calls markForCheck() automatically.
+
+Cross-Q²: The async pipe is used in a template with an Observable that emits frequently (WebSocket messages, ~100 or sec). Is this a performance problem, and how do you mitigate it?-- think --
+A: At 100 emissions or sec, async pipe calls markForCheck() 100 times per second triggering change detection. With default CD strategy this is heavy; with OnPush it's managed at that component but still runs 100 times. Mitigate: audit Time(16) or throttle Time(16) to cap at ~60fps.
+For very high-frequency streams, use observe On(animationFrameScheduler) to synchronize updates with browser paint cycles, or switch to a signal updated in a subscription, then let the template signal-track.
+
+-- pause --
+Drill 14, Memory leaks: common patterns.
+
+Q: Name three common subscription patterns that cause memory leaks in Angular.-- think --
+A: (1) ngOnInit() { this service poll$.subscribe(x goes to this.data = x); } with no ngOnDestroy unsubscribe. (2) combine Latest([a$, b$]).subscribe(.) stored in a local variable that's never unsubscribed, the component is destroyed but the subscription holds a reference to the component's closure.
+(3) Using a Subject in a service as an event bus, subscribing to it in many components, and never calling complete(), subjects in root services live forever, and component callbacks leak via the subscriber list.
+
+Cross-Q: You add ESLint rule rxjs or no-unsafe-takeuntil to the project. What does it catch?-- think --
+A: (In the maintained fork the rule id is rxjs-x or no-unsafe-takeuntil, described as "disallow applying operators after take Until ".) take Until placed before other operators that can re-subscribe ( repeat, repeat When, retry, retry When ) is unsafe, after take Until fires,
+the re-subscribe operators restart the upstream subscription, bypassing the take Until teardown and leaking.
+The rule enforces that take Until is the last operator in the pipe before subscribe, ensuring it's the final teardown gate.
+
+Cross-Q²: A developer argues: "I use take(1) so I don't need to unsubscribe." Is this always correct?-- think --
+A: Yes for one-shot Observables that complete after take(1) (for example, H T T P calls, router events). No for long-lived sources where the component is destroyed before the first emission, take(1) is still holding a live subscription in that case.
+Also no if the Observable is a BehaviorSubject that emits synchronously, take(1) completes immediately, which is correct. The edge case: if the source never emits (pending H T T P, filtered-out event), take(1) keeps the subscription open until it does.
+For components, takeUntilDestroyed() is more robust than take(1) for anything that might not emit before destroy.
+
+-- pause --
+Drill 15, Custom operator creation with pipe().
+
+Q: How do you create a custom RxJS operator using pipe()?-- think --
+A: A custom operator is a function that takes an Observable and returns an Observable. The idiomatic form: const my Op = (config: Config) goes to (source$: Observable): Observable goes to source$.pipe(operatorA(), operatorB()). It's just a function returning a function, pipeable.
+Usage: source$.pipe(my Op(config)). You compose existing operators internally; no need to write a new subscriber from scratch unless you need low-level control.
+
+Cross-Q: Write a custom operator distinctUntilChangedDeep that uses deep equality instead of reference equality.-- think --
+A: const distinctUntilChangedDeep = () goes to (source$: Observable) goes to source$.pipe(distinctUntilChanged((a, b) goes to Jason.stringify(a) === Jason.stringify(b))).
+Use a proper deep-equality library ( fast-deep-equal ) instead of Jason.stringify for production, Jason.stringify has ordering issues and can't handle circular references. The operator is still a simple composition: distinctUntilChanged with a custom comparator.
+
+Cross-Q²: Your custom operator needs to accumulate state across emissions (like a ring buffer of the last N values). Is composing existing operators enough or do you need to use the new Observable(subscriber goes to.) constructor?-- think --
+A: Composition is enough, scan is the right primitive: const lastN = (n: number) goes to (src$: Observable) goes to src$.pipe(scan((buf, val) goes to [.buf.slice(-(n-1)), val], [] as T[])).
+The new Observable constructor is only needed for truly imperative sources (wrapping a callback A P I, a DOM event, a WebSocket) or for custom teardown logic that composition can't express. For transformation operators, composition with scan or buffer Count or pairwise is almost always sufficient.
+
+-- pause --
+Drill 16, to Signal: initial Value, require Sync, and errors.
+
+Q: What does to Signal(source$) return before the source emits, and what are your options?-- think --
+A: undefined, and the type says Signal, so the template has to handle it.
+Three ways out: pass initial Value (the value returned until the first emission); pass require Sync: true, which asserts the source emits synchronously on subscribe and removes undefined from the type; or accept the undefined and treat it as "not loaded yet".
+Also know that to Signal subscribes immediately at the call site, not lazily on first read, so any side effect of subscribing happens when the field initializer runs.
+
+Cross-Q: A developer writes data = to Signal(this http get('/api or data'), { require Sync: true }) to avoid the undefined. What happens?-- think --
+A: It throws NG0601, " to Signal() called with require Sync but Observable did not emit synchronously", every time, at creation. An H T T P Observable cannot emit synchronously.
+require Sync is for sources that are guaranteed synchronous: a BehaviorSubject, a ReplaySubject(1) that has already emitted, or any pipeline ending in start With(.).
+For H T T P, use initial Value, or better, use http Resource / rx Resource so "loading" is a real state ( is Loading() ) rather than a sentinel value.
+
+Cross-Q²: The observable behind a to Signal errors. Where does the error surface, and how do you handle it?-- think --
+A: The error is stored and rethrown from the signal's getter, so it is thrown wherever the signal is read, typically during template evaluation, in a component that may be far away from the pipeline that failed.
+There is no error callback to attach and no reject Errors option (it was removed in v20 for encouraging uncaught exceptions).
+Handle it inside the pipeline with catch Error, mapping failure to a value your template can render, or move to rx Resource where status() and error() are part of the contract.
+
+-- pause --
+Drill 17, rx Resource versus a hand-rolled to Signal pipeline.
+
+Q: rx Resource went stable in v22. When would you use it instead of to Signal(pipeline$) ?-- think --
+A: When the shape is "reactive params in, async value out, and the template needs loading or error state".
+rx Resource({ params, stream }) re-runs the loader when params changes, aborts the previous one (its abort Signal unsubscribes your Observable), and exposes value(), status(), is Loading(), error(), has Value() and reload().
+A to Signal(pipeline$) gives you a value and nothing else, every team that writes one also hand-rolls three sibling signals for loading, error and reload. Use RxJS when the pipeline is the point: debounce, retry with backoff, exhaust Map, ordering, or merging several sources.
+
+Cross-Q: Your stream returns an Observable that completes without emitting, say EMPTY, or a stream where a filter rejected the only value. What does the resource do?-- think --
+A: It errors, with "Resource completed before producing a value". It does not sit in loading forever and it does not fall back to default Value.
+This surprises people migrating a filtered pipeline into a resource: if "no value" is a legitimate outcome, emit a value that represents it ( of(null), defaultIfEmpty(.) ) rather than completing empty.
+
+Cross-Q²: Someone on your team says rx Resource proves signals have replaced RxJS. What is the accurate version?-- think --
+A: rx Resource consumes an Observable, the loader's return type is Observable, so RxJS is still the transport. What v22 removed is the boilerplate around a very common shape: keyed async loading with cancellation and status.
+What it did not remove: debouncing (except the narrow case covered by the experimental debounced() ), retry with backoff, exhaust Map semantics for writes, ordering guarantees, coordination between multiple streams, and everything push-driven. Signals own state; Observables own events.
+rx Resource is the bridge for the one case that is both.
+
+-- pause --
+Drill 18, the 401 refresh race.
+
+Q: Six requests fire on page load, the access token has just expired, and all six return 401. What does a naive interceptor do, and what should it do?-- think --
+A: A naive catch Error(401) to refresh to retry interceptor issues six refresh calls.
+With refresh-token rotation on the server, the first rotates the token and the other five present one that has just been invalidated, which a correct implementation treats as possible token theft and answers by revoking the whole token family, logging the user out.
+The fix is single-flight: cache the in-flight refresh Observable in the service, share it with share Replay({ buffer Size: 1 }), and clear it in finalize so the gate reopens on success and failure. Every 401'd request then switch Map s onto the same refresh and replays itself once.
+
+Cross-Q: What stops this from becoming an infinite loop?-- think --
+A: Two guards. First, the refresh call itself must bypass the interceptor, mark it with an HttpContextToken ( SKIP_AUTH ) rather than matching on the URL, so a 401 from /auth or refresh propagates instead of triggering another refresh.
+Second, retry the original request exactly once: if the replay also 401 seconds, log out rather than looping. It is also worth distinguishing 401 from 403, refreshing on 403 is a wasted round trip that masks an authorisation bug.
+
+Cross-Q²: Why finalize rather than tap to clear the cached refresh Observable?-- think --
+A: tap 's next or complete handlers do not run when the stream errors or is unsubscribed.
+If the refresh fails once and you only cleared the cache on success, every future 401 in the session reuses a dead, permanently-erroring Observable, share Replay will replay that error to every new subscriber, so the app can never recover without a reload.
+finalize runs on complete, error and unsubscribe, which is exactly the "the flight is over, whatever happened" semantic a single-flight gate needs.
+
+-- pause --
+Section 2. Self-test.
+
+Cold Observables run their producer per subscription. If a service exposes the Observable directly and two consumers subscribe (for example, template async pipe plus a .subscribe() in component code), each issues an H T T P request.
+Fix with share Replay({ buffer Size: 1, ref Count: true }) to multicast the response, or read once and cache the result in a signal.
+
+It waits for every source to emit at least once. If one source is a cold Observable that hasn't emitted (for example, a route param stream that fires only on navigation), the combined stream never starts.
+Fix by prepending start With(initial Value) to that source, or use BehaviorSubject (already has a current value), or restructure with withLatestFrom so only the trigger source must emit.
+
+switch Map cancels the in-flight request when the user clicks again, fine for idempotent reads but dangerous for non-idempotent saves (you may abort the network call after the server already started writing, leaving partial state).
+exhaust Map ignores subsequent clicks while the save is running, safer for non-idempotent operations and prevents double-submission. Pair with a loading signal to disable the button visually.
+
+tap signals intent, side effects (logging, telemetry, mutating cached state) without changing the stream.
+map is for transformation; mutating in map and returning the same value technically works but obscures intent and breaks immutability assumptions in operators downstream (for example, distinctUntilChanged may now see the same reference). Reviewers should reject side effects inside map.
+
+No. Signals model current values; Observables model streams of values over time. Events (clicks, websocket frames, debounced search), H T T P responses, and complex async pipelines (retry+backoff, race, sequencing) remain natural Observables.
+Convert at the boundary with to Signal so the template binds to a signal while the upstream pipeline stays declarative. Rule of thumb: state to signal; events to Observable.
+Note also that rx Resource, the v22 stable A P I people cite as evidence signals won, takes an Observable loader, so RxJS is still the transport underneath it.
+
+The save. switch Map unsubscribes the previous inner Observable, which aborts the browser's request (the fetch backend, default since v22, calls AbortController.abort(); the XHR backend calls xhr.abort() ).
+The server may already have committed: in A S P dot NET Core the disconnect surfaces as HttpContext.RequestAborted, but only handlers that actually thread that CancellationToken through will stop working.
+So you have discarded the response to a write that happened, and the user, seeing nothing, clicks again. Use exhaust Map plus a disabled button, and make the endpoint idempotent with a client-generated key.
+
+It removes undefined from the signal's type by asserting the source emits synchronously on subscription, correct for a BehaviorSubject, a ReplaySubject(1) that has already emitted, or any pipeline ending in start With.
+If the source does not emit synchronously, Angular throws NG0601 at creation time. It therefore always throws on HttpClient, which is the mistake people make when they are trying to get rid of the undefined in a template.
+For async data, use initial Value, or rx Resource / http Resource where "loading" is a first-class status rather than a sentinel value.
+
+The feature goes quietly inert: error is terminal, so no further values arrive, the teardown has already run, and there is no automatic resubscribe. Typical report: "the save button stopped doing anything" with nothing in the console after the first stack trace.
+Where the error went depends on the bridge, the async pipe routes it to Angular's ErrorHandler, to Signal rethrows it at read (so it detonates during template evaluation), a bare subscribe with no error callback goes to RxJS's unhandled-error path and surfaces as a global error.
+The fix is a catch Error inside the inner pipe so a single failure cannot terminate the outer stream, plus an error-shaped value rather than a fallback that pretends success.

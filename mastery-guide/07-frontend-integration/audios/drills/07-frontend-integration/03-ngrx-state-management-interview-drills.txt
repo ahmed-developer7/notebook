@@ -1,0 +1,354 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, NgRx data flow.
+
+Q: Walk me through what happens between a user clicking "Load Orders" and the list rendering on screen.-- think --
+A: The component dispatches load Orders() to Store routes it synchronously to the reducer (sets loading: true ) and asynchronously to any registered Effect to the Effect's of Type(OrdersActions.load Orders) stream emits to switch Map calls the service to on success the Effect dispatches orders Loaded({ orders }) to reducer sets orders and clears loading to selectAllOrders memoized selector recomputes to store.select(.) Observable emits the new list to component re-renders.
+
+Cross-Q: At what point does the component get the intermediate loading: true state?-- think --
+A: The reducer handles the action synchronously before the Effect's async work begins, so the Store emits loading: true before the H T T P call fires. Any loading$ selector subscription sees the updated value immediately after dispatch, giving the spinner the correct timing.
+
+Cross-Q²: What if two rapid "Load Orders" dispatches fire before the first H T T P response returns?-- think --
+A: With switch Map, the second dispatch cancels (unsubscribes) the first inner Observable, the first H T T P request is abandoned and only the second result is dispatched. This is the "latest-wins" semantic.
+If you used merge Map both would run in parallel and the older response could overwrite the newer. switch Map is the correct choice for search or load effects; concat Map for ordered writes.
+
+-- pause --
+Drill 2, create Action / create Reducer / create Selector A P I.
+
+Q: What does create Selector actually do under the hood?-- think --
+A: It composes one or more input selectors with a projector function. The library stores the last set of input results. On every Store emission it runs each input selector; if every input returns the same reference as last time it short-circuits and returns the cached projector output.
+Only when at least one input changes does it call the projector and cache the new result.
+
+Cross-Q: If my projector receives the same primitive values but returns a new object { count: 5 }, does memoization help?-- think --
+A: No. The projector's output is a new reference, so downstream distinctUntilChanged() (which NgRx applies via reference equality by default) will re-emit. The selector did avoid re-running the projector unnecessarily, but downstream subscribers still receive a new value.
+Fix: lift primitive counts out as separate selectors and let components use the primitives directly, or provide a custom equality comparator to store.select().
+
+Cross-Q²: How do you unit-test a composed selector without a real Store?-- think --
+A: Call selector.projector(.inputs) directly with raw values. This bypasses the memoization machinery and just invokes the projector function. Example: selectSelectedOrder.projector(all Orders, selected Id) returns the result without needing TestBed or a store setup.
+
+-- pause --
+Drill 3, Effects: of Type, switch Map versus exhaust Map.
+
+Q: Why do Effects need of Type ?-- think --
+A: The Actions stream emits every action dispatched to the Store. Without of Type, the effect would react to all of them, including unrelated actions, causing unintended H T T P calls or side effects. of Type filters the stream to only the action type(s) the effect cares about.
+
+Cross-Q: When would you use exhaust Map instead of switch Map in an Effect?-- think --
+A: When you want to ignore subsequent triggers while one async operation is in flight, classically for login or form-submit effects. If the user double-clicks "Submit", exhaust Map ignores the second click until the first H T T P call completes.
+switch Map would cancel the first call, which for a write operation could mean a half-processed request on the server.
+
+Cross-Q²: An Effect for "delete order" uses merge Map. Two deletes fire in rapid succession. What's the risk?-- think --
+A: Both H T T P calls run in parallel. If the server processes them out of order (unlikely but possible), a race on shared state could occur.
+More practically, if one fails and you dispatch an error action that re-fetches all orders, the re-fetch could arrive before the second delete completes and overwrite state prematurely.
+concat Map (sequential, ordered) is safer for destructive writes; exhaust Map if you want to reject rapid duplicates.
+
+-- pause --
+Drill 4, Memoized selectors and projector function.
+
+Q: What is the projector function in create Selector ?-- think --
+A: The last argument to create Selector, a pure function that receives the resolved values of all input selectors and returns the derived result. The library only calls it when at least one input selector's output changes reference.
+
+Cross-Q: Can you pass more than two input selectors to create Selector ?-- think --
+A: Yes, up to eight input selectors in NgRx's typed overloads; beyond that, the variadic form accepts an array of selectors followed by the projector. In practice, if you need more than four inputs, it's often a sign the selector should be decomposed into intermediate selectors.
+
+Cross-Q²: What is MemoizedSelector.set Result() and when would you use it in tests?-- think --
+A: set Result(value) forces the memoized selector to always return a fixed value when used with MockStore.override Selector(selector, value). It bypasses state entirely.
+This is the standard NgRx testing pattern: create a MockStore, override selectors with override Selector, and verify component behavior without needing real reducer logic.
+
+-- pause --
+Drill 5, Entity adapter: add One, update One, select All.
+
+Q: What data shape does @ngrx or entity EntityAdapter produce?-- think --
+A: A normalized shape: { ids: number[] | string[], entities: Record }. IDs are stored as an ordered array (controlling display order); entities are stored as a dictionary keyed by ID for O(1) lookup. This replaces a flat Entity[] array that would require O(n) find-by-id.
+
+Cross-Q: When would you prefer upsert One over update One ?-- think --
+A: update One requires the entity to already exist, it's a partial update ( { id, changes } form). upsert One inserts if absent or replaces if present, safer when you receive a server response and can't guarantee prior local state.
+For optimistic updates you typically upsert One (the locally predicted state) then either confirm with another upsert One or roll back with the original on error.
+
+Cross-Q²: How do you select a single entity by ID without a factory selector?-- think --
+A: create Selector(selectOrdersState, (state, props: { id: number }) goes to state.entities[props.id]) using the props form, but note the docs say "Selectors with props are deprecated and will be removed in v23", so that answer needs a caveat.
+The modern form is a parameterized selector factory, const selectOrderById = (id: number) goes to create Selector(selectOrdersState, s goes to s.entities[id]), called as store.select(selectOrderById(42)).
+The factory creates a distinct memoized selector per call, so call it once and hold the result (a field, not a getter or template expression); each memoized selector caches exactly one invocation, so a shared instance called with different ids never hits the cache.
+
+-- pause --
+Drill 6, Store DevTools and time-travel debugging.
+
+Q: How does time-travel debugging work in NgRx DevTools?-- think --
+A: Because reducers are pure functions, the DevTools can replay any subset of the action log. When you click an earlier action in the DevTools panel, the extension recomputes state from initial State by re-running every reducer on every action up to that point and shows the resulting state diff.
+No network calls are replayed; only pure state recomputation.
+
+Cross-Q: What does log Only: !isDevMode() do in provideStoreDevtools ?-- think --
+A: In production, it prevents the DevTools from being able to dispatch actions or import state from the extension, a security measure. State can be observed (read) but not mutated via the browser extension.
+Without it, anyone with the extension installed could inject arbitrary actions into a production app.
+
+Cross-Q²: Time-travel triggers a selector recompute for every step. What's the perf implication for an app with 500 actions in the log?-- think --
+A: For each step, the DevTools recomputes state by running the reducer 500 times sequentially (in memory, synchronously), typically milliseconds. Then memoized selectors recompute from that state. For very large action logs, this can feel sluggish; max Age: 25 limits the retained history.
+In production log Only mode there is no replay overhead. The real perf concern is in dev: keep max Age low and avoid storing large blobs in state.
+
+-- pause --
+Drill 7, Facade pattern over NgRx.
+
+Q: What is the Facade pattern in NgRx and why would you use it?-- think --
+A: A Facade is a service class that wraps store.dispatch(.) and store.select(.) calls, exposing a clean domain A P I to components. Instead of components knowing about action creators and selectors, they call orders Service.load Orders() and observe orders Service.orders$.
+Components are decoupled from NgRx internals.
+
+Cross-Q: What's the downside of the Facade pattern?-- think --
+A: It adds an indirection layer that can hide the Redux discipline, developers may start putting logic into the Facade that belongs in reducers or effects, creating a hybrid that loses the testability and auditability benefits of NgRx.
+It also makes the action log in DevTools less descriptive because the Facade's method name doesn't appear, only the action type does.
+
+Cross-Q²: How do you test a component that depends on a Facade?-- think --
+A: Mock the Facade service with jasmine.createSpyObj or an interface-based mock. The component sees a plain service with observables, no NgRx at all in the test. This is actually one of the Facade's main advantages for testing: components become trivially testable without MockStore setup.
+
+-- pause --
+Drill 8, NgRx SignalStore versus traditional Store trade-offs.
+
+Q: What are the main trade-offs between NgRx SignalStore and the classic Redux Store?-- think --
+A: Classic Store: full Redux ceremony (actions, reducers, effects, selectors in separate files), explicit action audit log, time-travel debugging via DevTools, strict immutability checks.
+SignalStore: far less boilerplate (state + methods + computed in one file), native Angular signals, no explicit action events, integrates without async pipe. Classic wins for large teams needing compliance or audit trails and complex cross-feature flows.
+SignalStore wins for smaller teams and faster iteration.
+
+Cross-Q: Does NgRx SignalStore integrate with Redux DevTools?-- think --
+A: No, there is no official Redux DevTools integration for SignalStore, and claiming otherwise is a fast way to get caught.
+What NgRx ships is get State() and watch State() for observing state changes in code, and, since NgRx 21, the stable @ngrx or signals or events plugin, which reintroduces dispatched events, with Reducer / on and withEventHandlers, so there is at least a narrative of what happened.
+For the DevTools U I specifically you either keep @ngrx or store or take a third-party dependency: @angular-architects or ngrx-toolkit provides with Devtools() and with Redux(). If action-level auditability with time travel is a hard requirement, the classic Store remains the answer.
+
+Cross-Q²: Can you mix SignalStore and classic Store in the same Angular app?-- think --
+A: Yes. They're separate packages and can coexist. A common migration pattern is to start new features with SignalStore while leaving existing classic Store features untouched.
+Communication between them happens via Angular's D I, a SignalStore method can inject the classic Store and dispatch to it, or the classic Store's selector can be consumed in a SignalStore via rx Method and to Signal.
+
+-- pause --
+Drill 9, State normalization.
+
+Q: Why does nesting entities in NgRx state hurt selectors?-- think --
+A: Nested structures (for example, orders[].customer.address ) mean a single selector emitting "all orders" must be recomputed whenever any nested customer or address property changes, even if the component only cares about order IDs and totals.
+Memoization keys off reference equality, a deeply nested mutation produces a new root reference, invalidating every selector that touches orders.
+
+Cross-Q: How do you normalize that nested structure?-- think --
+A: Separate slices: orders stores {., customer Id: number } (foreign key only); customers stores { id, name, address Id }. Selectors that need the full projection compose the slices: selectOrderWithCustomer = create Selector(select Order, select Customers,.).
+Updates to a customer don't touch the orders slice, so order selectors don't recompute.
+
+Cross-Q²: What library or tool can help with normalization in a Redux-style store?-- think --
+A: normalizr (JS library) takes nested A P I responses and returns normalized entities plus ID arrays matching the Redux entity shape. In NgRx, @ngrx or entity 's EntityAdapter is the built-in answer for the normalized { ids, entities } shape.
+For complex relational data, some teams adopt @ngrx or data (auto-generated crud) which opinionates normalization per entity type.
+
+-- pause --
+Drill 10, Router Store integration.
+
+Q: What is NgRx Router Store and what problem does it solve?-- think --
+A: @ngrx or router-store synchronizes Angular Router state (URL, params, query params, route data) into the NgRx Store.
+This means URL changes dispatch router actions and the current route is accessible as a selector, effects can react to navigation events like any other action, and route params are reachable via selectors without injecting ActivatedRoute everywhere.
+
+Cross-Q: How would you read the current route's:order Id param via a selector?-- think --
+A: Define a router selector using getRouterSelectors() from @ngrx or router-store, which provides selectRouteParam('order Id'). Use create Selector(selectRouteParam('order Id'), id goes to +id) in a composed selector to combine with entity state.
+
+Cross-Q²: What's the risk of reacting to router actions in effects?-- think --
+A: Router actions fire on every navigation, including programmatic navigations triggered by other effects. An effect that listens to ROUTER_NAVIGATION and dispatches another action could create a dispatch loop if that action also triggers navigation.
+Always guard with a specific route-match check and prefer of Type(ROUTER_NAVIGATED) (after navigation completes) over ROUTER_REQUEST (before guard resolution) for data-loading effects to avoid loading data for routes the user won't reach.
+
+-- pause --
+Drill 11, Feature states and lazy-loaded modules.
+
+Q: How do feature states in NgRx interact with lazy-loaded Angular modules?-- think --
+A: Feature states are registered with provide State(feature Key, reducer) inside the lazy module's providers. When the lazy route is loaded, Angular instantiates those providers, NgRx registers the feature reducer into the global Store, and from that point selectors for that slice work.
+Before the lazy module loads, store.select(selectFeatureState) returns undefined.
+
+Cross-Q: What happens to a feature state when the user navigates away from the lazy-loaded route?-- think --
+A: By default, NgRx retains the feature state even after the route is left, the slice stays in the Store for the app's lifetime, which is usually what you want (returning to the route is instant).
+To clear it you dispatch a reset action the feature reducer handles, or add a meta-reducer that resets slices on a global event such as logout.
+The low-level escape hatch is ReducerManager.remove Feature() / remove Features(), which is what feature deregistration calls; there is no "destroy on navigate away" provider flag in NgRx. A component- or route-provided SignalStore gets this for free, because its lifetime is the injector's.
+
+Cross-Q²: Can two lazy-loaded modules register the same feature key?-- think --
+A: Yes, but the second registration overwrites the first reducer, effectively replacing it. This is almost always a bug caused by accidental key collision.
+Use unique, namespaced feature keys ( 'orders', 'admin or orders' ) and prefer create Feature({ name: '.' }) which centralizes the key definition to prevent typos.
+
+-- pause --
+Drill 12, Testing reducers and effects in isolation.
+
+Q: How do you unit-test a reducer?-- think --
+A: A reducer is a pure function, call it directly. Pass an initial state and an action, assert the returned state.
+No TestBed, no Angular, no async: const result = orders Reducer(initial State, OrdersActions.orders Loaded({ orders: mock Orders })); expect(result.orders).to Equal(mock Orders); expect(result.loading).to Be(false);
+
+Cross-Q: How do you test an Effect that makes an H T T P call?-- think --
+A: Use provideMockActions to provide a controllable Actions Observable. Provide a spy or mock for the service. In the test, emit the trigger action into actions$, subscribe to the Effect Observable, and assert the dispatched result action.
+For marble testing: actions$ = hot('-a', { a: OrdersActions.load Orders() }); const expected = cold('-b', { b: OrdersActions.orders Loaded({ orders }) }); expect(effects.load Orders$).toBeObservable(expected);
+
+Cross-Q²: What's MockStore and when is it preferable to a real Store in component tests?-- think --
+A: MockStore is a test double for the NgRx Store that lets you override Selector(selector, value) without running real reducers. Components get the mocked selector values instantly. Use it in component unit tests to isolate the component from reducer or selector logic.
+Use a real Store + real reducers only in integration tests that specifically validate the full Store flow end-to-end.
+
+-- pause --
+Drill 13, When NOT to use NgRx.
+
+Q: When would you advise against adding NgRx to an Angular app?-- think --
+A: When the app has fewer than 5-10 features, state is naturally local (single-route forms, dashboards that each own their data), or the team is small and the ceremony overhead slows delivery more than the discipline helps.
+Also avoid for form state (Reactive Forms already manages it), transient U I state (tooltip open or closed), and server cache state where a dedicated solution like TanStack Query is better suited.
+
+Cross-Q: What are the simpler alternatives to NgRx for shared state?-- think --
+A: (1) Injectable service with BehaviorSubject or signal(), simplest, no framework overhead. (2) NgRx SignalStore, modern, low-ceremony, Angular-native. (3) @ngrx or component-store, per-feature store with less global ceremony.
+(4) TanStack Query ( @tanstack or angular-query ), handles server-state caching, loading or error states, and background refresh without Redux patterns. The rule: start simple, add NgRx Store when cross-feature state sharing and auditability genuinely require it.
+
+Cross-Q²: A colleague insists "we should NgRx everything for consistency." How do you respond?-- think --
+A: Consistency is valuable but consistency in the wrong direction multiplies friction. For a forms-heavy crud app, NgRx for every form field's loading spinner is boilerplate that slows development and makes the codebase harder to onboard.
+The architectural principle is "use the simplest tool that meets the requirement." Consistency should mean "we agree on when to use NgRx (cross-feature state, complex async, auditability)" not "we use NgRx everywhere." Governance via a decision record (ADR) makes this explicit and discussable.
+
+-- pause --
+Drill 14, Optimistic versus pessimistic updates in effects.
+
+Q: What is an optimistic update in NgRx and how is it implemented?-- think --
+A: An optimistic update reflects the expected outcome in state immediately on dispatch, before the server confirms it, making the U I feel instant.
+Implementation: on the initial action (for example, update Order ), the reducer applies the change immediately; the Effect calls the A P I; on success it dispatches a confirm action (no-op or light update);
+on failure it dispatches a rollback action that the reducer uses to restore the original state.
+
+Cross-Q: What's the risk of optimistic updates and how do you mitigate it?-- think --
+A: If the server rejects the update (validation error, conflict, auth failure), the user briefly sees incorrect state and then sees it snap back, jarring U X.
+Mitigate with: (1) saving the previous entity value before the optimistic update so rollback is clean, (2) showing a non-blocking error toast on failure rather than a disruptive dialog, (3) only using optimistic updates for low-conflict operations (status toggles,
+soft deletes) not high-contention data (inventory, financial figures).
+
+Cross-Q²: How does the entity adapter help with optimistic rollback?-- think --
+A: Before dispatching the optimistic update, store the original entity (for example, const original = state.entities[id] ). If the Effect gets an error, dispatch a rollback Order({ order: original }) action; the reducer calls orders Adapter.upsert One(original, state) to restore the prior value.
+Entity adapter's upsert One handles both insert-if-missing and replace-if-exists, making rollback to a snapshot a one-liner.
+
+-- pause --
+Drill 15, Dispatching actions from effects (secondary actions).
+
+Q: Can an Effect dispatch multiple actions?-- think --
+A: Yes, return an array (or use merge / EMPTY ) from the inner Observable: switch Map(() goes to fork Join([.]).pipe(merge Map(results goes to [ActionA({. }), ActionB({. })]))). Both actions hit the Store synchronously in sequence, so reducers for both fire before any selector emits.
+Angular's change detection sees one batch.
+
+Cross-Q: What's the danger of chaining effects, Effect A dispatches Action B which triggers Effect B which dispatches Action A?-- think --
+A: An infinite dispatch loop. Actions route to all matching effects and reducers synchronously (within the same microtask queue tick). A cycle A to effect to B to effect to A to. floods the Store and locks the browser.
+Prevent by: (1) ensuring secondary actions are terminal (no effect listens to them), (2) using dispatch: false for fire-and-forget effects, (3) adding a guard in the effect (for example, check current state via withLatestFrom(store.select(select Flag)) before dispatching).
+
+Cross-Q²: When would you use dispatch: false on an Effect?-- think --
+A: When the Effect's only purpose is a side effect that doesn't produce a new action, navigation ( router.navigate ), analytics logging, showing a toast, updating local Storage.
+Without { dispatch: false }, NgRx expects the Effect to return an Observable of actions; if it returns a non-action or nothing, NgRx logs a warning and may emit errors. { dispatch: false } tells NgRx to ignore the return value.
+
+-- pause --
+Drill 16, SignalStore composition and custom features.
+
+Q: Why does the order of features inside signal Store() matter?-- think --
+A: Because signal Store is a left-to-right pipeline: each feature is a function from the store shape accumulated so far to a new shape. with Computed can only see slices declared by an earlier with State; with Methods can only call computed signals declared before it.
+The final store type is inferred from that chain, which is why there is no AppState interface to maintain, and why moving a with State call a with Computed that reads it is a compile error, not a runtime surprise.
+
+Cross-Q: How do you write a feature that needs state it does not declare, say a withSelectedEntity() that relies on entity Map ?-- think --
+A: Declare the requirement as an input constraint: signalStoreFeature({ state: type>() }, with State(.), with Computed(.)). The type() helper describes the shape the parent store must already provide; using the feature on a store without it fails to compile.
+The alternative direction is with Feature(store goes to some Feature(store.some Signal)), which hands the feature the actual store instance when it needs a value rather than a shape.
+
+Cross-Q²: You have withRequestStatus() and withSelectedEntity() on the same store and TypeScript starts inferring nonsense. What's the documented fix?-- think --
+A: Add an unused generic parameter to input-constrained features. The docs call this out explicitly: combining several features that declare input types can collapse their inference, and giving each feature its own generic keeps them distinct.
+The related guidance is to define state updaters as standalone functions (like the entity updaters) so they tree-shake and so features stay loosely coupled.
+
+-- pause --
+Drill 17, rx Method, signal Method and effect.
+
+Q: What can you pass to a method created with rx Method ?-- think --
+A: A static value (runs the pipeline once), a signal (re-runs on every change), a computation function (NgRx 21+, so several signals can be combined), or an observable (runs on every emission).
+It must be created inside an injection context, or given { injector }, and it is torn down with that injector; the method itself and each individual call both expose .destroy().
+
+Cross-Q: An rx Method that loads data stops working after the A P I returns a 500 once. Why, and how does that differ from a classic Effect?-- think --
+A: An unhandled error terminates the observable chain, and rx Method does not resubscribe, the method is inert for the rest of the session. A classic Effect is resubscribed by defaultEffectsErrorHandler up to 10 errors before it gives up.
+The fix in both cases is to keep the error inside the inner observable: tap Response (or map Response, or a plain catch Error ) so the outer stream never sees it.
+
+Cross-Q²: When would you use signal Method instead of rx Method, and when neither?-- think --
+A: signal Method when the reaction is "value changed to run this function" with no operator chain, no debounce, no cancellation, no switching. It accepts a value or a signal, re-runs on change, and pulls in no RxJS.
+Neither when the value is derived rather than an action: that is computed (read-only) or withLinkedState / linked Signal (writable but reset by its source).
+Reaching for effect() to write state back into the store is the anti-pattern, it is the thing that turns a signals migration into an infinite-loop debugging session.
+
+-- pause --
+Drill 18, The events plugin and scoped events.
+
+Q: What problem does @ngrx or signals or events solve that plain SignalStore methods do not?-- think --
+A: Decoupling the "what happened" from the "what changes". With methods, the component calls store.load Orders(), it knows the store and the operation.
+With events, the component dispatches [Orders Page] Opened and any number of stores can react in with Reducer (state transitions) and withEventHandlers (side effects, whose returned events are auto-dispatched).
+It is the Flux argument, restored for SignalStore: one event, many consumers, and a readable narrative of dispatches. It went stable in NgRx 21, where with Effects was renamed withEventHandlers.
+
+Cross-Q: How is that different from just using @ngrx or store actions?-- think --
+A: Three ways. State stays in per-store signals rather than one global tree, so features remain independently providable and destroyable. Types are inferred rather than declared, event Group plus type() gives payload typing without action files.
+And events can be scoped: provide Dispatcher() at a route or component creates a local bus, and dispatch is self (default), parent or global, with children seeing parent events but never the reverse.
+In @ngrx or store, every action is global to the application, always, there is no such thing as a private action.
+
+Cross-Q²: Where do the reducer and the handler see the event, and what is the ordering guarantee?-- think --
+A: Both receive the dispatched event object, so payloads are destructured as ({ payload }); reducer handlers registered with on() inside with Reducer return partial state or updaters. Handlers subscribe through the Events service ( events.on(a, b) returns a filtered observable).
+When a handler must run after the state transition for that event has been applied, it injects ReducerEvents instead of Events, that stream is processed before the general one, so state is already consistent when your handler reads it.
+
+-- pause --
+Drill 19, Removing NgRx.
+
+Q: You inherit an app where every feature stores fetched entities in NgRx and the recurring bug is stale data. What do you do?-- think --
+A: Name the real problem first: those slices are a cache with no invalidation policy, and reducers give you no cache primitives.
+Split the state by ownership, server data moves to something that models staleness (a query library, or http Resource for the simple per-id cases), client-owned truth (selection, filters, drafts, wizard position) moves to a route-scoped SignalStore,
+and anything genuinely global with many consumers (auth, feature flags) can stay in the Store.
+Do it feature by feature; the leaf routes go first.
+
+Cross-Q: What do you lose, and how do you cover it?-- think --
+A: The DevTools action log and time travel, and the single reset point. Cover the first with the events plugin (or keep the Store for the features that actually need auditing); cover the second by making the remaining global store own logout or rehydrate, since that is a legitimate meta-reducer job.
+Also budget for test rewrites, MockStore / override Selector has no SignalStore equivalent, tests become TestBed with real providers and mocked services.
+
+Cross-Q²: A colleague says removing NgRx is a regression because "we lose predictability". What's the counter-argument that isn't just taste?-- think --
+A: Predictability came from three specific properties, immutable transitions, one place to reset everything, and a log of what happened, not from the word Redux.
+A SignalStore with protected state ( patch State only from inside the store) keeps the first; a global event or a store method keeps the second; the events plugin keeps the third for the features that need it.
+What you actually drop is the ceremony that bought those properties for state that never needed them: a cached order list does not become more predictable by acquiring four actions and a selector file.
+Write it up as an ADR with the decision boundary ("server reads: query layer; client truth: SignalStore; cross-feature events and audit: Store") so the next argument is about the boundary, not about the library.
+
+-- pause --
+Drill 20, The dot NET seam: tokens, refresh races and SSR.
+
+Q: Where does the access token get attached to outgoing requests in an Angular app with NgRx, and why not in an effect?-- think --
+A: In a functional interceptor, HttpInterceptorFn, registered with provideHttpClient(with Interceptors([.])). Interceptors run in an injection context, so the interceptor can inject() the store and read a signal synchronously.
+Doing it in effects means every call site must remember to route through an action, and non-NgRx calls (a lazy-loaded widget, a third-party service) bypass it entirely. The one discipline: scope the header to your own A P I origin, or you leak bearer tokens to every host the app talks to.
+
+Cross-Q: Six requests fire in parallel, the token has just expired, all six get 401. What happens with a naive interceptor and how do you fix it?-- think --
+A: Six refresh calls. With refresh-token rotation, the first invalidates the token the other five are using, five refreshes fail, and the user is logged out, under load only, which is why it passes testing.
+The fix is single-flight: one shared refresh observable ( share Replay({ buffer Size: 1, ref Count:
+false }), cleared in finalize ) that all six wait on before retrying their original request, or in NgRx terms an effect on the unauthorized action using exhaust Map, which ignores triggers while one refresh is in flight.
+Guard the refresh endpoint itself so a 401 there logs out instead of recursing, and never refresh on a 403, that is "authenticated but not allowed".
+
+Cross-Q²: You turn on SSR and authenticated pages render as logged out. What is happening, and what breaks if you "fix" it by enabling the auth transfer cache?-- think --
+A: There is no browser on the server: no cookie jar, so the server-side HttpClient sends no credentials, the A P I returns 401, and the store hydrates empty.
+The fix is to forward the incoming request's cookie (or Authorization ) header explicitly, reading it from the REQUEST injection token, which is null during build, CSR, SSG and route extraction, so the interceptor must tolerate that.
+The dangerous "fix" is withHttpTransferCacheOptions({ includeRequestsWithAuthHeaders: true }):
+that embeds authenticated responses into the served HTML, and the moment any shared cache sits in front, C D N, reverse proxy, A S P dot NET Core output caching, one user's data is served inside another user's document.
+Auth-bearing requests are excluded from the transfer cache by default for exactly that reason.
+
+-- pause --
+Section 2. Self-test.
+
+Memoization, time-travel debugging, and predictable replay all depend on (state, action) goes to new State being deterministic with no side effects.
+Side effects (H T T P, navigation, logging) inside reducers would re-fire when devtools replays an action sequence, corrupt state during testing, and prevent reasoning about the system. Side effects belong in Effects, where the Actions stream is observable and replay-safe.
+
+When an input selector returns a new reference every call (for example, create Selector(state goes to state list map(x goes to transform(x))) builds a new array on every read). The outer selector recomputes because its input changed reference.
+Fix by composing memoized building-block selectors so the input is stable, or by sorting or normalizing upstream so equal data is the same reference.
+
+Classic Store gives full action audit log, time-travel debugging, and clear separation between reducer and effect, invaluable for compliance-heavy domains and large teams that need explicit conventions.
+Signal Store collapses ~5 files into one, integrates natively with Angular signals, and skips the dispatch or select ceremony, better for small teams, fewer cross-cutting concerns, and rapid iteration. Mixing both in one app is fine if the boundaries are clear.
+
+merge Map runs every inner Observable in parallel, fine for fan-out, dangerous for "load latest" because two rapid loads can race and the older response may overwrite the newer. switch Map cancels the previous inner when a new outer arrives, guaranteeing only the latest result wins.
+Use merge Map consciously (for example, independent telemetry events); switch Map for navigation-driven loads; concat Map for ordered writes.
+
+Use provideMockActions to drive the Actions stream and a test double for the service, jasmine.createSpyObj, a Jest or Vitest mock, or a hand-written fake (NSubstitute is dot NET; the Angular equivalents are the spy helpers your runner ships).
+Marble testing ( hot / cold from jasmine-marbles ) lets you assert the effect emits a specific action stream from specific inputs. For modern Signal Store rx Method, call the method directly and assert via patch State outcomes, usually less ceremony than classic effects testing.
+
+rx Method and signal Method need an injection context both when they are created and, for signal Method, when they are called with a signal. In the app the store is instantiated by D I so the context exists; in a bare unit test that constructs things by hand it does not.
+Use TestBed.configureTestingModule({ providers: [TheStore] }) and TestBed.inject(TheStore), or wrap the call in TestBed.runInInjectionContext(.). Passing { injector } explicitly is the escape hatch for creating an rx Method outside D I.
+Asynchronous assertions then need a tick, TestBed.tick() or a polling assertion, because effects are not synchronous.
+
+They are different couplings. An action is an event, several sources emitting the same event is the anti-pattern (you lose the origin), and several consumers of one event is the design goal.
+A SignalStore method is a call: the caller has a reference to the store and invokes behaviour directly, so there is no origin to lose and no fan-out to arrange;
+if two features need to react to one thing, that is precisely when you reach for the events plugin (or the global Store) instead of calling two stores in sequence from a component.
+
+When the value is derived from other signals and the user must be able to override it, with the override discarded when the source changes.
+Classic case: a form's selected item derived from a loaded list, computed gives you a read-only projection you cannot edit, and plain with State gives you a value that goes stale when the list reloads.
+withLinkedState (NgRx 20+) has linked Signal semantics: writable, but reset when its source changes. If nothing ever writes it, use with Computed.
+
+Because of properties, not habit: one event dispatched from anywhere is consumed by N feature reducers and effects (logout clearing eight slices); meta-reducers apply rehydration, reset and logging to the entire tree in one place;
+the DevTools action log is used by support to reproduce customer bugs; and @ngrx or router-store makes URL state reactive.
+Those are the four things SignalStore does not provide, and if the app needs none of them the honest continuation is "and we are migrating the features that don't".
+
+NgRx majors track Angular majors and peer-depend on them, NgRx 21 requires Angular 21.x, so a framework upgrade cannot land before the matching NgRx release.
+The mitigation is architectural, not tactical: keep the NgRx surface small and behind facades or feature-local stores so that a version pin blocks one boundary rather than the whole app, and treat every state library as a scheduling dependency when you adopt it.
+Forcing --legacy-peer-deps onto an unsupported pairing is not an answer you should give.

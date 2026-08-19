@@ -1,0 +1,533 @@
+-- pause --
+Section 1. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this section once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A. Practice answering the cross-questions without re-reading. If you stumble on any cross-Q², go re-read the relevant section.
+
+-- pause --
+Drill 1, Angular Universal / SSR fundamentals.
+
+Q: What is Angular SSR and how does it differ from a standard Angular CSR app?-- think --
+A: Angular SSR renders the Angular application on a Node.js server for each request, producing fully-formed HTML that the browser can display immediately, before any JavaScript executes.
+A CSR app sends a nearly-empty HTML shell and relies on the browser downloading and executing the JS bundle before anything appears. SSR improves First Contentful Paint, SEO, and perceived performance on slow devices.
+
+Cross-Q: What specifically runs on the server during SSR that doesn't run in CSR?-- think --
+A: The app bootstraps in a server-side DOM emulation (via @angular or platform-server ), runs route resolution, executes constructors and ngOnInit, resolves data (via resolvers or service calls), waits for application stability,
+then serializes the component tree to HTML plus a hydration node map and the transfer state, both inlined as blocks.
+afterNextRender / afterEveryRender callbacks deliberately do not run. The browser receives that HTML rather than a blank shell.
+
+Cross-Q²: Why is Angular's server render asynchronous, when React's renderToString is synchronous?-- think --
+A: Because Angular waits for the application to become stable before serializing, so that data loaded during the render is in the DOM.
+Historically that signal came from Zone.js, Angular's own guide still says "hydration relies on a signal from Zone.js when it becomes stable inside an application." With zoneless as the default from v21, stability is instead derived from tasks Angular tracks ( HttpClient, the router,
+resource() ) plus anything you register with PendingTasks; ApplicationRef.when Stable() is the promise form.
+If nothing announces the pending work, a raw fetch() from a vendor S D K, for instance, the render does not wait and you serialize the loading state.
+
+-- pause --
+Drill 2, AppServerModule versus standalone bootstrap for SSR.
+
+Q: What is the difference between AppServerModule and standalone bootstrap for Angular SSR?-- think --
+A: AppServerModule is the NgModule-based approach from Angular Universal, it imports ServerModule alongside your AppModule and serves as the server entry point.
+Standalone bootstrap replaces it with a bootstrap Application(App, mergeApplicationConfig(app Config, server Config), context) call in main server ts, where server Config provides provideServerRendering().
+The context parameter is a BootstrapContext ( interface BootstrapContext { platform Ref: PlatformRef } ) so the engine can supply the platform rather than each render creating one.
+
+Cross-Q: Where does provideServerRendering() come from, and what does it configure?-- think --
+A: @angular or ssr, and that is the version trap. It used to live in @angular or platform-server; in v20 it moved to @angular or ssr and absorbed the separate provideServerRouting(), which was removed.
+Be precise about that one if you are asked: it shipped in v19.0 as provideServerRoutesConfig(routes, { appShellRoute }) and was renamed provideServerRouting() in v19.1, with the app shell becoming a feature, withAppShell(AppShellComponent). A v19 codebase can legitimately contain either name.
+The modern call is provideServerRendering(with Routes(server Routes)), optionally with withAppShell(AppShellComponent) and an options object (for example { maxResponseBodySize } ).
+It wires up the server platform providers, the DOM emulation, server-safe H T T P, TransferState, and the per-route render-mode table.
+
+Cross-Q²: Can you mix NgModule components with standalone bootstrap for SSR?-- think --
+A: Yes. Standalone bootstrap supports importProvidersFrom(SomeLegacyNgModule) to pull in NgModule-based providers, and a standalone root can host NgModule-declared children.
+The one place it bites is @defer: deferred dependencies "must be standalone," so a legacy NgModule component cannot be the direct target of a @defer or a hydrate trigger, though its transitive dependencies may still be NgModule-declared.
+
+-- pause --
+Drill 3, TransferState and makeStateKey.
+
+Q: What is TransferState and why is it needed in Angular SSR?-- think --
+A: TransferState is a key-value store that allows the server to serialize data into the HTML response (as a tag with Jason) so the browser can read it during hydration instead of re-fetching.
+Without it, a service that fetches data on the server would fetch the same data again on the client, double network calls, duplicate work, and a flash of empty content while the client fetch completes.
+
+Cross-Q: What does makeStateKey('key') do, and why does it use a generic type parameter?-- think --
+A: makeStateKey creates a typed token, a StateKey, that serves as the lookup key for TransferState.get or set. The generic type T ensures that when you call state.get(ORDERS_KEY, null), TypeScript knows the returned value is Order[] | null rather than any.
+It prevents type mismatches between what the server writes and what the client reads.
+
+Cross-Q²: When would you use manual TransferState instead of the automatic H T T P transfer cache?-- think --
+A: First, correct the premise a lot of material gets wrong: the automatic cache comes from provideClientHydration(), not from with Fetch(), with Fetch() only selects the Fetch backend, and it is deprecated in v22 because fetch is now the default.
+Manual TransferState is for non-H T T P data: values computed expensively on the server, feature flags read from process.env, WebSocket or third-party S D K results, anything you want under your own key with your own lifecycle.
+on Serialize(key, callback) is the member for values that are only known once rendering finishes. And whatever you put there, remember it is Jason in the page source, Date comes back as a string, class instances lose their prototypes, and every field is publicly readable.
+
+-- pause --
+Drill 4, Hydration: full versus incremental.
+
+Q: What is the difference between full hydration and incremental hydration in Angular?-- think --
+A: Full hydration (developer preview v16, stable v17) preserves the server-rendered DOM and attaches listeners to the entire component tree at once when the JS bundle loads.
+Incremental hydration (developer preview v19, stable v20, default from v22) leaves individual @defer subtrees dehydrated, HTML on screen, no JavaScript downloaded, until a hydrate trigger fires.
+Note that withIncrementalHydration() is deprecated in v22.0 because it is now on by default with provideClientHydration(); withNoIncrementalHydration() is the opt-out.
+
+Cross-Q: What is a "hydration mismatch" and what causes one?-- think --
+A: Angular does not diff two trees, it walks the existing DOM against a serialised node map from the server, claiming each node. A mismatch is that walk failing an assertion, so it is a structural problem, not a content one.
+Causes: direct DOM manipulation or innerHTML / outerHTML; invalid HTML nesting the parser repairs ( without a, a inside a, an inside an ); non-deterministic values; local Storage / window -driven conditionals; and third-party scripts that mutate the DOM before hydration.
+Error codes NG0500 (node mismatch), NG0501 (missing siblings), NG0502 (missing node).
+
+Cross-Q²: How does incremental hydration interact with @defer, and what does it enable implicitly?-- think --
+A: @defer normally splits the block's dependencies into their own chunk and loads them on a trigger.
+With incremental hydration, the server renders the block's real content rather than the @placeholder, the client keeps that HTML dehydrated, and the hydrate trigger controls when the JS downloads and attaches.
+@placeholder is still required for "subsequent client-side rendering cases", a client-side navigation that recreates the block has no server HTML to reuse.
+Two implicit behaviours to name: incremental hydration depends on and enables event replay automatically, and "hydrating any component requires all of its parents also be hydrated," so triggering a nested block hydrates the chain it.
+
+-- pause --
+Drill 5, Platform-specific code: isPlatformBrowser / PLATFORM_ID.
+
+Q: Why does accessing window directly in an Angular component crash SSR?-- think --
+A: The Node.js server that runs Angular SSR does not have a real browser DOM, window, document, local Storage, and navigator are undefined.
+Angular SSR uses @angular or platform-server 's DOM emulator for the minimal DOM needed to render components, but it does not emulate the full browser A P I surface.
+Accessing window at module-eval or ngOnInit time throws ReferenceError: window is not defined.
+
+Cross-Q: What's the correct pattern to guard browser-only code?-- think --
+A: isPlatformBrowser(inject(PLATFORM_ID)) in a field initialiser, checked before touching browser A P Is.
+Better for DOM work: afterNextRender() and afterEveryRender(), which run only in the browser and only after the DOM exists, the natural home for measurement, analytics, scroll restoration and third-party S D K initialisation.
+Version landmine: both landed in 16.2, but after Render() was renamed afterEveryRender() in v20 with no backwards-compatible alias, so v16, v19 code fails to compile after that upgrade.
+
+Cross-Q²: A third-party analytics library imports window.data Layer = [] at module-evaluation time. How do you safely include it in an SSR app?-- think --
+A: Lazy-load the library dynamically inside a browser-only code path: if (isPlatformBrowser(this.platform Id)) { import('./analytics').then(m goes to m.init()); }.
+Since import() is executed only when that branch runs, not at module parse time, the Node.js server never evaluates the window.data Layer assignment. This is the standard pattern for any SSR-incompatible third-party code.
+
+-- pause --
+Drill 6, Express engine setup for Angular Universal.
+
+Q: How does the Node server integrate with Angular SSR rendering?-- think --
+A: In v19+ it does not call a render function directly, it delegates to an engine.
+ng add @angular or ssr generates a server.ts that constructs new AngularNodeAppEngine() (from @angular or ssr or node ), calls angular App.handle(req) for each request, and pipes the result through writeResponseToNodeResponse(response, res); createNodeRequestHandler(app) is the exported entry.
+handle() returns Promise, a Web-standard Response, so the engine decides from your ServerRoute[] table whether this URL is a prerendered file, an SSR render, or a CSR shell, and returns it with the right status and headers. null means "not mine", and you call next().
+
+Cross-Q: How did this evolve, and what would you see in an older codebase?-- think --
+A: Three generations. Universal ( at most v16): AppServerModule + ngExpressEngine from @nguniversal or express-engine. v17, v18: CommonEngine from @angular or ssr, invoked per request with { documentFilePath, url, public Path, providers }. v19+: AngularNodeAppEngine.
+render Application() from @angular or platform-server still exists and is still stable, but the generated server no longer calls it, you reach for it only for a bespoke host, a render worker pool, or non-web output like email or PDF.
+For non-Node hosts there is a parallel pair: AngularAppEngine + createRequestHandler, which work anywhere Web Request / Response exist.
+
+Cross-Q²: Why serve static assets separately from the SSR handler, and what breaks if you don't?-- think --
+A: The build produces browser/ (client bundles, CSS, images, prerendered HTML) and server/ (the Node bundle). If browser/ is not served, the page renders, looks perfect, and never hydrates, a failure that passes any smoke test that does not click something.
+Beyond correctness there is a load argument: every static file served by the Node process competes with a render for the same event loop, so in production static assets belong on a C D N, on nginx, or on UseStaticFiles in an A S P dot NET Core host, with only unmatched paths routed to the renderer.
+
+-- pause --
+Drill 7, Build outputs: browser bundle versus server bundle.
+
+Q: What are the two build outputs Angular SSR produces and what does each contain?-- think --
+A: The browser/ bundle contains the full Angular client application, component code, routing, services, and assets, optimized for the browser (tree-shaken, minified, code-split).
+The server/ bundle contains a Node.js-compatible version of the same application plus the Express server entry point, the @angular or platform-server providers, and any server-specific imports. The server bundle must be runnable in Node.js, so it excludes browser-only A P Is.
+
+Cross-Q: Why can't you just use the browser bundle on the server?-- think --
+A: Browser bundles reference browser globals ( window, document, browser A P Is) and use browser-specific module formats. Node.js doesn't have these globals, and module resolution differs.
+The server build uses @angular or platform-server in place of @angular or platform-browser, substituting a DOM emulator and server-safe H T T P providers. The build system (Webpack / esbuild) applies a different target and replaces browser-specific packages at the module level.
+
+Cross-Q²: What does output Mode: "server" versus output Mode: "static" control in angular.json?-- think --
+A: "server" produces a Node.js server bundle that renders HTML per request, suitable for fully dynamic content.
+"static" triggers prerendering at build time: Angular bootstraps the app once per route, serializes the HTML to files, and outputs them to browser/ as static assets served directly by a C D N or static host.
+"static" mode has no runtime server cost but can't render personalized or frequently-changing content.
+
+-- pause --
+Drill 8, DOM manipulation gotchas in SSR.
+
+Q: Beyond window and document, what other browser A P Is commonly break SSR?-- think --
+A: local Storage and session Storage, no server-side equivalent; accessing them throws. IntersectionObserver, ResizeObserver, MutationObserver, not implemented in Angular's DOM emulator; libraries that use them (virtual scroll, lazy-image loaders) must guard these.
+Canvas and WebGL A P Is, unsupported. set Timeout / set Interval, work in Node.js but can cause the SSR render to never stabilize (prevent ApplicationRef.is Stable from emitting) if not properly handled.
+
+Cross-Q: Why does an uncleaned set Interval inside a component prevent SSR from completing?-- think --
+A: The server waits for stability before serializing.
+Under Zone.js, a pending macrotask (a timer) keeps the app unstable indefinitely, so an ngOnInit that starts polling and never clears it hangs the render until the timeout, NG0506, "Application remains unstable", which Angular raises when the app "doesn't stabilize within 10 seconds." Fix:
+guard with isPlatformBrowser so polling only starts in the browser, or start it in afterNextRender().
+Diagnose with provideStabilityDebugging() (stable v21.1), which "will log information about what tasks are keeping the application from stabilizing if the application does not stabilize within 9 seconds", and with Zone.js, also import zone.js or plugins or task-tracking for macrotask stack traces.
+The inverse failure exists too: zoneless (default from v21) does not track a bare set Timeout or a raw fetch() at all, so instead of hanging, the render finishes early and serializes the loading state.
+
+Cross-Q²: A charting library calls document.create Element('canvas') during initialization. What is the cleanest fix for SSR?-- think --
+A: A dynamic import() inside a browser-only path, if (this.is Browser) { const { draw } = await import('./chart'); }, or, better, that import inside afterNextRender(), which runs only in the browser by construction.
+A static import cannot be saved by any guard, because it is evaluated before your code runs.
+Note there is no @defer (on browser) trigger, the trigger set is on idle | viewport | interaction | hover | immediate | timer, plus when; @defer (on viewport) with a skeleton @placeholder is the idiomatic shape, since the viewport trigger cannot fire on the server anyway.
+If the library must render into server HTML, wrap it in a leaf component marked ngSkipHydration, never a wrapper, because the flag is recursive.
+
+-- pause --
+Drill 9, SEO: SSR versus CSR versus prerendering.
+
+Q: Why is SSR better for SEO than CSR?-- think --
+A: Search engine crawlers (Googlebot, Bingbot) receive the rendered HTML directly from the server and can index the full content immediately. CSR sends a near-empty HTML shell; crawlers must execute JavaScript to see content.
+While Googlebot does execute JS, it does so in a second wave (sometimes hours later), and many other crawlers don't execute JS at all. SSR ensures every crawler sees complete, accurate content on the first H T T P response.
+
+Cross-Q: When is static prerendering (SSG) better than SSR for SEO?-- think --
+A: For content that changes infrequently, blog posts, documentation, marketing pages, product catalog pages with stable inventory. SSG serves pre-built HTML from a C D N with zero server compute cost and maximum TTFB performance.
+SSR is better when content is user-personalized, frequently updated (stock prices, inventory counts), or requires server-side auth context.
+
+Cross-Q²: Does Angular SSR automatically handle meta tags and Open Graph data for SEO?-- think --
+A: Not automatically. You use Angular's Meta and Title services (from @angular or platform-browser ) in your components or resolvers to set, and Open Graph tags.
+Because these services modify the document head, and the server renders the full document including, the tags appear in the SSR HTML output and are crawled correctly. Without explicit meta service calls, every page will have the same default title from index.html.
+
+-- pause --
+Drill 10, Angular prerendering (SSG), routes to prerender.
+
+Q: How do you configure Angular to prerender specific routes at build time?-- think --
+A: Two mechanisms. In angular.json, "prerender": { "discover Routes": true, "routes File": "routes.txt" }, discovery walks the router config and prerenders every parameterless route, and routes File lists concrete URLs one per line.
+In app routes server ts, mark the route render Mode: RenderMode.Prerender and supply getPrerenderParams(), which "returns a Promise that resolves to an array of objects.
+Each object is a key-value map of route parameter name to value." Angular bootstraps the app once per resolved route and writes static HTML into browser/.
+
+Cross-Q: What happens to a route that matched a prerender rule but wasn't in the enumerated set, the product added after the build?-- think --
+A: PrerenderFallback decides. Server, "falls back to server-side rendering. This is the default behavior if no fallback property is specified." Client, falls back to CSR. None, no fallback, so it 404 seconds.
+The default being Server is convenient and hides a cost: a catalogue where a small share of URLs are newer than the last build quietly needs a running Node fleet, and you only notice by looking at which routes actually reach the origin.
+output Mode: "static" has no server to fall back to, so Server is not available there.
+
+Cross-Q²: How do you prerender thousands of product pages, and what's the risk?-- think --
+A: Either getPrerenderParams() calling your service (it runs in an injection context, so inject(CatalogService) works), or a pre-build script that generates routes.txt from the database, the latter is more debuggable because the list is an artefact you can diff between builds.
+The risk is the one nobody plans for: your build now has a runtime dependency on your A P I.
+If it is down the build fails, if it is slow the build is slow, if it needs auth your CI needs a credential, and you discover this during an incident, when the rollback build cannot run because the service it queries is the broken one.
+Second risk: prerendering runs the whole application N times, so anything the app fetches per page (nav tree, footer, feature flags) is fetched N times. Cache shared lookups in a module-level promise.
+Angular has no built-in I S R; on-demand regeneration is a platform feature (Netlify, Vercel) if you have it, and RenderMode.Server behind an H T T P cache with stale-while-revalidate if you don't.
+
+-- pause --
+Drill 11, Cache-Control headers for SSR pages.
+
+Q: What Cache-Control strategy should an SSR Angular app use, and where do you configure it?-- think --
+A: For fully dynamic personalized pages (authenticated dashboards): Cache-Control: private, no-store, do not cache at any shared layer. For semi-static SSR pages (public product pages, blog posts): Cache-Control: public, max-age set to 60, stale-while-revalidate set to 3600.
+For hashed static assets: public, max-age set to 31536000, immutable.
+The where is the modern half of the answer: since v19 you set it declaratively on the route, next to the decision that makes it necessary, { path: 'account/**', render Mode: RenderMode.Server, headers: { 'Cache-Control':
+'private, no-store' } }, rather than in a C D N rule in a different repository that nobody reviews alongside the code.
+
+Cross-Q: Why is caching a personalized SSR page a security risk, not just a correctness issue?-- think --
+A: If a C D N caches an SSR response that includes user-specific data (name, orders, account info) and returns it to a different user whose request URL matches the cache key, you have a data leak.
+The C D N must vary the cache key on Cookie or Authorization headers ( Vary: Cookie ) to isolate per-user responses. Without this, the first user's session data is served to everyone until the T T L expires.
+
+Cross-Q²: What is stale-while-revalidate and why is it valuable for SSR performance?-- think --
+A: stale-while-revalidate tells the C D N to serve a cached (possibly stale) response immediately while simultaneously fetching a fresh version in the background.
+For SSR, this means the client gets a response instantly (no TTFB wait for the Node server to render), while the cache is refreshed asynchronously.
+It provides the feel of a cache hit with the freshness of a background revalidation, dramatically improving perceived TTFB without sacrificing content freshness for the next request.
+
+-- pause --
+Drill 12, Angular Hydration versus React Server Components.
+
+Q: How does Angular's hydration model differ philosophically from React Server Components?-- think --
+A: Angular's model is "render on server, hydrate on client", the full component tree runs both on the server (for HTML) and the client (for interactivity). Incremental hydration reduces the client cost, but the component code still ships to the browser.
+React Server Components go further: server components execute only on the server and never ship their code to the browser, the client receives serialized output (RSC payload), not component JS. Server components have zero JS cost on the client for their subtree.
+
+Cross-Q: Does Angular have an equivalent to React Server Components?-- think --
+A: Not a direct equivalent. The closest is @defer (hydrate never), which "allows users to specify that the content in the defer block should remain dehydrated indefinitely", server-rendered HTML with no client JavaScript for that subtree, permanently.
+That matches RSC's outcome for static content (footers, legal text, spec tables, rendered marketing copy) but not its model:
+the block is still an ordinary Angular component that ran on the server, there is no serialized RSC payload, and it cannot be made interactive later without changing the trigger.
+Angular's answer to the same problem is per-block hydration control rather than a server or client component type distinction.
+
+Cross-Q²: What's the performance implication of Angular needing to ship component JS for hydration versus React's RSC approach?-- think --
+A: Any Angular component that will ever hydrate must have its JS available, even if it is mostly static; an RSC component that never becomes interactive ships none.
+Angular's counter is that the timing is controllable, hydrate on viewport / on interaction means the JS is not on the critical path, and hydrate never means it is not shipped for that block at all.
+The honest comparison is that RSC pushes the decision into the type system (a component is a server component or it isn't) while Angular pushes it into the template (a block carries a trigger or it doesn't),
+which is more flexible and easier to get wrong, as v19, v21 codebases discovered when their hydrate triggers turned out to have been inert the whole time for want of a provider.
+
+-- pause --
+Drill 13, Performance: TTFB versus TTI versus LCP for SSR.
+
+Q: How does SSR affect TTFB, TTI, and LCP compared to CSR?-- think --
+A: TTFB is typically worse, the server must render before responding, and that render usually waits on your A P I. CSR returns the shell immediately. LCP is better, the largest content element is in the initial HTML rather than waiting on JS execution plus a data fetch.
+TTI is mixed: the page looks interactive early but is not until hydration completes, and on a heavy page hydration can occupy the main thread longer than a CSR boot would.
+Decompose the TTFB cost before defending it: network to the renderer, server bootstrap, waiting for stability (your A P I calls, almost always dominant), and serialization.
+The dominant term is a backend problem, which is why "SSR is slow" is usually a data-fetching conversation, not a rendering one.
+
+Cross-Q: How does incremental hydration specifically improve INP (Interaction to Next Paint)?-- think --
+A: Without incremental hydration, Angular hydrates the full component tree as soon as the JS bundle loads, monopolizing the main thread. Any user interaction during that window is queued, producing high INP.
+With @defer (hydrate on interaction), only the components the user is actively engaging with hydrate, keeping the main thread free for the interactions that actually matter. Deferring below-the-fold components reduces total hydration work, directly lowering INP.
+
+Cross-Q²: A product page has TTFB = 800 milliseconds with SSR but LCP = 1.1 second. The CSR version has TTFB = 50 milliseconds but LCP = 3.5 seconds. Which is better from a user experience perspective, and for Google ranking?-- think --
+A: The SSR version, and the reason is a vocabulary correction worth making out loud: LCP, INP and CLS are the Core Web Vitals; FCP and TTFB are diagnostic metrics, not Core Web Vitals.
+TTFB matters only insofar as it shows up inside LCP, and here it plainly does not, because LCP improved by far more than TTFB regressed. Users experience meaningful content at 1.1 second instead of 3.5 seconds.
+The measurement discipline that goes with this:
+judge it on field data (CrUX or RUM), not a Lighthouse run against a warm local server, and expect the p75 to improve more than the median, because SSR helps slow devices and slow networks most, which is exactly the population Core Web Vitals scores against.
+
+-- pause --
+Drill 14, Error handling in SSR.
+
+Q: What happens when an unhandled error occurs during Angular SSR rendering?-- think --
+A: The promise returned by angular App.handle(req) rejects. In the generated server.ts that is passed to Express's next(err), and Express's default handler returns a 500, with a stack trace in non-production.
+The user sees an error page and no HTML is served, on a page that would have worked perfectly in CSR.
+
+Cross-Q: What is a "hydration mismatch" error specifically versus a server render crash?-- think --
+A: A server render crash is a thrown exception that aborts the render on the server. A hydration mismatch happens in the browser, after correct HTML has already been delivered: the node walk fails an assertion, Angular reports NG0500 (or NG0501 or NG0502), and client-renders the affected subtree.
+The user sees correct content and loses the SSR benefit for that region.
+Related codes point at different layers, NG0505 means the server response contained no hydration info at all (hydration not enabled, or a cached or fallback shell was served), and NG0507 means the HTML was altered after server-side rendering, which is an infrastructure problem:
+a minifier, an injection proxy, or a C D N "HTML optimisation" toggle stripping the comment nodes Angular uses as view-container anchors.
+
+Cross-Q²: What is the recommended fallback strategy when SSR rendering fails?-- think --
+A: Degrade to CSR rather than to an error, serve browser or index.html so Angular boots in the browser. Wrap the engine call, log server-side with enough context to find it (URL, trace id), and return the shell with a Cache-Control: no-store so a bad render is not cached.
+A rendering bug should never become a user-facing 500 on a page that works fine client-side.
+The same reasoning applies one level down: a downstream A P I failure during render should degrade to a skeleton the browser fills in, not abort the render, which is why every server-side call needs a timeout your ingress timeout and an explicit decision about what to render when it fires.
+
+-- pause --
+Drill 15, Deployment: Node.js server versus edge functions.
+
+Q: What are the trade-offs between deploying Angular SSR on a Node.js server versus an edge function platform?-- think --
+A: A Node server (Cloud Run, Azure Container Apps, App Service, ECS) runs the full Node runtime, every npm package, file system access, compute headroom, and can sit inside your VNet next to the A P I. Container cold starts are a real cost; warm instances serve at full speed.
+Edge platforms (Cloudflare Workers, Deno Deploy, Vercel or Netlify Edge) run V8 isolates in C D N PoPs, close to the user, with a restricted runtime: no Node A P Is ( fs, child_process, Node crypto ), limited memory and C P U budget, and many npm packages that simply do not load.
+Angular supports both explicitly, AngularNodeAppEngine from @angular or ssr or node for Node, AngularAppEngine + createRequestHandler from @angular or ssr for anything that speaks Web Request / Response.
+
+Cross-Q: What Angular SSR features are incompatible with edge runtimes?-- think --
+A: Nothing in Angular's core rendering or the transfer cache, the incompatibility is in your code and your dependencies: fs.readFileSync (common for loading translation or template files), child_process, Node crypto, and npm packages with Node-native dependencies.
+The bigger practical blocker is topology rather than A P I surface: an edge isolate is not colocated with your backend, so anything reaching a service by internal D N S, a localhost sidecar, or a private VNet address does not work there.
+
+Cross-Q²: When would you choose edge SSR over Node SSR despite the restrictions?-- think --
+A: When the data is edge-available.
+Edge SSR optimises the hop you can see (browser to renderer) and pessimises the ones you cannot (renderer to A P I), so it wins when the render's data comes from edge-cached, globally replicated or static sources, marketing pages, public catalogues fronted by a C D N-cached A P I,
+geo-segmented media.
+It is usually a poor fit for "render a page from a single-region sequel Server", where you have moved the renderer away from the thing it spends most of its time waiting for.
+The rule of thumb: if your SSR logic needs only Fetch, Web Crypto and Jason, and your data is near the edge, go edge; otherwise run a regional fleet behind a C D N.
+
+-- pause --
+Drill 16, Cookie auth across the SSR boundary.
+
+Q: Your app authenticates with an HttpOnly cookie against an A S P dot NET Core A P I. You add SSR and logged-in users report "it logs me out for a second" on every hard navigation. What happened?-- think --
+A: There is no browser on the server, so there is no cookie jar and no automatic credential attachment. The server-side HttpClient call went out anonymous, the A P I returned 401 or the anonymous view of the data, and Angular rendered the signed-out layout.
+Then the browser hydrated, made its own calls with the cookie, and the correct layout replaced it. The fix is to forward the incoming request's cookie header onto the outgoing A P I calls, using the REQUEST injection token from @angular or core inside an H T T P interceptor.
+
+Cross-Q: What are the three ways that forwarding interceptor can be wrong?-- think --
+A: (1) Assuming REQUEST exists. It is null in the browser, "during the build processes", "when performing static site generation (SSG)" and "during route extraction in development", so inject(REQUEST, { optional: true }) plus a null check, or your prerender build crashes.
+(2) Forwarding the whole header bag.
+host makes the A P I generate links for the wrong hostname and can misroute host-based routing; accept, content-type, content-length and accept-encoding describe the incoming request, not yours; connection / transfer-encoding / upgrade are hop-by-hop and must not be forwarded.
+Use an explicit allow-list: cookie or authorization, accept-language, and your trace headers. (3) Not absolutising the URL. '/api or orders' has no origin in Node, so the relative URL must be rewritten against an internal base URL when REQUEST is present.
+
+Cross-Q²: You forward cookies successfully. What have you just made possible that is worse than the bug you fixed?-- think --
+A: Cross-user data leakage, via two independent paths. First, the rendered HTML now contains one user's data, so any shared cache, C D N, reverse proxy, an A S P dot NET Core output-caching policy on the route that fronts the renderer, will serve it to someone else.
+Those routes need Cache-Control: private, no-store, which you can declare on the ServerRoute itself. Second, the transfer cache: with includeRequestsWithAuthHeaders: true, responses to authenticated A P I calls are serialised into the HTML.
+Forwarded credentials + auth-header caching + any shared cache is an incident; any two of the three is survivable. Third, more subtly: provided In: 'root' on the server is per-process, not per-user, so any memoised "current user" is shared across every concurrent visitor on that pod.
+
+-- pause --
+Drill 17, The SSR process as an A P I client.
+
+Q: You enable SSR in front of a dot NET A P I. Describe how your A P I's traffic profile changes.-- think --
+A: The call count per page view barely changes, the same six endpoints get called, they just get called from a server instead of a browser.
+What changes is everything about the caller: the requests arrive in tight bursts from a small number of pod IPs, with no browser H T T P cache, no service worker, no user think-time between them, and no per-user identity.
+Meanwhile the browser still makes its own calls after hydration for anything not in the transfer cache.
+Practically: burst concurrency at the A P I goes up, per-IP rate limiters see one enormous client, and if the SSR pods call the A P I by internal D N S they bypass whatever the gateway was doing, WAF, rate limiting, logging, response caching, token validation.
+
+Cross-Q: Your app degrades specifically at peak, and only the SSR-rendered pages. Where do you look first?-- think --
+A: The rate limiter's rejection logs. A S P dot NET Core's rate limiting middleware partitioned by remote IP is the common default, and at peak a handful of SSR pod IPs collectively blow a per-IP limit that was written for abusive scrapers.
+Angular's error path then renders the empty state, so users get pages that look correct and are wrong, which is why this shows up as "the site is weird at lunchtime" rather than as errors.
+Fixes: give the SSR service its own authenticated identity with its own partition and its own dashboard, or partition on a forwarded user identity rather than IP.
+Also check whether an egress NAT is collapsing your pods onto one address, in which case the limiter cannot distinguish them from anything else behind that NAT.
+
+Cross-Q²: What would you change on the Angular side to reduce the pressure, in priority order?-- think --
+A: (1) Render fewer pages on the server, RenderMode.Prerender for anything not personalised, RenderMode.Client for anything behind login; this is usually the biggest win and it is a routing-table edit.
+(2) Cache user-independent data in-process in the SSR service, navigation trees, category lists, CMS fragments, feature flags, converting N renders times M shared calls into one call per T T L.
+The discipline is that it must be provably user-independent; anything derived from REQUEST must never enter that cache. (3) Reduce fan-out with a screen-shaped endpoint or a B F F, which also shrinks the transfer state you are publishing in the page source.
+(4) Move below-the-fold data into @defer blocks so the render does not wait for it at all. (5) Scope or remove retry policies on the server path, because a retry written for one browser tab is an amplifier when it runs once per concurrent render.
+
+-- pause --
+Drill 18, Hosting Angular SSR with A S P dot NET Core.
+
+Q: Your architect asks why the Angular SSR render cannot just run inside the existing A S P dot NET Core app. What do you say?-- think --
+A: Because dot NET cannot execute Angular's server bundle, SSR needs a JavaScript runtime.
+Every "host it in dot NET" option is really "run Node and put dot NET in front of it." The good version of that is a reverse proxy:
+A S P dot NET Core (or YARP) owns the public origin, serves /api/* itself, serves the static browser/ output via UseStaticFiles or a C D N, and forwards everything else to a Node container.
+That gives you one origin, so no cores, no preflights, and cookies are same-site by construction, with independent scaling for a C P U-bound renderer and an I O-bound A P I.
+
+Cross-Q: The architect remembers UseSpaPrerendering from a dot NET Core 3 project. Correct him precisely.-- think --
+A: Microsoft.AspNetCore.SpaServices and Microsoft.AspNetCore.NodeServices were obsoleted back around A S P dot NET Core 3.0.
+Microsoft.AspNetCore.SpaServices.Extensions ( UseSpa, UseSpaProxy ) is not obsolete and still underpins the SPA integration, but its job is dev-time proxying to the Angular dev server and a production SPA fallback to index.html; it does not do SSR.
+The one method that attempted server-side prerendering, UseSpaPrerendering, is marked [Obsolete] and prerendering "is no longer supported out of box"; Microsoft's guidance is to use the SPA framework's own SSR tooling.
+And the S D K's dotnet new angular template was removed in dot NET 8, replaced by Visual Studio SPA templates (versus 2022 17.8+) that use SpaProxy with a standard Angular C L I project, also no SSR.
+
+Cross-Q²: What operational details would you insist on in the proxy setup?-- think --
+A: Four. (1) Timeouts: the proxy timeout must be the ingress timeout so a hung render fails fast instead of holding connections; and the renderer's own outbound calls need timeouts that.
+(2) Static files must not go through Node, every static request served by the renderer competes with a render for the same event loop; copy dist//browser into wwwroot and let UseStaticFiles handle it with proper cache headers.
+(3) No output caching on the proxied route unless you have proven the response is user-independent; an [ResponseCache] or output-caching policy in front of personalised SSR HTML is a cross-user leak.
+(4) Health and readiness probes on the Node container, plus tracing that stitches the render and its downstream calls into one trace, forward traceparent from the incoming request, or the renderer is a black box in your observability stack.
+
+-- pause --
+Drill 19, The v22 hydration defaults.
+
+Q: In Angular v22, what exactly does a bare provideClientHydration() give you?-- think --
+A: Three things, because "by default, the function enables the recommended set of features for the optimal performance for most of the applications":
+DOM hydration (non-destructive node claiming), the H T T P transfer cache, and incremental hydration, and since "incremental hydration depends on and enables event replay automatically", event replay comes with it.
+So withEventReplay() and withIncrementalHydration() are both redundant in a default v22 app; the latter is formally deprecated as of v22.0 with removal planned for v24, and withNoIncrementalHydration() (new in v22.0) is the opt-out.
+
+Cross-Q: Your team upgrades a v20 app to v22. Which hydration-related behaviours can change without any code edit?-- think --
+A: Two, and both are silent. (1) hydrate triggers that were previously inert. In v19, v21, a @defer (hydrate on viewport) in a template with no withIncrementalHydration() in the config was ignored and the block hydrated eagerly.
+In v22 the trigger is honoured, so blocks that used to be interactive on load now are not until the trigger fires. Grep templates for hydrate before the upgrade and confirm each one is still intended.
+(2) Event replay becomes active, which is almost always an improvement but does change what happens to clicks landing in the pre-hydration window.
+Separately, unrelated to hydration but landing in the same upgrade: OnPush becomes the default change-detection strategy, which will surface any component that was relying on Default re-checking mutated shared state.
+
+Cross-Q²: What is still opt-in, and what happens if you forget it?-- think --
+A: withI18nSupport() (stable v20.0). Without it, "by default, Angular will skip hydration for components that use i18n blocks", silently, with no error. A localised app can have hydration enabled and most of its page quietly re-rendering.
+Also still your responsibility: matching preserve Whitespaces between tsconfig app json and tsconfig server json (Angular recommends false on both, and "a mismatched value will cause hydration to break"),
+and making sure the locale itself is derived from the same input on both sides, a locale chosen from Accept-Language on the server and from a cookie in the browser is a guaranteed mismatch.
+
+-- pause --
+Drill 20, TransferState as an information-disclosure surface.
+
+Q: A security reviewer flags your SSR page. What did they find in the page source?-- think --
+A: The transfer state, a block containing the Jason of every HttpClient response the server made during the render.
+Not a cache, not memory, not a cookie: it is in the document, so Ctrl+U, curl, the crawler's index, the corporate proxy's logs, any browser extension reading the DOM, and any C D N cache all have it.
+The classic finding is that the server called /api or orders or 42, the dot NET endpoint returned the full OrderDto because that is what the endpoint returns, the U I displays three fields, and the other twenty-five, customer email, internal margin, fulfilment partner ID, are sitting in the HTML.
+
+Cross-Q: Rank the mitigations.-- think --
+A: (1) Shape the DTO, return a view-model from the A P I so there is nothing extra to leak. This is the B F F argument arriving from the security direction rather than the performance one, and it is the only fix that also reduces payload size.
+(2) withHttpTransferCacheOptions({ filter }) to exclude specific requests. (3) withNoHttpTransferCache() and accept the double fetch, for genuinely sensitive apps. (4) Never put a token, session identifier or secret in there, that is not a mitigation to rank, it is a rule.
+Note that includeRequestsWithAuthHeaders: true makes all of this dramatically worse.
+One thing not to say here, because it is a common and checkable error: a strict CSP does not block the state block, it is emitted as type="application or json", which the browser treats as data and never executes, so script-src never applies to it.
+CSP's argument with SSR is about the event-replay scripts, which do execute.
+
+Cross-Q²: You put a DateTime from your dot NET DTO into manual TransferState and the client throws. Why?-- think --
+A: Because "the values in the store are serialized or deserialized using Jason.stringify / Jason.parse.
+So only boolean, number, string, null and non-class objects will be serialized and deserialized in a non-lossy manner." A Date goes in as a Date and comes out as an ISO string, so .get Time() works on the server and throws (or yields NaN ) in the browser.
+Same class of bug: class instances lose their prototypes so methods and instanceof are gone, and Map, Set, BigInt, undefined values and circular references do not survive at all.
+The dot NET angle: System.Text.Json emits decimal as a Jason number (safe) and TimeSpan as a string like "01:30:00" (safe on both sides), it is DateTime / DateTimeOffset that reliably bites, because the type changes across the boundary while the value looks fine.
+
+-- pause --
+Drill 21, Render modes as an architecture decision.
+
+Q: A colleague proposes { path: '', render Mode: RenderMode.Server } because "that's what we had before". Argue against it.**.-- think --
+A: A catch-all is a default, and a default copied from a previous architecture is not a decision.
+Every route behind login, admin screens, wizards, onboarding flows, is invisible to crawlers and gains nothing from SSR, but now pays a full server render on every hard navigation, plus the fan-out of A P I calls that goes with it.
+Every genuinely static route pays a per-request render for content that has not changed since the build.
+The v19+ route table exists precisely so you can say RenderMode.Client for the app-shell area, RenderMode.Prerender for marketing and docs, and RenderMode.Server only where per-request personalisation actually reaches the indexable content.
+
+Cross-Q: The counter-argument is "but the header shows the user's name, so every page is personalised." Answer it.-- think --
+A: Split the question: is the page's indexable content personalised, or only its chrome? A product page whose body is identical for everyone and whose header shows a name is a Prerender page with a client-hydrated header, not an SSR page.
+That single reframing is usually the difference between a C D N-served site and a Node fleet you have to scale, and it is the most valuable sentence in this whole topic.
+If the chrome genuinely must be correct in the first paint, for CLS reasons, say, the cheap version is to render a neutral skeleton for it and fill it in on hydration, not to server-render the entire page.
+
+Cross-Q²: What can you attach to a ServerRoute besides render Mode, and why does that matter architecturally?-- think --
+A: headers: Record, status: number, fallback: PrerenderFallback, and getPrerenderParams (the last two only on prerender routes, ServerRoute is a union type, so the compiler enforces which properties are legal where).
+The architectural point is headers: it lets caching policy live in code, in the same file, next to the render-mode decision that makes it necessary, private, no-store on the personalised routes, public, max-age=.,
+stale-while-revalidate=. on the semi-static ones, instead of in a C D N configuration in a different repository that is never reviewed alongside the code that depends on it.
+That is the difference between a caching bug being a code-review finding and being an incident.
+
+-- pause --
+Drill 22, Zoneless SSR.
+
+Q: Your team upgrades to v21 and the SSR pages start coming back with empty content areas, intermittently. Nothing errors. What is happening?-- think --
+A: Zoneless became the default in v21, so the server no longer learns "the app is busy" from Zone.js. Angular waits for stability before serialising, and it now derives stability from work it tracks, HttpClient, router navigations, resource(), plus whatever you register with PendingTasks.
+Anything else is invisible: a bare set Timeout, a raw fetch() inside a vendor S D K, a promise from a third-party client. The render finishes early and serialises the loading state, producing an empty content area with no error at all.
+It is intermittent because sometimes the untracked work happens to resolve fast enough to land before serialisation.
+
+Cross-Q: How do you fix it, and how do you find the ones you have not noticed yet?-- think --
+A: Fix by making the work visible: inject(PendingTasks).run(async () goes to {. }) for a promise, or const done = pending Tasks.add() / done() for a callback-based A P I.
+Find them with provideStabilityDebugging() (stable v21.1), which "will log information about what tasks are keeping the application from stabilizing if the application does not stabilize within 9 seconds", add it to the server config in staging.
+Under Zone.js, also import zone.js or plugins or task-tracking for macrotask stack traces.
+And note the asymmetry: this tool finds things that make you too slow to stabilise; the zoneless bug makes you stabilise too early, which is why the reliable technique for that one is auditing every async source that is not HttpClient or the router.
+
+Cross-Q²: Angular's hydration guide still talks about Zone.js stability. Is the documentation wrong?-- think --
+A: It is describing the Zone.js path, which is still supported and still what you get if you opt back in with provideZoneChangeDetection().
+The statements are accurate for that configuration: hydration "relies on a signal from Zone.js when it becomes stable inside an application", and a custom or noop Zone.js "may lead to a different timing of the 'stable' event, thus triggering the serialization or the cleanup too early or too late.
+This is not yet a fully supported configuration." Being able to say "that guidance predates zoneless being the default, and here is what replaced it" is a better answer than either quoting it or dismissing it, and the practical consequence is unchanged either way:
+something has to tell the server you are still busy.
+
+-- pause --
+Drill 23, Debugging NG0500 in production only.
+
+Q: Hydration works locally and throws NG0500 on every page in production. Give your diagnostic sequence.-- think --
+A: (1) Read the error, Angular's console output names the component and the DOM location. (2) curl the server's HTML rather than reading DevTools, because DevTools shows the DOM after the parser has repaired it and after scripts have run; the raw response is what Angular actually produced.
+(3) Compare the origin's response against the edge's response byte for byte, if they differ, this is NG0507 territory: a minifier, an injection proxy, or a C D N "HTML optimisation" toggle.
+Angular's own NG0500 guidance tells you to "verify Angular's server-rendered comment nodes (view container anchors) haven't been removed by C D N or custom post-processing logic." (4) Check preserve Whitespaces parity between tsconfig app json and tsconfig server json.
+(5) Bisect with ngSkipHydration to localise, then remove it and fix the cause.
+
+Cross-Q: The origin and edge responses are identical. What is left?-- think --
+A: Your own HTML. The commonest cause that behaves this way is invalid nesting the browser's parser repairs: without a (modern browsers "automatically create a element in tables that do not declare one"), a inside a, an inside an.
+The server serialises the tree Angular built; the browser parses the string and builds a different one; the node walk desynchronises.
+The reason this feels impossible is that the template was valid for years under CSR, under CSR Angular built the DOM with create Element and never round-tripped through the HTML parser. Turning on SSR is what exposed it.
+After that, look for direct DOM manipulation or [innerHTML], and for browser-only state ( local Storage, window.inner Width, Date ) gating an @if.
+
+Cross-Q²: You are told to "just add ngSkipHydration and move on." What is your objection?-- think --
+A: It is recursive, "the ngSkipHydration attribute will force Angular to skip hydrating the entire component and its children", so on anything a leaf it silently disables hydration for a whole page,
+and on the root component "would effectively disable hydration for your entire application." Nothing errors and nothing fails a test; you just quietly stop getting the thing you bought SSR for, and it will be found months later during an unrelated performance review.
+It also cannot be applied conditionally, and it only works on component host nodes (anywhere else gives NG0504).
+The defensible use is a leaf wrapper around a DOM-manipulating third-party library, Angular names D3 charts as the canonical case, with a comment naming the library, and a review rule that no other use is allowed.
+
+-- pause --
+Drill 24, Getting the transfer cache to actually hit.
+
+Q: You add SSR expecting your A P I's request rate to fall, because the server now fetches what the browser used to fetch. It goes up instead. Why?-- think --
+A: The transfer cache is keyed by the request URL, and in almost any real deployment the server and the browser use different URLs for the same endpoint, the SSR container calls internal service D N S ( the browser calls the public gateway ( Nothing matches, so every page does both fetches:
+the server's, and then the browser's after hydration.
+There is no error and no warning; the only symptom is the graph going the wrong way. The fix is HTTP_TRANSFER_CACHE_ORIGIN_MAP ( @angular or common or http ), mapping server origins to client origins.
+
+Cross-Q: Where must that token be provided, and what happens if you get it wrong?-- think --
+A: Server code only, the docs are explicit that "the token should only be provided in the server code of your application", and Angular errors if it detects it on the client.
+That is the correct behaviour: the map describes your internal network topology (service names, ports) and has no business being shipped in a browser bundle where anyone can read it. Provide it in app config server ts, never in the shared app config ts.
+Direction matters too: keys are the origins the server used, values are the origins the client will use.
+
+Cross-Q²: What else silently prevents transfer-cache hits?-- think --
+A: Several things, all silent. A request that differs in any way the key covers, a cache-busting query parameter added on one side, a different header set if you configured include Headers.
+POST -based A P Is, unless you set includePostRequests: true (relevant for graph Q L-over-POST and R P C-style endpoints).
+Requests carrying credentials, unless includeRequestsWithAuthHeaders / includeRequestsWithCredentials are enabled, which you usually should not enable, so the honest answer for authenticated data is that it will be fetched twice and that is the safer outcome.
+Responses whose own cache directives forbid storage, unless includeNonCacheableRequests: true. And of course a call that does not go through HttpClient at all, which the cache never sees.
+
+-- pause --
+Section 2. Self-test.
+
+Hydration is a walk, not a diff: Angular steps through the existing DOM against a serialised node map from the server, claiming each node. A mismatch is that walk failing an assertion, so the failures are structural.
+Angular reports NG0500 (node mismatch), NG0501 (missing siblings) or NG0502 (missing node), and client-renders the affected subtree, you keep correct content and lose the SSR benefit there.
+
+Causes, in rough order of frequency: direct DOM manipulation or innerHTML / outerHTML;
+invalid HTML nesting the browser's parser repairs ( without a, a inside a, an inside an ), which was harmless for years under CSR because Angular built the DOM with create Element and never round-tripped through the parser;
+browser-only state ( local Storage, window.inner Width, document.cookie ) gating a conditional; non-deterministic values ( Math.random(), Date.now(), timezone-dependent formatting); and third-party widgets mutating the DOM before hydration.
+
+Two neighbours worth naming: NG0505 (no hydration info in the server response, hydration isn't enabled, or a cached or fallback shell was served) and NG0507 (HTML altered after SSR, a minifier or C D N stripping the comment nodes Angular uses as view-container anchors).
+
+SSR: dynamic per-request (price, inventory, personalization) but adds server cost and TTFB. SSG: cheapest delivery (C D N-static) but can't show real-time inventory or personalized recommendations without client-side hydration calls.
+CSR: simplest, fastest TTFB, but slow LCP and bad SEO until JS runs.
+For a product page, SSR with aggressive caching (Vary on country or segment, 60 seconds T T L) usually wins; SSG works if inventory is rarely out-of-stock and personalization happens client-side post-hydration.
+
+provideClientHydration() enables it, the H T T P transfer cache is one of the features it turns on by default, alongside DOM hydration and (from v22) incremental hydration.
+The server makes the call once, the response is serialised into the HTML, and the browser's HttpClient reads it instead of refetching.
+
+with Fetch() is a different concern entirely: it selects the Fetch backend instead of XMLHttpRequest. It is deprecated in v22, because fetch is now the default backend.
+A lot of older material claims with Fetch() is what gives you TransferState; it does not, and saying so in an interview invites a follow-up you will not enjoy.
+
+Tune it with withHttpTransferCacheOptions({ include Headers, filter, includePostRequests, includeRequestsWithAuthHeaders, includeRequestsWithCredentials, includeNonCacheableRequests }), disable it with withNoHttpTransferCache(),
+and make it actually hit with HTTP_TRANSFER_CACHE_ORIGIN_MAP when the server and browser use different A P I origins.
+
+Without it, the entire app's JS must download, parse, and execute before any component is interactive. INP suffers because the main thread is busy hydrating components the user can't see yet.
+@defer (hydrate on viewport / interaction) schedules hydration only when the user reaches a component, keeping the main thread free for above-the-fold interactions. Particularly impactful for long pages with comments, recommendations, or complex footer widgets.
+
+Because forwarding solves one problem (the server renders logged-out HTML for a logged-in user) and creates three:
+
+Cross-user state. provided In: 'root' on the server is per-process, not per-user, the singleton outlives the request and is shared by every concurrent visitor on that pod. Anything derived from REQUEST must be recomputed per render, never memoised at root scope.
+Shared caches. The rendered HTML now contains one user's data. A C D N, reverse proxy, or an A S P dot NET Core output-caching policy in front of the renderer will serve it to someone else. Cache-Control: private, no-store, declarable on the ServerRoute.
+The transfer cache. includeRequestsWithAuthHeaders: true serialises authenticated A P I responses into the HTML. Combined with any shared cache, that is a cross-user leak.
+
+Also: forward an explicit allow-list, never the whole header bag, host in particular will corrupt link generation and host-based routing on the A P I side.
+And the SSR process must never refresh tokens: with refresh-token rotation it rotates a token the browser never receives, reuse detection fires, and the user is signed out.
+
+provideClientHydration() now enables incremental hydration by default, which in turn enables event replay automatically. withIncrementalHydration() is deprecated as of v22.0 (removal planned for v24); withNoIncrementalHydration() is the new opt-out.
+
+Two things to check before the upgrade. Grep templates for hydrate, in v19, v21 those triggers were silently ignored without the provider, so blocks that hydrated eagerly for years will now stay dehydrated until their trigger fires.
+And remember that the same release makes OnPush the default change-detection strategy and fetch the default HttpClient backend (deprecating with Fetch() ), neither of which is hydration but both of which land in the same upgrade.
+
+No cookie jar to cookie auth does not flow; forward the cookie header via the REQUEST token.
+No document.cookie, local Storage, session Storage to any state read from them diverges between server and client. Use cookies for anything that changes what is rendered.
+No origin to relative URLs ( /api or orders ) do not resolve; absolutise on the server.
+No cores to server-to-server calls send no Origin and are not preflighted. Your cores policy is not protecting that path, and editing it will never fix an SSR problem.
+No IntersectionObserver / ResizeObserver / match Media /Canvas to guard, or use afterNextRender().
+Different network position to different base URL, so the transfer cache misses without HTTP_TRANSFER_CACHE_ORIGIN_MAP, and the SSR path bypasses whatever the gateway was doing.
+One process, many users to root-scoped state is shared; rate limiters keyed on IP see one client; a hung call holds a handler, a socket and a render's memory.
+
+Not the render itself, dot NET cannot execute Angular's server bundle, which needs a JavaScript runtime.
+The workable architecture is A S P dot NET Core (or YARP) as a reverse proxy on the public origin: /api/* handled in dot NET, static browser/ output served by UseStaticFiles or a C D N, everything else forwarded to a Node container.
+Same origin means no cores, no preflights, and same-site cookies by construction.
+
+Correct the legacy premise precisely: Microsoft.AspNetCore.SpaServices and NodeServices were obsoleted around A S P dot NET Core 3.0. SpaServices.Extensions ( UseSpa / UseSpaProxy ) is not obsolete but does dev proxying and SPA fallback, not SSR.
+UseSpaPrerendering, the one method that did attempt prerendering, is [Obsolete], and prerendering is "no longer supported out of box". The S D K's dotnet new angular template was removed in dot NET 8.
+
+RenderMode.Server (per-request SSR), RenderMode.Client (CSR), RenderMode.Prerender (build-time SSG). Set per route in app routes server ts, wired up with provideServerRendering(with Routes(server Routes)) from @angular or ssr.
+
+The non-obvious properties are headers and status. headers lets caching policy live in code next to the render-mode decision, private, no-store on personalised routes, public, max-age=., stale-while-revalidate=. on semi-static ones, instead of in a C D N rule in another repository.
+status (plus RESPONSE_INIT from inside the app) is how you avoid soft 404 seconds, which crawlers index. Prerender routes additionally take getPrerenderParams and fallback, whose default is PrerenderFallback.Server.
+
+Zoneless is the default from v21, so stability no longer comes from Zone.js. Angular waits for stability before serialising, and now derives it from work it tracks, HttpClient, the router, resource().
+A bare set Timeout, a raw fetch() inside a vendor S D K, or any other promise is invisible: the render finishes early and serialises the loading state, with no error at all.
+
+Fix: inject(PendingTasks).run(async () goes to. ) for promises, or const done = pending Tasks.add();. done(); for callback A P Is. Find the ones you missed with provideStabilityDebugging() (stable v21.1) in staging, which logs the tasks blocking stability.
+The opposite failure, never stabilising, usually an unguarded set Interval, is NG0506.
+
+Token attachment becomes the browser's job again, one functional interceptor, scoped to your own origins so the token is never sent to a C D N or analytics endpoint, with HttpContextToken for the exceptions.
+That interceptor and the server-side cookie-forwarding one must be mutually exclusive: gate on whether inject(REQUEST, { optional: true }) is null.
+
+The refresh race gets worse under SSR, not better. In CSR, requests trickle out as components initialise, so a 401 usually finishes refreshing before the next request leaves.
+Under SSR the transfer cache satisfies the first wave and everything else fires in one burst the instant hydration completes, so N simultaneous 401 seconds produce N refreshes, and with refresh-token rotation the identity provider sees token reuse and revokes the session.
+Single-flight it: one shared in-flight Observable ( share Replay, field cleared in finalize ), everyone else waits and retries once. The server never refreshes; on the server a 401 means "render anonymous".
+
+cores applies only to the browser's half. The SSR process sends no Origin and is never preflighted. The browser still is: Authorization plus Content-Type: application or json disqualifies a request from being "simple", so each unique URL or method pays an OPTIONS round trip.
+Same-origin hosting removes the class entirely; SetPreflightMaxAge caches it; AllowCredentials() cannot be combined with a wildcard origin; and a cores failure surfaces in Angular as HttpErrorResponse with status: 0.
