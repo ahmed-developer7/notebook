@@ -1,0 +1,1330 @@
+# PostgreSQL
+
+> [Mastery Guide](../README.md) › [Data & Persistence](./README.md)
+
+| Status | Priority | Phase | Last reviewed |
+|---|---|---|---|
+| Not Started | High | Phase 5 — Data & Persistence | 2026-05-08 |
+
+## Contents
+- [Why it matters](#why-it-matters)
+- [Core concepts](#core-concepts)
+  - [What makes Postgres different from SQL Server](#what-makes-postgres-different-from-sql-server)
+  - [MVCC and the visibility model](#mvcc-and-the-visibility-model)
+  - [Isolation levels — what Postgres actually guarantees](#isolation-levels--what-postgres-actually-guarantees)
+  - [Locks, DDL, and safe migrations](#locks-ddl-and-safe-migrations)
+  - [Heap tables, correlation, and the missing clustered index](#heap-tables-correlation-and-the-missing-clustered-index)
+  - [Indexes — B-tree, Hash, GIN, GiST, BRIN](#indexes--b-tree-hash-gin-gist-brin)
+  - [Index-only scans and the visibility map](#index-only-scans-and-the-visibility-map)
+  - [The planner — costs, statistics, and generic plans](#the-planner--costs-statistics-and-generic-plans)
+  - [JSONB — relational + document in one](#jsonb--relational--document-in-one)
+  - [TOAST — how wide rows are really stored](#toast--how-wide-rows-are-really-stored)
+  - [Full-text search](#full-text-search)
+  - [Partitioning (declarative, native)](#partitioning-declarative-native)
+  - [Logical and physical replication](#logical-and-physical-replication)
+  - [Postgres extensions worth knowing](#postgres-extensions-worth-knowing)
+  - [Postgres in .NET — Npgsql, EF Core, Dapper](#postgres-in-net--npgsql-ef-core-dapper)
+  - [Hosted Postgres — RDS, Azure, Cloud SQL, Neon, Supabase](#hosted-postgres--rds-azure-cloud-sql-neon-supabase)
+- [Code & diagrams](#code--diagrams)
+- [Common pitfalls](#common-pitfalls)
+- [Interview-ready summary](#interview-ready-summary)
+- [Interview Cross-Questioning Drill](#interview-cross-questioning-drill)
+- [Cheat Sheet](#cheat-sheet)
+- [Walkthrough](#walkthrough--autovacuum-cant-keep-up-with-bloat)
+- [Self-test](#self-test)
+- [Cross-references](#cross-references)
+- [Sources](#sources)
+
+---
+
+## Why it matters
+
+**PostgreSQL** is the most-loved RDBMS on the StackOverflow developer survey for the last 5+ years and the *de facto* default open-source database in 2026. For .NET teams it has shifted from "the Linux DB" to a first-class option that often beats SQL Server on price-performance, advanced features (JSONB, GIN, partitioning, extensions), and cloud portability. Azure Cosmos DB now offers a Postgres API; Aurora and Cloud SQL Postgres are AWS / Google's flagships; managed services like Neon and Supabase have made Postgres-as-a-product cool.
+
+For senior backend interviews — especially at startups and platform teams — Postgres knowledge is now expected on par with SQL Server. The vendor-neutral SQL skills from the [SQL Mastery sub-chapter](./03-sql/README.md) transfer directly; this file extends with Postgres-specific depth: MVCC internals, JSONB, the index zoo, declarative partitioning, logical replication, and the .NET driver story.
+
+Why interviewers ask: knowing the operational side of Postgres (autovacuum, replication, connection pooling with PgBouncer, query plan analysis with `EXPLAIN ANALYZE`) is what separates "I've used Postgres" from "I've operated Postgres." It's also where SQL Server developers stumble — Postgres is *similar* but importantly different.
+
+When NOT to choose: deep Microsoft / Azure-only stack mandates, Always On / SSAS-era SQL Server features, or shops with established T-SQL tooling. For most new greenfield in 2026, Postgres is the safer default.
+
+> 🌍 **In the real world**: a team ported a .NET order system from SQL Server to PostgreSQL over a weekend. EF Core swapped providers cleanly, the migrations generated, the tests passed, and the cutover was uneventful. The incidents started three weeks later and none of them looked like a database migration: disk usage on the primary climbing without the row count moving, a nightly report that had always been harmless now leaving the whole cluster bloated, and one `ALTER TABLE` in a routine deploy that made every endpoint time out for four minutes. All three were the same fact wearing different clothes — PostgreSQL keeps old row versions until vacuum removes them, and vacuum can be blocked by a transaction that is doing nothing at all. Nothing in the port was wrong. What was wrong was that the team had carried across the *operational* model of the old engine along with the schema, and the operational models are where these two databases actually differ. The porting risk in a migration like this is almost never the SQL.
+
+## Core concepts
+
+### What makes Postgres different from SQL Server
+
+| Concern | SQL Server | PostgreSQL |
+|---|---|---|
+| **Concurrency model** | Lock-based by default; RCSI optional | MVCC always (no read locks) |
+| **NULLs in unique indexes** | One NULL allowed | Multiple NULLs allowed (per spec) |
+| **Identifier case** | Case-insensitive by default | Case-sensitive when quoted |
+| **Boolean** | bit (0/1) | True boolean type |
+| **JSON** | NVARCHAR + JSON_VALUE() | JSONB (binary, indexed) |
+| **Schema** | Default `dbo` | Default `public`; multiple schemas common |
+| **Stored proc model** | T-SQL only | PL/pgSQL + PL/Python + PL/Perl + PL/V8 (JS) + more |
+| **Indexes beyond B-tree** | Limited (filtered, included) | B-tree, Hash, GIN, GiST, SP-GiST, BRIN, BLOOM |
+| **Partitioning** | Partition functions/schemes | Declarative `PARTITION BY` |
+| **Replication** | Always On AGs (paid) | Streaming + logical (built-in, free) |
+| **Extensions** | Limited | Massive ecosystem (pgvector, PostGIS, TimescaleDB, …) |
+| **Pricing model** | Per-core licensing | Free open-source; managed services pay-as-you-go |
+
+Three rows in that table need their footnotes, because each is a place where a confident wrong answer is easy to give:
+
+- **NULLs in unique indexes.** The Postgres behaviour is the SQL standard one — two NULLs are not equal, so a unique index accepts any number of them. SQL Server's "one NULL only" is the deviation. Since **PostgreSQL 15** you can opt into SQL Server's behaviour explicitly: `UNIQUE NULLS NOT DISTINCT`, which the release notes describe as allowing "unique constraints and indexes to treat `NULL` values as not distinct." Before 15, the workaround was a partial unique index plus a second one covering the NULL case.
+- **Identifier case.** Postgres *folds unquoted identifiers to lower case* and treats quoted ones literally, so `CREATE TABLE Orders` produces a table called `orders` and `SELECT * FROM "Orders"` then fails. This bites .NET teams hard, because EF Core will happily quote the PascalCase names from your C# model and produce a schema you can no longer query by hand without quoting everything. Decide once: either `UseSnakeCaseNamingConvention()`-style mapping, or accept quoted PascalCase everywhere. SQL Server's identifier case sensitivity is a property of the database collation, not a fixed rule.
+- **Concurrency model.** "MVCC always" means no *read* locks on rows — a `SELECT` still takes an `ACCESS SHARE` lock on the table, which matters when someone runs DDL (see [Locks, DDL, and safe migrations](#locks-ddl-and-safe-migrations)). SQL Server's default `READ COMMITTED` is lock-based unless `READ_COMMITTED_SNAPSHOT` is on — off by default on-premises, on by default on Azure SQL Database. So "read committed" describes two genuinely different behaviours depending on which engine and which deployment you are standing in front of.
+
+There is also a structural difference that does not fit in a table at all: **Postgres has no clustered index.** Tables are heaps; the primary key is just another B-tree. That has consequences everywhere, and it gets [its own section below](#heap-tables-correlation-and-the-missing-clustered-index).
+
+**.NET-specific differences**:
+- Connection string: `Host=...;Database=...;Username=...;Password=...` (Npgsql) instead of SQL Server's `Server=...;Database=...;User Id=...;Password=...`.
+- Default schema: `public` vs `dbo`.
+- Identity column SQL: Postgres uses `GENERATED ALWAYS/BY DEFAULT AS IDENTITY` (SQL standard) or legacy `SERIAL`.
+- Concurrency tokens: SQL Server's `[Timestamp] byte[] RowVersion` has no Postgres equivalent. The Npgsql provider uses the system column `xmin` instead — `modelBuilder.Entity<Order>().UseXminAsConcurrencyToken()`. Porting the attribute across engines unchanged is a known way to ship an application with no concurrency control at all; see [EF Core](./01-ef-core.md).
+
+> 🌍 **In the real world**: a migration script generated from a SQL Server schema created every table and column in PascalCase, unquoted. Postgres folded all of it to lower case, EF Core then quoted the PascalCase names it got from the C# model, and every query failed with `relation "Orders" does not exist` — while `\dt` in psql cheerfully listed a table called `orders`. Half a day went into the theory that the migration hadn't run. The instructive part is the error message: it quoted the name back, which is Postgres telling you it looked for that name *exactly*, and the mismatch is between two casings of the same word. Pick a naming convention on day one of a port and enforce it in the model builder, because the alternative is a schema where the only safe way to write SQL by hand is to quote every identifier forever.
+
+### MVCC and the visibility model
+
+**MVCC = Multi-Version Concurrency Control.** Every row mutation creates a new tuple version; old versions remain visible to in-flight transactions. Readers never block writers; writers never block readers.
+
+Each tuple has hidden columns:
+- `xmin` — transaction ID that inserted it.
+- `xmax` — transaction ID that deleted/updated it (zero if alive).
+
+A row is visible to your snapshot if `xmin` committed before your snapshot started AND (`xmax` is zero OR not yet committed).
+
+**Implication 1: bloat.** Updates don't overwrite — they create new tuples. Old tuples become "dead" and stay until **autovacuum** reclaims them. A heavily-updated table with poor vacuum settings can grow to a multiple of its live-data size on disk while its row count stays flat; the ratio you actually measure is `n_dead_tup / n_live_tup` in `pg_stat_user_tables`, not anything you can predict from a formula.
+
+**Implication 2: transaction ID wraparound.** XIDs are 32-bit, and because visibility comparisons are modulo arithmetic, only half that space — about 2.1 billion (2³¹) transactions — can be "in the past" at any moment. At a sustained 1,000 transactions per second that is roughly 24 days of headroom, so the arithmetic is not comfortable on a busy system. Autovacuum prevents wraparound by **freezing** old tuples, but a stuck vacuum (a long-running transaction holding a snapshot) is a real outage risk. Monitor the frozen-XID age, which lives in `pg_database`, not in `pg_stat_database`:
+
+```sql
+SELECT datname, age(datfrozenxid) AS xid_age
+FROM pg_database ORDER BY xid_age DESC;
+```
+
+Compare that against `autovacuum_freeze_max_age` (default **200 million** transactions), the point at which Postgres forces an anti-wraparound vacuum whether you wanted one or not.
+
+**Implication 3: HOT updates.** If an UPDATE doesn't change indexed columns and there's free space on the same page, Postgres reuses the page (Heap-Only Tuple) — cheap, no index update. The documented conditions are exact and worth memorising, because both halves are things schema design controls:
+
+1. "The update does not modify any columns referenced by the table's indexes, **not including summarizing indexes**. The only summarizing index method in the core PostgreSQL distribution is BRIN." (So a BRIN index on a column does *not* disqualify HOT — a genuinely useful asymmetry for time-series tables. Note the version gate: this exemption arrived in **PostgreSQL 16**; on 15 and earlier a BRIN index blocked HOT like any other.)
+2. "There is sufficient free space on the page containing the old row for the updated row."
+
+The second condition is why `fillfactor` exists. Setting `ALTER TABLE orders SET (fillfactor = 85)` reserves 15% of each page at insert time so later versions of those rows have somewhere to land. It costs storage on an append-only table and buys HOT on an update-heavy one; the docs are blunt that without it "HOT updates will still happen because new rows will naturally migrate to new pages and existing pages with sufficient free space for new row versions" — just less often, and with an index write each time they don't.
+
+The first condition is the one people design against by accident. An index on a column your application updates on every request — `last_seen_at`, `status`, a retry counter — converts every one of those updates from a single heap write into a heap write plus an entry in every index on the table.
+
+> 🌍 **In the real world**: a session table had an index on `last_activity_at` because someone wanted to reap stale sessions efficiently, and the application touched that column on every authenticated request. The reaper query ran once a minute; the index was maintained millions of times a day. Nothing looked wrong in any query plan — the reaper was fast, which was the point — but the table was rewriting index entries on essentially every page view, HOT never applied, and autovacuum spent its budget on that one table. The fix was to drop the index and let the reaper do a sequential scan once a minute on a table that fits in cache. The general shape is worth carrying into an interview: **an index is a write-path cost paid continuously to make one read path cheaper**, and if the column it indexes is the volatile one, you have inverted the trade.
+
+> 🌍 **In the real world**: a counters table with a few thousand rows — one per tenant, incremented on every API call — grew to tens of gigabytes on disk. The row count never changed. Each increment created a new tuple version, autovacuum's default trigger is a *scale factor* of the table size, and by the time the table was large enough to trigger frequently the vacuum work per pass was already large. Two changes fixed it, and both are per-table storage parameters rather than server-wide ones: `autovacuum_vacuum_scale_factor = 0.01` on that table specifically, and `fillfactor = 70` so the increments could stay HOT. The lesson that generalises is that autovacuum's defaults are tuned for a table whose update rate is proportional to its size, and a small hot table is precisely the case that assumption gets wrong.
+
+### Isolation levels — what Postgres actually guarantees
+
+This is the section where SQL Server experience actively misleads you, because the level *names* are shared and the behaviours are not.
+
+**Postgres implements three levels, not four.** From the docs: "in PostgreSQL, you can request any of the four standard transaction isolation levels, but internally only three distinct isolation levels are implemented, i.e., PostgreSQL's Read Uncommitted mode behaves like Read Committed." There are no dirty reads in Postgres at any level — MVCC has no way to hand you an uncommitted tuple. Asking for `READ UNCOMMITTED` as a performance trick, the way people do on SQL Server with `NOLOCK`, does nothing.
+
+**READ COMMITTED (the default) takes a new snapshot per statement.** A `SELECT` "sees only data committed before the query began," and the docs spell out the consequence: "two successive `SELECT` commands can see different data, even though they are within a single transaction." If you need two queries to agree, one statement or one `REPEATABLE READ` transaction — not two statements at the default level.
+
+**The re-check rule is the part almost nobody knows.** When an `UPDATE` or `DELETE` at `READ COMMITTED` blocks on a row another transaction has locked, and that transaction commits, Postgres does not simply proceed:
+
+> "If the first updater commits, the second updater will ignore the row if the first updater deleted it, otherwise it will attempt to apply its operation to the updated version of the row. The search condition of the command (the `WHERE` clause) is **re-evaluated** to see if the updated version of the row still matches the search condition. If so, the second updater proceeds with its operation using the updated version of the row."
+
+So `UPDATE jobs SET worker = 'me' WHERE id = 7 AND status = 'pending'` can report zero rows updated *even though row 7 existed and was pending when your statement started* — because by the time your statement got the lock, someone else had moved it to `running`. That is the correct outcome and it is why checking the affected-row count is not optional. It also means the `WHERE` clause is doing double duty as an optimistic concurrency check, which is exactly what you want, and exactly what a `SELECT` followed by an `UPDATE id = 7` throws away.
+
+**REPEATABLE READ in Postgres does not allow phantom reads.** The docs: "PostgreSQL's Repeatable Read implementation does not allow phantom reads. This is acceptable under the SQL standard because the standard specifies which anomalies must *not* occur at certain isolation levels; higher guarantees are acceptable." The snapshot is taken once, at the first statement, and the whole transaction sees that one snapshot — new rows committed by others are simply not in it. The cost is that a write conflict aborts you with `could not serialize access due to concurrent update` (SQLSTATE `40001`), which your application must catch and retry.
+
+**SERIALIZABLE** adds Serializable Snapshot Isolation on top: Postgres tracks read/write dependencies between concurrent transactions and aborts one when it detects a pattern that could produce a non-serializable outcome, again with SQLSTATE `40001`. It gives you the strongest guarantee available and requires the same thing `REPEATABLE READ` does — a retry loop.
+
+**Retry is a design constraint, not an error handler.** A `40001` retry re-runs the whole transaction, so anything inside it that is not a database write happens twice. Publishing to a message bus, charging a card, sending an email — those belong outside the transaction, or behind an idempotency key.
+
+| Level | SQL Server (default engine behaviour) | PostgreSQL | MySQL / InnoDB |
+|---|---|---|---|
+| Default level | `READ COMMITTED` — lock-based unless `READ_COMMITTED_SNAPSHOT` is on (off on-prem, on for Azure SQL Database) | `READ COMMITTED`, snapshot per statement | `REPEATABLE READ` |
+| `READ UNCOMMITTED` | Real; dirty reads possible (`NOLOCK`) | Accepted but behaves as `READ COMMITTED` | Real; dirty reads possible |
+| Phantoms at `REPEATABLE READ` | Possible | **Not possible** | Prevented for locking reads via gap locks |
+| Conflict handling | Blocking, then deadlock victim | Blocking at `READ COMMITTED` (then the `WHERE` re-check); `40001` and application retry at `REPEATABLE READ`/`SERIALIZABLE` | Blocking, then deadlock victim |
+
+> 🌍 **In the real world**: a payments service was moved to `SERIALIZABLE` after an audit found a double-spend window, and the retry loop that came with it was the textbook one — catch `40001`, re-run the delegate. It worked. What nobody traced was that the delegate also published a `PaymentCaptured` message to the bus, inside the transaction scope, before the commit that failed. Under load the abort rate rose, the retries did their job, and downstream consumers started seeing the same capture twice. The database was correct throughout; the invariant that broke lived outside it. `40001` is not an error to swallow — it is a statement that this block of code will sometimes run more than once, and every side effect in it has to be able to survive that.
+
+> 🌍 **In the real world**: an inventory decrement was written as a `SELECT` for the current quantity, a subtraction in C#, and an `UPDATE ... WHERE id = @id`. It oversold during every sale and passed every test. The engineer's mental model was SQL Server's locking `READ COMMITTED`, where the read would have held a shared lock long enough to feel safe; under Postgres MVCC the read blocks nothing at all and the two requests happily computed the same new value from the same old one. The one-statement version — `UPDATE stock SET qty = qty - $1 WHERE sku = $2 AND qty >= $1` — needed no isolation level change, no lock, and no retry, because the predicate and the arithmetic evaluate inside the same statement and the re-check rule above does the concurrency control for you. Rows affected is then the answer to "did it work?".
+
+### Locks, DDL, and safe migrations
+
+MVCC removes read locks on *rows*. It does not remove locks on *tables*, and this is where a routine deployment takes a production site down.
+
+Every statement takes a table-level lock. `SELECT` takes `ACCESS SHARE`. `INSERT`/`UPDATE`/`DELETE` take `ROW EXCLUSIVE`. `ALTER TABLE` takes `ACCESS EXCLUSIVE` "unless explicitly noted," and `ACCESS EXCLUSIVE` "conflicts with locks of all modes… This mode guarantees that the holder is the only transaction accessing the table in any way." The docs also note the converse, which is the reassuring half: "Only an `ACCESS EXCLUSIVE` lock blocks a `SELECT` (without `FOR UPDATE/SHARE`) statement."
+
+**The failure mode is the queue, not the lock.** Conflicting lock requests wait in an ordered queue. The `pg_locks` docs confirm the queue exists while warning that the view can't show it to you — "the `pg_locks` view does not expose information about which processes are ahead of which others in lock wait queues" — and direct you to `pg_blocking_pids()` "to identify which process(es) a waiting process is blocked behind." So the sequence that kills a site is:
+
+1. A reporting query has been running for two minutes, holding `ACCESS SHARE`.
+2. Your migration runs `ALTER TABLE orders ADD COLUMN …`, requests `ACCESS EXCLUSIVE`, conflicts with the report, and joins the queue.
+3. The *next* `SELECT` on `orders` needs `ACCESS SHARE`, which conflicts with the queued `ACCESS EXCLUSIVE` request, so it waits too. As does every one after it.
+
+A migration that would have taken milliseconds now blocks all traffic to that table for as long as the slowest query in front of it. The mitigation is one setting, and it belongs in every migration session:
+
+```sql
+SET lock_timeout = '3s';   -- default is 0: wait forever
+ALTER TABLE orders ADD COLUMN promo_code text;
+```
+
+If the lock can't be taken in three seconds the statement fails, the queue drains, and you retry. Failing a deploy is cheap. Draining the connection pool is not.
+
+**Which DDL is actually cheap.** Since **PostgreSQL 11**, adding a column with a non-volatile default does not rewrite the table: "the default value is evaluated at the time of the statement and the result stored in the table's metadata, where it will be returned when any existing rows are accessed… In neither case is a rewrite of the table required." The `ACCESS EXCLUSIVE` lock is still taken — it is just held briefly.
+
+What *does* force a full rewrite of the table and all its indexes, per the same page: a **volatile** default (`clock_timestamp()`), a **stored** generated column, an **identity** column, a column whose domain type has constraints, changing an existing column's type, and `SET LOGGED`/`SET UNLOGGED`.
+
+**`SET NOT NULL` on a large table** scans the whole table under `ACCESS EXCLUSIVE`. The safe three-step version splits the scan out from the exclusive lock:
+
+```sql
+-- 1. Instant: records the constraint without scanning.
+ALTER TABLE orders ADD CONSTRAINT orders_promo_nn
+  CHECK (promo_code IS NOT NULL) NOT VALID;
+
+-- 2. Scans the table under SHARE UPDATE EXCLUSIVE — writers keep working.
+ALTER TABLE orders VALIDATE CONSTRAINT orders_promo_nn;
+
+-- 3. PostgreSQL 12+ can prove NOT NULL from the validated CHECK, so no second scan.
+ALTER TABLE orders ALTER COLUMN promo_code SET NOT NULL;
+ALTER TABLE orders DROP CONSTRAINT orders_promo_nn;
+```
+
+Step 2 is cheap on the lock because, in the docs' words, "validation acquires only a `SHARE UPDATE EXCLUSIVE` lock on the table being altered" — it knows concurrent writers are already enforcing the constraint, so only pre-existing rows need checking. Step 3 relies on the PostgreSQL 12 change that lets `SET NOT NULL` "avoid unnecessary table scans" when "the table's column constraints can be recognized as disallowing nulls."
+
+**`CREATE INDEX CONCURRENTLY`** is the other one you must know cold. Plain `CREATE INDEX` "locks out writes (but not reads) on the table until it's done." `CONCURRENTLY` doesn't, at a price the docs enumerate:
+
+- Two table scans instead of one, plus waiting "for all existing transactions that could potentially modify or use the index to terminate."
+- **Cannot run inside a transaction block.** This is the one that breaks EF Core migrations, which wrap each migration in a transaction by default — you need `migrationBuilder.Sql(sql, suppressTransaction: true)`.
+- On failure it "leave[s] behind an 'invalid' index… ignored for querying purposes because it might be incomplete; however it will still consume update overhead." `\d` shows it as `INVALID`; drop it and retry.
+- Even after it completes, "in the worst case, it cannot be used as long as transactions exist that predate the start of the index build."
+
+`REINDEX CONCURRENTLY` (PostgreSQL 12+) is the equivalent for rebuilding a bloated index without locking writes.
+
+> 🌍 **In the real world**: a Friday deploy contained one migration — add a nullable column to the orders table. It ran at 14:02 and the site was unavailable until 14:06. The migration itself completed in eleven milliseconds. What happened in between was that an analytics job had started a `SELECT` over the same table at 14:01, the `ALTER TABLE` queued behind it for `ACCESS EXCLUSIVE`, and every subsequent request queued behind the `ALTER TABLE` until the connection pool was exhausted and the health check failed. The post-mortem's first draft blamed the analytics job. The durable fix was three lines in the migration runner — `SET lock_timeout`, a retry, and a rule that DDL and long reads do not share a maintenance window — because the analytics job will always exist in some form, and the migration is the thing you control.
+
+> 🌍 **In the real world**: a team hand-edited an EF Core migration to use `CREATE INDEX CONCURRENTLY` after reading exactly the advice above, and the deploy failed with `CREATE INDEX CONCURRENTLY cannot run inside a transaction block`. They removed `CONCURRENTLY`, the deploy went green, and the write lock it took on a 90-million-row table was the outage they had been trying to avoid — arrived at by fixing the error message rather than the cause. The missing piece was `suppressTransaction: true` on the `migrationBuilder.Sql` call. The tell for next time: when a database refuses to run a statement inside a transaction, that is usually the statement's whole point.
+
+### Heap tables, correlation, and the missing clustered index
+
+PostgreSQL has no clustered index. Tables are **heaps** — an unordered collection of pages — and every index, including the primary key, is a separate structure whose leaf entries hold the key plus a `ctid` (page, offset) pointing into the heap. There is no equivalent of SQL Server's clustered index where the leaf level *is* the row.
+
+Three consequences, all of which change how you reason about a schema:
+
+**1. There is no index that avoids the heap by construction.** An index scan finds `ctid`s and then visits the heap. The only escape is an [index-only scan](#index-only-scans-and-the-visibility-map), and that has its own precondition. In SQL Server, a query answered entirely by a covering non-clustered index genuinely never touches the base table; in Postgres, "covering" is necessary but not sufficient.
+
+**2. A wide primary key does not inflate your other indexes.** On SQL Server the clustered key is the row locator stored inside every non-clustered index, so a `varchar(400)` clustered key is copied into all of them. Postgres stores a 6-byte `ctid` instead, regardless of the PK. The SQL Server advice "never make a wide column the clustered key" does not transfer — the Postgres cost of a wide PK is confined to the PK's own index. (Postgres has its own ceiling: a B-tree entry "cannot exceed approximately one-third of a page," roughly 2.7 kB on the default 8 kB page.)
+
+**3. Physical order is whatever your write history produced, and the planner measures it.** `pg_stats.correlation` is the "statistical correlation between physical row ordering and logical ordering of the column values… When the value is near -1 or +1, an index scan on the column will be estimated to be cheaper than when it is near zero, due to reduction of random access to the disk."
+
+```sql
+SELECT attname, correlation
+FROM pg_stats
+WHERE tablename = 'orders' AND attname IN ('id', 'created_at', 'customer_id');
+```
+
+On an append-only table `created_at` will be near 1.0 and `customer_id` near 0. That single number explains why a range scan on the timestamp is cheap and the same-sized range scan on the customer is not, and it is the input the planner uses when deciding between an index scan and a sequential scan.
+
+**`CLUSTER` is a one-shot rewrite, not a maintained property.** The docs are explicit: "Clustering is a one-time operation: when the table is subsequently updated, the changes are not clustered." It takes an `ACCESS EXCLUSIVE` lock for the duration — "this prevents any other database operations (both reads and writes) from operating on the table." The documented way to *hold* ordering afterwards is `fillfactor` below 100%, "since updated rows are kept on the same page if enough space is available there."
+
+**BRIN depends entirely on this.** A BRIN index stores a summary per range of pages; if physical order doesn't track the indexed column, every range covers the whole value domain and the index prunes nothing. BRIN on a well-correlated column is tiny and effective; BRIN on a correlation-zero column is a rounding error of wasted disk that never helps a query.
+
+> 🌍 **In the real world**: a team porting from SQL Server kept the design pattern they'd used for years — clustered on `(customer_id, created_at)` so a customer's orders sat together on disk — and reproduced it in Postgres as an ordinary composite index. The "my orders" endpoint got measurably worse than it had been, with plans showing an index scan followed by a heap access per row scattered across the table. There was no clustering, because Postgres does not have any; the index gave them lookup, not locality. They ran `CLUSTER orders USING ix_orders_customer_created` in a maintenance window and the endpoint improved, and six weeks of inserts and updates later it had drifted back. What finally worked was accepting the engine's model instead of emulating the old one: a covering index with `INCLUDE`, so the hot query never needed the heap at all. The transferable point is that "the rows are stored in index order" is a SQL Server guarantee, not a database guarantee.
+
+> 🌍 **In the real world**: a BRIN index went onto the `occurred_at` column of a 4-billion-row events table, and it was the right index for the right table — except the table had been populated by a parallel backfill from an archive, twelve workers each importing a different tenant's whole history at once. Physical order had no relationship to time. `pg_stats.correlation` on that column read close to zero, every BRIN block range spanned four years, and the index skipped nothing. The same DDL on the same schema, populated by ordinary sequential inserts, would have worked perfectly. **BRIN is not an index on a column; it is an index on the correlation between a column and the disk**, and the load process is what determines whether you have any.
+
+### Indexes — B-tree, Hash, GIN, GiST, BRIN
+
+Beyond the universal B-tree, Postgres ships several specialized index types:
+
+| Index | Best for | Example |
+|---|---|---|
+| **B-tree** | Equality, range, sorting (default) | `CREATE INDEX ON orders (created_at)` |
+| **Hash** | Equality only (rare; B-tree usually better) | `CREATE INDEX ON users USING hash (email)` |
+| **GIN** | Composite values: arrays, JSONB, full-text | `CREATE INDEX ON docs USING gin (tags)` |
+| **GiST** | Geometric/text similarity, range types | `CREATE INDEX ON locations USING gist (geom)` |
+| **SP-GiST** | Space-partitioned data, IP networks | `CREATE INDEX ON ips USING spgist (addr inet_ops)` |
+| **BRIN** | Massive tables with natural ordering (time-series) | `CREATE INDEX ON logs USING brin (logged_at)` |
+
+**Partial indexes** — index a subset of rows:
+```sql
+CREATE INDEX ON orders (created_at)
+WHERE status IN ('pending', 'paid');
+```
+Smaller, faster; great for "active rows" patterns.
+
+**Expression indexes** — index a function or expression:
+```sql
+CREATE INDEX ON users (lower(email));
+SELECT * FROM users WHERE lower(email) = 'x@y.com';   -- uses index
+```
+
+**Covering / INCLUDE indexes** (Postgres 11+):
+```sql
+CREATE INDEX ON orders (customer_id) INCLUDE (total, status);
+```
+`INCLUDE` columns are payload, not search keys: a non-key column "cannot be used in an index scan search qualification, and it is disregarded for purposes of any uniqueness or exclusion constraint enforced by the index." That makes `CREATE UNIQUE INDEX ON t (x) INCLUDE (y)` enforce uniqueness on `x` alone while still answering queries that need `y`. Only B-tree, GiST and SP-GiST support `INCLUDE`, and expressions are not allowed as included columns. This *enables* an index-only scan; it does not guarantee one — see the [next section](#index-only-scans-and-the-visibility-map).
+
+**Deduplication.** B-tree indexes store repeated keys once, followed by a sorted list of TIDs ("posting list tuples"). It is on by default and switchable per index with `WITH (deduplicate_items = off)`. It is why a low-cardinality B-tree — an index on `status` with six distinct values — is far less wasteful than the folklore suggests. It does *not* apply to `INCLUDE` indexes, `numeric`, `jsonb`, `float4`/`float8`, container types, or text with nondeterministic collations. (Introduced in PostgreSQL 13; the release notes warn that `pg_upgrade`d indexes need a `REINDEX` to gain it.)
+
+**Skip scan** (PostgreSQL 18+) softens the leftmost-prefix rule: multi-column B-tree indexes can now be used "when there are no restrictions on the first or early indexed columns… and there are useful restrictions on later indexed columns." Know the version boundary: on 17 and earlier the planner's only option in that situation is a full scan of the index (or of the table), so column order in a composite index is very nearly the whole ballgame.
+
+**The senior trap**: every index slows writes, and on Postgres specifically it can also cost you HOT updates (see [MVCC](#mvcc-and-the-visibility-model)). Audit for unused indexes and drop them:
+
+```sql
+SELECT relname, indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+Two caveats before you act on that list. `idx_scan` counts since the last stats reset, so a quarterly report's index looks unused in a month-old counter. And an index backing a unique or exclusion constraint may show zero scans while still being the only thing enforcing correctness.
+
+> 🌍 **In the real world**: an index-cleanup exercise dropped fourteen indexes with `idx_scan = 0` on a replica-checked report, and one of them was the unique index behind a constraint that stopped duplicate external references being imported. Constraint dropped with the index, no error, no test failure — duplicates started arriving from a partner feed six days later and had to be reconciled by hand. `idx_scan` measures whether the *planner* used it, which is not the same question as whether the *database* needs it. Filter the candidate list against `pg_constraint` before you run anything.
+
+### Index-only scans and the visibility map
+
+This is the single most commonly missed Postgres mechanism among engineers who learned indexing on SQL Server, and it is a favourite follow-up question because it has a clean, checkable answer in `EXPLAIN`.
+
+An index-only scan needs **two** things:
+
+1. **An index that can supply the data.** B-tree always can. GiST and SP-GiST can for some operator classes. **GIN never can** — GIN entries store fragments of the value, not the value, so a GIN index cannot answer a query without the heap.
+2. **Every column the query references present in the index** — in the key or in `INCLUDE`. `SELECT x, z FROM t WHERE x = 'k'` cannot use an index on `(x)` even though the *predicate* is fully covered, because `z` isn't there.
+
+But the row you found in the index might not be visible to your snapshot, and the index does not store `xmin`/`xmax`. So Postgres consults the **visibility map**: one bit per heap page recording whether *every* row on that page is old enough to be visible to all current and future transactions. Bit set — return the value from the index and never touch the heap. Bit unset — visit the heap page to check, which is exactly the work the index-only scan was supposed to avoid.
+
+**The visibility map bits are set by VACUUM.** That is the coupling that surprises people: your covering index's effectiveness is a function of how recently the table was vacuumed. A write-heavy table can have a perfect covering index and get no benefit from it, permanently.
+
+`EXPLAIN (ANALYZE)` reports this directly:
+
+```
+Index Only Scan using ix_orders_customer_incl on orders  (actual rows=214 loops=1)
+  Index Cond: (customer_id = 42)
+  Heap Fetches: 0            <-- the index-only scan actually worked
+```
+
+`Heap Fetches: 214` on the same plan means you paid for a covering index and got an index scan with extra steps. The tuning lever is vacuum, not the index: lower `autovacuum_vacuum_scale_factor` on that table, or run `VACUUM` after a bulk load.
+
+**Insert-only tables were the pathological case**, and PostgreSQL 13 fixed it deliberately. Before 13, an append-only table never triggered autovacuum, because autovacuum's trigger was dead tuples and inserts produce none — so its visibility map bits stayed unset forever. The PostgreSQL 13 release notes name this as one of the reasons for the change: "a vacuum scan has other useful side-effects such as setting page-all-visible bits, which improves the efficiency of index-only scans." That behaviour is controlled by `autovacuum_vacuum_insert_threshold` (default **1000** tuples) and `autovacuum_vacuum_insert_scale_factor` (default **0.2**).
+
+**Engine difference worth stating plainly**: on SQL Server, a non-clustered index that covers a query answers it without touching the base table, full stop. On PostgreSQL, "covering" gets you a *candidate* index-only scan whose actual cost depends on vacuum state. Same words, different guarantee.
+
+> 🌍 **In the real world**: an order-list endpoint got a covering index — `(customer_id, created_at) INCLUDE (status, total)` — and it worked beautifully in staging and did almost nothing in production. The plan node said `Index Only Scan` in both places, which is what stopped the investigation for two weeks. The difference was one line further down: `Heap Fetches: 0` in staging, where the data had been loaded once and vacuumed; `Heap Fetches: 3,847` in production, where the orders table was updated continuously and autovacuum was running on defaults against a large table. Nothing about the index was wrong. Reading `EXPLAIN ANALYZE` down to the counters rather than stopping at the node name is the skill being tested here, and `Heap Fetches` is the counter that makes a covering index on Postgres either real or decorative.
+
+> 🌍 **In the real world**: a nightly ETL loaded a fact table with `COPY`, and the reports over it were slow on the first morning after each load and fine by mid-afternoon. The theory on the table was cache warming. It was the visibility map: the freshly-inserted pages had no all-visible bits, so every index-only scan degraded into heap fetches until autovacuum eventually got round to the table. Adding an explicit `VACUUM (ANALYZE) fact_orders;` as the last step of the load job removed the effect entirely — and the `ANALYZE` half fixed a second problem nobody had connected to it, which was that the planner's row estimates were a day stale every morning. Load jobs own the statistics and the visibility map of what they load.
+
+### The planner — costs, statistics, and generic plans
+
+"Defend this execution plan" is the question this section exists for. The planner picks the cheapest plan by an arithmetic model, and every surprising plan is that model being fed something wrong.
+
+**The cost units are relative, and the defaults encode assumptions.** `seq_page_cost` is **1.0** by definition; everything else is expressed in multiples of it. `random_page_cost` defaults to **4.0**, `cpu_tuple_cost` to **0.01**. The docs explain the 4.0 rather than assert it:
+
+> "Random access to durable storage is normally much more expensive than four times sequential access. However, a lower default is used (4.0) because the majority of random accesses to storage, such as indexed reads, are assumed to be in cache."
+
+Which tells you when to change it: the docs continue that "if your data is likely to be completely in cache, such as when the database is smaller than the total server memory… decreasing `random_page_cost` might be appropriate." On instances where the working set fits in RAM, leaving it at 4.0 systematically biases the planner towards sequential scans.
+
+**`effective_cache_size` (default 4 GB) allocates nothing.** It is a *statement to the planner* about how much of the OS page cache plus shared buffers a single query can expect to find its data in, and it feeds index-scan cost estimates. Setting it too low makes indexes look expensive; setting it high does not consume a byte of memory.
+
+**Statistics.** `ANALYZE` samples the table and stores per-column histograms, most-common-value lists and `n_distinct` in `pg_statistic` (readable via `pg_stats`). Sample size is governed by `default_statistics_target` (default 100) and can be raised per column with `ALTER TABLE … ALTER COLUMN … SET STATISTICS`. Per-column statistics assume **column independence**, so correlated predicates multiply their selectivities and produce estimates orders of magnitude too low. The fix is extended statistics:
+
+```sql
+CREATE STATISTICS orders_tenant_country (dependencies, ndistinct, mcv)
+  ON tenant_id, country FROM orders;
+ANALYZE orders;
+```
+
+**Generic vs custom plans — the .NET-relevant one.** For a *prepared* statement with parameters, Postgres does not reuse one plan forever, and it does not replan forever either. From the `PREPARE` docs: "the first five executions are done with custom plans and the average estimated cost of those plans is calculated. Then a generic plan is created and its estimated cost is compared to the average custom-plan cost. Subsequent executions use the generic plan if its cost is not so much higher than the average custom-plan cost as to make repeated replanning seem preferable."
+
+A custom plan is built with your actual parameter values, so the planner can see that `status = 'archived'` matches 40 million rows and `status = 'pending'` matches 200. A generic plan is built without them, using average selectivity. On a skewed column, the sixth execution can therefore get a materially different plan from the first five, with no deploy, no data change, and no query change. `plan_cache_mode` overrides the heuristic: `auto` (default), `force_generic_plan`, `force_custom_plan`.
+
+This matters in .NET because **Npgsql prepares statements for you if you let it**. `Max Auto Prepare` defaults to `0` (off), but the moment you set it, `Auto Prepare Min Usages` (default `5`) starts server-preparing your hot queries — and server-prepared is precisely the condition under which the five-executions rule applies. Explicit `NpgsqlCommand.Prepare()` does the same. If a query is fast in tests and slow in production on the same data, "is it server-prepared, and is it on a generic plan?" is a real hypothesis, checkable with `SET plan_cache_mode = force_custom_plan` on a session.
+
+**JIT.** `jit` is **on** by default and engages above `jit_above_cost` (default **100000**). Compilation time is charged to the query, so a plan whose *estimated* cost crosses that threshold pays for compilation even if its actual runtime is short — a known cause of "adding partitions made this query slower," because a partitioned scan's estimated cost climbs with partition count. `SET jit = off` on the session is the diagnostic.
+
+> 🌍 **In the real world**: a search endpoint returned in milliseconds for a week and then started timing out for a subset of tenants, with no deploy in between. The query was parameterised on `tenant_id`, the tenant distribution was extremely skewed — one tenant held most of the rows — and Npgsql's auto-prepare had been switched on in the same release that "fixed nothing else." The first five executions per connection got custom plans sized for whichever tenant called first; from the sixth, the generic plan assumed average selectivity and chose a nested loop that was catastrophic for the large tenant and fine for everyone else. Which is why it looked like a tenant-specific bug rather than a planner one. `plan_cache_mode = force_custom_plan` confirmed the diagnosis in one session. The permanent fix was to stop parameterising the tenant filter on that one query so the planner always sees the value — the same plan-reuse-versus-plan-quality trade that EF Core's `EF.Constant` addresses on SQL Server.
+
+> 🌍 **In the real world**: a database was moved onto NVMe-backed instances and the reports got *slower*. The plans had shifted towards sequential scans, and the reason was that `random_page_cost` was still 4.0 from the previous decade's spinning disks while the working set now fitted comfortably in page cache. The planner was correctly optimising for a machine that no longer existed. Lowering it — carefully, one workload at a time, with `pg_stat_statements` before-and-after rather than a guess — moved the plans back to index scans. The interview point is not the value; it is that the planner's cost constants are *your* description of *your* hardware, they have never been auto-tuned, and nobody ever revisits them after the instance type changes.
+
+### JSONB — relational + document in one
+
+`JSONB` stores JSON as binary, indexed, queryable — making Postgres a credible alternative to MongoDB for many "schemaless" use cases.
+
+```sql
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  data JSONB NOT NULL
+);
+
+INSERT INTO products (data) VALUES
+  ('{"sku":"ABC","name":"Widget","tags":["new","sale"],"specs":{"weight":2.5}}');
+
+-- Path queries. Note the parentheses: ->> yields text, and the cast applies
+-- to the extracted value, not to the key name.
+SELECT data->>'name' AS name FROM products
+WHERE (data->'specs'->>'weight')::numeric > 2;
+
+-- Containment query (uses GIN index)
+SELECT * FROM products WHERE data @> '{"tags":["sale"]}';
+
+-- GIN index for fast containment
+CREATE INDEX ON products USING gin (data);
+-- Or smaller, and specific to @>, @? and @@:
+CREATE INDEX ON products USING gin (data jsonb_path_ops);
+```
+
+**JSON vs JSONB**:
+- `JSON` — stored as text; preserves whitespace + key order; slower queries; not indexable.
+- `JSONB` — binary; deduplicates keys; reorders for hash; indexable; faster.
+
+Always pick JSONB unless you need exact byte-for-byte preservation.
+
+**The two GIN operator classes, precisely.** Default `jsonb_ops` "supports queries with the key-exists operators `?`, `?|` and `?&`, the containment operator `@>`, and the `jsonpath` match operators `@?` and `@@`." `jsonb_path_ops` "does not support the key-exists operators, but it does support `@>`, `@?` and `@@`." The size difference has a mechanism rather than a multiplier: `jsonb_ops` creates an index item for every key *and* every value in the document, while `jsonb_path_ops` creates one item per value, hashed together with the keys leading to it. The docs' summary: "a `jsonb_path_ops` index is usually much smaller than a `jsonb_ops` index over the same data, and the specificity of searches is better, particularly when queries contain keys that appear frequently in the data."
+
+**Neither class supports `->>` equality.** `WHERE data->>'k' = 'v'` is an expression over a function result; it can only use an *expression* index, `CREATE INDEX ON t ((data->>'k'))`. This trips people constantly because the query looks like it is "on the indexed column."
+
+**Hybrid pattern**: relational columns for structured/queried fields, JSONB for variable extra attributes. Best of both worlds — and there is a second reason beyond indexing. `ANALYZE` builds histograms and most-common-value lists per *column*. A field buried in JSONB has no per-key statistics for the planner to reason with, so cardinality estimates on JSONB predicates are far cruder than on a real column. Promoting a field you filter on isn't only about the index; it is about giving the planner something to estimate with.
+
+> 🌍 **In the real world**: a product catalogue put everything in one JSONB column because the attributes genuinely varied by category, and the design was correct. What went wrong was the API's list endpoint, which filtered on `data->>'status' = 'active'` — a value that existed on every single product and was therefore not a variable attribute at all. There was a GIN index on `data`; it was never used, because `->>` equality isn't in either operator class's family. The query scanned the whole table on every page load. Two lines fixed it — a real `status text NOT NULL` column and a partial index — and the discipline it encodes is worth stating as a rule: **a field that appears in a `WHERE` clause on a hot path is not a variable attribute, it is a column that hasn't been promoted yet.**
+
+### TOAST — how wide rows are really stored
+
+A Postgres row cannot span a page, and the default page is 8 kB. So what happens when your JSONB document is 60 kB? **TOAST** — The Oversized-Attribute Storage Technique.
+
+When a row exceeds `TOAST_TUPLE_THRESHOLD` (normally **2 kB**), Postgres compresses the wide, TOAST-able attributes and, if the row still doesn't fit, moves them out of line into a companion table (`pg_toast.pg_toast_<oid>`) in chunks, leaving a pointer in the main row. A single TOASTed field can reach **1 GB** (2³⁰ − 1 bytes).
+
+Four per-column storage strategies, set with `ALTER TABLE … ALTER COLUMN … SET STORAGE`:
+
+| Strategy | Compression | Out-of-line | Use for |
+|---|---|---|---|
+| `PLAIN` | no | no | Fixed-width types that can't be TOASTed |
+| `EXTENDED` | yes | yes | **The default for most TOAST-able types** (text, jsonb, bytea) |
+| `EXTERNAL` | no | yes | Wide text/bytea where you do substring reads — no decompression pass |
+| `MAIN` | yes | last resort only | Keep the value inline if at all possible |
+
+Compression method is `default_toast_compression`, default `pglz`; `lz4` is available "if PostgreSQL was compiled with `--with-lz4`", which most distribution and managed-service builds are.
+
+**Why a senior engineer needs this:**
+
+- **`SELECT *` is more expensive than it looks.** A query that does not reference the wide column never detoasts it — the pointer is read and ignored. Add the column to the projection and you add a read of the TOAST table plus decompression, per row. This is the concrete Postgres mechanism behind "project to DTOs," and it is much sharper here than on SQL Server.
+- **Table size lies.** `pg_relation_size('products')` excludes the TOAST table. Use `pg_total_relation_size()` — which counts the heap, its indexes, and the TOAST relation with its index — or you will conclude a 400 GB table is 12 GB.
+- **The TOAST table bloats and vacuums separately.** It is a real table with real dead tuples. A workload that rewrites large JSONB documents produces bloat you cannot see in `pg_stat_user_tables` for the parent.
+- **`EXTERNAL` is a real tuning lever**, not trivia: it trades storage for cheap substring/prefix operations on wide values, because there is nothing to decompress first.
+
+> 🌍 **In the real world**: an audit table stored the full before/after JSON of every entity change, and a compliance screen listed audit entries — id, timestamp, actor, entity type. It was written with `SELECT *` through Dapper into a DTO that used four of the eight columns. The endpoint took seconds for a page of fifty rows and nobody could find a missing index, because there wasn't one; the index was fine and the plan was a clean index scan. Every one of those fifty rows was dragging a multi-hundred-kilobyte JSONB payload out of the TOAST table and decompressing it so that C# could discard it. Naming the four columns in the `SELECT` fixed it completely. "Don't `SELECT *`" is usually justified with hand-waving about network bytes; on a table with a TOASTed column the cost is disk reads and CPU on the server, and it is the difference between reading the row and reading the row plus everything hanging off it.
+
+> 🌍 **In the real world**: a storage alert fired on a Postgres instance where the sum of every table size in the monitoring dashboard came to a fraction of the disk in use. The dashboard query used `pg_relation_size()`. The events table's TOAST relation — invisible to that function — held the overwhelming majority of the data, and it had bloated because the application updated the JSONB payload in place on retry rather than inserting a new row. Switching the dashboard to `pg_total_relation_size()` made the problem visible in one query. It is worth checking which function your own monitoring uses before you need the answer under pressure.
+
+### Full-text search
+
+Postgres has built-in FTS — no Elasticsearch needed for moderate corpora.
+
+```sql
+ALTER TABLE articles ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(body, '')), 'B')
+  ) STORED;
+
+CREATE INDEX ON articles USING gin (search_vector);
+
+SELECT id, title, ts_rank(search_vector, query) AS rank
+FROM articles, plainto_tsquery('english', 'postgres performance') query
+WHERE search_vector @@ query
+ORDER BY rank DESC LIMIT 10;
+```
+
+**The two-argument `to_tsvector` is load-bearing.** A generated column's expression must be `IMMUTABLE`. `to_tsvector('english', body)` — with an explicit configuration — is immutable. The one-argument `to_tsvector(body)` reads the session's `default_text_search_config` and is therefore only `STABLE`, so using it here fails with "generation expression is not immutable." That error message does not mention text search configurations at all, which is why it costs people an afternoon.
+
+**`ts_rank` reads the matched rows.** The index finds candidates; ranking requires the `tsvector` for each of them. If the `tsvector` is a stored generated column it is in the heap (and likely TOASTed — see above), so a query matching 200,000 documents does 200,000 detoasts before returning the top 10. Narrow the match before you rank: filter on category, date range, or tenant first.
+
+**When to graduate to Elasticsearch**: dozens of millions of documents, distributed search, aggregations on full-text matches, fuzzy/synonym/multi-language requirements that exceed Postgres dictionaries. Until then, Postgres FTS is "good enough" for most apps.
+
+> 🌍 **In the real world**: a knowledge base shipped Postgres FTS, and search was excellent for a year. It degraded as the corpus grew, and the diagnosis kept coming back "we've outgrown it, time for Elasticsearch." The plan said otherwise: the index was doing its job in single-digit milliseconds and the query then ranked every match in the corpus before applying `LIMIT 10`, because the search box had no other filter on it. Adding the space filter the UI already had — search within a workspace — cut the ranked set by three orders of magnitude and the endpoint went back to where it started. A second search system is a second failure domain, a sync pipeline, and an on-call rota. Establish which node in the plan is actually slow before you buy one.
+
+### Partitioning (declarative, native)
+
+Postgres 10+ has **declarative partitioning** — natural syntax, no triggers:
+
+```sql
+CREATE TABLE events (
+  id BIGINT,
+  occurred_at TIMESTAMP NOT NULL,
+  payload JSONB
+) PARTITION BY RANGE (occurred_at);
+
+CREATE TABLE events_2026_05 PARTITION OF events
+  FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+
+CREATE TABLE events_2026_06 PARTITION OF events
+  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+```
+
+**Partition pruning** — Postgres automatically targets only the relevant partitions during a query, skipping the rest:
+
+```sql
+SELECT * FROM events WHERE occurred_at >= '2026-05-15';
+-- Plan: only scans events_2026_05 partition.
+```
+
+**Plan-time versus execution-time pruning.** Pruning happens at two moments, and knowing which is which is the difference between a correct answer and a confident wrong one. The planner prunes when the predicate is a constant. When the value isn't known at planning time — a `PREPARE` parameter, a subquery result, `now()` — pruning moves to execution. PostgreSQL 11 extended run-time pruning to handle any stable expression (that is the wording of the commit that did it), so `WHERE occurred_at > now() - interval '1 hour'` **is** pruned; it just happens at executor startup rather than in the plan. The tell in `EXPLAIN` is different too: partitions removed at initialisation "will not show up in the query's `EXPLAIN` or `EXPLAIN ANALYZE`," and you read the count from the **`Subplans Removed`** line instead. Partitions pruned later still, from nested-loop parameters, show as `(never executed)`.
+
+(The related-but-separate `constraint_exclusion` mechanism, used by legacy inheritance partitioning, genuinely does require constants: "a comparison against a non-immutable function such as `CURRENT_TIMESTAMP` cannot be optimized." Conflating the two is where the "`now()` defeats pruning" folklore comes from.)
+
+**What partitioning costs you.** Unique constraints must include the partition key — you cannot enforce global uniqueness on `email` across a table partitioned by `tenant_id`. Planning time and per-session memory grow with partition count: the docs say the planner "is generally able to handle partition hierarchies with up to a few thousand partitions fairly well, provided that typical queries allow the query planner to prune all but a small number of partitions," and that "each partition requires its metadata to be loaded into the local memory of each session that touches it."
+
+**An insert with no matching partition fails**, with `no partition of relation … found for row`. A `DEFAULT` partition catches those, but it is a trap of its own: attaching a new partition whose range overlaps rows already sitting in the default requires scanning the default partition to prove none belong in the new one, under a lock.
+
+Use cases: time-series, multi-tenant (`PARTITION BY LIST (tenant_id)`), geo-sharding, archival.
+
+Automate partition creation with `pg_partman` (extension) — declares retention, creates future partitions, archives old ones.
+
+> 🌍 **In the real world**: a monthly-partitioned events table was created by hand with twelve partitions "to get us through the year," and on the first of January every insert began failing with `no partition of relation "events" found for row`. The ingestion service retried, the retries failed, the queue backed up, and the incident was called at 00:04 on a public holiday. Adding a `DEFAULT` partition would have converted an outage into a slow accumulation of misfiled rows — better, but it is a shock absorber, not a solution, because attaching January's real partition later then has to scan the default to prove nothing in it belongs in January. Partition creation is a scheduled job, not a schema migration: `pg_partman` with `premake` set several periods ahead, plus an alert on "newest partition ends within N days."
+
+> 🌍 **In the real world**: a multi-tenant system partitioned by `tenant_id` and then discovered that the users table could no longer enforce a unique email address, because a unique index on a partitioned table must contain the partition key and `(tenant_id, email)` is not the constraint the product needed. The workaround that shipped was an unpartitioned side table holding just `(email, tenant_id)` with the real unique index on it, written in the same transaction as the user. It works, and it is two tables where there was one, and every developer since has had to be told about it. Worth internalising before you propose partitioning in an interview: partitioning is a *physical* decision that quietly takes away a *logical* guarantee, and that guarantee is usually one someone in the business depends on.
+
+### Logical and physical replication
+
+**Physical (streaming) replication** — replicas receive a byte-for-byte copy of WAL (Write-Ahead Log). Standby is identical to primary. Used for HA and read scaling.
+
+```
+Primary → WAL stream → Replica (read-only, hot standby)
+```
+
+Built-in, free, works since Postgres 9. Failover via tools like Patroni / repmgr.
+
+**Logical replication** — replicas receive change events (INSERT/UPDATE/DELETE per row), can subscribe to specific tables, can run different schemas. Used for:
+- **Cross-version upgrades** (no downtime).
+- **Cross-DB replication** (Postgres → Postgres-compatible warehouse).
+- **CDC (Change Data Capture)** to Kafka via Debezium.
+- **Multi-master setups** (with conflict resolution; tricky).
+
+```sql
+-- Publisher (primary)
+CREATE PUBLICATION my_pub FOR TABLE orders, customers;
+
+-- Subscriber (replica or different DB)
+CREATE SUBSCRIPTION my_sub
+  CONNECTION 'host=primary dbname=mydb user=replicator'
+  PUBLICATION my_pub;
+```
+
+**Combine with Debezium** for streaming row changes to Kafka — the cleanest CDC pattern in 2026.
+
+**What logical replication does not do**, straight from the restrictions page, because each of these has ended somebody's cutover:
+
+- **DDL is not replicated.** "The database schema and DDL commands are not replicated… Subsequent schema changes would need to be kept in sync manually." Add a column on the publisher without adding it on the subscriber and replication stops.
+- **Sequences are not replicated.** "Sequence data is not replicated. The data in serial or identity columns backed by sequences will of course be replicated as part of the table, but the sequence itself would still show the start value on the subscriber." Advancing sequences is a mandatory cutover step; skip it and the new primary starts issuing IDs from 1.
+- **Large objects are not replicated**, and views, materialized views and foreign tables cannot be published.
+- **`REPLICA IDENTITY` decides how UPDATE and DELETE find the row on the subscriber.** The default is the primary key. A table with no primary key needs `REPLICA IDENTITY FULL` (the whole old row is sent and matched, which is expensive) or updates and deletes on it will error.
+
+**Slots need a ceiling.** `max_slot_wal_keep_size` defaults to `-1`, meaning "replication slots may retain an unlimited amount of WAL files." That default is why a forgotten slot fills a primary's disk. Set it to a size you can afford to lose; the trade is explicit — beyond it "the standby using the slot may no longer be able to continue replication due to removal of required WAL files," i.e. you sacrifice the replica instead of the primary. That is almost always the right way round.
+
+```sql
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST;
+```
+
+> 🌍 **In the real world**: a Debezium connector was decommissioned when a team retired the service that consumed its topic. The Kubernetes deployment went away; the replication slot on the primary did not. WAL accumulated at the rate the database generated it, silently, for eleven days, and the first symptom was the primary refusing writes because `pg_wal` had filled the volume. Recovery meant dropping a slot at 3am while the application was down. Two controls would have caught it: an alert on `pg_replication_slots` where `active = false`, and a non-default `max_slot_wal_keep_size` so the database would have invalidated the slot itself rather than protecting a consumer that no longer existed. An inactive replication slot is the only object in Postgres that can consume unbounded disk while doing nothing.
+
+> 🌍 **In the real world**: a major-version upgrade via logical replication went exactly to plan — subscriber caught up, application cut over, old primary retired — and the first write on the new primary failed with a duplicate key violation on the orders table. Sequences had not been advanced. `nextval` on the new server returned 1, and row 1 already existed, having been replicated. The rollback was clean because the team had kept the old primary for an hour, which is the only reason this is a story rather than an incident. Rehearse the cutover checklist against a copy, and put "advance every sequence" on it in writing, because it is the one step that logical replication's own documentation warns about and that nothing in the tooling will do for you.
+
+### Postgres extensions worth knowing
+
+| Extension | What it adds |
+|---|---|
+| **pg_stat_statements** | Per-query performance metrics (must-have) |
+| **pgvector** | Embedding storage + similarity search (RAG, ML) |
+| **PostGIS** | Geospatial — points, polygons, distance, indexes |
+| **TimescaleDB** | Time-series superpowers; hypertables, continuous aggregates |
+| **pg_partman** | Automated partition lifecycle |
+| **pg_cron** | Scheduled jobs in-DB |
+| **citext** | Case-insensitive text |
+| **uuid-ossp** / **pgcrypto** | UUID + crypto functions |
+| **hstore** | Key-value pairs (legacy; JSONB is usually better) |
+| **Citus** | Sharded distributed Postgres (scale-out) |
+| **pgaudit** | Detailed audit logging for compliance |
+
+**pg_stat_statements is non-negotiable** in production:
+```sql
+-- postgresql.conf, then restart:
+--   shared_preload_libraries = 'pg_stat_statements'
+CREATE EXTENSION pg_stat_statements;
+
+SELECT query, calls, total_exec_time, mean_exec_time
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC LIMIT 20;
+```
+
+`CREATE EXTENSION` alone is not enough and the failure is confusing: "the module must be loaded by adding `pg_stat_statements` to `shared_preload_libraries` in `postgresql.conf`, because it requires additional shared memory" — which means a **restart**, not a reload. Defaults worth knowing: `pg_stat_statements.max` is 5000 tracked statements, and `.track` is `top` (statements issued directly by clients, not ones nested inside functions).
+
+Order by `total_exec_time`, not `mean_exec_time`. The query costing your database the most is usually a fast one called constantly, and sorting by mean puts it on page four.
+
+### Postgres in .NET — Npgsql, EF Core, Dapper
+
+**Npgsql** is the canonical .NET driver — high-quality ADO.NET provider, async-first, supports advanced types (arrays, JSONB, geometry, range, enum mapping).
+
+```csharp
+// NpgsqlDataSource (Npgsql 7+) is the modern entry point: it owns the
+// connection pool and the type mappings, and is what AddNpgsqlDataSource registers.
+await using var dataSource = NpgsqlDataSource.Create(connectionString);
+
+// Positional parameters ($1, $2) are the recommended style since Npgsql 6 —
+// they are PostgreSQL's native syntax, so Npgsql doesn't have to parse and
+// rewrite the SQL the way it must for named (@p) parameters.
+await using var cmd = dataSource.CreateCommand("SELECT id, name FROM users WHERE id = $1");
+cmd.Parameters.Add(new NpgsqlParameter { Value = 42 });
+
+await using var reader = await cmd.ExecuteReaderAsync();
+while (await reader.ReadAsync())
+{
+    var id = reader.GetInt32(0);
+    var name = reader.GetString(1);
+}
+```
+
+**JSONB ↔ POCO is opt-in, and this changed.** Reflection-based JSON mapping is not on by default: "starting with Npgsql 8.0, to use this feature, you must first enable it by calling `EnableDynamicJson`." Applications that upgraded to Npgsql 8 without doing so found every JSONB-to-POCO read failing at runtime.
+
+```csharp
+var builder = new NpgsqlDataSourceBuilder(connectionString);
+builder.EnableDynamicJson();                       // required for arbitrary POCO <-> json/jsonb
+await using var dataSource = builder.Build();
+
+public record ProductData(string Sku, string[] Tags);
+```
+
+**EF Core with Npgsql** (`Npgsql.EntityFrameworkCore.PostgreSQL`):
+
+```csharp
+builder.Services.AddDbContext<AppDbContext>(opt =>
+    opt.UseNpgsql(connectionString, npg =>
+    {
+        npg.EnableRetryOnFailure();
+        npg.MigrationsAssembly("MyApp.Infrastructure");
+    }));
+```
+
+EF Core supports Postgres-specific features:
+- `ILike()` for case-insensitive LIKE.
+- Array columns via `int[]`, `string[]` properties.
+- JSONB via `[Column(TypeName = "jsonb")]`.
+- Citext, hstore, range types via Npgsql plugins.
+- Enum mapping (`builder.HasPostgresEnum<OrderStatus>()`).
+- `UseXminAsConcurrencyToken()` — the Postgres answer to SQL Server's `rowversion`, using the system column that MVCC already maintains.
+
+**Dapper for raw SQL** — same as anywhere; pairs cleanly with Npgsql.
+
+**Statement preparation.** `Max Auto Prepare` defaults to `0` — automatic preparation is **off** unless you turn it on. Set it and `Auto Prepare Min Usages` (default `5`) governs how many executions promote a statement to server-prepared. Auto-prepared statements persist across pooled connections, so short-lived connections still benefit. The cost is not performance, it is predictability: server-prepared statements are the ones subject to PostgreSQL's [generic-plan heuristic](#the-planner--costs-statistics-and-generic-plans), so switching this on can change plans on skewed data.
+
+**Connection pooling — PgBouncer**: Postgres runs **one operating-system process per connection**, and each backend carries its own memory, participates in snapshot and lock bookkeeping, and is scheduled by the OS. That is the mechanism behind the usual operational advice to keep server connections in the low hundreds rather than thousands; the right number for your instance comes from measurement, not from a rule of thumb. **PgBouncer** is a transparent pooler that multiplexes many client connections onto few server connections. It is effectively mandatory for serverless/Lambda/Functions workloads, where every invocation would otherwise open its own connection.
+
+The three `pool_mode` values, and what each costs you:
+
+| Mode | Server connection released | What breaks |
+|---|---|---|
+| `session` (default) | On client disconnect | Nothing — but you get little multiplexing benefit |
+| `transaction` | At end of each transaction | Session state: `SET`, session-level advisory locks, `LISTEN`/`NOTIFY`, `WITH HOLD` cursors, temp tables |
+| `statement` | After each statement | The above, plus multi-statement transactions are disallowed |
+
+Prepared statements used to belong on that "breaks" list; PgBouncer now tracks protocol-level prepared statements "in transaction and statement pooling mode" when `max_prepared_statements` is non-zero (default **200**, kept in an LRU cache per server connection). One sharp edge remains and it shows up right after a deploy: if a prepared statement's result types change under it — because a migration altered the table — PostgreSQL raises `cached plan must not change result type`, and PgBouncer's documented remedy is a `RECONNECT`.
+
+> 🌍 **In the real world**: a .NET service moved behind PgBouncer in transaction mode to survive a traffic increase, and connection errors vanished. What appeared instead, intermittently, was a feature that read a per-request tenant identifier set with `SET app.current_tenant` at the start of the request and read back by row-level security policies. In transaction mode the server connection is handed to another client at the end of each transaction, so the `SET` sometimes applied to a connection a different request was about to use, and sometimes was simply gone by the time the next statement ran. Row-level security was, briefly, showing tenants each other's data. The fix was `set_config('app.current_tenant', $1, true)` — the `true` makes it transaction-scoped — which is correct in every pool mode. Pooling mode is not an infrastructure detail you can adopt without reading your own application: the question "what state does a request leave on the connection?" has to be answered before the mode changes, not after.
+
+> 🌍 **In the real world**: an Azure Functions app on a consumption plan exhausted a Flexible Server's connections during a traffic spike, and the first fix attempted was raising `max_connections`. It made things worse — each additional backend is a process, and the instance spent its time on context switching and snapshot bookkeeping rather than on queries, so throughput fell while the error changed from "too many connections" to "everything is slow." PgBouncer in transaction mode, with a server-side pool an order of magnitude smaller than the client-side one, fixed it at the original `max_connections`. The general principle is one worth being able to state: **`max_connections` is a limit, not a capacity**. Raising it does not create the CPU or the memory the extra backends will need.
+
+### Hosted Postgres — RDS, Azure, Cloud SQL, Neon, Supabase
+
+| Service | Notes |
+|---|---|
+| **AWS RDS Postgres / Aurora** | RDS = managed; Aurora = AWS-rewritten engine, faster, cloud-native HA |
+| **Azure Database for PostgreSQL Flexible Server** | Microsoft's managed Postgres; pairs with AAD auth, Defender, App Service |
+| **Google Cloud SQL Postgres** | Standard managed Postgres |
+| **Cosmos DB for PostgreSQL** | Postgres + Citus sharding; for distributed write-scale |
+| **Neon** | Serverless Postgres; branching (per-PR DBs!), bottomless storage; great for dev/preview environments |
+| **Supabase** | Postgres + auth + REST/GraphQL + realtime + storage; "Firebase but SQL"; OSS-friendly |
+| **Render / Fly / Railway** | Lightweight managed Postgres for small apps |
+
+**Pick by workload**:
+- Enterprise / regulated: AWS Aurora, Azure Flexible Server.
+- Serverless apps with PR-preview DBs: Neon (branching is killer).
+- Full-stack BaaS for small teams: Supabase.
+- Distributed write-scale: Cosmos DB for PostgreSQL (Citus).
+
+**What every managed service takes away**: superuser. You cannot install an arbitrary extension — each provider publishes an allow-list, and `CREATE EXTENSION` on anything outside it fails. You usually cannot edit `postgresql.conf` or `pg_hba.conf` directly; parameters go through the provider's parameter group or portal, and some are locked. Anything that requires a filesystem (`COPY … FROM '/path'`, `archive_command`, custom C extensions) is off the table; you use `\copy` from the client and the provider's own backup mechanism. Check the extension list *before* designing around pgvector, PostGIS or TimescaleDB on a managed service — this is a normal interview follow-up and "I'd check the provider's supported-extensions page" is the answer that shows you've done it.
+
+> 🌍 **In the real world**: an architecture was signed off on the strength of TimescaleDB hypertables for a metrics workload, and the cloud team then provisioned the database on a managed service whose extension allow-list didn't include it. The discovery happened during the first deployment. The options at that point were all expensive: self-manage Postgres on VMs, move to the vendor's own timeseries product and rewrite the queries, or reimplement hypertables as native declarative partitioning plus a `pg_cron` job — which is what they did, at a cost of several weeks. The extension list is not an implementation detail to be settled later; it is a constraint on the design, and it takes ten minutes to check.
+
+## Code & diagrams
+
+<details>
+<summary>🧩 Click to expand — code samples and diagrams</summary>
+
+### Reading EXPLAIN ANALYZE
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 42 AND status = 'paid';
+
+-- Output:
+-- Bitmap Heap Scan on orders  (cost=4.32..15.50 rows=4 width=124)
+--                              (actual time=0.022..0.025 rows=3 loops=1)
+--   Recheck Cond: ((customer_id = 42) AND (status = 'paid'))
+--   Buffers: shared hit=4
+--   ->  BitmapAnd  (cost=4.30..4.30 rows=4 width=0)
+--         ->  Bitmap Index Scan on idx_customer (cost=0..2.10 rows=20 width=0)
+--         ->  Bitmap Index Scan on idx_status (cost=0..2.10 rows=200 width=0)
+-- Planning Time: 0.45 ms
+-- Execution Time: 0.057 ms
+```
+
+Read top-down, indented inward = inner steps. Look for:
+- **Seq Scan** on big tables → missing/unused index.
+- **Rows estimated vs actual** — large divergence = stale stats; run `ANALYZE`.
+- **Buffers** — `shared hit` good, `shared read` = disk I/O.
+- **`Heap Fetches`** under an `Index Only Scan` — anything above zero means the visibility map didn't cover those rows and you paid for the heap anyway.
+- **`Rows Removed by Filter`** — rows the index brought back and the executor then threw away. A large number here with a small final row count means the index is finding candidates, not answers.
+- **`Subplans Removed`** on an `Append` — partitions pruned at executor startup. Absent line means nothing was pruned at that stage.
+
+Always use `EXPLAIN (ANALYZE, BUFFERS)`. Plain `EXPLAIN` gives estimates only, and estimates are precisely the thing you are trying to check.
+
+### A covering index that isn't covering
+
+The same query, same index, same data — two plans separated only by vacuum state. This is the shape to recognise:
+
+```
+-- Before VACUUM
+Index Only Scan using ix_orders_cust_created on orders
+    (cost=0.56..48.21 rows=214 width=28) (actual time=0.03..7.94 rows=214 loops=1)
+  Index Cond: (customer_id = 42)
+  Heap Fetches: 214
+  Buffers: shared hit=9 read=205
+
+-- After VACUUM orders;
+Index Only Scan using ix_orders_cust_created on orders
+    (cost=0.56..48.21 rows=214 width=28) (actual time=0.02..0.21 rows=214 loops=1)
+  Index Cond: (customer_id = 42)
+  Heap Fetches: 0
+  Buffers: shared hit=9
+```
+
+The cost estimate is identical in both. The node name is identical. `Heap Fetches` and the `Buffers` line are the only places the truth appears — which is the argument for reading a plan past its first line.
+
+### A migration that can't take the site down
+
+```sql
+-- Every DDL session starts with this. Default lock_timeout is 0: wait forever,
+-- and take the whole table's traffic into the queue behind you.
+SET lock_timeout = '3s';
+SET statement_timeout = '0';   -- long index builds must not be killed by a global default
+
+-- Add the column: no rewrite since PG 11 (non-volatile default), brief ACCESS EXCLUSIVE.
+ALTER TABLE orders ADD COLUMN promo_code text;
+
+-- Backfill in batches, each its own transaction — never one giant UPDATE that
+-- holds a snapshot (and blocks vacuum cluster-wide) for an hour.
+-- ... loop until zero rows affected ...
+UPDATE orders SET promo_code = ''
+WHERE promo_code IS NULL AND id IN (
+  SELECT id FROM orders WHERE promo_code IS NULL ORDER BY id LIMIT 5000
+);
+
+-- NOT NULL without an ACCESS EXCLUSIVE full-table scan.
+ALTER TABLE orders ADD CONSTRAINT orders_promo_nn
+  CHECK (promo_code IS NOT NULL) NOT VALID;         -- instant
+ALTER TABLE orders VALIDATE CONSTRAINT orders_promo_nn;  -- SHARE UPDATE EXCLUSIVE
+ALTER TABLE orders ALTER COLUMN promo_code SET NOT NULL; -- PG 12+: no rescan
+ALTER TABLE orders DROP CONSTRAINT orders_promo_nn;
+
+-- Index build outside any transaction block.
+-- In EF Core: migrationBuilder.Sql(sql, suppressTransaction: true)
+CREATE INDEX CONCURRENTLY ix_orders_promo ON orders (promo_code);
+
+-- Verify it didn't land INVALID.
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+```
+
+### A job queue with SKIP LOCKED
+
+The Postgres answer to "can I use my database as a queue" — and the one thing `LISTEN`/`NOTIFY` can't give you, which is safe competing consumers.
+
+```sql
+-- Each worker claims its own batch. Rows locked by another worker are skipped
+-- rather than waited on, so N workers do not serialise behind row 1.
+UPDATE jobs SET status = 'running', locked_by = $1, locked_at = now()
+WHERE id IN (
+  SELECT id FROM jobs
+  WHERE status = 'pending' AND run_after <= now()
+  ORDER BY run_after
+  LIMIT 20
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, payload;
+```
+
+```csharp
+// One round-trip: claim and fetch. RETURNING removes the second SELECT.
+await using var cmd = dataSource.CreateCommand(ClaimSql);
+cmd.Parameters.Add(new NpgsqlParameter { Value = workerId });
+await using var reader = await cmd.ExecuteReaderAsync(ct);
+```
+
+The docs are explicit about what you are trading: "skipping locked rows provides an inconsistent view of the data, so this is not suitable for general purpose work, but can be used to avoid lock contention with multiple consumers accessing a queue-like table." That is a precise description of a job queue and a warning against using it anywhere else. A partial index on `(run_after) WHERE status = 'pending'` keeps the claim query on the small live set rather than the whole history.
+
+> 🌍 **In the real world**: an outbox dispatcher was scaled from one worker to six and got no faster. Each worker ran `SELECT … WHERE status = 'pending' ORDER BY created_at LIMIT 10 FOR UPDATE`, so all six queued on the same ten rows and the extra five spent their lives blocked — six workers doing one worker's throughput, with five times the connection count. Adding `SKIP LOCKED` was a one-word change and made the scaling linear. It is a good interview answer precisely because the failure is invisible in every per-query metric: each statement was fast, the table was correctly indexed, and the only signal was that adding capacity did nothing.
+
+### MVCC, vacuum, and what depends on it
+
+```mermaid
+graph TD
+    U["UPDATE row"] --> N["New tuple version<br/>xmin = current xid"]
+    U --> D["Old tuple<br/>xmax = current xid → dead"]
+    D --> AV["autovacuum"]
+    AV --> R["Space reclaimed<br/>for reuse in this table"]
+    AV --> VM["Visibility map bits set<br/>→ index-only scans work"]
+    AV --> FZ["Old xids frozen<br/>→ no wraparound"]
+    AV --> ST["ANALYZE: planner statistics"]
+    LT["Long-running transaction<br/>(or idle in transaction)"] -. "pins the xmin horizon" .-> AV
+    RS["Inactive replication slot"] -. "retains WAL" .-> DISK["pg_wal grows"]
+```
+
+The dotted edge is the one to remember: a single transaction left open anywhere in the cluster stops autovacuum from removing tuples newer than its snapshot — and therefore stops all four of the things vacuum does, on every table, not just the one being read.
+
+### Connection topology
+
+```mermaid
+graph LR
+    App["App pods"]
+    Bouncer["PgBouncer pool"]
+    Primary["Primary Postgres"]
+    Replicas["Replicas 1, 2, 3<br/>(read scaling / standby)"]
+    AppRead["App pods<br/>(read-heavy queries)"]
+    App --> Bouncer
+    Bouncer --> Primary
+    Primary -- WAL --> Replicas
+    AppRead --> Replicas
+```
+
+### Hybrid relational + JSONB schema
+
+```sql
+CREATE TABLE products (
+  id BIGSERIAL PRIMARY KEY,
+  sku TEXT NOT NULL UNIQUE,           -- queried, indexed
+  category TEXT NOT NULL,             -- queried, indexed
+  price NUMERIC(10,2) NOT NULL,       -- queried, indexed
+  data JSONB NOT NULL DEFAULT '{}',   -- variable attrs
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX ON products (category, price);
+CREATE INDEX ON products USING gin (data jsonb_path_ops);
+```
+
+Queries on `sku`, `category`, `price` use B-tree. Queries on flexible attrs (`data->>'color'`) use GIN. One table, two access patterns.
+
+</details>
+
+## Common pitfalls
+
+1. **No autovacuum monitoring.** Bloat eats disk; XID wraparound risks an outage. Watch `pg_stat_user_tables.n_dead_tup` and `xact_age`.
+2. **Connection storms without PgBouncer.** Postgres runs one OS process per connection, each with its own memory and its own share of snapshot and lock bookkeeping — so throughput degrades well before `max_connections` is reached. Serverless workloads must front with PgBouncer (transaction pooling mode). Find your own ceiling by measurement; raising `max_connections` to escape "too many connections" trades an error for a slowdown.
+3. **Long-running transactions blocking vacuum.** A reporting query holding a snapshot for hours stops vacuum from cleaning bloat across the entire DB. Set `idle_in_transaction_session_timeout`.
+4. **`SELECT *` in EF Core / Dapper hot paths.** Inflates network + memory. Project to DTOs.
+5. **Forgetting timezone awareness.** `TIMESTAMP` (without TZ) is a footgun. Use `TIMESTAMPTZ` for almost everything.
+6. **Poor JSONB indexing.** `WHERE data->>'k' = 'v'` doesn't use a GIN index unless you index the expression. Use `@>` containment + `gin (data)` for general filtering.
+7. **Sequential UUIDs as primary keys.** Random UUIDs cause B-tree bloat and bad cache locality. Use UUIDv7 (time-ordered) or BIGSERIAL.
+8. **Default `work_mem`.** Default 4 MB triggers disk-spill on big sorts. Tune per-workload.
+9. **Confusing `RETURNING *`.** Postgres-only; gives back inserted/updated rows in one round-trip — use it instead of separate SELECTs after writes.
+10. **Schema drift from migration tools.** Postgres is strict about schemas. EF Migrations + Flyway / DbUp + manual changes accumulate diff. Pick one source of truth.
+11. **No replicas for read scaling.** Even small workloads benefit from a hot standby. Reads to replica, writes to primary.
+12. **Ignoring `pg_stat_statements`.** Without it you're blind to slow queries. Install on every cluster on day one — and remember it needs `shared_preload_libraries` plus a restart, not just `CREATE EXTENSION`.
+13. **DDL without `lock_timeout`.** `ALTER TABLE` takes `ACCESS EXCLUSIVE`; if it has to wait, every subsequent query on that table waits behind it. `SET lock_timeout` in the migration session and retry on failure.
+14. **Reading `Index Only Scan` as proof the heap wasn't touched.** Check `Heap Fetches`. On a write-heavy table the visibility map may never be set and the covering index does nothing.
+15. **Assuming SQL Server's isolation semantics.** Postgres has no dirty reads at any level, `REPEATABLE READ` prevents phantoms, and `REPEATABLE READ`/`SERIALIZABLE` abort with `40001` — which your application must retry, with all non-database side effects moved outside the transaction.
+16. **Measuring table size with `pg_relation_size()`.** It excludes the TOAST relation and the indexes. Use `pg_total_relation_size()`, or a table full of JSONB will look small until the disk fills.
+17. **Unbounded replication slots.** `max_slot_wal_keep_size` defaults to `-1` (unlimited). An inactive slot will fill the primary's disk; set a ceiling and alert on `pg_replication_slots.active = false`.
+18. **A partitioned table with no future partitions.** Inserts fail outright once you run past the last defined range. Automate creation with `pg_partman` and alert on the newest partition's end date.
+19. **PascalCase identifiers from EF Core.** Postgres folds unquoted names to lower case, so a quoted PascalCase schema is one you can never query by hand without quoting. Choose a naming convention in the model builder before the first migration.
+20. **`SELECT *` on a table with a wide JSONB or text column.** Every returned row detoasts and decompresses a payload you then discard. Name the columns.
+
+## Interview-ready summary
+
+- **PostgreSQL** is the open-source RDBMS standard in 2026 — strong typing, MVCC concurrency, rich indexes (B-tree / Hash / GIN / GiST / BRIN), JSONB, declarative partitioning, logical replication, and a vast extension ecosystem (pgvector, PostGIS, TimescaleDB, Citus, pg_stat_statements).
+- **MVCC**: every update creates new tuple version; readers don't block writers. Bloat and XID wraparound are the operational risks autovacuum prevents.
+- **JSONB** makes Postgres a credible document store; `@>` containment + GIN index = fast JSON queries.
+- **Partitioning** is declarative (`PARTITION BY RANGE/LIST/HASH`); great for time-series and multi-tenant.
+- **Replication**: streaming (physical) for HA + read scaling; logical for cross-version upgrades, CDC, multi-master.
+- **Isolation**: three levels implemented, not four — `READ UNCOMMITTED` behaves as `READ COMMITTED`, and there are no dirty reads. `READ COMMITTED` snapshots per statement and re-evaluates the `WHERE` clause after a blocking write commits. `REPEATABLE READ` prevents phantoms in Postgres. `REPEATABLE READ` and `SERIALIZABLE` abort with `40001` and require an application retry.
+- **Locking**: MVCC removes row read locks, not table locks. `ALTER TABLE` takes `ACCESS EXCLUSIVE` and queues; a waiting DDL statement blocks every query behind it. `SET lock_timeout` in every migration, and `CREATE INDEX CONCURRENTLY` outside a transaction block.
+- **No clustered index**: tables are heaps, every index points at a `ctid`. Physical ordering is measured by `pg_stats.correlation`, `CLUSTER` is a one-time rewrite, and BRIN only works where correlation is high.
+- **Index-only scans** need a supporting index *and* the visibility map bit set by vacuum; `Heap Fetches` in `EXPLAIN ANALYZE` is the proof.
+- **Planner**: costs are relative to `seq_page_cost = 1.0`; `random_page_cost` defaults to 4.0 and encodes an assumption about caching. Prepared statements get five custom plans, then a generic one may take over — the mechanism behind "it got slow on the sixth call."
+- **TOAST**: once a *row* exceeds ~2 kB its wide attributes compress and move out of line into a companion table. `SELECT *` detoasts them; `pg_relation_size()` doesn't count them.
+- **In .NET**: Npgsql is the canonical driver (`NpgsqlDataSource` since 7.0, positional `$1` parameters since 6.0, `EnableDynamicJson()` required for POCO↔JSONB since 8.0); EF Core integrates fully with array/JSONB/enum support and `UseXminAsConcurrencyToken()`; PgBouncer is mandatory for high-conn workloads, and transaction pooling costs you all session-scoped state.
+- **Hosted options** in 2026: RDS/Aurora, Azure Flexible Server, Cosmos DB for PostgreSQL, Neon (serverless + branching), Supabase (BaaS). All of them take away superuser and restrict extensions to an allow-list.
+
+**Expected interview questions:**
+
+1. *"Postgres vs SQL Server — when each?"* — Postgres for cost, JSONB, advanced indexes, extensions, multi-cloud. SQL Server when the org is Microsoft-heavy, needs T-SQL features, or has Always-On / SSAS investments.
+2. *"Walk me through MVCC."* — Every update writes a new row version; readers see the snapshot at transaction start. Old versions reclaimed by autovacuum. No read locks.
+3. *"How does JSONB query performance work?"* — `@>` containment + GIN index = fast. Path traversal (`data->>'k'`) without an expression index = sequential scan.
+4. *"What's the difference between physical and logical replication?"* — Physical: byte-level WAL stream, identical replicas, used for HA. Logical: row-level events, selective tables, used for upgrades / CDC / cross-version.
+5. *"How do you partition a multi-billion-row time-series table?"* — Declarative `PARTITION BY RANGE (occurred_at)` with monthly partitions; pg_partman for automation; partition pruning in the planner; BRIN indexes on time within each partition.
+6. *"What's a HOT update?"* — UPDATE that doesn't change indexed columns and reuses free space on the same page. No index updates. Schema design that exploits HOT (avoid indexing volatile columns) reduces bloat.
+7. *"Postgres connection scaling?"* — one OS process per connection, each carrying private memory and participating in snapshot and lock bookkeeping, so the practical ceiling is far below `max_connections` and is a property of the instance rather than a fixed number. PgBouncer multiplexes thousands of client connections onto a small server pool. Required for serverless. Say what the trade costs: transaction pooling mode discards session state (`SET`, session advisory locks, `LISTEN`, temp tables) between transactions.
+8. *"How would you do CDC out of Postgres?"* — Logical replication slot + Debezium → Kafka. Streams every row change as an event. Pairs cleanly with event-driven architectures. Name the caveats: DDL and sequences aren't replicated, and `REPLICA IDENTITY` must be set on tables without a primary key.
+9. *"You need to add a NOT NULL column to a 200-million-row table with no downtime. Walk me through it."* — `SET lock_timeout` first. `ADD COLUMN` with a non-volatile default doesn't rewrite (PG 11+). Backfill in batched transactions. Then `ADD CONSTRAINT … CHECK (col IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT` (only `SHARE UPDATE EXCLUSIVE`), then `SET NOT NULL`, which PG 12+ proves from the validated constraint without a rescan. Index with `CREATE INDEX CONCURRENTLY`, outside a transaction block.
+10. *"Your covering index shows an Index Only Scan and the query is still slow. Why?"* — `Heap Fetches` is non-zero. The index-only scan checks the visibility map; if vacuum hasn't marked those heap pages all-visible, it must visit the heap to check visibility. Tune autovacuum on that table, or vacuum after bulk loads. This has no SQL Server equivalent — there, a covering index genuinely covers.
+11. *"A query got slow with no deploy and no data change. Where do you look?"* — Stale statistics (`ANALYZE`, and check estimated vs actual rows). A predicate past the end of the histogram after a load. Or a prepared statement that flipped from a custom plan to a generic one after five executions — confirm with `SET plan_cache_mode = force_custom_plan`.
+12. *"Postgres as a job queue — yes or no?"* — Yes for moderate throughput, using `FOR UPDATE SKIP LOCKED` so competing workers don't serialise, `RETURNING` to claim and fetch in one round-trip, and a partial index on the pending set. No for durable fan-out, consumer groups, or replay — that's a broker. `LISTEN`/`NOTIFY` alone is not a queue: no persistence, no load balancing, 8 kB payload cap.
+13. *"What's the difference between REPEATABLE READ in Postgres, SQL Server and MySQL?"* — Postgres: snapshot at first statement, phantoms impossible, conflicts raise `40001`. SQL Server: lock-based, holds shared locks to end of transaction, phantoms possible, conflicts resolve by blocking or deadlock. MySQL/InnoDB: the *default* level, consistent non-locking reads from a snapshot, gap locks preventing phantoms on locking reads. Same three words, three behaviours.
+
+## Interview Cross-Questioning Drill
+
+<details>
+<summary>📖 Click to expand — cross-question chains (~15-20 min, cover answers and write cold)</summary>
+
+> ⚠️ **Honest caveat**: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is **Q → A → Cross-Q → A → Cross-Q² → A**.
+
+### Drill 1 — MVCC and tuple visibility
+
+> **Q**: Walk me through MVCC in Postgres.
+>
+> **A**: Every row mutation creates a **new tuple version** with hidden `xmin` (creator transaction ID) and `xmax` (deleter transaction ID). Old versions remain until autovacuum reclaims them. A row is visible to my transaction if `xmin` committed before my snapshot started AND (`xmax` is zero OR not yet committed before my snapshot). Readers never block writers; writers never block readers.
+>
+> **Cross-Q**: How does `SELECT FOR UPDATE` interact with MVCC?
+>
+> **A**: It takes a **row-level exclusive lock** on the selected rows. Other readers can still see the row (MVCC unblocked), but other `SELECT FOR UPDATE` or `UPDATE` of the same rows block. The lock is released at transaction commit/rollback. Use it for **pessimistic locking**: read-modify-write where you need to prevent concurrent writes (inventory decrement, balance updates). Trade-off: serializes contended rows.
+>
+> **Cross-Q²**: What's the difference between `REPEATABLE READ` and `SERIALIZABLE` isolation in Postgres?
+>
+> **A**: Both use MVCC snapshots. **REPEATABLE READ**: the transaction takes one snapshot at its first query and sees only that. Postgres's implementation is stronger than the SQL standard requires — the docs state that "PostgreSQL's Repeatable Read implementation does not allow phantom reads," because rows committed after your snapshot simply aren't in it. A write conflict aborts you with `could not serialize access due to concurrent update`, SQLSTATE `40001`. **SERIALIZABLE**: adds Serializable Snapshot Isolation (SSI) — Postgres tracks **read/write dependencies** between concurrent transactions and aborts one when the pattern could produce a non-serializable outcome, also `40001`. Stronger guarantee, higher abort rate under contention. Both levels make retry an application requirement, which means every non-database side effect inside the transaction must be idempotent or moved out. (Careful with the comparison: SQL Server's `REPEATABLE READ` *does* allow phantoms, so this is one of the places the shared vocabulary misleads.)
+
+### Drill 2 — VACUUM and autovacuum
+
+> **Q**: Why does autovacuum exist and what does it actually do?
+>
+> **A**: MVCC creates dead tuples (old versions) on every UPDATE/DELETE. Without cleanup, these accumulate as **bloat** — disk grows, queries slow down scanning dead rows. Autovacuum is a background worker that periodically reclaims dead tuples, updates statistics for the planner, and freezes old `xmin` to prevent transaction ID wraparound.
+>
+> **Cross-Q**: What's transaction ID wraparound and why is it an outage risk?
+>
+> **A**: Postgres uses **32-bit transaction IDs** (xids), and visibility comparisons are modulo arithmetic, so only half the space — 2³¹, about 2.1 billion — can be "in the past" at once. At a sustained 1,000 transactions per second that arithmetic gives roughly 24 days of headroom. To prevent old rows from appearing to be in the future after a wrap, autovacuum **freezes** old tuples (marks them visible to all transactions). `autovacuum_freeze_max_age` (default **200 million**) is the age at which Postgres forces an anti-wraparound vacuum regardless of the usual thresholds. If autovacuum stays blocked — typically by a long-running transaction holding a snapshot — the database eventually stops accepting new write transactions until vacuum catches up. Production outage. Monitor with `SELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC` and alert well before `autovacuum_freeze_max_age`.
+>
+> **Cross-Q²**: I have a long-running reporting query that holds a transaction open for 8 hours. What's the cascade effect?
+>
+> **A**: That transaction's snapshot **pins old tuple versions across the entire database** — autovacuum can't remove them. Bloat grows on every table being updated, not just the one being read. Indexes bloat. WAL accumulates. **A single misbehaving reporting query can starve the whole cluster of vacuum work.** Mitigations: (a) `idle_in_transaction_session_timeout` to kill idle transactions; (b) `statement_timeout` to kill long queries; (c) use a **read replica** for reporting so primary's vacuum isn't blocked.
+
+### Drill 3 — JSON vs JSONB
+
+> **Q**: When should I use JSON and when JSONB?
+>
+> **A**: **JSONB** almost always. It stores binary, deduplicates keys, indexable via GIN, faster querying. **JSON** preserves exact text — whitespace, key order, duplicate keys — useful only when you need byte-for-byte exact round-trip (rare). Storage size is comparable for typical documents.
+>
+> **Cross-Q**: Why does `WHERE data->>'k' = 'v'` not use my GIN index but `WHERE data @> '{"k":"v"}'` does?
+>
+> **A**: GIN with default `jsonb_ops` (and the lighter `jsonb_path_ops`) supports the **containment operator family** (`@>`, `?`, `?&`, `?|`), not arbitrary path-extraction equality. `->>` operator produces a text value that the planner can't match to GIN. To support `data->>'k' = 'v'`, create an **expression index**: `CREATE INDEX ON t ((data->>'k'))`. Most teams refactor to use `@>` containment for queries.
+>
+> **Cross-Q²**: I have a JSONB column with 100 fields per document. Indexing the whole column with GIN is huge. How do I optimize?
+>
+> **A**: Three options: (1) **`jsonb_path_ops`** instead of default `jsonb_ops`. The mechanism is what to quote, not a multiplier: `jsonb_ops` creates an index item for every key *and* value; `jsonb_path_ops` creates one per value, hashed with the keys leading to it — so the docs say it "is usually much smaller than a `jsonb_ops` index over the same data, and the specificity of searches is better." The cost is that it drops the key-exists operators (`?`, `?|`, `?&`), keeping `@>`, `@?` and `@@`. (2) **Index a subtree** rather than the document: `CREATE INDEX ON t USING gin ((data #> '{a,b}'))`. (3) **Promote queried fields to relational columns** (hybrid pattern); leave the variable rest in JSONB. Option 3 is what most production schemas end up doing, and it buys something the index options don't — per-column statistics, so the planner can estimate cardinality on that predicate instead of guessing.
+
+### Drill 4 — Index zoo
+
+> **Q**: When do I use GIN, GiST, BRIN vs B-tree?
+>
+> **A**: **B-tree** (default) — equality, range, ordering for scalar values. **GIN** — composite values: arrays, JSONB, full-text. Inverted index style. **GiST** — geometric, range types, similarity (pg_trgm), where keys overlap is the question. Generalized. **BRIN** — massive tables with natural ordering (time-series, append-mostly). Block-range index; tiny size, lossy precision.
+>
+> **Cross-Q**: For a 100GB time-series table indexed on `(occurred_at)`, why is BRIN often better than B-tree?
+>
+> **A**: The size difference is structural, not a tuning result. A B-tree stores one entry per row; BRIN stores one summary per **range of pages** — `pages_per_range` defaults to 128, which is 1 MB at the default 8 kB page size. So a BRIN index has roughly one entry per 128 pages where a B-tree has one per row, and the ratio is the number of rows per 128 pages, not a benchmark. Range queries (`WHERE occurred_at BETWEEN x AND y`) use the summaries to skip page ranges whose min/max can't match. The trade-off: BRIN is lossy — within a matching range, every row is scanned and re-checked. **And it only works when physical order tracks the column**: check `pg_stats.correlation` first, because a backfilled or randomly-inserted table gives ranges that all span the whole value domain and prune nothing. BRIN also doesn't disqualify HOT updates, since the docs class it as a summarizing index.
+>
+> **Cross-Q²**: I want fuzzy text matching ("postgresql" matches "postgers"). What index?
+>
+> **A**: **GIN or GiST with `pg_trgm` extension**. `pg_trgm` decomposes text into trigrams (3-char overlapping sequences); similarity is measured by trigram overlap. `CREATE INDEX ON t USING gin (name gin_trgm_ops)`. Queries: `WHERE name % 'postgrs'` (similar) or `WHERE name ILIKE '%post%'` (prefix/substring; gin_trgm supports it). For pure prefix matching, **B-tree with `text_pattern_ops`** is faster. For fuzzy / substring search, pg_trgm wins.
+
+### Drill 5 — Generated columns and expression indexes
+
+> **Q**: Difference between a generated column and an expression index?
+>
+> **A**: **Generated column** — a real column whose value is computed from other columns in the same row. Know the version boundary here, because it moved: **PostgreSQL 12** introduced generated columns with `STORED` only, and the `STORED` keyword was mandatory; **PostgreSQL 18** added `VIRTUAL` (computed on read) and made it the default when neither keyword is given — so `GENERATED ALWAYS AS (…)` with no `STORED` is a syntax error on 17 and a virtual column on 18. **Expression index** indexes a computed expression without storing it in the table. Generated columns give you a value to project and to index like any other column; expression indexes give you a WHERE/ORDER BY path with no per-row storage. A generated column's expression must be `IMMUTABLE` — which is why full-text `tsvector` columns must use the two-argument `to_tsvector('english', body)` rather than the one-argument form.
+>
+> **Cross-Q**: I want to query `WHERE lower(email) = 'x@y.com'` efficiently. Generated column or expression index?
+>
+> **A**: **Expression index**: `CREATE INDEX ON users (lower(email))`. Cheaper (no storage cost for the lowercased version), works automatically when the planner sees `WHERE lower(email) = ...`. Generated column would work too but adds disk overhead per row. Generated column wins if you also need to **project** `lower(email)` in SELECTs — avoids recomputation. For purely query-filtering purposes, expression index is right.
+>
+> **Cross-Q²**: Can I create a unique constraint on an expression?
+>
+> **A**: Yes, via expression index: `CREATE UNIQUE INDEX ON users (lower(email))`. Now case-insensitive email uniqueness is enforced without storing the lowercase version. Common pattern for case-insensitive natural keys. Alternative: **`citext` extension** — case-insensitive text type that handles this automatically without expression indexes. Production prefers citext for whole-column case insensitivity, expression indexes for one-off lookups.
+
+### Drill 6 — Partitioning
+
+> **Q**: I have a 5 billion-row events table. How would I partition it?
+>
+> **A**: Declarative range partitioning on `occurred_at`, monthly partitions: `CREATE TABLE events (...) PARTITION BY RANGE (occurred_at); CREATE TABLE events_2026_05 PARTITION OF events FOR VALUES FROM ('2026-05-01') TO ('2026-06-01')`. Each partition is a separate table; planner prunes partitions outside the query range. Use **pg_partman** extension to automate creation of future partitions and drop of expired ones.
+>
+> **Cross-Q**: What's partition pruning and how do I verify it works?
+>
+> **A**: The planner excludes partitions that can't match the WHERE clause when the predicate is constant, and the executor excludes more when values only become known at run time. Verify with `EXPLAIN`: plan-time pruning shows an `Append` over only the relevant partitions. Execution-time pruning is invisible in the partition list — the docs say partitions pruned at initialisation "will not show up in the query's `EXPLAIN` or `EXPLAIN ANALYZE`" and you read the count from the **`Subplans Removed`** line instead; partitions pruned later still, from nested-loop parameters, appear as `(never executed)`. The common myth is that `WHERE occurred_at > now() - interval '1 hour'` defeats pruning. It defeats *plan-time* pruning, because `now()` is `STABLE` and not constant-folded — but PostgreSQL 11 extended run-time pruning to handle any stable expression, so it is pruned at executor startup. The claim that stable functions can't be optimised belongs to `constraint_exclusion`, the older mechanism used by inheritance-based partitioning, and conflating the two is where the folklore comes from.
+>
+> **Cross-Q²**: What's the trade-off of partitioning vs not partitioning?
+>
+> **A**: **Wins**: queries on a single partition are faster (smaller table, smaller indexes). Dropping a partition is instant (`DROP TABLE events_2026_05`) vs slow DELETE. Maintenance (VACUUM, ANALYZE) parallelizes per partition. **Costs**: planner overhead (each query considers all partitions for pruning), unique constraints must include partition key, foreign keys to partitioned tables require careful handling, every partition has its own indexes (more disk overall). Worth it for tables > 100M rows or with clear time/tenant boundaries; overkill for small tables.
+
+### Drill 7 — Logical vs streaming replication
+
+> **Q**: Difference between streaming and logical replication.
+>
+> **A**: **Streaming (physical)**: replicas receive byte-for-byte WAL. Identical to primary. Used for HA, read scaling. Built-in since Postgres 9. **Logical**: replicas receive row-level change events (decoded from WAL). Can subscribe to specific tables, run different schemas, cross-version. Used for upgrades, CDC, multi-master.
+>
+> **Cross-Q**: Why can't I have streaming replication across Postgres versions?
+>
+> **A**: WAL format includes internal binary layouts that vary by major version. A 14.x replica can't read 15.x WAL. **Logical replication** uses a logical decoder that translates WAL into version-independent change events (INSERT/UPDATE/DELETE with values). That's why **logical replication is the canonical zero-downtime upgrade path**: stand up new-version subscriber, replicate from old primary, cut over, drop old.
+>
+> **Cross-Q²**: What's a replication slot and why do they sometimes fill up disk?
+>
+> **A**: A **replication slot** is a Postgres-side bookmark that ensures the primary retains WAL until a specific replica/subscriber consumes it. If a subscriber goes offline and stops consuming, the slot's `restart_lsn` stalls, **WAL accumulates indefinitely**, primary's disk fills. "Indefinitely" is literal: `max_slot_wal_keep_size` defaults to `-1`, documented as "replication slots may retain an unlimited amount of WAL files." Monitor `pg_replication_slots.active` and `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` — note the modern function names; `pg_xlog_location_diff` is the pre-PostgreSQL-10 spelling and no longer exists. Drop stale slots if subscribers are gone permanently (`SELECT pg_drop_replication_slot('name')`), and set `max_slot_wal_keep_size` so the database sacrifices the replica rather than the primary's disk.
+
+### Drill 8 — Parallel query
+
+> **Q**: How does Postgres parallel query work?
+>
+> **A**: For supported plan nodes (Seq Scan, Index Scan, Hash Join, Aggregate), Postgres spawns **parallel workers** that scan partitions of the data and feed results to a leader process. Controlled by `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`. Effective for large scans and aggregates; planner decides based on table size and cost.
+>
+> **Cross-Q**: When does the planner choose NOT to parallelize even though it could?
+>
+> **A**: When parallel overhead exceeds gain — small tables (< `min_parallel_table_scan_size`, default 8 MB), queries with cursors, queries calling functions marked `PARALLEL UNSAFE`, queries with `SELECT FOR UPDATE`. Also: workers come from a cluster-wide pool, so under high concurrency there may be none available and the plan runs serially regardless of what `EXPLAIN` suggested. For testing, the developer setting is `debug_parallel_query` — **renamed from `force_parallel_mode` in PostgreSQL 16**, so the old name is what you'll find in older blog posts and it will simply error on a current server.
+>
+> **Cross-Q²**: I have a 50GB table with a complex aggregation. Plans show 2 workers. Can I get more?
+>
+> **A**: Yes — raise `max_parallel_workers_per_gather` (default 2) to 4-8. Cluster-wide cap is `max_parallel_workers` (default 8) and `max_worker_processes` (default 8). On a 16-core machine, set max_worker_processes=16, max_parallel_workers=12, max_parallel_workers_per_gather=8. **Caveat**: parallelism helps single big queries; on heavy concurrent workloads, more workers per query starves others. Tune for your access pattern.
+
+### Drill 9 — WAL and replication slots
+
+> **Q**: What is WAL and how is it used?
+>
+> **A**: **Write-Ahead Log** — every change to data is first written to WAL (durable, sequential) before the data file. On crash, replay WAL to recover. WAL is also **streamed to replicas** for replication. Located in `pg_wal/` directory; segments are 16 MB by default. Tools like `pg_basebackup` and PITR work by combining a base backup with WAL replay.
+>
+> **Cross-Q**: A replication slot's `restart_lsn` is 100 GB behind current. What's the impact?
+>
+> **A**: Primary retains 100 GB of WAL specifically for that slot — can't archive or recycle those segments. Disk pressure on primary. If the slot's consumer doesn't catch up, disk fills, primary refuses writes. Operational checklist: alarm on lag > 1GB, kill stale slots, monitor `pg_wal/` directory size. A dropped/forgotten slot is one of the top operational outages in Postgres.
+>
+> **Cross-Q²**: How does PITR (point-in-time recovery) work?
+>
+> **A**: Continuously archive WAL segments to safe storage (S3, NFS via `archive_command`). To restore: start from a base backup, replay WAL segments up to a specific timestamp (`recovery_target_time`). Granular — can recover to any moment between backups. Critical for "dropped a table 10 minutes ago" disasters. Tools like **pgBackRest** and **WAL-G** automate this; production Postgres should always have PITR set up.
+
+### Drill 10 — Common extensions
+
+> **Q**: Name the extensions you'd install on every production Postgres cluster.
+>
+> **A**: **pg_stat_statements** (per-query performance metrics — non-negotiable), **pg_trgm** (trigram/fuzzy text search), **pgcrypto** (UUID and encryption functions), **uuid-ossp** (UUID generation — though `gen_random_uuid()` is built-in in 13+). Beyond those, situational: **PostGIS** (geospatial), **TimescaleDB** (time-series), **pgvector** (embeddings), **pg_partman** (partition lifecycle), **Citus** (sharding).
+>
+> **Cross-Q**: What does pg_stat_statements actually track?
+>
+> **A**: Per-normalized-query: total exec time, mean time, call count, rows returned, buffer hits/reads, IO time. Queries normalized by replacing parameter values with placeholders, so `SELECT * FROM users WHERE id=1` and `id=2` aggregate to one entry. Top-N slow queries: `SELECT query, total_exec_time FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 20`. Pair with `pg_stat_user_indexes` (unused index detection) and `pg_stat_user_tables` (per-table activity).
+>
+> **Cross-Q²**: TimescaleDB vs raw Postgres with partitioning for time-series?
+>
+> **A**: **TimescaleDB** is a Postgres extension that automates time-series patterns: hypertables (transparent partitioning by time and optionally space), continuous aggregates (incrementally-refreshed materialized views), retention policies, and columnar compression of older chunks. **Raw Postgres** can reach most of the same place with declarative partitioning, `pg_partman` for the lifecycle, materialized views for rollups and BRIN indexes on time — you just own the scripts. The decision is operational, not architectural, and it has a hard constraint attached: TimescaleDB is an extension, so check your managed provider's allow-list before the design depends on it. That check has sunk more time-series designs than any performance consideration.
+
+### Drill 11 — COPY for bulk loading
+
+> **Q**: I need to load 100M rows from a CSV. What's the fastest path?
+>
+> **A**: **`COPY ... FROM`** — Postgres's bulk loader. It reads a delimited stream straight into table storage, so there is no per-row SQL parse or plan. Splitting the file and running several `COPY` streams in parallel scales further. To go faster still: drop indexes before the load and rebuild after (one sorted build beats millions of incremental inserts); `synchronous_commit = off` for the load session, trading the last commit on a crash; or load into an `UNLOGGED` table when the data is reproducible. From .NET, use `NpgsqlConnection.BeginBinaryImport()` — the binary `COPY` protocol, not a loop of `INSERT`s. Finish with `VACUUM ANALYZE` on the loaded table: the `ANALYZE` gives the planner current statistics and the `VACUUM` sets the visibility-map bits that index-only scans depend on.
+>
+> **Cross-Q**: What's the difference between `COPY` and `INSERT ... VALUES (...)` (batched)?
+>
+> **A**: `COPY` streams rows directly into table storage — no SQL text to parse, no plan per statement, and WAL written in bulk. Batched `INSERT` is regular SQL: parsed and planned, once per statement rather than once per row when you use multi-row `VALUES`, which closes much but not all of the gap. Prefer the mechanism to a multiplier in an interview: the difference is the per-statement parse/plan and the round-trip, so it grows with row count and shrinks with batch size. For a few thousand rows a batched `INSERT` is simpler and fine; for millions, `COPY` is the only sensible answer.
+>
+> **Cross-Q²**: I want bulk loading but with on-conflict logic (upsert). COPY doesn't support that.
+>
+> **A**: Two patterns: (1) **COPY to a staging table, then INSERT ... SELECT ... ON CONFLICT** from staging into target. Fast, atomic. (2) **`MERGE`** (Postgres 15+) — SQL-standard upsert syntax; more flexible than ON CONFLICT for complex matching. (3) For continuous high-volume upsert, **pg_bulkload** extension or write to a partitioned staging area and swap partitions. COPY + staging is the standard production pattern.
+
+### Drill 12 — pg_hba.conf and authentication
+
+> **Q**: What is pg_hba.conf?
+>
+> **A**: **Host-Based Authentication** config — defines who can connect, from where, with what auth method. Each line: `TYPE DATABASE USER ADDRESS METHOD`. Read top-down; first match wins. Common methods: `trust` (no password, dev only), `md5`/`scram-sha-256` (password), `cert` (TLS cert), `peer` (OS user matching), `ldap`, `gss` (Kerberos).
+>
+> **Cross-Q**: Why is `scram-sha-256` better than `md5`?
+>
+> **A**: `md5` uses MD5 — broken cryptographically, and Postgres's scheme salts only with the username, so the stored hash is a password equivalent. `scram-sha-256` (SCRAM mechanism) does **per-session challenge-response** with PBKDF2-iterated SHA-256: replay-resistant, and the password itself never crosses the wire. SCRAM arrived in Postgres 10, and **`password_encryption` has defaulted to `scram-sha-256` since PostgreSQL 14** — the old "the default is md5" answer is out of date, and current docs carry a deprecation notice saying MD5 support "will be removed in a future release." The migration trap: changing `password_encryption` doesn't rewrite existing hashes; each role has to set its password again before its `pg_hba.conf` line can require `scram-sha-256`. **Don't use trust auth except on localhost dev.**
+>
+> **Cross-Q²**: How do I integrate Postgres auth with Azure AD or AWS IAM?
+>
+> **A**: **Azure Database for PostgreSQL Flexible Server**: native Microsoft Entra ID (Azure AD) integration — pg_hba.conf uses `aad-auth` method; tokens are short-lived OAuth tokens. **AWS RDS Postgres**: IAM database authentication — RDS generates short-lived tokens (15 min) via IAM Auth Token API; the app fetches the token and uses it as the password. Both eliminate static credentials but require fast token-refresh logic in the app. For Kubernetes, pair with **Workload Identity** for cleanest secret-less auth.
+
+### Drill 13 — Postgres vs MySQL vs MS SQL
+
+> **Q**: Postgres vs MySQL — when each?
+>
+> **A**: **Postgres**: stricter SQL compliance, richer types (JSONB, arrays, range, enums), advanced indexes (GIN/GiST/BRIN), declarative partitioning, vast extension ecosystem. **MySQL**: simpler, faster on simple workloads, larger ecosystem of tooling and tutorials, default in PHP/WordPress/Rails. For new greenfield in 2026, Postgres is the safer pick — better feature set + similar performance + cleaner semantics. MySQL still wins for shops with deep MySQL ops experience or specific tooling lock-in.
+>
+> **Cross-Q**: Postgres vs SQL Server for an enterprise .NET app?
+>
+> **A**: **SQL Server**: deeper integration with Microsoft stack (SSAS, Power BI, Azure AD), Always On AGs are mature HA, T-SQL features (CLR, In-Memory OLTP, Columnstore), per-core licensing means predictable enterprise cost. **Postgres**: free (no license cost), JSONB + array types, multi-cloud portable, faster pace of feature additions, extension ecosystem. For new .NET projects in 2026: Postgres unless org-mandated to SQL Server. EF Core works equally well with both via Npgsql provider.
+>
+> **Cross-Q²**: Where does MySQL still beat Postgres operationally?
+>
+> **A**: (1) **Replication ecosystem**: MySQL's async/semi-sync replication is battle-tested at very large scale, and the tooling around it has had longer to mature. (2) **Connection model**: MySQL/InnoDB is thread-per-connection where Postgres is process-per-connection, so MySQL absorbs high connection counts natively while Postgres wants PgBouncer in front of it. (3) **No vacuum**: InnoDB's undo log and purge thread reclaim old row versions without the operational surface Postgres's autovacuum presents — no bloat monitoring, no XID wraparound class of outage. (4) **Online schema changes**: `gh-ost` and `pt-online-schema-change` are mature; Postgres's story is `CREATE INDEX CONCURRENTLY` plus a lot of care with lock levels. (5) **Clustered index**: InnoDB tables *are* the primary-key B-tree, so PK range scans have physical locality that Postgres has to be coaxed into with `CLUSTER` or a covering index. For massive write-scale read-replicated workloads, MySQL is still credible.
+
+### Drill 14 — Advisory locks
+
+> **Q**: What are advisory locks and when do you use them?
+>
+> **A**: User-defined locks identified by 64-bit integers (or pair of 32-bit). **No relation to rows or tables** — purely application semantics. Two scopes: **session** (held until session ends or explicitly released) and **transaction** (released on commit/rollback). API: `pg_advisory_lock(key)`, `pg_try_advisory_lock(key)` (non-blocking), `pg_advisory_unlock(key)`. Use for distributed mutual exclusion using Postgres as the lock manager.
+>
+> **Cross-Q**: When would I use an advisory lock instead of `SELECT FOR UPDATE`?
+>
+> **A**: When the thing to lock isn't a row. Examples: (1) **Singleton job** — only one instance of "daily report generator" should run; lock on `hash('daily-report') :: bigint`. (2) **Cross-table coordination** — multiple tables affected by a process; no single row to lock. (3) **Lock by external key** — lock on hash of a tenant ID or file path. Advisory locks survive without modifying data, are cheap (~microseconds), and don't interact with MVCC.
+>
+> **Cross-Q²**: A worker takes a session-level advisory lock and crashes. What happens?
+>
+> **A**: Postgres releases the lock when the **TCP connection drops**. If the connection survives (e.g., process hangs but connection is open), the lock persists. Mitigations: (a) prefer **transaction-level** advisory locks — auto-released on commit/rollback regardless of process state; (b) use `pg_terminate_backend(pid)` to forcibly drop hung connections; (c) configure `tcp_keepalives_idle` / `tcp_keepalives_interval` so dead connections detect and close faster. Production: always prefer transaction-scoped locks unless you need cross-transaction coordination.
+
+### Drill 15 — LISTEN/NOTIFY for lightweight queues
+
+> **Q**: Can I use Postgres LISTEN/NOTIFY as a message queue?
+>
+> **A**: For lightweight async notifications — yes. `LISTEN channel; NOTIFY channel, 'payload';` — sends a string to subscribers on the channel. Payload limited to 8000 bytes. Subscribers receive notifications via the connection's async messages. Use cases: cache invalidation across app instances sharing a DB, signaling background workers when new rows arrive.
+>
+> **Cross-Q**: Why isn't LISTEN/NOTIFY a real message queue replacement?
+>
+> **A**: (1) **No persistence** — subscribers not connected when NOTIFY is sent miss it forever. (2) **No consumer groups, no load balancing** — every listener gets every message. (3) **Payload limit** — 8 KB max. (4) **Per-channel queue is in-memory** on the server — notifications can be dropped under pressure. (5) **NOTIFY only fires on transaction commit** — uncommitted writes don't trigger notifications. For real queue semantics (durability, retry, ordering), use **Kafka / RabbitMQ / Redis Streams** or Postgres-backed queue libraries like **pgmq** or **graphile-worker**.
+>
+> **Cross-Q²**: What's the pattern for "new row inserted, do work" using LISTEN/NOTIFY?
+>
+> **A**: Trigger pattern — note that `EXECUTE FUNCTION` needs a function returning `trigger`, so you cannot name `pg_notify` directly or pass it `NEW.id`; you write a wrapper: `CREATE FUNCTION notify_new_order() RETURNS trigger AS $$ BEGIN PERFORM pg_notify('new_order', NEW.id::text); RETURN NULL; END $$ LANGUAGE plpgsql;` then `CREATE TRIGGER notify_new_row AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION notify_new_order();`. Worker process runs `LISTEN new_order;` and processes incoming IDs. **Critical**: combine with a polling fallback — worker also polls `WHERE processed = false` every N seconds to catch missed notifications (worker offline at NOTIFY time, server restart, etc.). The claim step must use `FOR UPDATE SKIP LOCKED`, or multiple workers serialise on the same head-of-queue rows. Note also that `LISTEN` is session state, so it does not survive PgBouncer in transaction pooling mode — listeners need a direct connection. Trigger-based notification as a latency optimisation, `SKIP LOCKED` polling as the correctness mechanism, idempotent handlers throughout: that combination is a real low-throughput queue. Durable fan-out, consumer groups and replay still mean a broker.
+
+### Drill 16 — Locks and safe DDL
+
+> **Q**: You run `ALTER TABLE orders ADD COLUMN promo_code text` on a busy production table. What can go wrong?
+>
+> **A**: The statement itself is cheap — since PostgreSQL 11 a column with a non-volatile default is stored in the table's metadata and "in neither case is a rewrite of the table required." The danger is the lock. `ALTER TABLE` takes `ACCESS EXCLUSIVE`, which "conflicts with locks of all modes," and if any transaction is already holding a lock on that table — a long `SELECT`, an idle-in-transaction session that touched it — the `ALTER` waits. While it waits it sits in the lock queue, and every subsequent statement that conflicts with it queues behind it. A millisecond of DDL becomes an outage as long as the slowest query in front of it, ending when the connection pool exhausts.
+>
+> **Cross-Q**: How do you make that safe?
+>
+> **A**: `SET lock_timeout = '3s'` in the migration session, and retry on failure. The statement then either takes its lock quickly or gets out of the way, and a failed deploy is cheaper than a drained pool. Pair it with `SET statement_timeout = 0` for long index builds so a global default doesn't kill them, and with an operational rule that DDL doesn't run while long analytical queries are running. Also alert on `idle in transaction` sessions — they hold locks while doing nothing, and they are the usual thing found at the head of the queue.
+>
+> **Cross-Q²**: Now add a `NOT NULL` constraint and an index to the same 200-million-row table, still with no downtime.
+>
+> **A**: Backfill in batched transactions first — never one statement, because a long transaction pins the xmin horizon and blocks vacuum cluster-wide. Then avoid the `ACCESS EXCLUSIVE` full-table scan `SET NOT NULL` would do: `ADD CONSTRAINT … CHECK (col IS NOT NULL) NOT VALID` is instant, `VALIDATE CONSTRAINT` scans under only `SHARE UPDATE EXCLUSIVE` because "other transactions will be enforcing the constraint for rows that they insert or update; only pre-existing rows need to be checked", then `SET NOT NULL` is proved from the validated constraint without a rescan on PostgreSQL 12+. For the index, `CREATE INDEX CONCURRENTLY`: two table scans, waits for existing transactions, **cannot run inside a transaction block** (so `migrationBuilder.Sql(..., suppressTransaction: true)` in EF Core), and on failure leaves an `INVALID` index that must be dropped and retried. Check with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`.
+
+### Drill 17 — Why the plan changed
+
+> **Q**: A parameterised query has been fast for months. Nothing was deployed. This morning it times out for one customer and is fine for everyone else. Where do you look?
+>
+> **A**: Three candidates, in order of likelihood. (1) **Stale statistics** — compare estimated vs actual rows in `EXPLAIN ANALYZE`; a bulk load can put a predicate past the end of the histogram. (2) **Generic plan takeover** — if the statement is server-prepared, "the first five executions are done with custom plans" and after that Postgres may switch to a generic plan built without your parameter values. On a skewed column that is a different plan for the same query, arriving with no deploy. (3) **Correlated predicates** the planner assumes are independent, multiplying selectivities into an estimate orders of magnitude too small.
+>
+> **Cross-Q**: How do you confirm the generic-plan hypothesis in one command?
+>
+> **A**: `SET plan_cache_mode = force_custom_plan;` on the session and re-run. If it gets fast, that was it. `force_generic_plan` proves it in the other direction. In .NET, check whether the statement is server-prepared at all: Npgsql's `Max Auto Prepare` defaults to `0`, so unless someone enabled it or called `Prepare()` explicitly, your statements are not prepared and this is not your bug.
+>
+> **Cross-Q²**: What's the fix, and what does it cost?
+>
+> **A**: For the skewed predicate specifically, stop parameterising it so the planner always sees the value — you give up plan reuse and get plan quality, which is the right trade when the values are not interchangeable. `plan_cache_mode = force_custom_plan` at the role or database level is the blunt instrument: correct plans always, replanning on every execution. For correlated columns, `CREATE STATISTICS … (dependencies, ndistinct, mcv) ON a, b FROM t` fixes the estimate at the source. And for the stale-statistics case, move `ANALYZE` into the load job rather than leaving it to autovacuum's schedule — whatever changes the data owns the statistics.
+
+</details>
+
+## Cheat Sheet
+
+- **MVCC**: every update creates a new tuple version; readers don't block writers and vice versa.
+- **Autovacuum**: reclaims dead tuples; without it, bloat grows and XIDs eventually wrap around.
+- **JSONB + GIN**: binary JSON with index support; `@>` containment is the fast path.
+- **Index zoo**: B-tree (default), GIN (arrays/JSONB/FTS), GiST (geo), BRIN (huge naturally-ordered tables), Hash (rare).
+- **Partial index**: `WHERE` predicate on the index; smaller and faster for "active" subsets.
+- **HOT update**: doesn't touch indexed columns and reuses page space; no index update, low bloat.
+- **TIMESTAMPTZ**: always prefer over `TIMESTAMP`; the latter is timezone-naive and a known footgun.
+- **PgBouncer**: transaction-pooling proxy; effectively mandatory for serverless, and for any workload whose client connection count outgrows what one process per connection can support. Transaction mode costs you all session state.
+- **pg_stat_statements**: per-query stats extension; install on every cluster, day one. Needs `shared_preload_libraries` and a restart. Sort by `total_exec_time`, not `mean_exec_time`.
+- **Logical replication**: row-level changes via publications/subscriptions; foundation for Debezium CDC. Does not replicate DDL or sequences.
+- **Isolation**: no dirty reads at any level; `READ COMMITTED` re-evaluates the `WHERE` clause after a blocking write commits; `REPEATABLE READ` has no phantoms; `40001` means retry.
+- **`ACCESS EXCLUSIVE`**: what `ALTER TABLE` takes, conflicts with everything, and queues — always `SET lock_timeout` before DDL.
+- **`Heap Fetches`**: the `EXPLAIN ANALYZE` counter that says whether your index-only scan was real. Non-zero means vacuum, not the index, is the lever.
+- **No clustered index**: heaps plus `ctid` pointers. `pg_stats.correlation` is how you measure physical ordering; `CLUSTER` is one-shot.
+- **Generic plans**: five custom executions, then Postgres may switch. The cause of "slow from the sixth call" on skewed data.
+- **TOAST**: once a row exceeds ~2 kB its wide attributes compress and move out of line. `pg_total_relation_size()`, not `pg_relation_size()`.
+- **`FOR UPDATE SKIP LOCKED`**: the competing-consumers primitive; without it, N workers do one worker's throughput.
+
+## Walkthrough — Autovacuum can't keep up with bloat
+
+<details>
+<summary>📖 Click to expand — worked walkthrough scenario</summary>
+
+**Problem**: A 200GB Postgres database is now 1TB on disk; queries that used to take 50ms take 4 seconds. The team raised disk alarms but doesn't see why - row counts haven't grown.
+
+**Diagnosis**: The senior connects with `psql` and runs:
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup::numeric / NULLIF(n_live_tup, 0), 2) AS dead_ratio,
+       last_autovacuum
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC LIMIT 10;
+```
+
+The hottest table `events` shows 80M live, 350M dead, ratio 4.4. `last_autovacuum` was 2 days ago. They check `pg_stat_activity`:
+
+```sql
+SELECT pid, state, xact_start, query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+ORDER BY xact_start;
+```
+
+A reporting service has held a transaction open for 38 hours - autovacuum can't remove tuples newer than that snapshot. They confirm the horizon is stuck by reading `backend_xmin` on that session, and check how much wraparound headroom is left:
+
+```sql
+SELECT pid, backend_xmin, xact_start FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL ORDER BY age(backend_xmin) DESC;
+
+SELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC;
+```
+
+The frozen-XID age is climbing towards `autovacuum_freeze_max_age`. The fix has two parts.
+
+**Fix**: Kill the offending transaction and prevent recurrence:
+
+```sql
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+WHERE state = 'idle in transaction' AND xact_start < now() - interval '5 minutes';
+```
+
+Then add a server-wide guard:
+
+```ini
+# postgresql.conf
+idle_in_transaction_session_timeout = 60000  # 60s
+autovacuum_vacuum_scale_factor = 0.05        # was 0.2 (default)
+autovacuum_naptime = 30s
+```
+
+Once vacuum can run, plain `VACUUM` reclaims the dead tuples for reuse *inside* the table but, as the docs put it, "extra space is not returned to the operating system (in most cases); it's just kept available for re-use within the same table." To give the disk back you need a rewrite, and there are two ways:
+
+- **`VACUUM (FULL, VERBOSE) events;`** — "rewrites the entire contents of the table into a new disk file with no extra space, allowing unused space to be returned to the operating system." It "requires an `ACCESS EXCLUSIVE` lock on each table while it is being processed" and "requires extra disk space, since it writes a new copy of the table and doesn't release the old copy until the operation is complete." Maintenance window only, and check you have room for two copies.
+- **`pg_repack`** (extension) — does the same rewrite while keeping the table online, taking a brief exclusive lock only at the swap. It needs the same extra disk space and it needs to be on your managed provider's extension allow-list.
+
+**Why it works**: MVCC retains tuple versions visible to any in-flight snapshot. A long-lived transaction pins old versions across the entire DB — not just the table it read. Autovacuum can only delete tuples no transaction can see.
+
+**What the team should also fix**: the reporting query belongs on a read replica, where its snapshot cannot hold the primary's vacuum hostage. That is the structural fix; `idle_in_transaction_session_timeout` is the guardrail for the next time someone forgets.
+
+</details>
+
+## Self-test
+
+<details><summary>1. <code>EXPLAIN ANALYZE</code> shows estimated 50 rows, actual 5,000,000. What do you do?</summary>
+
+Run `ANALYZE table_name` to refresh statistics. If estimates are still off after that, the planner may need extended statistics (`CREATE STATISTICS` for correlated columns) or per-column statistics targets bumped via `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS 1000`.
+</details>
+
+<details><summary>2. Trade-off: storing variable attributes in JSONB vs adding nullable columns.</summary>
+
+JSONB wins when attributes are sparse, vary by row, and you don't query them often. Columns win when you query frequently, want statistics for the planner, or need referential integrity. Hybrid (relational core + JSONB extensions) is usually right; pick columns for anything in WHERE clauses.
+</details>
+
+<details><summary>3. Why does <code>WHERE data-&gt;&gt;'k' = 'v'</code> ignore your GIN index, but <code>WHERE data @&gt; '{"k":"v"}'</code> uses it?</summary>
+
+GIN with `jsonb_ops` (and `jsonb_path_ops`) supports the containment operator family (`@>`, `?`, `?&`, `?|`), not arbitrary expression equality. To support path equality, create an expression index: `CREATE INDEX ON t ((data->>'k'))`. Most teams just refactor queries to use containment.
+</details>
+
+<details><summary>4. PgBouncer is "transaction pooled". What breaks if a client uses session-level features?</summary>
+
+Anything that survives a transaction boundary: `SET` (session vars), prepared statements with names, `LISTEN/NOTIFY`, advisory session locks, server-side cursors. Connections are returned to the pool after each transaction, so the next query may land on a different backend. Either use session-pool mode (loses concurrency benefits) or refactor the app to be transaction-scoped.
+</details>
+
+<details><summary>5. Sequential UUIDs vs random UUIDs as primary keys - what's the impact on Postgres?</summary>
+
+Random UUIDs (v4) have no temporal locality, so each insert touches a random B-tree page. WAL grows, cache hit rate drops, vacuum work increases. UUIDv7 (or BIGSERIAL) embeds a time prefix, so inserts append at the right edge - far better cache behaviour and lower bloat. It also raises `pg_stats.correlation` on the key, which keeps BRIN and range scans viable. **PostgreSQL 18 added a built-in `uuidv7()`** (and `uuidv4()` as an explicit alias for `gen_random_uuid()`); before 18 you generate v7 in the application or from an extension. Use v7 unless you have a security reason for unpredictability.
+</details>
+
+<details><summary>6. Your query plan says <code>Index Only Scan</code> and the query is still slow. What is the next thing you look at, and what fixes it?</summary>
+
+`Heap Fetches` on the same plan node. An index-only scan consults the visibility map — one bit per heap page saying "every row here is visible to everyone" — and where the bit isn't set it must visit the heap after all. Non-zero `Heap Fetches` means you are paying for an index scan plus heap access despite the covering index. The lever is vacuum, not the index: lower `autovacuum_vacuum_scale_factor` on that table, or `VACUUM` after bulk loads. Note this has no SQL Server equivalent — a covering non-clustered index there answers the query without touching the base table, unconditionally.
+</details>
+
+<details><summary>7. Why can a one-millisecond <code>ALTER TABLE</code> take a site down?</summary>
+
+`ALTER TABLE` requests `ACCESS EXCLUSIVE`, which conflicts with every other lock mode including the `ACCESS SHARE` a plain `SELECT` takes. If any transaction already holds a lock on the table, the `ALTER` waits in the lock queue — and every later statement that conflicts with the queued request waits behind it. So the outage lasts as long as the longest query that was already running, not as long as the DDL. Mitigation: `SET lock_timeout` in the migration session and retry, plus alerting on `idle in transaction` sessions.
+</details>
+
+<details><summary>8. A worker pool of six processes claims jobs with <code>SELECT … FOR UPDATE LIMIT 10</code> and is no faster than one worker. Why?</summary>
+
+All six select the same ten head-of-queue rows and five of them block on the row locks the first one took. `FOR UPDATE SKIP LOCKED` makes each worker skip rows it cannot lock immediately, so they claim disjoint batches and scale. The docs are explicit about the trade: "skipping locked rows provides an inconsistent view of the data, so this is not suitable for general purpose work, but can be used to avoid lock contention with multiple consumers accessing a queue-like table" — which is exactly and only the job-queue case.
+</details>
+
+<details><summary>9. Postgres accepts <code>SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED</code>. What does it do?</summary>
+
+Nothing. Postgres implements three of the four standard levels: "PostgreSQL's Read Uncommitted mode behaves like Read Committed." MVCC has no mechanism for handing you an uncommitted tuple, so there are no dirty reads at any level. Engineers coming from SQL Server sometimes reach for it as a `NOLOCK` equivalent; there is nothing to gain because there were no read locks to avoid in the first place.
+</details>
+
+<details><summary>10. Your monitoring says the largest table is 12 GB; the disk says 400 GB is in use. What is the most likely explanation?</summary>
+
+The monitoring query uses `pg_relation_size()`, which counts only the main heap fork — not the indexes, and not the TOAST relation where oversized values live. Once a row's total width passes roughly 2 kB its wide attributes are compressed and moved out of line into `pg_toast.pg_toast_<oid>`, which has its own storage and its own bloat. Use `pg_total_relation_size()`. The second candidate, if the numbers still do not add up, is an inactive replication slot retaining WAL, since `max_slot_wal_keep_size` defaults to unlimited.
+</details>
+
+<details><summary>11. A query is fast for the first five executions and slow afterwards, same parameters shape, no deploy. What happened?</summary>
+
+The statement is server-prepared and Postgres switched to a generic plan. The documented rule: "the first five executions are done with custom plans and the average estimated cost of those plans is calculated. Then a generic plan is created and its estimated cost is compared to the average custom-plan cost." A custom plan sees your actual parameter values and can account for skew; a generic plan uses average selectivity. Confirm with `SET plan_cache_mode = force_custom_plan`. In .NET, check whether Npgsql is preparing at all — `Max Auto Prepare` defaults to `0`.
+</details>
+
+<details><summary>12. You put a BRIN index on the timestamp column of a huge events table and it prunes nothing. Why?</summary>
+
+BRIN summarises min/max per range of pages (`pages_per_range` defaults to 128, i.e. 1 MB), so it only helps when physical row order tracks the indexed column. Check `pg_stats.correlation` for that column: if the table was populated by a parallel backfill, or is heavily updated, correlation is near zero and every block range spans the whole value domain. BRIN indexes the correlation between a column and the disk, not the column — and Postgres has no clustered index to give you that ordering for free.
+</details>
+
+## Cross-references
+
+- **Sibling: [SQL Mastery](./03-sql/README.md)** — vendor-neutral SQL fundamentals; everything in there applies to Postgres.
+- **Sibling: [MS SQL Server](./04-mssql-server.md)** — direct comparison: T-SQL specifics, Always On, RCSI.
+- **Sibling: [NoSQL & Document Stores](./07-nosql-document-stores.md)** — JSONB blurs the line; Postgres is often the right answer where teams default to MongoDB.
+- **Sibling: [Redis](./05-redis.md)** — caching layer in front of Postgres reads.
+- **[EF Core](./01-ef-core.md)** — fully supports Npgsql provider with Postgres-specific extensions.
+- **[RAG & Vector Databases](../11-ai-integration/04-rag-and-vector-databases.md)** — pgvector turns Postgres into a vector DB for RAG.
+
+## Sources
+
+<details>
+<summary>📚 Click to expand — sources and further reading</summary>
+
+- *PostgreSQL: Up and Running* (3rd ed.) by Regina Obe & Leo Hsu (O'Reilly, 2017) — practical operational depth.
+- *The Art of PostgreSQL* by Dimitri Fontaine — SQL and Postgres-specific features in depth.
+- Official documentation — [postgresql.org/docs](https://www.postgresql.org/docs/) — exceptionally clear.
+- Lukas Fittl's blog — [pganalyze.com/blog](https://pganalyze.com/blog) — top-tier Postgres internals + tuning.
+- Bruce Momjian's talks — [momjian.us/main/presentations](https://momjian.us/main/presentations/) — Postgres committer's deep-dives.
+- Npgsql documentation — [npgsql.org](https://www.npgsql.org/) — .NET driver docs.
+- *PostgreSQL High Performance Cookbook* by Chitij Chauhan & Dinesh Kumar — tuning recipes for production.
+
+**Primary sources for the specifics on this page** — the quoted sentences, default values and version gates above are drawn from these pages:
+
+- [Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — three levels not four, the `READ COMMITTED` re-check rule, no phantoms at `REPEATABLE READ`, SQLSTATE `40001`.
+- [Index-Only Scans and Covering Indexes](https://www.postgresql.org/docs/current/indexes-index-only-scans.html) — visibility map, `Heap Fetches`, which index types qualify, `INCLUDE` semantics.
+- [TOAST](https://www.postgresql.org/docs/current/storage-toast.html) — 2 kB threshold, the four storage strategies, 1 GB field limit.
+- [Heap-Only Tuples](https://www.postgresql.org/docs/current/storage-hot.html) — the two HOT conditions and the BRIN exemption.
+- [ALTER TABLE](https://www.postgresql.org/docs/current/sql-altertable.html) — `ACCESS EXCLUSIVE` default, which forms rewrite, `NOT VALID` / `VALIDATE CONSTRAINT` lock levels.
+- [CREATE INDEX](https://www.postgresql.org/docs/current/sql-createindex.html) — `CONCURRENTLY`: two scans, no transaction block, `INVALID` on failure.
+- [Explicit Locking](https://www.postgresql.org/docs/current/explicit-locking.html) and [pg_locks](https://www.postgresql.org/docs/current/view-pg-locks.html) — the lock conflict matrix and the wait queue.
+- [PREPARE](https://www.postgresql.org/docs/current/sql-prepare.html) — the five-custom-plans rule and `plan_cache_mode`.
+- [Query Planning config](https://www.postgresql.org/docs/current/runtime-config-query.html) — `random_page_cost` 4.0 and the reasoning behind it, `effective_cache_size`, `jit_above_cost`.
+- [JSON Types](https://www.postgresql.org/docs/current/datatype-json.html) — `jsonb_ops` vs `jsonb_path_ops` operator support and relative size.
+- [Table Partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html) — plan-time vs execution-time pruning, `Subplans Removed`, partition-count limits.
+- [Logical Replication Restrictions](https://www.postgresql.org/docs/current/logical-replication-restrictions.html) — DDL, sequences, `REPLICA IDENTITY`.
+- [Autovacuum config](https://www.postgresql.org/docs/current/runtime-config-autovacuum.html) and [Replication config](https://www.postgresql.org/docs/current/runtime-config-replication.html) — thresholds, `autovacuum_freeze_max_age`, `max_slot_wal_keep_size`.
+- [pg_stats](https://www.postgresql.org/docs/current/view-pg-stats.html) and [CLUSTER](https://www.postgresql.org/docs/current/sql-cluster.html) — `correlation`, and clustering as a one-time operation.
+- [VACUUM](https://www.postgresql.org/docs/current/sql-vacuum.html) — plain vacuum not returning space to the OS, and what `FULL` costs.
+- [SELECT](https://www.postgresql.org/docs/current/sql-select.html) — the `SKIP LOCKED` "inconsistent view … queue-like table" caveat.
+- [B-Tree Indexes](https://www.postgresql.org/docs/current/btree.html) and [Multicolumn Indexes](https://www.postgresql.org/docs/current/indexes-multicolumn.html) — deduplication restrictions, the one-third-of-a-page entry limit, skip scan.
+- [pg_stat_statements](https://www.postgresql.org/docs/current/pgstatstatements.html) — `shared_preload_libraries` and restart, `.max`, `.track`.
+- [Password Authentication](https://www.postgresql.org/docs/current/auth-password.html) and [PostgreSQL 14 release notes](https://www.postgresql.org/docs/release/14.0/) — MD5 deprecation, and `password_encryption` defaulting to `scram-sha-256`.
+- Release notes for the version gates: [11](https://www.postgresql.org/docs/release/11.0/) (`ADD COLUMN` default without rewrite), [12](https://www.postgresql.org/docs/release/12.0/) (`SET NOT NULL` scan avoidance, `REINDEX CONCURRENTLY`, stored generated columns), [13](https://www.postgresql.org/docs/release/13.0/) (B-tree deduplication, insert-triggered autovacuum, `gen_random_uuid()`), [15](https://www.postgresql.org/docs/release/15.0/) (`UNIQUE NULLS NOT DISTINCT`, `MERGE`), [16](https://www.postgresql.org/docs/release/16.0/) (`force_parallel_mode` → `debug_parallel_query`), [18](https://www.postgresql.org/docs/release/18.0/) (virtual generated columns by default, `uuidv7()`, B-tree skip scan).
+- [Npgsql: JSON](https://www.npgsql.org/doc/types/json.html), [Basic Usage](https://www.npgsql.org/doc/basic-usage.html), [Prepared Statements](https://www.npgsql.org/doc/prepare.html) — `EnableDynamicJson()` from 8.0, `NpgsqlDataSource` from 7.0, positional `$1` from 6.0, `Max Auto Prepare` default 0.
+- [PgBouncer configuration](https://www.pgbouncer.org/config.html) — pool modes, `max_prepared_statements` and its default.
+
+<!-- nav-footer-start -->
+
+---
+
+[← Previous: NoSQL & Document Stores (MongoDB, Cosmos DB)](07-nosql-document-stores.md) · [↑ Back to top](#postgresql) · [Next: 04 — Architecture & Patterns →](../04-architecture-and-patterns/README.md)
+
+<!-- nav-footer-end -->
+
+</details>
