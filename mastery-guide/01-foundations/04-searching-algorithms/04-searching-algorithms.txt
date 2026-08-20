@@ -1,0 +1,45 @@
+-- pause --
+Section 1. Why it matters.
+
+Search is the most-asked algorithm category in interviews, Two Sum, Find First or Last Position, Search in Rotated Array are staples.
+Production code is full of search even when you don't call it that: Dictionary lookup is search; IndexOf is search; database index probes are search; pattern matching is search.
+Knowing which algorithm is behind which BCL primitive lets you pick the right primitive, and lets you write the algorithm yourself when an interviewer asks.
+
+-- pause --
+Section 2. Quick reference table.
+
+Linear search, O(n), O(1), Any, Small N, unsorted, or short-circuit ( Any / First ).
+Binary search, O(log n), O(1) iter / O(log n) rec, Sorted, The default for sorted random-access data.
+Lower / upper bound, O(log n), O(1), Sorted, Find boundaries / insertion points.
+Exponential search, O(log i), O(1), Sorted, unbounded, Target near start of huge stream.
+Interpolation search, O(log log n) avg / O(n) worst, O(1), Sorted, uniform distribution, Rare; numeric data.
+Hash lookup, O(1) avg / O(n) worst, O(n) extra, Hashable keys, Default for point lookups.
+Bloom filter, O(k), O(bits), keys not stored, Hashable keys, Probabilistic membership; false positives only.
+Tree search (BST), O(log n) balanced / O(n) degenerate, O(n) tree, IComparable keys, Ordered iteration + lookup.
+Trie, O(L), O(total chars), String keys, Prefix queries, autocomplete.
+BFS (graph), O(V + E), O(V), Graph, Shortest path on unweighted graphs.
+DFS (graph), O(V + E), O(V), Graph, Connectivity, cycle detection, topo sort.
+Dijkstra, O((V+E) log V) binary heap, O(V), Weighted, non-negative, Shortest path on weighted graphs.
+Naive substring, O(n times m) worst, O(1), Strings, What the BCL vectorizes.
+KMP, O(n + m), O(m), Strings, Guaranteed-linear; streamable.
+Boyer-Moore, O(n or m) avg / O(n times m) worst, O(m + Σ), Strings, Skip-scanning long patterns ( grep ).
+Rabin-Karp, O(n + m) avg / O(n times m) worst, O(1), Strings, Rolling hash; multi-pattern.
+Aho-Corasick, O(n + m + z), O(m), Strings, multi-pattern, Many needles in one pass.
+Regex, varies, backtracking can blow up, varies, Patterns, Structured matching, not substring search.
+
+n = size, m = pattern length (total, multi-pattern), L = prefix length, k = hash functions, z = matches, Σ = alphabet, V = vertices, E = edges, i = target's index.
+
+-- pause --
+Section 3. Hand-rolled binary search (the interview classic).
+
+The classic bug: int mid = (low + high) / 2; overflows when low + high > int.MaxValue. Use low + (high - low) / 2. (Joshua Bloch's famous Java fix in 2006.)
+
+-- pause --
+Section 4. Read the full deep dive.
+
+This page is a quick reference.
+For the full treatment, variant binary searches, off-by-one walkthroughs, exponential and interpolation search, BCL IndexOf vectorization, KMP / Boyer-Moore mechanics, BFS / DFS reference implementations, and 15 cross-questioning drills plus a 5-question self-test, go to:
+
+DSA, Searching Algorithms (full deep dive).
+
+For the full DSA sub-chapter index covering data structures, complexity analysis, sorting, graph algorithms, and dynamic programming, see DSA README.

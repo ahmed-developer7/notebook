@@ -1,0 +1,35 @@
+-- pause --
+Section 1. Why it matters.
+
+Picking the right data structure is the highest-leverage performance decision in most code. List where you needed HashSet is O(n) lookup pretending to be O(1). Dictionary where you needed SortedDictionary makes ordered iteration impossible.
+ConcurrentDictionary where a plain lock would suffice pays for per-operation synchronization you don't need, and still won't give you atomicity across a multi-step read-compute-write. Senior interviews probe this judgment relentlessly.
+
+-- pause --
+Section 2. Quick reference table.
+
+Dynamic array, List, O(n) scan, O(1) index, O(1) amortized end, O(n) middle, Insertion order, Default for sequential data.
+Linked list, LinkedList, O(n), O(1) at known node, O(1) at known node, Insertion order, Rare; cache-unfriendly.
+Hash map, Dictionary, O(1) avg, O(n) worst, O(1) avg, O(1) avg, No, Workhorse for keyed lookup; worst case = bad GetHashCode.
+Hash set, HashSet, O(1) avg, O(n) worst, O(1) avg, O(1) avg, No, Deduplication, membership.
+Sorted map, SortedDictionary, O(log n), O(log n), O(log n), Yes (key order), Red-black tree; worst case is O(log n).
+Sorted array map, SortedList, O(log n) binary search, O(n) shift, O(n) shift, Yes (key order), Less memory, faster iteration than the tree; build-once.
+Sorted set, SortedSet, O(log n), O(log n), O(log n), Yes, Range queries via GetViewBetween.
+Stack, Stack, O(1) amortized push, O(1) pop, LIFO, DFS, undo, parsing.
+Queue, Queue, O(1) amortized enqueue, O(1) dequeue, FIFO, BFS, producer-consumer.
+Priority queue, PriorityQueue, O(log n), O(log n) min, Min-heap, Dijkstra, top-K; Remove by element is O(n), dot NET 9+.
+Frozen map or set, FrozenDictionary, FrozenSet, O(1) avg (faster reads), (immutable), No, Build once, query many.
+Concurrent map, ConcurrentDictionary, O(1) avg, O(n) worst, O(1) avg, O(1) avg, No, Lock-free reads, fine-grained write locks.
+Immutable list, ImmutableList, O(log n), O(log n), O(log n), Yes, Structural sharing.
+Trie, (hand-rolled), O(L), O(L), O(L), Prefix order, Autocomplete, IP routing.
+Graph, (hand-rolled), depends, Adjacency list / matrix / edge list.
+
+L = key or word length.
+
+-- pause --
+Section 3. Read the full deep dive.
+
+This page is a quick reference. For the full treatment, internal mechanics of Dictionary collisions, when LinkedList actually wins, frozen-collection trade-offs, B-trees, tries, graph representations, concurrent collections, and 15 cross-question drills, go to:
+
+DSA, Data Structures (full deep dive).
+
+For the full DSA sub-chapter index covering complexity analysis, searching, sorting, graphs, dynamic programming, and interview problems, see DSA README.
