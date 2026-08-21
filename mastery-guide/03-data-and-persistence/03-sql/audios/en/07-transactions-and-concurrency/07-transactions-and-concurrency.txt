@@ -1,0 +1,1117 @@
+-- pause --
+Section 1. Why it matters.
+
+Transactions are how databases stay consistent under concurrent access. Without them, a "transfer $100 from A to B" can leave $100 missing if the second update fails. With them, the entire operation succeeds or none of it does.
+Every senior backend engineer needs to understand isolation levels, locking, and how their O R M (E F Core) maps to the sequel underneath.
+
+Concurrency questions surface real-world judgment: when does the default isolation level fail you? When do you need explicit locks? How do you avoid deadlocks? When is optimistic concurrency the right answer? These come up in production every week and feature in most senior interviews.
+
+When NOT to dive deep: simple read-mostly apps with low contention may run forever on default isolation without trouble. Reach for this knowledge when you see lock timeouts, dirty reads, or "the same query returns different counts" symptoms.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+acid properties.
+
+The four guarantees a transactional database makes:
+
+Atomicity, all operations in a transaction commit together or none do. Half-completed transactions can't exist after a crash.
+
+Consistency, every transaction moves the database from one valid state to another. Constraints (PK, FK, CHECK, UNIQUE) hold throughout.
+
+Isolation, concurrent transactions don't see each other's intermediate state. (Strength varies by isolation level.)
+
+Durability, once a transaction commits, the data survives crashes (power failure, operating system crash, disk failure depending on storage configuration).
+
+acid is the relational database's defining promise. no sequel and "BASE" (Basically Available, Soft state, Eventual consistency) trade some acid for scale; relational databases prioritize it.
+
+Durability is the letter with a dial on it. All three engines let you return from COMMIT before the log record is on disk: Postgres Q L synchronous_commit = off, sequel Server delayed durability ( ALTER DATABASE.
+SET DELAYED_DURABILITY = ALLOWED | FORCED, sequel Server 2014 and later), MySQL innodb_flush_log_at_trx_commit = 2.
+In each case what you lose on a crash is a window of recently committed transactions, the engines are explicit that this is a data-loss risk, not a corruption risk, because the log is still written in order and recovery still replays a prefix of it.
+
+In the real world: a telemetry ingest service was bottlenecked on log flushes, so synchronous_commit = off went on and the throughput problem disappeared. Nobody had the mechanism wrong.
+What was wrong was the scope: the setting was applied to the database role, and the same role was used by the billing writer that shared the instance. When the host fenced the V M six weeks later, the last seconds of both streams were gone, and only one of them had an upstream that could replay.
+The lesson is not "never turn it off". It is that a durability relaxation belongs to a workload, not to a server, and you have to be able to name what replays the window you just agreed to lose.
+That is a question an interviewer can ask about any of the three engines, and "we set it and it got faster" is not an answer to it.
+
+-- pause --
+BEGIN / COMMIT / ROLLBACK.
+
+The three statements that control transaction boundaries.
+
+Auto-commit is the default in most clients: each statement runs in its own implicit transaction. Wrapping multiple statements requires explicit BEGIN.
+
+In dot NET / E F Core:
+
+SaveChangesAsync() itself wraps a transaction by default (one for the whole batch). Explicit BeginTransactionAsync is for multi- SaveChanges work or coordinating with raw sequel.
+
+Best practice:
+Keep transactions short. Long transactions hold locks; widen blocking surface.
+Don't include user input wait or H T T P calls inside. Pre-commit, then call.
+Wrap multi-step domain operations that need atomicity.
+
+In the real world: a checkout handler opened a transaction, reserved stock, called the payment provider, then wrote the payment row and committed, because that ordering made "payment taken, stock gone" impossible. It held for two years, until the provider had a slow morning.
+Every checkout was now holding write locks on Inventory rows for the duration of an outbound H T T P call, and because popular products are precisely the rows everybody wants, the queue formed on a handful of rows and spread outward from there.
+Every dashboard said the database was healthy: C P U flat, no long-running queries, no deadlocks, just sessions accumulating lock waits.
+The repair was to split it into reserve (short transaction, with an expiry on the reservation), call the provider outside any transaction, then confirm or release (second short transaction).
+That is strictly weaker than one atomic operation, which is why it needs a sweeper for abandoned reservations. The trade was finally made deliberately; it had been made accidentally for two years.
+The general form: a transaction's duration is the duration of the slowest thing inside it, and anything that leaves the process has no bounded duration.
+
+-- pause --
+Isolation levels and the four phenomena.
+
+The sequel standard defines four isolation levels with increasing strictness. Each prevents specific concurrency anomalies.
+
+The four phenomena:
+
+Dirty read, Read uncommitted data from another transaction, A reads B's tentative update; B rolls back; A used invalid data.
+Non-repeatable read, Re-reading same row gives different value, A reads row set to 100; B updates to 200, commits; A re-reads to 200.
+Phantom read, Re-running same query returns different row count, A SELECT COUNT(*) WHERE x = 1 to 5; B inserts; A re-runs to 6.
+Lost update, Two writes overwrite each other, A reads x set to 100; B reads x set to 100; A writes 110; B writes 105 (A's update lost).
+
+The four standard isolation levels:
+
+READ UNCOMMITTED, possible, possible, possible, possible.
+READ COMMITTED, prevented, possible, possible, possible (in some impls).
+REPEATABLE READ, prevented, prevented, possible (standard); prevented in some impls, prevented.
+SERIALIZABLE, prevented, prevented, prevented, prevented.
+
+Two caveats on that table, both fair game in an interview.
+Lost update is not one of the ANSI sequel-92 phenomena, the standard defines three, and lost update comes from Berenson et al.'s A Critique of ANSI sequel Isolation Levels (1995), which is also where the analysis placing it at REPEATABLE READ comes from.
+And "prevented at REPEATABLE READ" means prevented by the engine's own conflict handling, which differs: Postgres Q L raises could not serialize access due to concurrent update, so the update is refused;
+MySQL's InnoDB does not, because its consistent reads are non-locking while its writes read the latest committed row, so an application-level read-then-write can still lose an update at InnoDB's REPEATABLE READ.
+The version column or SELECT. FOR UPDATE is what actually closes it, not the isolation level's name.
+
+Default isolation:
+Postgres Q L: READ COMMITTED.
+sequel Server: READ COMMITTED.
+MySQL or InnoDB: REPEATABLE READ.
+Oracle: READ COMMITTED.
+
+Practical guidance:
+READ COMMITTED is the default and right for most workloads.
+REPEATABLE READ stops a row you already read from changing under you, but name the engine before you call it a snapshot.
+On Postgres Q L it is snapshot isolation and phantoms are impossible; on sequel Server it is lock-based, holds shared locks to the end of the transaction, and still permits phantoms, so a report that re-runs a range query can see new rows.
+For read-heavy reporting that must see one consistent view on sequel Server, the level is SNAPSHOT (transaction-level row versioning), not REPEATABLE READ. See the engine table.
+SERIALIZABLE when invariants must hold across multi-row queries (rare; performance cost).
+READ UNCOMMITTED / NOLOCK is dangerous, reading uncommitted data including potentially-rolled-back changes. Don't use for "fast read"; use snapshot isolation instead.
+
+sequel Server's RCSI (Read Committed Snapshot Isolation): modifies READ COMMITTED so that reads take row-version snapshots instead of shared locks.
+Microsoft describes it as giving READ COMMITTED statement-level read consistency, in contrast to the SNAPSHOT isolation level, which gives transaction-level read consistency (Microsoft Learn, Transaction Locking and Row Versioning Guide).
+It removes the reader-blocks-writer and writer-blocks-reader interactions that dominate blocking incidents on locking-mode sequel Server.
+
+That one-line statement is not a one-line deployment.
+Setting READ_COMMITTED_SNAPSHOT requires exclusive access to the database, the ALTER DATABASE blocks until it is the only connection,
+which on a live system means it blocks forever unless you add WITH ROLLBACK IMMEDIATE (which kills every other session's in-flight work) or take a maintenance window.
+It is also not free at runtime: every versioned row carries a pointer into the version store, and the version store lives in tempdb (or, from sequel Server 2019 with Accelerated Database Recovery enabled, in the database's own Persistent Version Store). Size tempdb and watch it.
+
+In the real world: an RCSI enablement was scheduled as a "one-line change, no downtime" item at the end of a release. The ALTER DATABASE ran, returned nothing, and sat there, waiting for exclusive access it was never going to get from a live web farm.
+Twenty minutes later someone added WITH ROLLBACK IMMEDIATE from a second window, which did work, and also rolled back every transaction in flight at that moment, including a half-finished import. The change itself was right and the database was measurably better afterwards.
+What was wrong was the classification: this is a database-level configuration change with a locking requirement, not a settings tweak, and it needs the same treatment as a schema migration.
+The tell that should have caught it in review is that no query in the release notes explained what happens to the other connections.
+
+Postgres Q L uses MVCC by default: ordinary SELECT s never take row locks, so plain readers and writers do not block each other at any isolation level. The exceptions are worth knowing, because interviewers use them, locking reads ( SELECT.
+FOR UPDATE, FOR SHARE ) do conflict with writers, and DDL takes ACCESS EXCLUSIVE on the relation, which blocks everything including plain reads.
+"Readers never block writers in Postgres" is true of the read path and false of the migration path, which is why an ALTER TABLE behind a long-running SELECT can stall an entire application.
+
+-- pause --
+Locking, shared, exclusive, intent.
+
+Locks coordinate concurrent access. Modes:
+
+Shared (S), reads, many readers, many S, no X.
+Exclusive (X), writes, one writer, nothing.
+Update (U), "I might upgrade to X", one, many S.
+Intent Shared (IS), "I'll take S below", parent, IS, IX.
+Intent Exclusive (IX), "I'll take X below", parent, IS, IX.
+
+Granularity:
+Row lock, one row.
+Page lock, 8 kilobytes / 16 kilobytes page (multiple rows).
+Table lock, entire table.
+
+Lock escalation (sequel Server): many small locks to one big lock to save lock memory.
+Microsoft documents the threshold as a single T sequel statement acquiring at least 5,000 locks on one reference to a table or index, and if escalation is blocked by a conflicting lock, the engine retries every 1,250 new locks acquired (Microsoft Learn, Transaction Locking and Row Versioning Guide).
+Symptom: blocking spreads from a few rows to the whole table with no change in the query. Postgres Q L has no lock escalation, it records row locks on the tuple itself rather than in a shared lock table, so there is no memory pressure to escape from.
+InnoDB likewise does not escalate row locks to table locks.
+
+FOR UPDATE / UPDLOCK is the manual pessimistic lock. Use sparingly; can deadlock.
+The two are not the same object, and saying so in an interview is a cheap way to show you have used both:
+sequel Server's UPDLOCK is a U-mode lock in the engine's lock manager, compatible with S but not with another U or an X, which is precisely what makes it the anti-deadlock hint for read-then-update.
+Postgres Q L's FOR UPDATE is a row-level lock recorded on the tuple; it conflicts with other FOR UPDATE / FOR NO KEY UPDATE locks and with writers, but it does not block plain SELECT s, because in an MVCC engine plain SELECT s do not ask permission.
+
+In the real world: the "report locked production" story almost always has the same shape, and it is worth being able to tell it precisely. A finance analyst ran a month-end aggregate over Orders on a locking-mode sequel Server (RCSI off).
+The query was read-only, so nobody thought about locks, but under locking READ COMMITTED a scan takes shared locks as it goes, and this one touched enough rows on a single index to cross the 5,000-lock escalation threshold,
+at which point the engine converted the whole thing into one table-level lock.
+Checkout inserts then queued behind a SELECT. The incident channel filled with "the database is down"; the database was idle, holding one lock. Three fixes were on the table and only one of them was right for the long run. NOLOCK on the report (fast, wrong, see the pitfalls).
+Running the report on a replica (correct, but a project). Enabling RCSI so the report reads versions and takes no shared locks at all (correct, and one statement plus a maintenance window).
+What made it a senior conversation rather than a firefight was naming the mechanism, escalation of shared locks under a locking isolation level, instead of describing the symptom.
+
+Blocking, when transaction A waits for a lock held by B:
+
+Both of those queries answer "who is waiting". Neither reliably answers "who is at the head of the chain", which is the question you actually need under pressure, and the head of the chain is very often a session that is not running anything, so it does not appear in sys.dm_exec_requests at all.
+Go one level further:
+
+Long-running transactions are the usual root of a blocking chain, and "long" includes transactions that are doing nothing at all: a connection sitting in idle in transaction holds every lock it has already taken and, on Postgres Q L, also pins the snapshot horizon that VACUUM needs.
+Keep transactions narrow, and set a guard so a leaked one cannot sit forever, idle_in_transaction_session_timeout on Postgres Q L, and on the dot NET side a DbContext lifetime that cannot outlive the request scope.
+
+-- pause --
+MVCC, non-locking reads.
+
+Multi-Version Concurrency Control, readers don't block writers, writers don't block readers. Postgres Q L is MVCC-from-day-one; sequel Server has it via Snapshot Isolation.
+
+Mechanism: when a row is updated, a new version is created; the old version is kept until no transaction needs it. Readers see the version that existed when their transaction started.
+
+In Postgres Q L, with REPEATABLE READ or higher, the entire transaction sees the same snapshot. With READ COMMITTED (default), each statement sees the latest committed snapshot.
+
+There is a consequence of that statement-level snapshot which almost nobody knows and which is documented explicitly:
+under READ COMMITTED, when an UPDATE or DELETE reaches a row that a concurrent transaction has already updated, it waits for that transaction, and then, if the other transaction committed, re-evaluates the WHERE clause against the new version of the row.
+If the new version no longer matches, the row is silently skipped (Postgres Q L manual, Transaction Isolation). So UPDATE orders SET status='Shipped' WHERE id = 7 AND status = 'Paid' can report zero rows affected even though row 7 exists and was Paid when your statement started.
+At REPEATABLE READ the same situation is not silent, you get ERROR: could not serialize access due to concurrent update (SQLSTATE 40001) and must retry. Two different isolation levels, two completely different failure signatures for the same race, and only one of them shows up in your logs.
+
+In the real world: a Postgres-backed order service had an endpoint whose integration tests were solid and which nevertheless "lost" state transitions in production, a handful per day, no errors, no exceptions, nothing in the logs.
+The handler ran UPDATE orders SET status = 'Shipped' WHERE id = $1 AND status = 'Paid' and treated the row count as a formality.
+A concurrent retry from the same client had already moved the row through Paid, so by the time the second statement re-checked the predicate against the freshly committed version, status was no longer 'Paid' and Postgres dropped the row from the update set. Everything behaved exactly as documented.
+The defect was in the application: a conditional update whose rows-affected result was never read. Checking it turned an invisible data problem into a 409, which is what it always was.
+
+VACUUM in Postgres Q L, reclaims space from old row versions. Autovacuum runs in the background; manual VACUUM for heavy workloads. Skipping vacuum to bloat to slow queries.
+
+Snapshot Isolation in sequel Server:
+
+SNAPSHOT and RCSI are not two names for one feature, and the difference is where the exam question lives. RCSI changes what READ COMMITTED reads; it adds no conflict detection, so a read-then-write across two statements can still be based on a stale read.
+SNAPSHOT gives the transaction one snapshot and first-updater-wins conflict detection: if a snapshot transaction tries to modify a row that changed after its snapshot was taken, the update fails with Msg 3960.
+Snapshot isolation transaction aborted due to update conflict and the transaction is rolled back, at the point of the conflicting statement, not at commit.
+Microsoft's own mitigation is to take WITH (UPDLOCK) on the SELECT that reads the rows you intend to modify, which turns an optimistic failure into a pessimistic wait (Microsoft Learn, Snapshot Isolation in sequel Server).
+The same document adds the sentence worth quoting in an interview: "If your application has many conflicts, snapshot isolation may not be the best choice."
+
+For most apps, MVCC-based isolation is the right answer, readers and writers don't fight. Plain locking-based isolation is legacy.
+
+-- pause --
+Deadlocks.
+
+Two transactions each hold a lock the other wants to infinite wait. Database detects it and kills one ("victim").
+
+The DB picks one as victim, rolls back, returns an error. The app should retry.
+
+The deadlock most people never see coming, the conversion deadlock. The write-write cycle is the textbook case, and it is not the only shape.
+Microsoft's Deadlocks Guide opens with a variant built out of shared locks rather than writes: transaction A takes an S lock on row 1 and B takes an S lock on row 2, then A asks for an X lock on row 2 and B asks for an X lock on row 1, and each waits on the other's shared lock.
+Squeeze that onto a single row and you get the degenerate case, where consistent lock ordering has nothing left to order:
+
+Nothing here is out of order. Both transactions touch exactly one row, in the same order, doing the same thing, so consistent lock ordering, the standard advice, cannot help: there is only one resource to order. The fix is to take the right lock the first time: SELECT.
+WITH (UPDLOCK) on sequel Server, SELECT. FOR UPDATE on Postgres Q L and MySQL. A U lock is compatible with S, so other readers proceed, but not with another U, so the second transaction waits at the SELECT instead of colliding at the UPDATE.
+Be precise about when this is live, because the qualifier is the whole point: the read lock has to still be held when the write is attempted. That means REPEATABLE READ or SERIALIZABLE, or an explicit HOLDLOCK / REPEATABLEREAD hint.
+A plain FirstAsync followed by SaveChangesAsync under default READ COMMITTED does not produce this, E F Core's read releases its S lock immediately, which is why that pattern is an optimistic-concurrency problem (a lost update) rather than a deadlock.
+
+Detection, precisely.
+sequel Server: a lock monitor thread searches for cycles on a default interval of 5 seconds, dropping to as low as 100 milliseconds while deadlocks are being found and easing back when they stop;
+the victim is the transaction least expensive to roll back, unless SET DEADLOCK_PRIORITY differs between the sessions, in which case the lower priority loses regardless of cost, with ties broken randomly; the victim's batch is terminated and error 1205 returned (Microsoft Learn, Deadlocks Guide).
+Postgres Q L waits deadlock_timeout (default 1 second) on a lock before it even looks for a cycle, then aborts the transaction that ran the detection, with SQLSTATE 40P01 ( deadlock_detected ).
+InnoDB detects immediately from its wait-for graph and rolls back the transaction with the smallest number of rows inserted, updated, or deleted (MySQL Reference Manual, Deadlock Detection). Three engines, three different rules for who dies, so "the database picks a victim" is only half an answer.
+
+In the real world: an inventory service deadlocked on a single table, between two executions of the same statement, and a week went into hunting for the out-of-order lock acquisition that every article said must exist. There wasn't one.
+The UPDATE filtered on a column with no supporting index, so each execution scanned and took locks on rows it never modified, and two concurrent executions acquired those rows in whatever order their scans happened to visit them.
+Adding the index on the filter column ended the deadlocks, not by changing any order, but by shrinking the locked set to the rows actually being changed.
+That connection is worth carrying into an interview: an index is a concurrency feature as much as a speed feature, because rows a statement never reads are rows it never locks.
+The deadlock graph had said so all along, in one attribute, the indexname on the lock resources was the clustered index, for a query that filtered on something else entirely.
+
+Prevention:
+Consistent lock ordering. All transactions acquire locks in the same order (by ID, alphabetical, et cetera). If A locks row 1 then row 2, B must too.
+Short transactions. Less time holding locks to less deadlock window.
+Lower isolation level if business logic permits. RCSI / Snapshot eliminates most read-write conflicts.
+Retry logic in app code:
+
+action here has to be the whole transaction, not one statement inside it, retrying a single failed statement after the engine has already rolled the transaction back replays it against a state that no longer exists.
+E F Core's EnableRetryOnFailure does treat sequel Server error 1205 as transient (it is in the provider's transient-error list, alongside 3960, the snapshot update conflict), but it will refuse to run at all inside a transaction you opened yourself.
+That refusal, and the correct pattern, are in Retrying correctly.
+
+-- pause --
+Optimistic versus pessimistic concurrency.
+
+Two strategies for "user A and user B both want to update row X":
+
+Pessimistic (lock at read):
+Lock the row when reading it.
+Other transactions wait.
+Safe but holds locks to blocking.
+
+Optimistic (detect at save):
+No locks during read.
+On write, check if the row changed since read (via version column or timestamp).
+If changed, fail; caller retries with fresh data.
+
+E F Core handles this with [ConcurrencyCheck] or [Timestamp] attributes, see E F Core.
+
+Choose:
+Optimistic for typical web apps with low contention. Fast (no locks); occasional retry on conflict.
+Pessimistic for high contention or batch jobs that must succeed first time.
+
+Most apps default to optimistic; reach for pessimistic only when conflicts are frequent.
+
+What optimistic concurrency does not cover. A version column protects exactly one row against exactly one class of problem: someone else changed this row between your read and your write.
+It says nothing about an invariant spanning several rows, that is write skew, and no amount of rowversion will catch it (see Drill 15). It says nothing about a read that never becomes a write. And it says nothing about what happens to a copy of the data you took outside the database.
+
+In the real world: a catalogue service cached prices in Redis, filled on miss, and invalidated the key from the price-update handler after the database transaction committed.
+Correct ordering, correct invalidation, and prices still went stale, not for seconds, for the full cache T T L, and only for products that had just been repriced. The race is entirely in the timings.
+Request A misses the cache and starts a read; its snapshot is taken before the repricing transaction commits, so it legitimately reads the old price. The repricing transaction then commits and deletes the cache key.
+Request A, still holding a value that was correct when it read it, finally writes it into Redis. The invalidation had already happened, so nothing will remove that entry until it expires.
+Nobody wrote a bug: every participant behaved correctly, and MVCC's whole point is that A's read was consistent as of its snapshot. What was missing was any notion of version crossing the boundary out of the database.
+The repair was to carry one, write (price, rowversion) into the cache and refuse to overwrite a cache entry with a lower version, which makes the late write a no-op.
+The generalisation is the thing to say in an interview: the instant data leaves the transaction that read it, its isolation guarantee stops travelling with it, and every cache is a replica with no concurrency control unless you give it one.
+
+-- pause --
+Savepoints.
+
+A savepoint is a marker inside a transaction. You can rollback to a savepoint without rolling back the whole transaction.
+
+Use cases:
+Multi-step batch processing where some steps may fail.
+Stored procedures with branching logic.
+Atomic sub-operations within a larger transaction.
+
+In dot NET, IDbContextTransaction.CreateSavepoint() (E F Core 5+).
+
+In the real world: an import procedure was written defensively, BEGIN TRANSACTION at the top, and every helper procedure it called did the same, each with its own COMMIT / ROLLBACK in a TRY / CATCH. The intent was "each step cleans up after itself".
+T sequel does not work that way: a nested BEGIN TRANSACTION only increments @@TRANCOUNT, an inner COMMIT only decrements it, and a ROLLBACK TRANSACTION at any depth discards the entire stack.
+So one bad row in one helper silently rolled back the whole import, and the outer procedure, whose CATCH had never fired, carried on issuing statements outside any transaction,
+then hit COMMIT with @@TRANCOUNT already at zero and raised error 3902 ( The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION; the mirror-image error for a stray ROLLBACK is 3903).
+Half the import was committed piecemeal by auto-commit. The fix is the rule every T sequel developer eventually learns: only the outermost caller owns the transaction.
+Inner scopes use SAVE TRANSACTION name and ROLLBACK TRANSACTION name, and every procedure that wants to be composable checks @@TRANCOUNT on entry to decide whether it is the owner or a guest.
+
+-- pause --
+Where the isolation level actually comes from (dot NET).
+
+Three layers can set the isolation level of a dot NET database call, and they do not agree by default. Knowing the precedence is the difference between diagnosing a blocking incident and guessing at it.
+
+The database's own configuration, sequel Server's READ_COMMITTED_SNAPSHOT setting changes what READ COMMITTED means without any code change. Azure sequel Database ships with RCSI on by default; a sequel Server instance you install does not.
+The session, SET TRANSACTION ISOLATION LEVEL. persists for the life of the connection, not the statement.
+The transaction, BeginTransaction(IsolationLevel), or TransactionOptions.IsolationLevel on a TransactionScope.
+
+Layers 2 and 3 carry the traps, and all of them are common enough to be worth memorising.
+
+new TransactionScope() is SERIALIZABLE. The parameterless constructor uses IsolationLevel.Serializable and a one-minute timeout.
+On sequel Server that means key-range locks around every read in the scope, on tables where the surrounding application is running READ COMMITTED, so the scope blocks and deadlocks against traffic it has no logical conflict with.
+Microsoft's own guidance archive carries a post titled "using new TransactionScope() considered harmful" for exactly this reason. Always pass options:
+
+TransactionScopeAsyncFlowOption.Enabled is not the default. Without it, Transaction.Current does not flow across an await continuation, so work after the first await silently runs outside the ambient transaction. Nothing throws.
+The scope completes, the early statements commit, the later ones were never in the transaction at all. This is the single most common way an "atomic" dot NET operation turns out not to be.
+
+There are also two different enums named IsolationLevel, System.Data.IsolationLevel for BeginTransaction, System.Transactions.IsolationLevel for TransactionOptions. They have overlapping member names and no conversion between them; a using directive decides which one you got.
+
+Isolation level leaks through the connection pool. Microsoft states it plainly: "When a connection is closed and returned to the pool, the isolation level from the last SET TRANSACTION ISOLATION LEVEL statement is retained.
+Subsequent connections reusing a pooled connection use the isolation level that was in effect at the time the connection is pooled" (Microsoft Learn, Snapshot Isolation in sequel Server).
+sequel Server 2014 briefly changed sp_reset_connection to reset the level to READ COMMITTED, which broke TransactionScope code that had set a level on the scope; the behaviour was put back in sequel Server 2014 Cumulative Update 6 (KB3025845).
+So one code path that runs SET TRANSACTION ISOLATION LEVEL SERIALIZABLE can hand a serializable connection to an unrelated request minutes later.
+
+Diagnose rather than assume, ask the session what it actually has:
+
+In the real world: an intermittent deadlock storm on a sequel Server order system was traced to a reporting endpoint nobody had deployed that week.
+The endpoint used a TransactionScope written years earlier with the parameterless constructor, so it ran SERIALIZABLE and took key-range locks over a date range. It had always done that, harmlessly, because it ran nightly.
+The change that broke things was elsewhere: a new dashboard called the same handler on page load. Two lines of context were doing the damage, one that constructed a scope without options, and one that reused a handler in a new setting.
+The repair took a TransactionOptions initialiser; finding it took three days, because everybody looked at what had changed and the defective line had not changed in years.
+This is why "which isolation level is this connection running, and who set it" is a reasonable first question at a blocking incident, and why sys dm exec sessions transaction isolation level is worth knowing by name.
+
+-- pause --
+Errors inside a transaction, XACT_ABORT, doomed transactions, timeouts.
+
+"An error rolls the transaction back" is true by default on exactly one of the three engines. The other two roll back the statement and leave the transaction running, which is why an application ported between them can commit half its work and report success.
+
+sequel Server. SET XACT_ABORT is OFF by default in T sequel (ON inside triggers).
+With it off, a run-time error may roll back only the offending statement and let the transaction continue, Microsoft's own documented example inserts three rows, the second violating a foreign key, and commits rows one and three.
+So a procedure without XACT_ABORT ON can commit a partial result and report success.
+
+Some errors instead leave the transaction doomed (uncommittable). XACT_STATE() returns -1 for that state: the session "can't commit the transaction or roll back to a savepoint; it can only request a full rollback" and cannot perform any write until it does (Microsoft Learn, XACT_STATE).
+A CATCH block that tries to COMMIT, or to roll back to a savepoint, fails on top of the original failure, and the second error is the one the application logs.
+
+XACT_ABORT ON also covers a case that catches people out: a client-side query timeout.
+When SqlCommand.CommandTimeout elapses, the client sends an attention signal, and Microsoft states the consequence plainly, "When an SPID receives a query timeout or a cancel, it terminates the current query and batch but doesn't automatically roll back or commit the transaction.
+The application is responsible for this action" (Microsoft Learn, Understand and resolve sequel Server blocking problems). The connection then goes back to the pool still holding locks.
+It is cleared either when that physical connection is next handed out and sp_reset_connection runs, or, if it is never reused, when the connection times out and is removed from the pool.
+Microsoft's remedy for both the delay and the leak is the same pair: roll back explicitly in the client's error handler ( IF @@TRANCOUNT > 0 ROLLBACK TRAN ), or run with SET XACT_ABORT ON.
+
+Postgres Q L. Any error aborts the whole transaction at once. Every subsequent statement returns ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02 ), and a COMMIT at that point behaves as a ROLLBACK.
+That is the strictest of the three and the easiest to reason about; the escape hatch when you want to continue is a savepoint, which is exactly what psql 's ON_ERROR_ROLLBACK and most drivers' "try one statement" helpers use under the hood.
+
+MySQL / InnoDB. An error rolls back the statement, not the transaction.
+Worse, the two lock-related failures behave differently from each other:
+a deadlock rolls back the entire transaction, while a lock wait timeout ( innodb_lock_wait_timeout, default 50 seconds) rolls back only the statement that waited, unless innodb_rollback_on_timeout is enabled, and it is off by default.
+So a MySQL application that catches "lock wait timeout exceeded" and carries on to COMMIT will commit a transaction with a hole in it.
+
+In the real world: a nightly reconciliation on sequel Server ran inside a stored procedure with BEGIN TRAN, a TRY / CATCH, and no SET XACT_ABORT. It had a 30-second CommandTimeout from the dot NET job host.
+On a busy night the procedure timed out mid-transaction; the dot NET side caught SqlException, logged "reconciliation failed, will retry", and moved on without disposing the connection promptly.
+The transaction stayed open on the server, holding locks, until the connection was eventually reused and reset. Meanwhile the retry ran, blocked on the locks its own previous attempt was still holding, and timed out too.
+The failure looked like a database problem, a growing blocking chain with no obvious head, and was in fact a two-line configuration gap: SET XACT_ABORT ON in the procedure, and a using on the connection. Neither line is exotic.
+What was missing was the knowledge that a timeout cancels a statement and not a transaction.
+
+-- pause --
+Retrying correctly, execution strategies and the transaction boundary.
+
+Deadlocks and serialization failures are not bugs to be eliminated; they are a contract that says "run me again". The hard part is what to run again.
+
+E F Core turns retries on with EnableRetryOnFailure(), which installs a provider-specific execution strategy. The sequel Server strategy's transient list includes error 1205 (deadlock victim) and 3960 (snapshot update conflict).
+It deliberately excludes the timeout ( -2 ); the provider source comments that a timeout "can be thrown even if the operation completed successfully, so it's safer to let the application fail". That is the correct instinct and the reason blind retry-on-anything is dangerous.
+
+Then the trap. Turn retries on, open your own transaction, and E F Core refuses:
+
+InvalidOperationException: The configured execution strategy 'SqlServerRetryingExecutionStrategy' does not support user-initiated transactions. Use the execution strategy returned by 'DbContext.Database.CreateExecutionStrategy()' to execute all the operations in the transaction as a retriable unit.
+
+The reasoning is sound: with retries enabled, each query and each SaveChangesAsync is independently retriable, but your transaction is a unit the strategy knows nothing about, so it cannot replay it. You have to hand it the whole unit:
+
+Two further points a senior candidate is expected to raise unprompted:
+
+Commit-time ambiguity. If the connection drops during COMMIT, the outcome is unknown. The strategy's default assumption is that the transaction rolled back, and retrying on that assumption can double-insert when the commit actually succeeded and the key is store-generated.
+E F Core's answer is IExecutionStrategy.ExecuteInTransactionAsync(operation, verify Succeeded), where verify Succeeded checks the database for evidence the work landed, typically a client-generated GUID written in the same transaction.
+This is the outbox or idempotency-key idea applied to your own retry loop.
+
+Side effects are not retriable. Anything the transaction body does outside the database, send an email, charge a card, publish to a broker, repeats on every retry.
+Three ways out, and you need one of them: move it after the commit, put it behind an outbox, or make it idempotent on a deduplication key. Leaving it inside the delegate and hoping retries are rare is not one of them.
+
+For Postgres Q L, retry on SQLSTATE 40001 ( serialization_failure ) and 40P01 ( deadlock_detected ).
+Any application that sets REPEATABLE READ or SERIALIZABLE on Postgres Q L must have this loop, the manual says applications using those levels "must be prepared to retry transactions due to serialization failures". Retrying is part of choosing the isolation level, not an optional hardening step.
+
+In the real world: a team enabled EnableRetryOnFailure after an Azure sequel failover cost them a night, deployed, and the checkout endpoint started throwing InvalidOperationException on every request, because checkout was the one handler with an explicit BeginTransactionAsync.
+The rollback was quick and the lesson was mis-drawn: "connection resiliency conflicts with transactions, leave it off". It doesn't conflict; it requires you to say where the retriable boundary is, which is a thing the framework genuinely cannot infer.
+The version that shipped a sprint later wrapped the transaction in CreateExecutionStrategy().ExecuteAsync(.), moved the confirmation email to after the commit, which the retry work exposed as a second, pre-existing bug, and kept resiliency on.
+
+-- pause --
+Lock waits, timeouts, and queue tables (SKIP LOCKED / READPAST).
+
+How long will a statement wait for a lock? Forever, on two of the three engines, unless you say otherwise.
+
+sequel Server, Unlimited, "transactions in the Database Engine don't time out, unless LOCK_TIMEOUT is set" (Deadlocks Guide), SET LOCK_TIMEOUT 5000 (milliseconds), per session, 1222, "Lock request time out period exceeded".
+Postgres Q L, Unlimited ( lock_timeout = 0 ), SET lock_timeout = '5 seconds'; also statement_timeout, idle_in_transaction_session_timeout, SQLSTATE 55P03 lock_not_available.
+MySQL / InnoDB, 50 seconds ( innodb_lock_wait_timeout ), change the variable, session or global, 1205, "Lock wait timeout exceeded".
+
+Note the collision worth knowing: error 1205 means "deadlock victim" on sequel Server and "lock wait timeout" on MySQL. Handlers copied between stacks get this wrong.
+
+SET LOCK_TIMEOUT in front of a migration or a maintenance statement is the cheap version of "fail fast rather than pile up behind me", it stops a DDL statement that cannot get its lock from becoming the head of a blocking chain of its own.
+Postgres Q L's lock_timeout is the same idea, and is standard practice in zero-downtime migration tooling.
+
+Queue tables. The lock-skipping variants exist because of one workload: several workers polling the same table for the next unit of work. Without them the workers serialise, worker 2 waits for worker 1's lock on row 1, even though it would happily take row 2.
+
+Four things about these that get asked, and the third one will bite you in production.
+
+READPAST skips only row-level locks, page-level locks are not skipped, and is permitted only in transactions running at READ COMMITTED or REPEATABLE READ.
+
+SKIP LOCKED and READPAST both give a non-deterministic result set by design. That is exactly right for a work queue and wrong for anything you are counting.
+
+READPAST and RCSI collide. Microsoft's table-hints reference states that READPAST can't be specified when READ_COMMITTED_SNAPSHOT is ON and the session's isolation level is READ COMMITTED (or a READCOMMITTED hint is present), because under RCSI a read takes no locks to skip past in the first place.
+The documented workaround is to add the READCOMMITTEDLOCK hint, which forces that one statement back onto locking READ COMMITTED so READPAST has something to do:
+
+Note the ROWLOCK from the earlier example is gone: the same reference lists READCOMMITTEDLOCK and ROWLOCK both as granularity hints, and it permits at most one hint from that group per table in the FROM clause.
+
+This is the sharpest edge on the page: enabling RCSI to fix a blocking problem can silently break the queue pattern you built to fix a different one.
+
+Finally, NOWAIT (Postgres Q L, MySQL 8.0, Oracle; and a WITH (NOWAIT) table hint on sequel Server, equivalent to SET LOCK_TIMEOUT 0 for that table) is the third member of the family: rather than waiting or skipping, it errors immediately, what you want for "take this lock or tell me you can't".
+
+In the real world: an outbox dispatcher was scaled from one instance to six to clear a backlog, and throughput did not move. Each worker ran SELECT TOP (100).
+WHERE status = 'pending' ORDER BY id inside a transaction and then updated the rows it had read, so all six workers picked the same hundred rows, and five of them sat waiting on the first one's locks. Six workers, one worker's worth of progress, and six times the lock contention.
+Adding WITH (UPDLOCK, READPAST, ROWLOCK) and folding the claim into a single UPDATE. OUTPUT finally made six workers behave like six, each skipping rows already claimed rather than queueing behind them.
+The instinct to reach for NOLOCK here is worth naming as the trap it is: it would also stop the waiting, by letting every worker read and process the same rows twice.
+
+-- pause --
+The bill for MVCC, bloat, freezing, and XID wraparound.
+
+MVCC's cost is not paid at write time; it is paid by whatever has to clean up afterwards. On Postgres Q L that is VACUUM, and the mechanism has one property that turns it into an outage risk: vacuum can only remove a dead row version if no snapshot in the system can still see it.
+One long-running transaction, including one that is merely idle in transaction, pins the horizon for the entire database, and dead tuples pile up behind it in tables that transaction never touched.
+
+That is the bloat story, and it is the well-known half. The other half is transaction ID wraparound, and it is what makes this a senior topic rather than a maintenance footnote.
+Postgres Q L transaction IDs are 32 bits and are compared using modulo-2³² arithmetic, so at any moment two billion XIDs look "older" than the current one and two billion look "newer".
+Rows must be frozen, marked as unconditionally old, before the counter laps them, or old rows would abruptly appear to be from the future and vanish.
+The manual's rule: "it is necessary to vacuum every table in every database at least once every two billion transactions." Autovacuum handles this normally, driven by autovacuum_freeze_max_age (default 200 million transactions). When it cannot, Postgres Q L escalates in two documented steps:
+
+The warning starts forty million transactions out. The refusal lands at three million: read-only transactions still start, everything that writes fails. It is a self-imposed outage to prevent silent data loss, and recovering from it requires a vacuum you now have very little runway to complete.
+
+What blocks the cleanup is a short list, and knowing it is the answer to "how would you prevent this":
+long-running transactions ( pg_stat_activity, look for large age(backend_xmin) ), abandoned prepared transactions ( pg_prepared_xacts ), and replication slots whose consumer has gone away ( pg_replication_slots ).
+All three hold the horizon; all three are invisible on a C P U graph.
+
+sequel Server's version of the same bill is the version store: with RCSI or SNAPSHOT enabled, old row versions accumulate in tempdb (or in the database's Persistent Version Store when Accelerated Database Recovery is on, from sequel Server 2019),
+and a single long-running snapshot transaction stops them being cleaned up, so tempdb grows instead of a table bloating.
+Same mechanism, different place for the mess to accumulate.
+
+In the real world: a Postgres Q L orders database started growing at several gigabytes a day with no change in row count, and query times drifted up across endpoints that had nothing in common.
+The cause was a BI tool that opened a transaction on connect and held it for the life of its connection pool, reading almost nothing, committing almost never. Every dead tuple produced anywhere in the database after that snapshot was untouchable by autovacuum.
+The immediate fix was one pg_terminate_backend, after which autovacuum spent a day catching up.
+The durable fixes were the boring ones: idle_in_transaction_session_timeout set on the reporting role so a leaked transaction cannot outlive a coffee break, and a monitor on max(age(backend_xmin)) rather than on table size, because table size is the symptom and the snapshot horizon is the disease.
+The alarming part, on review, was how close it had come to the second escalation step, the one where the database stops accepting writes.
+
+-- pause --
+Engine differences that change the answer.
+
+Almost every concurrency claim is engine-specific. This table is the set of differences that most often turn a correct answer into a wrong one.
+
+Default isolation, READ COMMITTED, READ COMMITTED, REPEATABLE READ.
+Default read mechanism, Shared locks, unless RCSI is on (on by default in Azure sequel Database, off in a fresh on-prem install), MVCC snapshots always, MVCC snapshots (consistent reads).
+REPEATABLE READ and phantoms, Phantoms possible; range locks only at SERIALIZABLE, Prevented, the manual states its Repeatable Read "does not allow phantom reads", Prevented for locking reads via next-key (gap) locks; non-locking reads use the snapshot.
+SERIALIZABLE mechanism, Key-range locks, blocks early, SSI: tracks read or write dependencies, aborts late with 40001, REPEATABLE READ plus implicit SELECT. FOR SHARE on plain reads (when autocommit is off).
+Snapshot with conflict detection, SNAPSHOT isolation level, error 3960, REPEATABLE READ, error 40001, No equivalent, RR does not abort on update conflict.
+Deadlock detection, Lock monitor, 5 seconds interval down to 100 milliseconds, After deadlock_timeout (default 1 second) of waiting, Immediate, from the wait-for graph.
+Deadlock victim, Cheapest to roll back; DEADLOCK_PRIORITY overrides, The transaction that ran the detection, Fewest rows changed.
+Deadlock error, 1205, 40P01, 1213 ( ER_LOCK_DEADLOCK ).
+Default lock wait, Unlimited ( LOCK_TIMEOUT unset), Unlimited ( lock_timeout = 0 ), 50 seconds ( innodb_lock_wait_timeout ), error 1205.
+Error mid-transaction, Statement only, unless XACT_ABORT ON, Whole transaction aborts; further statements rejected ( 25P02 ), Statement only; deadlock rolls back all, lock timeout does not.
+Lock escalation, Yes, at ~5,000 locks on one index or table reference, None, row locks live on the tuple, None.
+Skip-locked syntax, WITH (READPAST), FOR UPDATE SKIP LOCKED (9.5+), FOR UPDATE SKIP LOCKED (8.0+).
+Cleanup cost lands in, tempdb version store (or PVS with ADR, 2019+), Table or index bloat; VACUUM; XID freezing, Undo tablespaces / history list.
+
+Two entries deserve elaboration because they are the ones interviewers push on.
+
+MySQL's gap locks. InnoDB's REPEATABLE READ prevents phantoms for locking reads by locking not just matching rows but the gaps between index entries, a next-key lock. SELECT. WHERE id BETWEEN 10 AND 20 FOR UPDATE locks the range, so another session's INSERT of id 15 waits.
+(The manual's own qualifier matters: for a unique index with a unique search condition InnoDB locks only the record found,
+not the gap before it, it is range and non-unique predicates that pull in gap locks.) This is why MySQL applications deadlock on inserts in patterns that would be conflict-free on Postgres Q L,
+and why "we just moved to MySQL and now we get deadlocks on INSERT" is a real support ticket rather than a mystery.
+
+Postgres has no lock escalation, and that is not free. Row locks are recorded on the tuple itself (in xmax, with multixacts when several transactions share a row lock), so a million-row update needs no shared lock-table memory and cannot escalate to a table lock.
+The cost moves elsewhere: those million updated rows are a million dead tuples for vacuum, and heavy shared row-locking generates multixact traffic of its own. Different architecture, different bill, not a free lunch.
+
+In the real world: a service was ported from Postgres Q L to MySQL for operational reasons, with the sequel essentially unchanged, and immediately began deadlocking on a table whose only concurrent operations were inserts. Nothing in the application had changed.
+The pattern was a "reserve the next slot in this range" query, a locking read over a range, followed by an insert into it. On Postgres Q L that read locked the rows it matched and no more.
+On InnoDB, at its default REPEATABLE READ, it locked the gaps too, so two sessions reserving adjacent slots blocked each other and then cycled. The eventual fix was to stop reserving by range and use a unique key with insert-and-catch instead.
+The generalisable lesson is the one at the top of this section: isolation level names port between engines and isolation behaviour does not, and the defaults differ before you have written a line of code.
+
+-- pause --
+Section 3. Code and diagrams.
+
+-- pause --
+acid in action, bank transfer.
+
+If any step fails (or app crashes), ROLLBACK undoes the partial work.
+
+-- pause --
+Isolation level demo.
+
+READ COMMITTED (default):
+
+REPEATABLE READ (Postgres Q L implementation):
+
+SERIALIZABLE:
+
+Postgres Q L uses Serializable Snapshot Isolation (SSI), detects conflicts and aborts one transaction. The app retries.
+
+-- pause --
+Locking visualization.
+
+S or X or U lock modes are sequel Server terminology, and this picture is a locking-mode engine (RCSI off). On Postgres Q L the "T2 blocked by T1's X" line is simply false, a plain SELECT reads a version and never waits, and the U-lock row corresponds to SELECT.
+FOR UPDATE, which conflicts with other FOR UPDATE requests and with writers but not with plain readers.
+
+-- pause --
+Deadlock graph.
+
+Transaction A holds row 1, wants row 2. Transaction B holds row 2, wants row 1.
+
+Cycle of waits: A to row 2 back to B to row 1 back to A to.
+
+DB detects the cycle, picks a victim, rolls it back. App retries.
+
+Prevention: always acquire locks in the same order (for example, always lower ID first).
+
+The ordering rule has to be applied to the locks, not to the business meaning of the statements, which is where the obvious version of this goes wrong.
+"Always update the lower ID first" cannot be written as SET balance = balance - 100 WHERE id = LEAST(@from, @to), because that debits whichever account has the smaller ID rather than the one sending the money.
+Acquire the locks in ID order first, then apply the signed amounts in whatever order you like:
+
+If every transfer follows this rule, two transfers over the same pair of accounts queue cleanly instead of forming a cycle: both ask for the lower ID first, and the loser waits at the SELECT.
+Note that the ORDER BY inside a FOR UPDATE is a hint about intent as much as a guarantee, the robust version of the rule is a single statement whose access path is deterministic, which is what the ordered locking SELECT gives you here.
+
+-- pause --
+Optimistic concurrency in E F Core.
+
+[Timestamp] adds a rowversion column the database auto-increments. E F Core adds it to the WHERE clause; if no rows match, someone else updated.
+
+-- pause --
+Setting isolation level in E F Core.
+
+Or globally via connection string (provider-specific) or per-DbContext.
+
+-- pause --
+Snapshot isolation enabling (sequel Server).
+
+What changes and what does not: reads stop taking shared locks and stop blocking writers, and writers stop blocking readers. Writers still block writers, RCSI does nothing for write-write conflicts, so update-heavy hot rows contend exactly as before.
+What you take on in exchange is a version store to size and watch ( sys.dm_tran_version_store_space_usage ), and the fact that a long-running transaction now grows tempdb instead of merely holding locks.
+It removes the largest single source of blocking on a locking-mode sequel Server; it is not a general concurrency solvent.
+
+-- pause --
+Long-running transaction symptoms.
+
+Common causes:
+Long-running batch in same connection as O L T P traffic.
+Forgotten BEGIN without commit (clients keep transactions open silently).
+Web request that calls a slow third-party A P I mid-transaction.
+
+Fix: keep transactions narrow, async work outside, monitor pg_stat_activity / sys.dm_exec_sessions.
+
+-- pause --
+Connection pooling and transactions.
+
+Transactions are tied to connections. Connection pooling reuses connections, important interaction:
+
+What actually happens when a connection with an open transaction goes back to the pool: nothing, immediately.
+The transaction stays open on the server, holding every lock it has taken, until either that physical connection is handed to the next caller and sp_reset_connection runs, or the connection times out and is removed from the pool, whichever comes first is what finally rolls it back.
+Between those two moments the blocking is real and the blocker looks idle, because it is: the session is sleeping with an open transaction and no running request, so it does not appear in sys.dm_exec_requests at all.
+That is the diagnostic signature to recognise (see the session-level blocking query under Locking), and the reason SET XACT_ABORT ON matters for anything with a client timeout on it.
+
+The related dot NET failure has a different shape and a specific message: using a SqlTransaction object after it has been committed, rolled back, or disposed throws InvalidOperationException: This SqlTransaction has completed; it is no longer usable.
+That is almost always a lifetime bug, a transaction captured by something that outlives the request that created it.
+
+-- pause --
+The upsert race, get-or-create under READ COMMITTED.
+
+This one is worth a section of its own because it is the most common concurrency bug in dot NET code that has no explicit transaction handling at all, and because "check, then insert" reads as obviously correct.
+
+The SELECT finds nothing in both requests, because at READ COMMITTED a read takes no lock that survives the statement (and under RCSI or MVCC it takes none at all), so there is nothing to stop the other request from inserting in the gap. Two things fix it, and a senior answer names both.
+
+Let the database be the arbiter. A unique constraint on Email is the only thing that makes the invariant true regardless of how the application is written. Then handle the violation, because a constraint that fires is a correct outcome, not an exception to be logged:
+
+Or serialise the check on sequel Server, where there is no ON CONFLICT.
+The hint pair is UPDLOCK, HOLDLOCK on the existence check:
+UPDLOCK takes an update-mode lock so two sessions cannot both pass the check, and HOLDLOCK (= SERIALIZABLE for this statement) takes a key-range lock so the absence of the row is locked too, which is the part a plain UPDLOCK cannot do, because you cannot lock a row that is not there.
+
+HOLDLOCK requires an index on email to lock a narrow range; without one the key-range lock covers far more of the table than you intended, and the fix for the duplicate becomes a blocking incident.
+Both defences together, the constraint for correctness, the hint to avoid a constant stream of caught violations, is the shape to describe.
+
+In the real world: a signup flow raised duplicate-key exceptions only for users who double-clicked the submit button, at a rate low enough to be dismissed as noise for a year.
+There was no transaction and no explicit isolation level in sight; the "check then insert" was two lines of ordinary E F Core, and every unit test passed because a unit test runs one request.
+It surfaced properly during a marketing campaign, when the same email arriving twice within milliseconds stopped being rare.
+The instructive part was the first fix that was proposed and rejected: wrapping the check and the insert in a BeginTransactionAsync, which does nothing at all here, because READ COMMITTED does not lock rows that do not exist. A transaction is not a mutex.
+What the code needed was a unique index plus an insert-first flow, and that combination is also the one that survives being called from a second service later.
+
+-- pause --
+Section 4. Common pitfalls.
+
+NOLOCK for "fast reads". Reads uncommitted data including potentially-rolled-back writes; can scan rows twice or miss rows. Use snapshot isolation instead.
+Long-running transactions. Hold locks; spread blocking. Keep transactions narrow; never include user-input wait or external H T T P calls.
+Forgetting COMMIT or ROLLBACK. Connection holds locks until session ends. Auto-rollback on disconnect, but slow.
+Mixing isolation levels in one workflow. Inconsistent results. Commit to one isolation level per logical operation.
+No retry on deadlock. App throws to user; user sees errors. Add retry middleware (E F Core's EnableRetryOnFailure ).
+Inconsistent lock ordering across transactions. Deadlock magnet. Always lock in deterministic order (by ID, alphabetical).
+Optimistic concurrency without conflict resolution U X. "Save failed; try again" to user lost their work. Show diff; let user merge.
+Pessimistic locking everywhere. Holds locks unnecessarily; serializes traffic. Only when conflicts are very frequent.
+Treating SaveChanges as one transaction "automatically." True, but doesn't span multiple SaveChanges calls. Use explicit BeginTransactionAsync for multi-step.
+Skipping VACUUM (Postgres Q L). Old row versions accumulate; queries slow down; disk fills. Autovacuum usually handles, but tune for write-heavy tables.
+Different default isolation level surprises. MySQL is REPEATABLE READ; Postgres Q L or sequel Server are READ COMMITTED. Code that worked on one fails on the other.
+Cross-database transactions (distributed transactions). XA / MSDTC has high overhead and operational pain. Prefer outbox pattern or sagas, see EDA.
+new TransactionScope() with no options. Defaults to SERIALIZABLE with a one-minute timeout, and does not flow across await unless you pass TransactionScopeAsyncFlowOption.Enabled. Always construct it with explicit TransactionOptions.
+Assuming an error rolls the transaction back. sequel Server rolls back only the statement unless XACT_ABORT is ON; MySQL rolls back only the statement on a lock-wait timeout unless innodb_rollback_on_timeout is on. Only Postgres Q L aborts the whole transaction on any error.
+A client timeout does not end a transaction. CommandTimeout cancels the statement. Without XACT_ABORT ON the transaction stays open, holding locks, until the pooled connection is reused and reset.
+Hand-rolled retry around E F Core's BeginTransactionAsync with retries enabled. Throws InvalidOperationException; the retriable unit has to be handed to Database.CreateExecutionStrategy().
+Retrying without jitter. Two victims of the same deadlock back off by the same amount and collide again. Add randomness to the delay.
+"Check then insert" as a uniqueness guarantee. No isolation level SERIALIZABLE locks a row that does not exist. Use a unique constraint, plus ON CONFLICT / UPDLOCK, HOLDLOCK.
+Reading rowversion semantics into UpdatedAt. An application-set timestamp can repeat, be skipped, or be wrong; rowversion and xmin are engine-maintained.
+Assuming isolation level resets between requests. On sequel Server it is retained on pooled connections, so one code path's SET TRANSACTION ISOLATION LEVEL can leak into unrelated requests.
+Polling a queue table without SKIP LOCKED / READPAST. Extra workers add contention rather than throughput, every worker fights for the same head-of-queue rows.
+
+-- pause --
+Section 5. Interview-ready summary.
+
+acid: Atomicity, Consistency, Isolation, Durability. Default guarantees of relational databases.
+Isolation levels: READ UNCOMMITTED, READ COMMITTED (default), REPEATABLE READ, SERIALIZABLE, increasing strictness.
+Four phenomena: dirty read, non-repeatable read, phantom read, lost update. Higher isolation prevents more.
+MVCC (Postgres Q L default; sequel Server snapshot isolation): readers don't block writers; row versions instead of shared locks.
+Locks: S (shared, reads), X (exclusive, writes), U (update, intent to escalate). Granularities: row, page, table.
+Deadlock = cyclical wait. DB picks victim. Prevent with consistent lock ordering, short transactions, retry.
+Optimistic versus pessimistic: optimistic (version check at save); pessimistic (lock at read). Default optimistic for web apps.
+Savepoints for partial rollback within a transaction.
+Defaults differ: READ COMMITTED on sequel Server and Postgres Q L, REPEATABLE listen on MySQL; RCSI on by default on Azure sequel Database, off on a fresh sequel Server install.
+Error handling differs: only Postgres Q L aborts the whole transaction on any error. sequel Server needs XACT_ABORT ON; MySQL rolls back the statement on lock-wait timeout and the transaction on deadlock.
+The dot NET layer sets isolation too: new TransactionScope() is SERIALIZABLE, needs TransactionScopeAsyncFlowOption.Enabled to survive await, and sequel Server keeps a session's isolation level on the pooled connection.
+Retry is part of the design: E F Core retries via an execution strategy; with your own transaction you must wrap it in CreateExecutionStrategy().ExecuteAsync(.).
+Queue tables need SKIP LOCKED / READPAST, or extra workers add contention instead of throughput.
+
+Expected interview questions:
+
+"Explain acid.", Atomicity (all or nothing), Consistency (valid to valid state), Isolation (concurrent txns don't see each other's intermediate state), Durability (committed survives crashes).
+"What's the difference between READ COMMITTED and REPEATABLE READ?", READ COMMITTED prevents dirty reads but allows non-repeatable reads. REPEATABLE READ prevents both. Postgres Q L's REPEATABLE READ also prevents phantoms.
+"What's a deadlock and how do you prevent it?", Cycle of transactions each waiting for a lock the other holds. DB detects, kills one. Prevent: consistent lock ordering, short transactions, retry logic, reduce isolation level when safe.
+"Optimistic versus pessimistic concurrency?", Optimistic: detect conflict at save via version column; retry on conflict. Pessimistic: lock at read; others wait. Optimistic for typical web apps; pessimistic for high contention.
+"What's MVCC?", Multi-Version Concurrency Control. Writers create new row versions instead of overwriting. Readers see version that existed when their transaction started. Eliminates reader-writer blocking.
+"What's RCSI in sequel Server?", Read Committed Snapshot Isolation. Modifies READ COMMITTED to use row versioning instead of shared locks, giving statement-level read consistency. Removes reader or writer blocking; writers still block writers.
+Costs a version store in tempdb and requires exclusive database access to enable.
+"What does WITH (NOLOCK) do, and should you use it?", Reads uncommitted data (= READ UNCOMMITTED). Avoids locks but can read dirty data, miss rows, or see them twice. Avoid; use snapshot isolation instead.
+"An error happens halfway through your transaction. What rolls back?", Depends on the engine. Postgres Q L: everything, and every later statement is rejected until you end the block.
+sequel Server: only the statement, unless SET XACT_ABORT ON, and some errors leave the transaction doomed ( XACT_STATE() = -1 ), where the only legal move is a full rollback. MySQL: the statement, except a deadlock which rolls back the transaction.
+"Your SqlCommand times out mid-transaction. What is the state of the transaction?", Still open.
+A timeout is a client-side cancel (an attention signal); the server terminates the query and batch but does not roll back or commit the transaction, that is the application's job, unless XACT_ABORT is ON.
+The connection returns to the pool holding locks until it is reused and sp_reset_connection rolls it back, or until it ages out of the pool.
+"How do you make several workers process a queue table in parallel?", Claim rows with FOR UPDATE SKIP LOCKED (Postgres Q L 9.5+, MySQL 8.0+) or WITH (UPDLOCK, READPAST, ROWLOCK) plus OUTPUT (sequel Server), so each worker skips rows another already holds instead of queueing behind them.
+Without it, adding workers adds contention, not throughput.
+"Two requests both run 'if not exists, insert'. Both insert. Why, and what fixes it?", Nothing SERIALIZABLE locks a row that does not exist, so both existence checks legitimately return nothing. Fix with a unique constraint (the actual guarantee) plus INSERT.
+ON CONFLICT / ON DUPLICATE KEY UPDATE, or on sequel Server SELECT. WITH (UPDLOCK, HOLDLOCK) so the key range is locked.
+"You enabled connection resiliency and your checkout endpoint started throwing. Why?", EnableRetryOnFailure installs an execution strategy that cannot replay a transaction you opened yourself, so it throws InvalidOperationException rather than retry something it cannot reason about.
+Wrap the whole transaction in Database.CreateExecutionStrategy().ExecuteAsync(.).
+
+-- pause --
+Section 6. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, acid, letter by letter.
+
+Q: Explain each letter of acid with a concrete failure mode it prevents.-- think --
+
+A: Atomicity, all or none; prevents "$100 debited from A but never credited to B" when the second statement crashes. Consistency, every commit moves the DB from one valid state to another; prevents constraint-violating in-between states.
+Isolation, concurrent transactions don't see each other's intermediate state; prevents reading half-applied updates. Durability, committed data survives crashes; prevents acknowledged transactions vanishing on power loss.
+
+Cross-Q: Which letter is the most "negotiable" in distributed systems?-- think --
+
+A: Consistency, in the CAP sense (which is a different "C" from acid's). Distributed systems often relax consistency to eventual consistency for availability and partition tolerance.
+acid's Consistency (invariants hold) is rarely traded; acid's Isolation is the one most often weakened by choosing READ COMMITTED over SERIALIZABLE. Durability is rarely sacrificed, fsync skipping is a deliberate trade for write throughput in specific systems.
+
+Cross-Q²: How is each letter implemented under the hood?-- think --
+
+A: Atomicity via write-ahead log + rollback: every change logged before applied; on crash, replay log up to last commit, undo the rest. Consistency via constraint checking at commit time (or eagerly).
+Isolation via locks (pessimistic) or MVCC versions (optimistic), different mechanisms, same goal. Durability via fsync on the write-ahead log: commit returns only after the log is on disk, so a crash can replay the write-ahead log to recover.
+All four rely on the write-ahead log as the source of truth.
+
+-- pause --
+Drill 2, Isolation levels and phenomena.
+
+Q: Which phenomena does each standard isolation level prevent?-- think --
+
+A: READ UNCOMMITTED prevents nothing, dirty reads, non-repeatable reads, phantoms all possible. READ COMMITTED prevents dirty reads only; non-repeatable and phantoms still possible.
+REPEATABLE READ prevents dirty + non-repeatable; phantoms still possible per standard (but Postgres or InnoDB prevent them via snapshot semantics). SERIALIZABLE prevents all three.
+
+Cross-Q: Define each phenomenon with an example.-- think --
+
+A: Dirty read, A reads B's uncommitted change; B rolls back; A used invalid data. Non-repeatable read, A reads x set to 100, B updates x set to 200 and commits, A re-reads x and gets 200 (same row, different value).
+Phantom read, A runs SELECT COUNT(*) WHERE x set to 1 to 5, B inserts a matching row and commits, A re-runs the same query to 6 (same predicate, different row count).
+
+Cross-Q²: What's "write skew" and does SERIALIZABLE prevent it?-- think --
+
+A: Write skew is when two transactions read overlapping data, make decisions based on what they read, then write disjoint rows in a way that violates a multi-row invariant.
+Example: "at least one doctor must be on call", both A and B read "two doctors on call," both go off-call simultaneously, both commit, invariant violated. Snapshot isolation (Postgres REPEATABLE READ) DOES NOT prevent it.
+SERIALIZABLE does, Postgres uses SSI (Serializable Snapshot Isolation) which detects the dangerous read pattern and aborts one. This is the killer reason to upgrade from snapshot to serializable for safety-critical invariants.
+
+-- pause --
+Drill 3, READ COMMITTED SNAPSHOT versus SERIALIZABLE.
+
+Q: My team enabled RCSI in sequel Server and considers the concurrency story "solved." What case still needs SERIALIZABLE?-- think --
+
+A: Any invariant spanning multiple rows or multiple queries within one transaction. RCSI gives each statement a consistent snapshot, but two statements in the same transaction can see different snapshots.
+sequel Server's SERIALIZABLE closes that with key-range locks, it does not give you a snapshot, it prevents anyone else from changing what you read, including inserting into ranges you scanned.
+SNAPSHOT isolation takes the other route: one snapshot for the whole transaction plus update-conflict detection. Use one of the two for invariants like "sum of balances = constant" or "at least one row must exist"; RCSI alone permits write skew.
+
+Cross-Q: What's the difference between RCSI and the standard sequel Server SNAPSHOT isolation level?-- think --
+
+A: RCSI modifies the behavior of READ COMMITTED, statements take row-version snapshots instead of S locks, giving statement-level read consistency.
+SNAPSHOT isolation is a separate isolation level giving transaction-level read consistency:
+the entire transaction sees one snapshot taken at transaction start, and if it tries to modify a row that changed since then, the statement fails with error 3960 and the transaction is rolled back, at the conflicting statement, not at commit.
+RCSI is "cheap blocking fix"; SNAPSHOT is "Postgres-style REPEATABLE READ + conflict detection." Microsoft's documented mitigation for frequent 3960 seconds is WITH (UPDLOCK) on the reads you intend to modify.
+
+Cross-Q²: Why does sequel Server's SERIALIZABLE use range locks while Postgres uses SSI?-- think --
+
+A: Different architectures. sequel Server's pre-MVCC heritage uses locking to prevent phantoms, range locks cover the predicate range so other transactions can't insert into it.
+Postgres's MVCC can't lock ranges the same way (writers don't block readers), so it uses SSI: tracks read-write dependencies, detects cycles in the serialization graph, aborts the offending transaction at commit.
+sequel Server's approach blocks early; Postgres's approach allows progress but may abort later. Both achieve serializability but with different latency / abort-rate profiles.
+
+-- pause --
+Drill 4, MVCC versus locking architectures.
+
+Q: Postgres uses MVCC; sequel Server can use locking or RCSI. What's the architectural difference?-- think --
+
+A: In MVCC, writers create new row versions instead of overwriting in place; readers see the version that existed at the start of their transaction. Readers and writers never block each other.
+In a pure locking architecture, readers take S locks and writers take X locks; readers and writers block each other unless lock-free reads are explicitly enabled.
+
+Cross-Q: What's the cost of MVCC?-- think --
+
+A: Space and cleanup. Every UPDATE creates a new row version; old versions accumulate until no transaction needs them. In Postgres, VACUUM reclaims dead tuples, without it, tables bloat indefinitely.
+Long-running transactions prevent vacuum from cleaning up versions visible to them, causing bloat to snowball. Cost: more disk I O (more rows to scan), more memory pressure, occasional full-table vacuums. The blocking-free behavior usually justifies it.
+
+Cross-Q²: When does locking architecture win?-- think --
+
+A: Workloads with very few updates and high read concurrency where you want predictable lock behavior. Or systems built around explicit pessimistic locks ( SELECT FOR UPDATE heavy use). Most modern systems lean MVCC because the blocking-free read property is so valuable.
+sequel Server's hybrid (default locking, optional RCSI or SNAPSHOT) is a transitional architecture, most production systems enable RCSI for the MVCC-style behavior on reads.
+
+-- pause --
+Drill 5, Deadlock detection and victim selection.
+
+Q: How does a database detect a deadlock?-- think --
+
+A: Wait-for graph. Each transaction is a node; an edge points from A to B if A is waiting for a lock B holds. A cycle is a deadlock.
+When the engine looks differs: sequel Server runs a lock monitor thread on a default 5-second interval, tightening to as low as 100 milliseconds while deadlocks are being found; Postgres Q L only starts looking after a lock wait exceeds deadlock_timeout (default 1 second);
+InnoDB checks its wait-for graph immediately on each lock wait.
+Whoever is chosen gets rolled back and an error returned; the others proceed.
+
+Cross-Q: How does the engine pick the victim?-- think --
+
+A: sequel Server: the transaction that is cheapest to roll back (least log to undo), unless SET DEADLOCK_PRIORITY differs between the sessions, priority wins over cost, and equal priority with equal cost is broken randomly. Postgres: aborts the transaction that ran the detection, that is
+the one whose deadlock_timeout fired. InnoDB: the transaction with the fewest rows inserted, updated or deleted.
+None of these is aligned with what you care about, which is usually "not the customer-facing one", DEADLOCK_PRIORITY LOW on the batch job is the only one of the three you can nudge directly.
+
+Cross-Q²: Why retry on deadlock instead of redesigning to prevent them?-- think --
+
+A: Real-world systems can't prevent all deadlocks, lock ordering is impossible to enforce across all code paths, especially with ORMs that may reorder DML. Deadlocks are inherent to concurrency with locking.
+The pragmatic answer: prevent the common ones (consistent lock ordering for hot paths, short transactions) and retry the rest. EnableRetryOnFailure in E F Core, idempotent operation design, exponential backoff, these turn deadlocks from production fires into invisible retries.
+
+-- pause --
+Drill 6, Pessimistic versus optimistic concurrency.
+
+Q: When do you choose optimistic over pessimistic?-- think --
+
+A: When conflicts are rare and reads outnumber writes, typical web apps. Optimistic: read freely, check at write ( UPDATE. WHERE version = @original ); rows-affected = 0 means conflict, app retries. No locks held during user think-time.
+Pessimistic: lock at read ( SELECT FOR UPDATE ); guaranteed to succeed but holds locks to other transactions wait. Use pessimistic when conflicts are frequent and retries are expensive.
+
+Cross-Q: What's the failure mode of optimistic concurrency that's easy to get wrong?-- think --
+
+A: User experience. Conflict to retry means the user's edits are lost or merge logic is required. Bad U X: "Save failed, try again", user lost everything they typed. Good U X: show the diff, let the user merge.
+Worse mode: silent retries that succeed but apply stale logic, for example, retry computes balance from a stale read and overwrites a fresh value. Optimistic concurrency needs explicit conflict-resolution U I, not just retry-on-error.
+
+Cross-Q²: How do you decide the contention threshold where pessimistic wins?-- think --
+
+A: Don't quote a threshold, there isn't a published one, and an interviewer who has tuned this will know.
+Reason about it instead: optimistic costs you P(conflict) times (cost of a wasted attempt + cost of a retry), pessimistic costs you the wait time every transaction spends queueing whether or not a conflict would have occurred.
+The crossover moves with how expensive your transaction body is, so a cheap update tolerates a far higher conflict rate than one that recomputes something first. Make it measurable: instrument conflict or retry counts per endpoint and watch the retry rate rather than guessing.
+The qualitative half is reliable, workloads with locality (one customer's session writing one customer's rows) barely conflict and suit optimistic; hot keys (top-N counters, one popular product) conflict constantly and suit pessimistic locking or serialising the updates through a queue.
+
+-- pause --
+Drill 7, rowversion / xmin patterns.
+
+Q: How does sequel Server's rowversion (a k a. timestamp ) work for optimistic concurrency?-- think --
+
+A: A rowversion / timestamp column auto-increments on every UPDATE to that row. E F Core (via [Timestamp] ) reads the original value, then adds WHERE RowVersion = @original to every UPDATE.
+If another transaction updated the row, the version changed, the WHERE clause fails to match, 0 rows affected to DbUpdateConcurrencyException.
+
+Cross-Q: What's the Postgres equivalent, xmin ?-- think --
+
+A: xmin is a system column on every row holding the transaction ID that wrote it. After an UPDATE, xmin becomes the new transaction's ID.
+You can use WHERE xmin = @original_xmin for optimistic concurrency, E F Core supports this via IsConcurrencyToken() on a [NotMapped] shadow property mapped to xmin. Functionally equivalent to sequel Server's rowversion; uses existing system column instead of an extra column.
+
+Cross-Q²: Why can't you just compare an UpdatedAt timestamp instead?-- think --
+
+A: Granularity and atomicity. UpdatedAt = NOW() from app code has millisecond precision, two near-simultaneous updates can set the same timestamp; the second's "WHERE UpdatedAt = @original" would falsely match (or fail to detect).
+rowversion / xmin are guaranteed unique per row update by the engine. Also, UpdatedAt set by the app can be forgotten or wrong; system-managed columns can't drift.
+
+-- pause --
+Drill 8, SAVEPOINT and nested transactions.
+
+Q: What's a SAVEPOINT and what problem does it solve?-- think --
+
+A: A marker inside a transaction you can rollback to without aborting the whole transaction. Use case: multi-step batch where some steps are optional or expected to fail. SAVEPOINT s1;. if error: ROLLBACK TO SAVEPOINT s1. The transaction continues; only the work after s1 is undone.
+
+Cross-Q: T sequel has BEGIN TRANSACTION inside another BEGIN TRANSACTION. Are those real nested transactions?-- think --
+
+A: No, they're "named transactions" but only the outermost COMMIT actually commits. Inner BEGIN TRANSACTIONs increment @@TRANCOUNT; inner COMMIT decrements. ROLLBACK at any level rolls back the entire transaction stack.
+Truly nested transactions don't exist in T sequel; the closest is SAVEPOINTs via SAVE TRANSACTION name. Many T sequel developers don't realize this and write code assuming inner ROLLBACK only undoes inner work, broken.
+
+Cross-Q²: How does E F Core handle this?-- think --
+
+A: E F Core 5+ added IDbContextTransaction.CreateSavepoint(name) and RollbackToSavepoint(name), proper savepoint A P I.
+SaveChangesAsync automatically creates a savepoint before each batch if a transaction is active, so a constraint violation inside one batch doesn't kill the surrounding transaction.
+The transaction itself is still a single transaction; savepoints are the right abstraction for "atomic sub-operation" patterns inside it.
+
+-- pause --
+Drill 9, DTC versus single-node transactions.
+
+Q: What's MSDTC and when do you actually need it?-- think --
+
+A: Microsoft Distributed Transaction Coordinator, orchestrates transactions spanning multiple databases or resource managers via two-phase commit (2PC). Needed when one logical transaction must atomically commit across sequel Server + MSMQ, or sequel Server + Oracle.
+Phase 1: ask all participants "ready?" Phase 2: tell all to commit or all to abort.
+
+Cross-Q: Why has DTC fallen out of favor?-- think --
+
+A: Three big problems. (1) Operational pain, DTC requires firewall holes, MSDTC service running on every node, network configuration; failures are nightmares to debug. (2) Performance, 2PC adds 2 network round trips per commit; latency multiplies.
+(3) Coordinator failure, if the coordinator crashes mid-protocol, participants are stuck in "in-doubt" state until manually resolved.
+Modern distributed systems prefer the outbox pattern + idempotent consumers, which give "at-least-once delivery with idempotency" instead of "exactly-once across heterogeneous systems."
+
+Cross-Q²: When is DTC still the right answer?-- think --
+
+A: Legacy systems where an outbox refactor is too expensive, or hard regulatory invariants requiring synchronous cross-DB atomicity. Even then, isolate the DTC scope, most logic runs single-node; only the small atomic boundary uses DTC.
+Modern designs almost always pick eventual consistency + saga, or outbox + event-driven, over DTC.
+There is also a platform fact that decides it for many teams: dot NET Core through dot NET 6 did not support distributed transactions at all, so escalating a TransactionScope threw PlatformNotSupportedException.
+dot NET 7 brought support back for sequel Server on Windows only, and it is off until you set TransactionManager.ImplicitDistributedTransactions = true. If your service runs in a Linux container, DTC is not an architectural preference you are weighing, it is unavailable.
+
+-- pause --
+Drill 10, Eventual consistency in distributed transactions.
+
+Q: My checkout flow updates the order DB and publishes an event to RabbitMQ. How do I make those atomic without DTC?-- think --
+
+A: Outbox pattern. Write the event to an outbox table in the same transaction as the order update, one local transaction, atomic. A separate background worker polls the outbox, publishes to RabbitMQ, marks the row as sent.
+If the worker crashes between publish and mark, the event will be re-published, consumers must be idempotent. You traded "exactly-once across DB + queue" for "at-least-once with idempotency." That's the standard trade in modern distributed systems.
+
+Cross-Q: What's the failure mode of just publishing to the queue first, then writing to the DB?-- think --
+
+A: The event is published before the DB write commits to consumers may see "order created" event for an order that doesn't exist (race) or never exists (DB write failed). "Write DB then publish" is similarly broken: DB commits, app crashes before publishing, event is lost.
+Neither order works without atomicity. Outbox solves it by putting the publish step inside the DB transaction.
+
+Cross-Q²: What's the consistency window, how stale can downstream be?-- think --
+
+A: Bounded by the outbox poller frequency + queue latency. Typical: 100 milliseconds-1 second for the poller, sub-second for the queue to end-to-end ~1-2 seconds eventually-consistent. For most business workflows that's fine.
+For real-time UIs that need instant cross-service consistency, you need different architecture (C Q R S with read replicas synchronized through the same event stream, plus optimistic U I updates).
+
+-- pause --
+Drill 11, Two-phase commit pitfalls.
+
+Q: What's the in-doubt state in 2PC and why is it dangerous?-- think --
+
+A: After phase 1 (all participants vote "ready"), the coordinator decides commit or abort and sends the decision in phase 2. If the coordinator crashes between phase 1 and phase 2, participants are "in doubt", they voted ready, locked their resources, but don't know whether to commit or roll back.
+They hold locks until the coordinator recovers. Hours-long lock holds, cascading blocking, manual operator intervention to force commit or abort.
+
+Cross-Q: Why doesn't a backup coordinator solve it?-- think --
+
+A: 2PC is fundamentally a blocking protocol, even a perfect backup coordinator can fail.
+Three-phase commit (3PC) adds a "pre-commit" phase that allegedly removes blocking, but it requires synchronous network with bounded delays (impossible on the real internet) and doesn't tolerate network partitions.
+There's no non-blocking atomic commit protocol over an asynchronous network, that's a theorem. Modern systems work around it via outbox or sagas, not by inventing new commit protocols.
+
+Cross-Q²: When is the latency cost of 2PC actually intolerable?-- think --
+
+A: Anywhere with high throughput, and the argument is structural rather than a number you can quote.
+2PC costs two synchronous round trips per commit plus a durable log flush at every participant, so commit latency is at least twice the slowest participant's round trip, the coordinator can only proceed when the last vote arrives.
+Then Little's law does the damage: sustaining a given rate at that latency requires proportionally more transactions in flight, and every one of them is holding locks the whole time, so contention rises with the latency you just added.
+Microservices with their own databases effectively can't use 2PC at scale; they use sagas, outbox, eventual consistency.
+
+-- pause --
+Drill 12, Idempotent retries on deadlock.
+
+Q: My deadlock retry middleware retries failed transactions automatically. What can go wrong?-- think --
+
+A: Non-idempotent side effects. If the transaction sent an email, charged a credit card, or published to a queue during the transaction body (not after commit), a retry repeats those external calls. Customer gets two emails; card charged twice.
+The fix: keep all side effects outside the transaction (publish-after-commit, or outbox-pattern), or make every operation idempotent (deduplicate via message ID).
+
+Cross-Q: How do you make UPDATE statements idempotent under retry?-- think --
+
+A: UPDATEs are naturally idempotent when written as set-to-value: UPDATE accounts SET balance = 100, retrying produces the same state. They become non-idempotent with increments: UPDATE accounts SET balance = balance - 10, retrying double-debits.
+Solutions: (a) compute the target value in code and set it absolutely; (b) use a transfer ID and check WHERE NOT EXISTS (SELECT 1 FROM ledger WHERE tx_id = @id); (c) use the database's idempotency tokens or unique constraints.
+
+Cross-Q²: What's "exactly-once" semantics and is it achievable?-- think --
+
+A: "Exactly-once" across distributed systems is a marketing term, what you can actually achieve is "at-least-once delivery + idempotent consumer = effectively-once processing." The receiver must deduplicate.
+Stripe's idempotency keys and Kafka's transactional producer both work this way: the protocol gives at-least-once, the application logic makes duplicates no-ops.
+The impossibility result to cite here is the Two Generals problem, no finite exchange of messages over a lossy channel can leave both parties certain the other acted, which is precisely the sender or receiver situation.
+(FLP is a different result, about consensus with a faulty process in an asynchronous system; it is often cited here and it is the wrong one.)
+
+-- pause --
+Drill 13, Lock escalation.
+
+Q: What's lock escalation in sequel Server?-- think --
+
+A: When a transaction holds too many fine-grained locks (~5000 row locks), sequel Server escalates to a single table-level lock to save memory. Symptom: a transaction that was only updating 50 rows suddenly blocks all access to the entire table.
+Often confuses developers, "why is this blocking everything?"
+
+Cross-Q: How do you prevent it?-- think --
+
+A: Several options: (1) split the work into smaller transactions, each touching < 5000 rows; (2) ALTER TABLE.
+SET (LOCK_ESCALATION = DISABLE) per table (avoid in production, increases lock memory pressure); (3) use a covering index that lets the engine seek directly to the needed rows instead of scanning + locking many rows;
+(4) WITH (ROWLOCK) hint (rarely effective, engine still escalates under memory pressure).
+Best practical answer: chunk large updates into batches of < 1000 rows in a loop.
+
+Cross-Q²: Does Postgres have lock escalation?-- think --
+
+A: No, by design, and the reason is worth knowing, because it's the reason escalation exists at all. sequel Server escalates because row locks live in a shared in-memory lock table and a million of them costs a million entries.
+Postgres records a row lock on the tuple itself (in xmax, using a multixact when several transactions share the lock), so a million-row update costs no shared lock memory and there is nothing to escape from.
+The cost simply moves: those million updated rows are a million dead tuples for VACUUM, and heavy shared row-locking produces multixact traffic that has its own maintenance. max_locks_per_transaction, which people sometimes cite here, sizes the lock table for relation-level locks, not row locks.
+Different architecture, different bill, not a free lunch.
+
+-- pause --
+Drill 14, Isolation for read-only queries (NOLOCK trap).
+
+Q: My read-only reporting query is slow because of blocking. The senior says "add WITH (NOLOCK)." What's wrong with that?-- think --
+
+A: WITH (NOLOCK) = READ UNCOMMITTED. You read uncommitted data, including data from transactions that will roll back. Worse: a row that's moving between index pages can be read twice or missed entirely. A sum can include rolled-back values.
+Reports can show wrong totals, missing transactions, or "ghost" data that never committed. It's "fast" because it doesn't take locks; it's "broken" because correctness was the lock's whole point.
+
+Cross-Q: What's the right answer?-- think --
+
+A: Enable RCSI (Read Committed Snapshot Isolation): ALTER DATABASE Db SET READ_COMMITTED_SNAPSHOT ON. Reads no longer take S locks, they see a snapshot of committed data as of statement start. No blocking, no dirty reads.
+The costs are real and you should name them rather than wave them off:
+a version store to size and monitor (tempdb, or the Persistent Version Store when Accelerated Database Recovery is on from sequel Server 2019), no help at all for writer-versus-writer contention, and an ALTER DATABASE that needs exclusive access to the database to run.
+Or use SNAPSHOT isolation for the whole reporting transaction if you need transaction-wide consistency.
+
+Cross-Q²: When is WITH (NOLOCK) actually acceptable?-- think --
+
+A: Truly never for correctness-critical reads. Sometimes used for "approximate" dashboards (active session count, queue depth where being slightly off is fine) when RCSI isn't enabled and the change can't be scheduled. Even then, the team should document "this number is approximate" loudly.
+And note what "the cost of enabling RCSI" actually is, not runtime cost so much as a change window, because setting it requires exclusive access to the database. That is a scheduling problem, not a technical objection, so it should not be the reason NOLOCK stays on queries that matter.
+Azure sequel Database has RCSI on by default, which is Microsoft answering the question with its own product.
+
+-- pause --
+Drill 15, Write skew anomaly.
+
+Q: I have two doctors on call. Two requests come in simultaneously: each doctor wants to go off-call. The app reads "two doctors on call to at least one must remain to I can go off." Both write. Now zero doctors are on call. What just happened?-- think --
+
+A: Write skew. Both transactions read the same state (two on call), both decided independently that going off was safe, both wrote disjoint updates (different doctor rows). No locks conflicted because they updated different rows. The multi-row invariant ("at least one on call") was violated.
+
+Cross-Q: Does Postgres REPEATABLE READ (snapshot isolation) prevent this?-- think --
+
+A: No. Snapshot isolation gives each transaction a consistent read snapshot, but doesn't detect conflicts on disjoint writes. Both transactions read the same snapshot (two on call), both wrote disjoint rows, both succeed.
+This is the canonical example of why "snapshot isolation" is not "serializable", it's strictly weaker.
+
+Cross-Q²: How do you actually prevent it?-- think --
+
+A: Three options: (1) SERIALIZABLE isolation, Postgres SSI detects the dangerous read-write pattern and aborts one transaction; sequel Server SERIALIZABLE uses range locks to prevent both from succeeding concurrently.
+(2) Materialize the invariant, SELECT COUNT(*) FROM on_call FOR UPDATE forces both transactions to serialize on the COUNT query; one wins, the other sees the updated state. (3) Application-level pessimistic lock or distributed lock around the critical section.
+SERIALIZABLE is the cleanest answer; the FOR UPDATE pattern is the most common in practice.
+
+-- pause --
+Drill 16, Where did this isolation level come from?.
+
+Q: A sequel Server blocking incident shows sessions holding key-range locks. Nothing in the application code says SERIALIZABLE. Where are the range locks coming from?-- think --
+
+A: Almost certainly a TransactionScope built with the parameterless constructor, which defaults to IsolationLevel.Serializable (and a one-minute timeout). Key-range locks are sequel Server's mechanism for SERIALIZABLE, it locks the ranges a query scanned so nobody can insert into them.
+Confirm rather than assume: SELECT transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID returns 4 for serializable, and the deadlock graph's element carries an isolationlevel attribute too.
+
+Cross-Q: Anywhere else it could have come from?-- think --
+
+A: Yes, a session-level SET TRANSACTION ISOLATION LEVEL that leaked through the connection pool. Microsoft documents that when a connection is closed and returned to the pool it keeps the isolation level from its last SET, and subsequent users of that pooled connection inherit it.
+sequel Server 2014 briefly changed sp_reset_connection to reset it, then reverted the change (KB3025845) because it broke TransactionScope. So one stored procedure or one code path setting SERIALIZABLE can affect unrelated requests minutes later on the same physical connection.
+
+Cross-Q²: Same code on Postgres Q L, would you get the same incident?-- think --
+
+A: Not the same one. Postgres Q L's SERIALIZABLE is SSI, not range locking: it lets the transactions run and aborts one, with 40001 and the message "could not serialize access due to read or write dependencies among transactions", when it detects a dangerous read or write dependency pattern.
+So instead of a blocking pile-up you would get a burst of serialization failures, and if the application has no retry loop for 40001 those become user-visible 500 seconds. Same root cause, opposite symptom, blocking on one engine, error rate on the other.
+That is the reason "which engine?" has to be the first question about any concurrency incident.
+
+-- pause --
+Drill 17, Retry that isn't a retry.
+
+Q: You enable EnableRetryOnFailure on E F Core and the app throws InvalidOperationException on the one endpoint that calls BeginTransactionAsync. Why does the framework refuse instead of just retrying?-- think --
+
+A: Because it cannot know what to replay. With retries on, each query and each SaveChangesAsync becomes its own retriable unit; a transaction you opened yourself is a unit the strategy has no handle on, and replaying half of it would be worse than failing.
+The exception says so explicitly and names the fix: use the strategy returned by Database.CreateExecutionStrategy() and pass the whole transaction as a delegate.
+
+Cross-Q: What must be true of that delegate for the retry to be safe?-- think --
+
+A: It has to be replayable from scratch.
+Practical consequences:
+create a fresh DbContext inside it (the change tracker of a failed attempt is not a clean starting state), keep every external side effect, email, payment capture, message publish, out of it or behind an outbox, and make writes idempotent or key them so a duplicate is rejected.
+The riskiest case is a SaveChanges that failed during commit: the outcome is genuinely unknown, and a blind retry can double-insert when the commit actually succeeded.
+E F Core's answer is ExecuteInTransactionAsync(operation, verify Succeeded), where you supply a check, typically a client-generated GUID written in the same transaction, that tells the strategy whether the work already landed.
+
+Cross-Q²: Would you retry a command timeout?-- think --
+
+A: No, and neither does E F Core: the sequel Server provider deliberately leaves the timeout error ( -2 ) out of its transient list, on the grounds that a timeout can be reported for an operation that actually completed.
+A deadlock (1205) is safe to retry because the engine tells you it rolled the transaction back; a timeout tells you nothing about the transaction's fate.
+That distinction, "the engine has already undone my work" versus "I don't know what happened", is the whole basis for deciding what is retriable.
+
+-- pause --
+Drill 18, The same code, three engines.
+
+Q: You port a service from Postgres Q L to MySQL without changing any sequel. What changes in its concurrency behaviour on day one?-- think --
+
+A: Three things, before a line of code is touched. The default isolation level goes from READ COMMITTED to REPEATABLE READ.
+Errors stop aborting the transaction, MySQL rolls back the failing statement and lets you carry on to COMMIT, and a lock-wait timeout does that too unless innodb_rollback_on_timeout is enabled (it is off by default).
+And locking reads now take next-key locks, which lock the gaps between index entries, so a range read blocks inserts into that range, a class of deadlock that simply does not occur on Postgres Q L.
+
+Cross-Q: What breaks in the other direction, MySQL to Postgres Q L?-- think --
+
+A: The error-handling assumption inverts and gets stricter: on Postgres Q L any error aborts the whole transaction, and every subsequent statement returns current transaction is aborted, commands ignored until end of transaction block ( 25P02 ), with COMMIT behaving as ROLLBACK.
+Code that swallowed an error mid-transaction and continued, legal on MySQL, now fails on the statement after the one that failed, which makes for confusing logs. The tool for keeping that behaviour intentionally is a savepoint around the fallible statement.
+
+Cross-Q²: And to sequel Server?-- think --
+
+A: You inherit the locking read model unless RCSI is enabled, which is the single biggest behavioural difference from either MVCC engine, reports start blocking writers.
+You also inherit lock escalation, so a statement touching enough rows converts to a table lock at around 5,000 locks with no warning. And you inherit XACT_ABORT being off, so errors roll back only the statement.
+On Azure sequel Database, RCSI is on by default; on a self-installed sequel Server it is not, so "which sequel Server?" is a real question rather than a pedantic one.
+
+-- pause --
+Drill 19, MVCC's maintenance bill.
+
+Q: A Postgres Q L table is growing steadily while its row count is flat. What is happening, and what is the mechanism?-- think --
+
+A: Bloat from dead tuples. Every UPDATE writes a new row version and leaves the old one; VACUUM reclaims the space, but only for versions no live snapshot can still see.
+Something is holding an old snapshot, most often a long-running or idle in transaction session, sometimes an abandoned prepared transaction or a replication slot with no consumer, so the dead tuples are ineligible for reclamation and accumulate, in every table,
+not just the one that transaction touched.
+
+Cross-Q: What's the worst case if nobody notices?-- think --
+
+A: Transaction ID wraparound. XIDs are 32 bits and compared modulo 2³², so rows must be frozen before the counter laps them; the manual's rule is that every table in every database must be vacuumed at least once every two billion transactions.
+If autovacuum can't keep up, Postgres Q L warns from forty million transactions out ("database must be vacuumed within N transactions") and then, at three million, refuses to assign new XIDs, read-only transactions still start, every write fails.
+It is a self-imposed outage taken in preference to silent data loss, and you reach it with very little runway to run the vacuum that fixes it.
+
+Cross-Q²: Does sequel Server have an equivalent, and what would you monitor on each?-- think --
+
+A: Not wraparound, but the same class of bill in a different place.
+With RCSI or SNAPSHOT enabled, row versions accumulate in tempdb's version store (or the Persistent Version Store with Accelerated Database Recovery from sequel Server 2019), and a long-running snapshot transaction stops cleanup, so tempdb grows instead of a user table bloating.
+Monitor age(datfrozenxid) per database and max(age(backend_xmin)) across sessions on Postgres Q L; sys.dm_tran_active_snapshot_database_transactions and sys.dm_tran_version_store_space_usage on sequel Server.
+On both, the actionable metric is the age of the oldest open transaction, not the size of the thing that is growing.
+
+-- pause --
+Section 7. Cheat Sheet.
+
+acid: atomicity, consistency, isolation, durability - the relational guarantee.
+Isolation ladder: read uncommitted -> read committed -> repeatable read -> serializable.
+Four anomalies: dirty read, non-repeatable read, phantom, lost update; each level prevents more.
+MVCC: readers see snapshot; writers don't block readers; Postgres default, sequel Server via RCSI.
+RCSI: ALTER DATABASE. SET READ_COMMITTED_SNAPSHOT ON removes shared-lock blocking on SELECTs.
+Deadlock victim: DB detects cycle, kills one transaction; the app must retry.
+Lock ordering: deterministic order (always lower ID first) prevents most deadlocks.
+Optimistic concurrency: version column + UPDATE WHERE version=@orig; check rows-affected.
+Pessimistic locking: SELECT. FOR UPDATE / WITH (UPDLOCK); holds X lock until commit.
+NOLOCK / READ UNCOMMITTED: dirty reads, double-counts, missed rows; never use as a "fast" hint.
+Defaults: READ COMMITTED (sequel Server, Postgres), REPEATABLE READ (MySQL); RCSI on by default on Azure sequel Database only.
+Enabling RCSI needs exclusive access to the database, WITH ROLLBACK IMMEDIATE or a window; it is a migration, not a setting.
+Conversion deadlock: two SELECT s take S on the same row, both want X. Fix with UPDLOCK / FOR UPDATE on the read.
+XACT_ABORT ON in every T sequel procedure that opens a transaction; XACT_STATE() = -1 means doomed, rollback only.
+A client timeout leaves the transaction open unless XACT_ABORT is ON; the pooled connection's reset is what finally rolls it back.
+new TransactionScope() = SERIALIZABLE + 1 minute; always pass TransactionOptions and TransactionScopeAsyncFlowOption.Enabled.
+E F Core retries: EnableRetryOnFailure + your own transaction implies wrap in Database.CreateExecutionStrategy().ExecuteAsync(.).
+Retriable: 1205 / 40P01 / 40001. Not retriable blind: timeouts, the outcome is unknown.
+Queue tables: FOR UPDATE SKIP LOCKED (Postgres 9.5+, MySQL 8.0+) or WITH (UPDLOCK, READPAST, ROWLOCK) (sequel Server), add READCOMMITTEDLOCK if RCSI is on, or READPAST is rejected.
+Get-or-create is a race at every level SERIALIZABLE: unique constraint + ON CONFLICT / UPDLOCK, HOLDLOCK.
+idle in transaction blocks locks and vacuum; guard with idle_in_transaction_session_timeout.
+
+-- pause --
+Section 8. Walkthrough, Deadlock victims piling up in sequel Server log.
+
+Problem: sequel Server error log shows 200+ "Transaction (Process ID 53) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction." per hour. Users see intermittent 500 seconds on checkout.
+
+Diagnosis: start with the system_health Extended Events session, which captures xml_deadlock_report events by default on sequel Server and Azure sequel Managed Instance, no configuration needed, and nothing to turn on after the fact.
+(Trace flags 1204 or 1222 write deadlock detail to the error log, but Microsoft advises against them on workload-intensive systems and points at the extended event instead.
+On Azure sequel Database the equivalent history lives in sys.event_log in the master database; that view does not exist on-premises.)
+
+The graph shows two procs: one updates Orders then Inventory; another updates Inventory then Orders. Classic out-of-order locking. Both transactions hold an X on one row and wait for the other.
+
+Fix: Two changes. Enforce lock ordering in code; both procs touch tables in the same order:
+
+Then add resilient retries:
+
+Finally, enable RCSI to eliminate read or write blocking on the inventory query path:
+
+Deadlock count drops to near zero.
+
+Why it works: With consistent lock ordering, two concurrent transactions queue cleanly instead of forming a cycle. RCSI eliminates the shared-lock blocking that occasionally creates lock-upgrade deadlocks. Retries cover the residual cases.
+
+-- pause --
+Section 9. Self-test.
+
+Throughput. SERIALIZABLE either acquires range locks or runs SSI conflict detection. On a hot table with 1000 requests per second, both lead to lock waits or constant serialization_failure errors and retries.
+The right answer is usually RCSI or snapshot for reads, plus optimistic concurrency for writes.
+
+Rowversion is in-DB, atomic with the write, and free. Redis lock externalises the protocol but covers logic that spans multiple DB calls or non-DB resources (file uploads, third-party A P Is).
+Pick rowversion for "did this row change?"; Redis lock for "only one worker should run this entire workflow at a time".
+
+Without it, multiple workers polling the queue serialise on the lock - the second waits for the first, even though they want different rows. SKIP LOCKED (Postgres, sequel Server READPAST ) lets each worker grab a different unlocked row, achieving parallelism without explicit work distribution.
+
+Vacuum can only remove tuples no transaction can see. A long-running transaction pins its snapshot, so all dead tuples produced after that snapshot remain visible to it - vacuum is forbidden to remove them. The DB-wide bloat keeps growing until the long transaction commits or is killed.
+
+Dirty reads (rolled-back data still visible), non-repeatable rows (the same row appears twice during a scan if it moved pages), and missed rows (deleted before the scan reached them). Reports built on NOLOCK can show negative balances or missing transactions. Use snapshot isolation or RCSI instead.
+
+A conversion deadlock. Both sessions read the row first (shared lock, S is compatible with S), then try to update it (exclusive). Neither can be granted X while the other's S is held, and neither will release its S before its own X is granted.
+There is only one resource, so there is no order to fix.
+The precondition to state explicitly: the S locks have to outlive the SELECT, which means REPEATABLE READ or SERIALIZABLE, or a HOLDLOCK / REPEATABLEREAD hint, under locking READ COMMITTED the shared lock is dropped as soon as the row is read and this cycle cannot form.
+The remedy is to take the stronger lock on the read: SELECT. WITH (UPDLOCK) on sequel Server, SELECT. FOR UPDATE on Postgres Q L or MySQL. A U lock is compatible with S but not with another U, so the second session waits at the read instead of colliding at the write.
+
+SET XACT_ABORT is OFF by default in T sequel, and with it off a run-time error can roll back only the failing statement while the transaction carries on. Microsoft's own documented example inserts three rows, the middle one violating a foreign key, and commits the other two.
+SET XACT_ABORT ON makes any run-time error terminate and roll back the whole transaction. Pair it with TRY / CATCH and IF XACT_STATE() <> 0 ROLLBACK, XACT_STATE() returns -1 for a doomed transaction, which can neither commit nor roll back to a savepoint, only roll back entirely.
+
+Not by the timeout.
+CommandTimeout is a client-side concept: the driver sends an attention signal, sequel Server terminates the current query and batch, and it neither rolls back nor commits the transaction, Microsoft is explicit that cleaning up is the application's responsibility,
+since one cancelled query is not evidence the whole transaction should be undone.
+The connection goes back to the pool still holding locks, and it is cleared only when sp_reset_connection runs on the next reuse, or when the connection ages out of the pool. That gap is why a timeout can present as a blocking chain whose head is a sleeping session with no running request.
+Close it with IF @@TRANCOUNT > 0 ROLLBACK TRAN in the error handler, or SET XACT_ABORT ON.
+
+EnableRetryOnFailure makes each query and each SaveChangesAsync independently retriable, which is enough when E F Core owns the transaction boundary.
+The moment you call BeginTransactionAsync yourself, the strategy has a unit it cannot replay and throws InvalidOperationException rather than retry blindly.
+CreateExecutionStrategy().ExecuteAsync(.) hands it the whole transaction as a replayable delegate, at the price that the delegate must genuinely be replayable:
+fresh DbContext inside, no external side effects, and something to resolve the ambiguous case where the connection dropped during COMMIT ( ExecuteInTransactionAsync with a verify Succeeded check).
+
+Every worker's SELECT. ORDER BY id inside a transaction picks the same head-of-queue rows, so five wait on the first one's locks. Adding workers adds contention, not parallelism.
+The fix is to skip rather than wait: FOR UPDATE SKIP LOCKED (Postgres Q L 9.5+, MySQL 8.0+) or WITH (UPDLOCK, READPAST, ROWLOCK) on sequel Server, ideally folded into a single claiming UPDATE. RETURNING / OUTPUT.
+NOLOCK would also stop the waiting, and would let every worker process the same rows, it removes the symptom by removing the correctness.
+
+No. A transaction is not a mutex, and no isolation level SERIALIZABLE locks a row that does not exist, so both sessions' existence checks legitimately find nothing and both insert. The guarantee has to come from a unique constraint. Then either insert first and handle the violation ( INSERT.
+ON CONFLICT DO NOTHING on Postgres Q L, ON DUPLICATE KEY UPDATE on MySQL), or on sequel Server lock the key range on the check with SELECT. WITH (UPDLOCK, HOLDLOCK), which needs an index on the predicate column, or the range lock covers far more than you meant.
+
+Different mechanisms for the same guarantee. sequel Server takes key-range locks and blocks early, the incident presents as a blocking chain and lock timeouts.
+Postgres Q L uses SSI: it lets transactions proceed and aborts one with 40001 when it detects a dangerous read or write dependency, so the incident presents as a spike in serialization failures and, if the app has no retry loop, in 5xx responses.
+Same isolation level, same anomaly prevented, opposite operational signature, which is why the engine has to be part of any answer about isolation.

@@ -1,0 +1,1149 @@
+-- pause --
+Section 1. Table of Contents.
+
+Introduction.
+Index Fundamentals.
+Storage Space Requirements.
+Clustered versus Non-Clustered Indexes.
+Memory Overhead Explained.
+Why Too Many Indexes Slow Down Queries.
+Composite Index Column Order.
+Index Sorting.
+Covering Indexes.
+Index Fragmentation.
+Query Optimizer.
+Best Practices.
+Monitoring and Maintenance.
+Real-World Scenarios.
+Interview Cross-Questioning Drill.
+Self-test.
+Sources.
+
+-- pause --
+Section 2. Introduction.
+
+-- pause --
+What is an Index?.
+
+An index is a database structure that improves the speed of data retrieval operations on a table. Think of it like an index in a book:
+Without Index: Read every page to find a topic.
+With Index: Look in index and jump directly to relevant pages.
+
+-- pause --
+Why Indexes Matter?.
+
+Speed: a seek walks down a tree, so its cost grows with the depth of the index, which grows with the logarithm of the row count. A scan reads every page, so its cost grows with the row count itself. That difference in growth rate, not any particular multiplier, is why indexes matter.
+Scalability: doubling a table adds at most a level to the tree, usually not even that. It doubles the work of every scan.
+Concurrency: an index does not only make a query fast, it makes its footprint small. Rows a query never reads are rows it never locks. On sequel Server this is often the real reason an index fixes a production incident, see the report-blocks-checkout example under Real-World Scenarios.
+
+In the real world: an orders table was created with OrderId uniqueidentifier PRIMARY KEY DEFAULT NEWID(), because the dot NET service wanted to assign IDs client-side before saving.
+sequel Server makes a primary key the clustered index by default, so random GUIDs became the key order the table was maintained in. Every insert landed in a random existing page rather than at the end, so pages split constantly, page density fell, and the table grew far faster than the data in it.
+The team's first instinct was a nightly REBUILD job, which reset density every night and let it decay again by lunchtime, the maintenance window grew, the problem didn't move.
+The actual fix was two changes: an int IDENTITY clustered key, and the GUID kept as a unique non-clustered index for external references.
+Then the second problem arrived: every insert now targeted the same rightmost page, and wait stats filled with PAGELATCH_EX, which Microsoft documents as last-page insert contention and for which OPTIMIZE_FOR_SEQUENTIAL_KEY = ON (sequel Server 2019 and later) exists.
+There is no free clustered key on a high-insert table: random keys buy you spread and cost you density, sequential keys buy you density and cost you a hot spot. What you can do is choose which one you have tooling for.
+
+-- pause --
+Section 3. Comprehensive Index Fundamentals.
+
+-- pause --
+Index Analogy: Phone Book Example.
+
+️ Where the phone-book analogy breaks, and why interviewers push on it. A phone book is one sorted list, so it suggests an index is the table, sorted. That is only true of a clustered index.
+A non-clustered index is a second, narrower sorted copy of a few columns, and reaching the rest of the row costs an extra step, the mechanism that costs you is the lookup, and it is the thing the analogy hides.
+The other thing it hides: a phone book is rebuilt once a year, whereas a database index is maintained on every single write. Half of index design is paying for that maintenance in the right places.
+
+-- pause --
+1. Clustered Index.
+
+Definition: The clustered index is the table, its leaf level holds the data rows themselves, kept in key order. Only one per table, because a table can only be stored one way.
+
+Key Characteristics:
+
+️ Correction, "physical order on disk" is the wrong phrase, and interviewers listen for it. A clustered index maintains a logical order: leaf pages are chained in key order by a doubly-linked list, and each page's slot array orders the rows within it.
+Neither guarantees the pages sit next to each other on the storage device.
+That gap between logical order and physical placement is precisely what avg_fragmentation_in_percent measures, Microsoft defines rowstore fragmentation as existing "when indexes have pages in which the logical ordering within the index, based on the key values of the index,
+doesn't match the physical ordering of index pages" (Microsoft Learn, Maintain indexes optimally).
+If a clustered index really did guarantee physical order, fragmentation could not exist. Say "the rows are stored in key order, and the leaf level of the index is the table."
+
+On the version note: online index rebuild has existed since sequel Server 2005 and is an Enterprise-edition feature to this day (Microsoft Learn, Perform index operations online, which points at the Editions and supported features page rather than naming a version).
+What changed in sequel Server 2012 was the LOB restriction, before it, an index whose leaf held large-object columns could not be rebuilt online at all. Azure sequel Database and Azure sequel Managed Instance have online index operations regardless of tier.
+
+How It Works:
+
+When to Use Clustered:
+
+-- pause --
+2. Non-Clustered Index.
+
+Definition: Separate structure that contains sorted columns and pointers to table rows. Up to 999 per table.
+
+Key Characteristics:
+
+How It Works:
+
+️ Correction, this is only right for a heap. "Disk Addr 1", "0x1000" and similar physical addresses in these ASCII blocks describe a table with no clustered index.
+Microsoft Learn (Index architecture and design guide) states the rule directly: "If the table has a clustered index, or the index is on an indexed view, the row locator is the clustered index key for the row. If the table is a heap. the row locator is a pointer to the row.
+built from the file identifier (ID), page number, and number of the row on the page. The whole pointer is known as a Row ID (RID)." Mentally substitute clustered key for every "disk address" you see below; the mechanism and its consequences are in the next section.
+The per-lookup cost is also not a fixed multiple of a clustered seek, it is one extra tree descent per row returned, which is why a lookup plan is cheap for ten rows and ruinous for a hundred thousand.
+
+When to Use Non-Clustered:
+
+-- pause --
+3. Composite (Multi-Column) Index.
+
+Definition: Non-clustered index on multiple columns. Column order is critical.
+
+Key Characteristics:
+
+Example:
+
+-- pause --
+4. Covering Index.
+
+Definition: Non-clustered index that includes all columns needed for a query, eliminating table lookups.
+
+Key Characteristics:
+
+Example:
+
+️ BuilderObject is NVARCHAR(MAX) in this schema, so this example is a trap. INCLUDE -ing a LOB column duplicates the whole document into the index leaf.
+The index then approaches the size of the table, the buffer pool has to hold two copies of the same Jason, and every update to that Jason writes it twice. Before sequel Server 2012 it also made the index ineligible for online rebuild.
+INCLUDE narrow columns you return; leave LOBs to the lookup, which for the handful of rows a good seek returns is cheap.
+
+-- pause --
+5. Unique Index.
+
+Definition: Ensures all values in indexed columns are unique.
+
+Key Characteristics:
+
+Example:
+
+️ Correction, and one of the most reliable interview traps on this page. The original text claimed multiple NULLs are allowed "because NULL != NULL in sequel". That is the ANSI reasoning and it is what Postgres Q L and MySQL do, but sequel Server does not follow it for unique indexes.
+Microsoft Learn (Create a unique index) is explicit: "You cannot create a unique index on a single column if that column contains NULL in more than one row. Similarly, you cannot create a unique index on multiple columns if the combination of columns contains NULL in more than one row.
+These are treated as duplicate values for indexing purposes."
+
+| Engine | Multiple NULLs in a unique index? |.
+| sequel Server | No, one NULL only. Work around it with a filtered index: CREATE UNIQUE INDEX. WHERE Email IS NOT NULL |.
+| Postgres Q L | Yes by default; NULLS NOT DISTINCT (Postgres Q L 15+) opts into sequel Server's behaviour |.
+| MySQL / InnoDB | Yes, any number of NULLs |.
+
+The filtered-index workaround is worth committing to memory, because "nullable but unique when present" is an extremely common shape: optional email, optional external reference, optional SSO subject ID.
+
+In the real world: a Users table carried a nullable ExternalSsoId, unique when present, enforced by CREATE UNIQUE INDEX IX_Users_ExternalSsoId ON Users (ExternalSsoId). It worked in the developers' Postgres Q L containers, several local users had no SSO ID and nothing complained.
+It worked in the sequel Server test environment too, because exactly one seeded user had a NULL there.
+It failed in production the first time a second non-SSO user was created, with a unique key violation on a column the application had deliberately left empty, and the stack trace pointed at a SaveChanges call that looked completely innocent.
+The root cause was an engine difference nobody had checked: Postgres Q L allows any number of NULLs in a unique index, sequel Server allows one. The fix was one clause, WHERE ExternalSsoId IS NOT NULL, which also made the index smaller, since the excluded rows were the majority.
+The general lesson is that "it passed locally" means nothing when local and production are different engines, and the differences cluster exactly around NULL, collation, and isolation defaults.
+
+-- pause --
+6. Filtered Index.
+
+Definition: Non-clustered index that applies only to subset of rows matching a WHERE condition.
+
+Key Characteristics:
+
+Example:
+
+The two things that make filtered indexes fail silently in production:
+
+Parameters defeat them. The optimizer has to prove the query's predicate implies the index's predicate while compiling, before it knows the parameter value, and the plan it produces will be reused for other values. So it declines.
+OPTION (RECOMPILE), or a dedicated query with the literal in the sequel, restores the match. sequel Server records the near-miss in the plan X M L's element, which is the fastest way to confirm the diagnosis. Postgres Q L partial indexes behave the same way for generic cached plans.
+SET options. Filtered indexes require ANSI_NULLS, ANSI_PADDING, ANSI_WARNINGS, QUOTED_IDENTIFIER, ARITHABORT and CONCAT_NULL_YIELDS_NULL ON and NUMERIC_ROUNDABORT OFF.
+With the wrong settings the optimizer will not consider the index at all, and any INSERT / UPDATE / DELETE touching indexed rows fails outright.
+The nasty case: ANSI_NULLS and QUOTED_IDENTIFIER are baked into a stored procedure at creation time, not taken from the calling session, so a procedure created under the wrong settings keeps failing no matter how the connection is configured.
+
+Engine note: filtered indexes are sequel Server 2008+. Postgres Q L calls the same thing a partial index.
+MySQL has no equivalent, the usual workaround is a generated column that evaluates to NULL for excluded rows, exploiting the fact that InnoDB still indexes NULLs but they cost little and match nothing.
+
+In the real world: an outbox table held tens of millions of dispatched rows and a few thousand pending ones, so the obvious filtered index went on, WHERE Status = 'Pending'. The dispatcher got no faster.
+Six weeks later someone checked sys.dm_db_index_usage_stats and found the index had never been seeked, not once. The predicate was correct; the parameter was the problem.
+The dispatcher called a shared repository method that passed status as @status, so the optimizer could not prove at compile time that the cached plan would only ever run for 'Pending', and quietly ignored the index.
+Meanwhile the index was still being maintained on every insert, pure write cost, zero read benefit, for a month and a half. The fix was a dedicated query with the literal inlined.
+The lesson is about the failure mode rather than the fix: a filtered index that is not being used does not error, does not warn, and does not show up anywhere except a DMV nobody reads. An index with zero seeks and non-zero updates is always worth a look.
+
+-- pause --
+7. Full-Text Index.
+
+Definition: Specialized index for searching text content efficiently.
+
+Key Characteristics:
+
+Example:
+
+-- pause --
+8. Columnstore Index.
+
+Definition: Specialized index for analytical queries on large datasets (sequel Server 2012+).
+
+Key Characteristics:
+
+Microsoft's own figures, quoted rather than invented (Microsoft Learn, Columnstore indexes: Overview):
+columnstore "achieve[s] gains up to 10 times the query performance in your data warehouse over traditional row-oriented storage" and "up to 10 times the data compression over the uncompressed data size";
+batch mode execution "improves query performance typically by two to four times." The "100 times" and "90% compression" figures the box originally carried have no source and overstate what the vendor claims.
+
+Mechanism worth knowing.
+A rowgroup is up to 1,048,576 rows compressed together; each rowgroup holds one column segment per column, and each segment carries min or max metadata "to allow for fast elimination of segments without reading them." That is rowgroup elimination:
+WHERE OrderDate >= '2026-01-01' discards whole rowgroups on metadata alone.
+It works only to the extent that the predicate column's values are clustered by load order, so that rowgroups have narrow, non-overlapping min or max ranges, an append-only fact table eliminates well on its date column by accident, and eliminates badly on anything else.
+Making that property deliberate is what ordered clustered columnstore indexes are for.
+Writes land in a delta rowgroup (a B-tree) until it reaches 1,048,576 rows, then the tuple-mover compresses it; bulk loads under 102,400 rows go entirely to the deltastore and are never compressed until maintenance runs.
+
+Version gates, precisely. Non-clustered columnstore arrived in sequel Server 2012 but made the table read-only. Clustered columnstore came in 2014. Updatable non-clustered columnstore, the one that enables real-time operational analytics alongside an O L T P workload, came in sequel Server 2016.
+
+Example:
+
+-- pause --
+Query Performance Benefits.
+
+️ The number the original table gave, "covering index: 60,000 times faster", is unsourced and would not survive a follow-up question. If an interviewer asks "how much faster?", the honest and stronger answer is a question back: how many rows does it return, and is the working set in memory?
+A seek that returns one row from a cached index and a scan of a 100 gigabytes table off cold storage differ by whatever ratio you like; a seek returning 40% of the table may be slower than the scan. See the tipping point for why.
+
+-- pause --
+Pros versus Cons Summary Table.
+
+Query Speed, 10-1000 times faster SELECT, None.
+INSERT Speed, None, 2-5 times slower with 5-10 indexes.
+UPDATE Speed, None, 2-5 times slower with 5-10 indexes.
+Storage, Compressed data possible, 20-40% overhead with 10+ indexes.
+Memory, Frequently used pages cached, 200-500MB per covering index.
+Maintenance, Automatic via DBCC, 4-8 hours or month for large systems.
+Scalability, Enable growth to millions, Limits concurrent writes.
+Optimizer, Can choose best index, Longer compile times, less stable plan choices.
+Development, Query optimization easier, Complex index design needed.
+Operations, Predictable performance, Fragmentation issues over time.
+
+️ Every multiplier in that table is unsourced and none should be quoted in an interview, they are shape, not measurement.
+The "Optimizer" row originally read "Confused with 15+ options", which is the same folklore corrected under Query Optimizer Confusion: a cost-based optimizer is never confused, it costs every candidate and takes the cheapest.
+What extra indexes actually cost you is compile time, plan stability, write amplification and buffer pool.
+
+-- pause --
+Section 4. Storage Space Requirements.
+
+-- pause --
+Why Indexes Consume Space.
+
+Column Duplication: Index stores copy of indexed columns.
+Pointers: Each entry includes pointer to table row.
+B-Tree Structure: Overhead for tree nodes and branches.
+Covering Indexes: Store additional non-key columns.
+Metadata: Index statistics and page information.
+
+-- pause --
+Section 5. Clustered versus Non-Clustered Indexes.
+
+-- pause --
+Clustered Index (Usually Primary Key).
+
+Characteristics:
+Determines the key order the rows are maintained in, the leaf level is the.
+table. Not physical placement on disk: see the correction under Clustered Index.
+Only ONE per table.
+Fastest access by key value.
+Pages split when inserting in the middle.
+
+Structure:
+
+-- pause --
+Non-Clustered Index.
+
+Characteristics:
+Separate structure pointing to rows.
+Up to 999 per table.
+Fast for specific lookups.
+Extra storage required.
+
+Structure:
+
+-- pause --
+Comparison Table.
+
+Quantity per table, 1 only, Up to 999 (Microsoft Learn, Maximum capacity specifications).
+Storage, No extra copy of the row, A second, narrower copy of the key columns.
+Leaf level contains, The data rows themselves, Key columns, INCLUDE columns, and the row locator.
+Reaching other columns, Already there, Costs a lookup, one per row returned.
+Insertion Impact, Page splits if the key isn't sequential, One more structure to maintain per insert.
+Default, Created by PRIMARY KEY unless you say NONCLUSTERED, Manual creation, or by a UNIQUE constraint.
+Row Order, Rows kept in key order (logical, not physical placement), Its own key order, unrelated to the table's.
+Max key size, 900 bytes, 1,700 bytes since sequel Server 2016 (Microsoft Learn, CREATE INDEX).
+
+-- pause --
+When to Use Clustered.
+
+️ CREATE CLUSTERED INDEX CIX_TenantId ON Table (TenantId) has a cost the comment doesn't mention.
+It is not declared UNIQUE and TenantId is full of duplicates, so sequel Server silently adds a hidden 4-byte uniqueifier to make each key distinct, Microsoft Learn (Index architecture and design guide): "If the clustered index isn't unique,
+a 4-byte internal uniqueifier column is automatically added to the index key to ensure uniqueness." The uniqueifier is only materialised for the second and subsequent rows sharing a key value,
+and, because the clustered key is the row locator, it is copied into every non-clustered index alongside the key.
+A non-unique clustered index on a low-cardinality column is the most expensive kind: you pay the width in every index, and you get almost no seek selectivity for it. If you cluster on TenantId, cluster on (TenantId, Id) and declare it unique.
+
+-- pause --
+The row locator: what a non-clustered index leaf actually points at.
+
+This is the single mechanism that explains most sequel Server index design decisions, and it is the one the ASCII diagrams get wrong. A non-clustered index leaf row does not hold a disk address. It holds a row locator, and what the locator is depends on how the table is stored:
+
+Three consequences follow, and they are what a senior candidate is expected to derive on the spot:
+
+1. The clustered key's width is charged to every non-clustered index. A uniqueidentifier clustered key means 16 bytes are copied into every leaf row of every non-clustered index on that table. Ten non-clustered indexes on a hundred-million-row table means the key is stored a billion times.
+This is why "make the clustered key narrow" is advice about the other indexes, not about the clustered index itself.
+
+2. The locator columns are added to the index key or to the includes, depending on uniqueness.
+Microsoft Learn (Index architecture and design guide) tabulates it: on a table with a unique clustered index, a non-unique non-clustered index gets the clustered keys "added to key columns", while a unique non-clustered index gets them "added to included columns".
+The engine "never stores a given column more than once in a nonclustered index", and locator columns are appended "at the end of the key, following the columns specified in the index definition."
+
+3. You can seek and sort on the clustered key for free. Because the clustered key is physically present in the leaf, the optimizer can use it "regardless of whether they are explicitly specified in the index definition" (same source).
+An index on (CustomerId) over a table clustered on (Id) is really (CustomerId, Id), so WHERE CustomerId = 7 ORDER BY Id needs no sort, a fact worth knowing before you widen an index to get it.
+
+In the real world: an integrations table used the partner's reference string, varchar(400), genuinely unique, as its primary key, because every inbound webhook looked rows up by it. Lookups were fast, code review passed, and nothing surfaced for a year.
+What eventually surfaced was in the storage graph: the table's indexes together were larger than the table. Nobody had added a big index; the six modest ones had each quietly grown by 400 bytes per row, because the clustered key is the row locator and gets copied into all of them.
+The buffer pool filled with index pages that were mostly one repeated string, hot data got evicted, and read latency drifted up across endpoints that had nothing to do with webhooks.
+The fix was structural and boring: int IDENTITY clustered primary key, plus a UNIQUE non-clustered index on the reference to keep the guarantee. Same constraints, same queries, every secondary index smaller.
+sequel Server's key ceilings, 900 bytes clustered, 1,700 non-clustered since sequel Server 2016, 32 key columns (Microsoft Learn, CREATE INDEX), are the engine describing what it expects a key to look like, and a 400-byte key is near the edge of that envelope for a reason.
+
+-- pause --
+Engine differences that change the answer.
+
+Almost everything is sequel Server. Carrying it unmodified to another engine produces confidently wrong answers, which is exactly what an interviewer probing "have you worked outside sequel Server?" is testing for.
+
+Table storage, Clustered index or heap; you choose, Always a heap. There is no maintained clustered index, Always clustered on the PK, no choice.
+If you don't pick a key, Heap, unless PRIMARY KEY creates a clustered index, Heap with ctid row identity, InnoDB clusters on the first UNIQUE NOT NULL index, else a hidden 6-byte row ID.
+Non-clustered leaf holds, Clustered key, or RID on a heap, ctid (physical tuple pointer), The primary key value.
+Rows kept in key order, Yes, by the clustered index (logical order, not physical placement on disk), No; CLUSTER reorders once and then decays, see, Yes, by the PK.
+Covering columns, INCLUDE (. ), INCLUDE (. ), Postgres Q L 11+, No INCLUDE; widen the key instead.
+Partial / filtered index, WHERE on CREATE INDEX, 2008+, Partial indexes, long supported, Not supported.
+DESC in a key, Real, stores descending, Real, stores descending, Ignored before MySQL 8.0; real from 8.0 (MySQL Reference Manual, Descending Indexes).
+
+Two of these bite hardest in practice:
+
+Postgres Q L has no clustered index. CLUSTER table USING index is a one-shot physical reorder, not a maintained property: "Clustering is a one-time operation: when the table is subsequently updated, the changes are not clustered" (Postgres Q L docs, CLUSTER).
+It also takes an ACCESS EXCLUSIVE lock, which "prevents any other database operations (both reads and writes) from operating on the table" for the duration. Answering "I'd add a clustered index" to a Postgres Q L question is an immediate tell.
+InnoDB's secondary indexes store the primary key, so consequence (1) applies to MySQL with even more force than to sequel Server, and MySQL has no INCLUDE, so the only way to make an index covering is to add columns to the key, which widens what gets copied.
+A UUID primary key in InnoDB is doubly expensive: random insert order in the clustered index, and the full UUID duplicated in every secondary index.
+
+-- pause --
+Section 6. Why Too Many Indexes Slow Down Queries.
+
+-- pause --
+Scenario: Multiple Choices.
+
+️ "The optimizer chooses randomly" is wrong, and saying it in an interview signals you think the optimizer is a black box. sequel Server's optimizer is cost-based: it enumerates candidate plans, costs each one against the statistics, and takes the cheapest. It never picks at random.
+What genuinely degrades with many similar indexes is subtler and worth stating precisely:
+
+Compilation cost rises. More candidate access paths means a larger search space; the optimizer works under a time or effort budget and can stop before exploring the plan you wanted.
+Plans become unstable. When (TenantId, WorkflowId) and (TenantId, WorkflowId, CreatedAt) cost nearly the same, a small change in estimates flips the choice.
+The plan changed because the cost changed, which is the optimizer working correctly, but the outcome is the unpredictability the box describes.
+The write path pays for all of them regardless of which one gets chosen. This is the real cost and it is unrelated to optimizer behaviour.
+
+-- pause --
+Query Plan Regression.
+
+️ "Statistics cache invalidation" is not a sequel Server mechanism and the "250 times slower" figure was invented. The real causes are listed.
+To diagnose plan regressions rather than guess at them, use Query Store (sequel Server 2016+): it records every plan a query has had along with its runtime metrics, shows you the regression on a timeline, and lets you force the previous plan while you work out what changed.
+"I'd check Query Store for a plan change" is the answer an interviewer is listening for.
+
+-- pause --
+Recommended Index Limits.
+
+️ Unsourced, and it used to contradict the rest of the document, the Index Budget section originally gave 5-15 indexes for tables over 10M rows where this table gives 8-20.
+(Index Budget's numbers have since been replaced with the reasoning behind them; these have been left in place as the exhibit.) Neither figure was ever measured, which is the point.
+Row count is also the wrong axis: a 50-million-row append-only table carries many indexes cheaply because every insert lands at the right-hand edge of each one, while a 2-million-row table taking a thousand updates a second can be crippled by three.
+If you quote a number in an interview, quote it as "there is no number" and then say what actually binds, write rate, insert ordering, buffer pool pressure, and how many query shapes each index serves. That reasoning is in Index Budget.
+
+-- pause --
+Section 7. Composite Index Column Order.
+
+-- pause --
+Query 3: WHERE WorkflowId = 100 (No TenantId filter).
+
+️ Two corrections to "the index is useless here". First, a full scan of a narrow index is normally cheaper than a full scan of the table, the index rows are a few columns wide, the table rows are the whole row, so there are far fewer pages.
+The optimizer often picks exactly this plan and it is not a bug; it's the cheapest scan available. What you have lost is the seek, not the index. Second, some engines have an index skip scan, which turns the missing leading column into many small seeks, one per distinct leading value.
+It exists in Postgres Q L 18+, MySQL 8.0.13+ and Oracle; sequel Server has no such operator.
+So on sequel Server the answer really is "add an index led by WorkflowId if this query is hot", while on Postgres Q L 18 the honest answer is "it may skip-scan, which is viable while TenantId has few distinct values and collapses when it has many."
+
+-- pause --
+Best Practice: Selectivity Order.
+
+️ This section originally taught "most selective column first". That rule is folklore, and it is the single most-repeated wrong answer about composite indexes.
+It is corrected rather than deleted, because you will hear it in interviews and need to be able to say why it's wrong without sounding like you're contradicting for sport.
+
+Why it's wrong. For a query with equality predicates on every key column, column order does not change how many index rows the seek touches.
+WHERE TenantId = 1 AND WorkflowId = 100 AND DiagramId = 50 finds exactly the rows satisfying all three, whether the index is (DiagramId, WorkflowId, TenantId) or (TenantId, WorkflowId, DiagramId). The seek descends to one contiguous range either way.
+The original worked example, "wrong order narrows to 100,000 rows, then 1,000, then 2, so 5,000 pages scanned", describes something the engine does not do; it does not read 100,000 index rows and then filter them. A composite seek positions on the full key prefix in one descent.
+
+What actually decides column order, in priority order:
+
+The three-star model. Lahdenmäki and Leach's Relational Database Index Design and the Optimizers gives the standard framework, and it is worth being able to recite:
+
+1, Rows the query wants are adjacent in the index, equality predicates form the leading key columns, The seek reads a contiguous range instead of filtering.
+2, Index rows are already in the query's required order, No Sort operator.
+3, The index contains all columns the query needs, No lookups (covering).
+
+A three-star index is the best possible index for one query shape. You cannot give three stars to every query, and trying is how tables end up with thirty indexes. The judgement is which queries deserve which stars.
+
+In the real world: a reporting query on a multi-tenant orders table was tuned by a contractor who applied "most selective first" faithfully. OrderReference had the highest cardinality, so the index went in as (OrderReference, TenantId, CreatedAt).
+It was measurably excellent for the one query used to justify it, which filtered on all three, and useless for everything else in the application, because nothing else knew an order reference up front.
+The screens that filtered by tenant and date still scanned, so the next sprint added (TenantId, CreatedAt), and now the table carried two indexes where one (TenantId, CreatedAt, OrderReference) would have served both plus the tenant-only queries.
+Nobody had done anything careless; the rule they were following was just the wrong rule. Selectivity decides how good an index is for one query. The leading column decides how many queries it can serve at all, and that is the decision with the bigger blast radius.
+
+-- pause --
+Section 8. Index Sorting.
+
+-- pause --
+How Sorting Works.
+
+Leaf Level Layout (Key Order, not physical placement on disk):
+
+-- pause --
+1. Binary Search.
+
+️ A seek is not a binary search over the sorted list, and the difference is why B-trees beat balanced binary trees on disk. A B+ tree descends level by level.
+Within each 8 kilobytes page the engine does binary-search the rows, but the number of pages it touches is the depth of the tree, and depth is governed by fanout: how many child pointers fit on one page.
+With a narrow key, an 8 kilobytes page holds hundreds of entries, so each level multiplies capacity by hundreds rather than by two.
+
+Binary tree over 1,000,000 rows: log2(1,000,000) approximately 20 node reads.
+B+ tree, fanout ~400: log400(1,000,000) approximately 3 page reads.
+
+Twenty random reads versus three. That gap, not sortedness in the abstract, is why every disk-backed index in every major engine is a B-tree variant.
+It also explains why key width matters so much: a wider key means fewer entries per page, which means lower fanout, which means a deeper tree, which means more page reads on every seek. "Narrow keys make shallow trees" is the whole argument in five words.
+
+-- pause --
+Sort Order Control.
+
+️ Correction, for a single-column sort, DESC in the index buys you almost nothing, and the reason it sometimes does is not the one usually given.
+A B-tree's leaf pages are doubly linked, so sequel Server can read any index backwards; an ascending index serves ORDER BY CreatedAt DESC with a backward ordered scan at essentially the same cost. There is no "reverse scan penalty" to avoid.
+
+The two cases where DESC genuinely matters:
+
+Mixed sort directions in a composite index. ORDER BY TenantId ASC, CreatedAt DESC cannot be satisfied by (TenantId ASC, CreatedAt ASC) in either direction, reading that index backwards gives you TenantId DESC, CreatedAt DESC. You need (TenantId ASC, CreatedAt DESC) to eliminate the Sort.
+This is the real use case and it is the one interviewers ask about.
+Parallelism. sequel Server cannot use a parallel plan with a backward ordered scan. On a large scan-and-aggregate query, matching the index direction to the query's direction is what lets the plan go parallel.
+This is well documented in the sequel Server community, Brent Ozar's When Should You Use DESC in Indexes? is the accessible write-up, and it is a genuine reason to add DESC to a warehouse index.
+
+Engine note: MySQL ignored DESC in index definitions entirely before 8.0, " DESC in an index definition is no longer ignored but causes storage of key values in descending order.
+Previously, indexes could be scanned in reverse order but at a performance penalty" (MySQL Reference Manual, Descending Indexes). Postgres Q L has stored real DESC ordering for far longer, and also has NULLS FIRST / NULLS LAST as part of the index definition.
+
+-- pause --
+How sequel Maintains Sorting.
+
+Page splits, the mechanism behind fragmentation, and behind fill factor.
+
+Microsoft's guidance on the countermeasure is narrower than folklore suggests: "To avoid lowering page density unnecessarily, Microsoft doesn't recommend setting fill factor to values other than 100 or 0, except in certain cases for indexes experiencing a high number of page splits.
+For example, this can occur in frequently modified indexes with the leading column that contains nonsequential GUID values" (Microsoft Learn, Maintain indexes optimally). A fill factor 100 reserves empty space everywhere, permanently, to absorb inserts that only land in some places.
+On a monotonically increasing key, inserts only ever go to the rightmost page, so the reserved space is never used and you have simply made every scan read more pages.
+
+-- pause --
+Section 9. Covering Indexes.
+
+-- pause --
+Without Covering Index.
+
+Two-Step Process:
+
+Visual Representation:
+
+-- pause --
+The Solution: Covering Index.
+
+One-Step Process:
+
+Visual Representation:
+
+-- pause --
+Performance Comparison Table.
+
+Size, Key columns + row locator, Plus every INCLUDE column, at the leaf only.
+Work per row returned, Seek + one lookup, Seek only.
+Reads, Index + base table, Index only.
+Plan operator, Index Seek + Key Lookup (or RID Lookup on a heap), Index Seek alone.
+Write cost, Updated when key columns change, Also updated when any INCLUDE d column changes.
+Degrades when, Many rows returned, see the tipping point, Too many or too wide INCLUDE s.
+Use Case, Selective predicates, Known, hot query shapes.
+
+-- pause --
+The tipping point: why the optimizer abandons your index.
+
+The most common "the index is there and it isn't using it" ticket has nothing to do with a broken index. It is the optimizer doing arithmetic correctly.
+
+A seek-plus-lookup plan costs one tree descent per row returned, and those descents are effectively random reads scattered across the table. A clustered index scan costs one pass over the table's pages, sequentially.
+As the estimated row count rises, the lookup plan's cost rises linearly while the scan's stays flat, and they cross.
+
+Kimberly Tripp (SQLskills) is the standard reference for where the crossing happens on sequel Server, and the number is the surprising part: it is expressed in pages of the table, not rows, and not percent of rows.
+Roughly, a non-clustered seek with lookups tends to survive while estimated rows are about 25% of the table's page count, and a scan tends to win about 33% of it. Since a page holds many rows, that can be a very small fraction of the rows, a few percent is enough to tip a wide table.
+
+Three things follow:
+
+A "bad plan" is often a good decision on a bad estimate. If statistics say 40 rows and reality is 400,000, the optimizer picked the lookup plan for a query that would never have qualified. Fix the estimate, not the plan.
+Covering removes the cliff entirely. With no lookup, the per-row cost disappears and the curve flattens. This is the real argument for INCLUDE: not "it's faster", but "it stops being a cliff."
+The threshold is a behaviour, not a constant. Parallelism, memory, table size and server settings all move it.
+Quote it as "somewhere in the region of a quarter to a third of the table's pages, per Kimberly Tripp's work at SQLskills" and you're on solid ground; quote it as an exact percentage of rows and you'll be wrong.
+
+-- pause --
+Covering indexes on Postgres Q L do not work the way you expect.
+
+Postgres Q L 11+ supports INCLUDE, so the syntax transfers. The guarantee does not.
+
+Visibility information in Postgres Q L lives in the heap tuple, not the index entry, the docs state it plainly: "Visibility information is not stored in index entries, only in heap entries;
+so at first glance it would seem that every row retrieval would require a heap access anyway." The escape hatch is the visibility map: "An index-only scan, after finding a candidate index entry, checks the visibility map bit for the corresponding heap page.
+If it's set, the row is known visible and so the data can be returned with no further work. If it's not set, the heap entry must be visited to find out whether it's visible, so no performance advantage is gained over a standard index scan."
+
+So on Postgres Q L a covering index gives you an Index Only Scan only when VACUUM has recently marked the relevant heap pages all-visible.
+On a table taking steady writes, the visibility map lags, EXPLAIN (ANALYZE, BUFFERS) shows a non-zero Heap Fetches, and your "covering" index quietly performs like an ordinary one.
+The lever is autovacuum aggressiveness on that table, not the index definition, which is not a lever a sequel Server background suggests looking for.
+
+In the real world: an order-list endpoint was covered properly, (customer_id, created_at) INCLUDE (status, total), and stayed fast for two years. Then a product change added ShippingRegion to the DTO the endpoint returned.
+One property on a C sharp record; one extra column in the SELECT that E F Core generates; and the plan went from a single seek to a seek plus one key lookup per row. Nothing failed, nothing errored, no alert fired.
+p99 drifted up over a release and was written off as traffic growth, and the connection to that pull request was never made because the pull request touched no sequel.
+The point is where a covering index's contract actually lives: it is defined by the column list of every query that depends on it, and that list is in the application code, not the schema. An index is the only kind of production dependency that can be broken by editing a DTO.
+Either the entity carries a comment naming the index it feeds, or a test asserts the plan shape, or the next projection change silently undoes the tuning.
+
+-- pause --
+Section 10. Index Fragmentation.
+
+-- pause --
+What is Fragmentation?.
+
+Fragmentation occurs when index pages are scattered across disk instead of being contiguous.
+
+-- pause --
+Fragmentation Levels and Impact.
+
+️ These thresholds are the most-copied and least-defensible numbers in sequel Server operations, and the "30-50% slower" impact column was invented, no source supports it.
+Microsoft's current position, verbatim from Maintain indexes optimally to improve performance and reduce resource utilization: "Index maintenance decisions should be made after considering multiple factors in the specific context of each workload, including the resource cost of maintenance.
+They shouldn't be based on fixed fragmentation or page density thresholds alone." Four things a senior candidate should be able to add:
+
+1. Page density usually matters more than logical fragmentation. Microsoft: "In many workloads, increasing page density results in a greater positive performance impact than reducing fragmentation." Logical fragmentation costs you when a scan has to jump between out-of-order pages.
+Low page density costs you always, more pages to read, more buffer pool consumed to cache the same rows, higher estimated I O cost which can change the plan the optimizer picks. The column to watch is avg_page_space_used_in_percent, and almost nobody's maintenance script looks at it.
+
+2. On flash, half the argument evaporates. Fragmentation hurts because sequential I O beats random I O. Microsoft notes that "for most types of storage used in Azure sequel Database and Azure sequel Managed Instance, there's no difference in performance between sequential I O and random I O.
+This reduces the impact of index fragmentation on query performance." The reorganize-then-rebuild rule, quoted as 5 or 30 as often as the 10 or 30 in the box, which is itself a sign nobody measured either, was written for spinning disks with moving heads.
+
+3. The rebuild that "fixed" performance usually fixed the statistics. This is the best single fact to have ready. Microsoft again: "Customers often observe performance improvements after rebuilding indexes.
+However, in many cases these improvements are unrelated to reducing fragmentation or increasing page density.
+In reality, the same benefit can often be achieved at a much lower resource cost by updating statistics instead of rebuilding indexes." A rowstore rebuild updates the index's statistics by scanning every row, the equivalent of WITH FULLSCAN, and that recompiles the plans that referenced them.
+
+4. Small indexes report meaningless fragmentation. "Rebuilding or reorganizing small rowstore indexes usually doesn't reduce fragmentation. Up to, and including, sequel Server 2014 (12.x), the sequel Server Database Engine allocates space using mixed extents.
+Mixed extents are shared by up to eight objects, so the fragmentation in a small index might not be reduced after reorganizing or rebuilding it." This is why maintenance scripts filter on page_count > 1000, not as a performance heuristic, but because the number that is noise.
+
+In the real world: a nightly ALTER INDEX ALL. REBUILD job on a 400 gigabytes database had run for years and was defended on the grounds that queries were visibly slower on the mornings it failed. That observation was correct; the explanation was not.
+When the job was replaced with UPDATE STATISTICS on the same tables as an experiment, the morning slowdowns stopped just the same, the rebuild's real contribution had always been a full-scan statistics refresh, and the eight hours of I O and log generation around it were incidental.
+The job had also been quietly harming the environment in a way nobody had connected to it: it generated enough transaction log to make the geo-replica lag every night, and a failover during that window would have taken far longer than the RTO everyone had signed off.
+Replacing rebuild-by-schedule with statistics-by-default and rebuild-by-evidence cut the maintenance window to minutes.
+Before you defend an index maintenance job, be able to say which of the two things it does, defragment, or refresh statistics, is the one your workload is actually benefiting from.
+
+-- pause --
+REBUILD (Offline, Complete).
+
+️ "Reduces fragmentation to 0%" and the per-100MB timings were unsourced and are removed.
+The claim that matters more is the asymmetry Microsoft states directly:
+"Statistics aren't updated when an index is reorganized." That produces the classic own goal, a maintenance script reorganizes an index, then runs UPDATE STATISTICS with default sampling over a table whose statistics were previously full-scan quality from an earlier rebuild.
+The script "did maintenance" and left the optimizer with worse information than it started with.
+
+In the real world: an index was added to fix a slow endpoint on a 300-million-row Postgres Q L table, at 11am, with a plain CREATE INDEX. Checkout began timing out within a minute.
+Nothing had deadlocked and the index definition was correct, writers were simply queued behind the SHARE lock that a non-concurrent build holds for its entire duration, and there was no way out except cancelling the build and starting again that evening with CONCURRENTLY.
+The sequel Server equivalent is WITH (ONLINE = ON), with the sting that it is Enterprise-only, so the statement that works in the DBA's Enterprise test instance silently blocks on a Standard-edition production box.
+On a busy table, the concurrent form is not an optimisation to remember at review time; it is the only form of the statement anyone should be typing.
+
+-- pause --
+Automated Defragmentation Script.
+
+️ The script that was here did not run. It contained two errors worth recognising because both are common: ALTER INDEX.
+REBUILD accepts no WHERE clause (it is DDL, not DML), and EXEC sp_executesql N'.' + @var is a syntax error, sp_executesql requires its statement as a single variable or literal, not a concatenation expression.
+The corrected version also fixes a third, quieter problem: it uses SAMPLED rather than LIMITED mode so that avg_page_space_used_in_percent is actually returned, since page density is the metric worth acting on.
+
+QUOTENAME is not decoration here: index and table names come from a catalog view, and concatenating them into dynamic sequel without it is how a maintenance script becomes an injection vector, a real risk in any system where users can name objects.
+
+-- pause --
+Section 11. Query Optimizer.
+
+-- pause --
+The Role of Query Optimizer.
+
+The Query Optimizer is the "intelligent brain" of sequel Server that decides how to execute your query for optimal performance.
+
+-- pause --
+Problem 3: Parameter Sniffing.
+
+️ Solution 2 is presented as a fix; it is really a trade, and knowing which trade is the interesting part.
+The optimizer cannot see the runtime value of a local variable, so it stops sniffing and falls back to the average density from the statistics object, mathematically identical to OPTION (OPTIMIZE FOR UNKNOWN), just harder to read.
+That does not give you a good plan; it gives you the same mediocre plan for every value. For the tenant with 50 rows and the tenant with a million, you now get one compromise plan that suits neither.
+It is the right answer only when consistency of latency matters more than best-case latency, a real preference, but state it as a preference.
+
+The full ladder, in the order you should reach for them:
+
+| Approach | What it does | Cost |.
+| OPTION (RECOMPILE) | Compiles per execution with the actual value, and can also fold the value into a filtered-index match | Compilation C P U on every call; no plan reuse; the plan is not cached for you to inspect later |.
+| OPTIMIZE FOR (@p = ) | Pins the plan to one representative value | Wrong for values unlike that one; needs revisiting as data shifts |.
+| OPTIMIZE FOR UNKNOWN / local variable | Density-average plan for everyone | Nobody gets the good plan |.
+| Split the procedure | Separate procedures (or branches) for the "big tenant" and "small tenant" shapes, each getting its own cached plan | Duplicated code; you must be able to classify at call time |.
+| Query Store forced plan | Pin a known-good plan operationally, no code change | Silent rot when the data distribution moves under it |.
+
+Note also that sequel Server 2022 added Parameter Sensitive Plan optimization, which caches multiple plan variants for a single parameterised statement and dispatches on the parameter's estimated cardinality bucket, worth naming if the interviewer is on a current version,
+because it changes "what would you do" into "what does the engine now do for you".
+
+-- pause --
+Optimizer Hints (Override Optimizer).
+
+️ Three corrections to the original hint examples, all of which would be caught in an interview.
+
+** FORCESEEK does not force a scan, it forces a seek. The comment "force full table scan" attached to it had the meaning exactly inverted. The hint that forces a scan is FORCESCAN, added in sequel Server 2008 R2 SP1.
+FORCESEEK is stricter than it looks: if no seek is possible on any index, the query does not fall back to a scan, it fails to compile**. That is occasionally useful as a guard rail and usually a foot-gun.
+OPTIMIZE FOR does not suggest an index. It tells the optimizer to compile as though a parameter held a given value. The original example applied it to an ad-hoc statement with literals and no parameters at all, which cannot compile.
+There is also OPTION (OPTIMIZE FOR UNKNOWN), which asks for a plan based on average density rather than any specific value.
+NOLOCK is not a performance hint and does not belong in an example about index choice. It is READ UNCOMMITTED spelled differently.
+It permits dirty reads, and less famously it permits missing and duplicated rows, an allocation-order scan can skip or revisit rows when page splits move them mid-scan, so a NOLOCK COUNT(*) can be wrong in either direction with no error raised.
+If the goal is "readers shouldn't block writers", the correct tool on sequel Server is RCSI ( READ_COMMITTED_SNAPSHOT ON ), which gives a statement-consistent view via the version store instead of abandoning consistency altogether.
+
+-- pause --
+Key Takeaway: Trust but Verify.
+
+️ The "99% / 1%" split was invented. It also frames the problem badly: bad plans are not random misfires, they are a short list of failure modes with names. Learning the names is what lets you diagnose instead of guess, the two most valuable are.
+
+-- pause --
+SARGability: predicates the engine cannot seek on.
+
+The word never appeared on this page and it is the most useful piece of vocabulary in query tuning. A predicate is SARGable (Search ARGument-able) if the engine can turn it into a seek boundary, a start and end position in the index.
+The rule is one sentence: the indexed column must appear alone on one side of the comparison. Wrap it in anything and the B-tree, which is sorted on the raw column value, no longer knows where to start.
+
+Two notes that separate a real answer from a memorised one:
+
+LIKE 'ABC%' seeks; LIKE '%ABC' cannot. A B-tree can find everything starting with a prefix because that is a contiguous range. It cannot find everything containing a substring, because those entries are scattered. This is not a sequel Server limitation, it is what sorted order means.
+Postgres Q L's escape hatch is a pg_trgm GIN index; sequel Server's is full-text search.
+The dot NET-specific one: implicit conversion. A varchar(32) column compared against a parameter that E F Core sends as nvarchar, the default for a string property, triggers sequel Server's data type precedence rules, which convert the column to nvarchar for every row.
+The seek is gone and the DDL is untouched. The tells are in the plan: CONVERT_IMPLICIT(nvarchar(32), [reference], 0) inside the predicate, plus a plan-level warning that the conversion "may affect SeekPlan in query plan choice". The fix is .IsUnicode(false) on the property mapping.
+This is probably the easiest way for a dot NET application to defeat an index it correctly created.
+
+-- pause --
+Seek predicate versus residual predicate: the ratio that matters.
+
+"Is it using an index?" is the wrong question, and the plan will happily say Index Seek while doing an enormous amount of work. What a seek does is establish a range to read; anything the index cannot bound is applied afterwards, as a residual predicate, to rows already fetched.
+
+41 is what the user sees. 380,000 is what the server did. The operator is a seek, the index is "being used", and the query is reading four hundred thousand rows to return forty.
+
+Where to find the two numbers:
+
+sequel Server, Seek Predicates in the operator properties, Predicate, and Number of Rows Read next to Actual Number of Rows, actual plans only, in the properties pane, not on the face of the plan.
+Postgres Q L, Index Cond, Filter and Rows Removed by Filter in EXPLAIN ANALYZE.
+MySQL, key_len in EXPLAIN shows how much of the key bounded the seek, rows_examined versus rows_sent; EXPLAIN ANALYZE from 8.0.18.
+
+The fix is almost never a hint. It is moving the residual column into the index key so that it bounds the scan instead of trimming its output, which, per Rule 1 in the column-order section, usually means putting the equality column before the range column.
+
+In the real world: a slow query was escalated with a screenshot of its plan attached and the note "it's using the index, so it isn't the index". Two things were wrong with the artefact used to close the investigation.
+It was an estimated plan, so it contained no Rows Read at all, estimated plans are free and silent about the one number that mattered. And it had been captured against a developer database holding a small fraction of production's rows, where the estimate of forty rows happened to be correct.
+In production the same operator read close to a million. The query survived two reviews and a "we already checked the index" reply before anyone opened the properties pane on an actual plan from the live system.
+Everyone who tunes sequel for a living converges on reading one ratio before anything else: rows read per row returned. If it is near 1, the index fits the query. If it is in the thousands, the index is bounding the wrong thing, whatever the operator is called.
+
+-- pause --
+Statistics: the histogram the optimizer is actually reading.
+
+"Update your statistics" is advice everyone repeats and few can justify. Knowing the structure lets you explain which estimates go wrong and why.
+
+A sequel Server statistics object has two parts:
+
+A histogram, built on the first key column only, never on the others. It aggregates values into "a maximum of 200 contiguous histogram steps" (Microsoft Learn, Statistics), each holding a range, its upper bound, the row count equal to that bound, and the count and distinct count within the range.
+A density vector, holding 1 / (number of distinct values) for each prefix of the key columns. For key columns (CustomerId, ItemId, Price), densities are stored for (CustomerId), (CustomerId, ItemId) and all three.
+Density is how the optimizer estimates when it cannot use the histogram, which is exactly the local-variable and OPTIMIZE FOR UNKNOWN case.
+
+Two consequences fall straight out of the structure:
+
+200 steps for any number of distinct values. On a column with millions of distinct values, each step covers a huge range and estimates within it are interpolated averages. Skew inside a step is invisible.
+This is why a heavily skewed column can produce good estimates for the values that earned their own boundary and bad ones for everything else.
+
+Only the leading column gets a histogram, so WHERE Country = 'PK' AND City = 'Karachi' has to be estimated by combining two separate single-column selectivities, and those columns are not independent.
+The legacy cardinality estimator simply multiplied them, as if they were;
+the estimator introduced in sequel Server 2014 (compatibility level 120 and, the default since) uses exponential backoff instead, it sorts the selectivities and applies progressively weaker exponents to the less selective ones,
+which softens the underestimate without fixing the underlying blindness to correlation.
+Either way the estimate comes out too low, the optimizer picks a plan for far too few rows, and you get the tipping-point failure described earlier. The named fix on Postgres Q L is extended statistics ( CREATE STATISTICS.
+ON country, city FROM customers ); on sequel Server it is a multi-column statistics object or a filtered statistic.
+
+When does auto-update fire? With AUTO_UPDATE_STATISTICS on, from sequel Server 2016 at database compatibility level 130 or, the threshold for a table of n rows where n > 500 is MIN(500 + (0.20 n), SQRT(1000 n)) modifications (Microsoft Learn, Statistics).
+Microsoft's own worked example: a 2,000,000-row table takes the minimum of 500 + 0.20 times 2,000,000 = 400,500 and SQRT(1000 times 2,000,000) = 44,721, so statistics refresh every 44,721 modifications. compatibility level 130 the old rule applies, 500 + (0.20 * n), that is
+400,500 for that same table, roughly nine times less often, and trace flag 2371 is the pre-2016 way to opt into the dynamic threshold.
+
+In the real world: a nightly import loaded the day's rows into a 200-million-row table, and the first report to run afterwards took twenty minutes instead of one. Nothing had been deployed and no index had changed.
+The import had inserted rows carrying today's date; statistics still described yesterday's maximum; and the report's WHERE created_at >= @today therefore sat past the end of the histogram, where the optimizer estimates a handful of rows.
+It picked a nested-loop plan built for a handful of rows and ran it against millions.
+The auto-update threshold scales with table size, so a big table is slow to notice its own change:
+by the formula, a 200-million-row table needs SQRT(1000 times 200,000,000) approximately 447,000 modifications before statistics refresh themselves, and under the pre-2016 rule it would have been 500 + 0.20 times 200,000,000 = 40 million, which is to say never, in practice, for a daily import.
+Either way the import was too small to trip it and too significant to ignore. Moving UPDATE STATISTICS to the end of the import job, rather than leaving it to a maintenance window with its own unrelated schedule, made it stop happening.
+The general rule this teaches: statistics maintenance belongs to whatever changes the data, not to the calendar. The specific pattern has a name worth knowing, the ascending key problem, and it is the reason created_at and IDENTITY columns are over-represented in "it was fine yesterday" incidents.
+
+-- pause --
+Section 12. Monitoring and Maintenance.
+
+-- pause --
+Key DMVs (Dynamic Management Views).
+
+️ All four queries were defective as originally written. Each fault is a common one, so they are named rather than quietly patched.
+
+Query 1 could not return its own answer. It LEFT JOIN ed sys.dm_db_index_usage_stats and then filtered on s.user_seeks +. = 0. An index that has never been touched has no row in that DMV, so the join yields NULLs, NULL = 0 evaluates to unknown, and the row is discarded by the WHERE.
+The query returned everything except the indexes it was written to find. It also omitted database_id from the join, the DMV covers the whole instance, so object_id values from other databases can match.
+Query 2 did not detect duplicates. Joining sys.indexes to itself on object_id and type_desc returns every pair of same-type indexes on a table. It never inspected a column. Duplication is a property of the key column list, so the key column list has to be in the query.
+The rewrite catches both shapes that matter, an exact duplicate key list, and a key list that is a strict prefix of another, which is why the comparison appends the delimiter to both sides.
+Query 3 named a DMV that does not exist. It is sys.dm_db_missing_index_group_stats, group, singular. The plural form fails with an invalid object name. The join column is index_group_handle to group_handle, not index_group_id.
+Query 4 asks LIMITED mode for a metric it does not return. LIMITED gives fragmentation but leaves avg_page_space_used_in_percent NULL, and page density is the number worth acting on (see above). Use 'SAMPLED'.
+Its CASE also encodes the 10 or 30 thresholds Microsoft has explicitly disowned, and it doesn't filter page_count, so it will report alarming fragmentation on eight-page indexes where the figure is meaningless.
+
+The missing-index DMVs are a hint generator, not a design tool, and creating what they emit is a well-known way to make a database worse. Microsoft publishes the constraints; these are the ones that bite, quoted from Limitations of the Missing Indexes Feature:
+
+"It is not intended to fine tune an indexing configuration."
+"It does not specify an order for columns to be used in an index.", the equality_columns come out in the DMV's own order (in practice, column-id order), not an order chosen for selectivity or ORDER BY support;
+Microsoft's own worked example is a query whose ideal index is (column_b, column_a) and whose suggestion lists column_a first.
+Reordering them is your job, and Rules 1-3 of the column-order section are how you do it. Microsoft's guidance for that reordering is "list equality columns first and then inequality columns.
+order them based on their selectivity, listing the most selective columns first" (Microsoft Learn, sys.dm_db_missing_index_group_stats, Example B).
+Note that this is consistent with Rule 4 rather than with the folklore version: equality before inequality is the load-bearing half, and selectivity is the tiebreak among the equality columns, once the range column is already last.
+"It cannot gather statistics for more than 500 missing index groups." Separately, the group-stats DMV's own documentation notes the result set "is limited to 600 rows." Two different documented limits, the tracking cap and the return cap, so quote whichever you mean.
+"For queries involving only inequality predicates, it returns less accurate cost information."
+"It reports only include columns for some queries, so index key columns must be manually selected."
+"It does not suggest filtered indexes."
+"It does not consider trivial query plans."
+
+Add the one Microsoft does not list, which is the most damaging in practice: the suggestions do not consider the indexes that already exist. The feature will happily propose (TenantId, Status) INCLUDE (Total) on a table that already carries (TenantId, Status, CreatedAt) INCLUDE (Total, CustomerId).
+Create both and you maintain two structures on every write to serve one query.
+The avg_user_impact figure is only the "average percentage benefit that user queries could experience if this missing index group was implemented" (Microsoft Learn, sys.dm_db_missing_index_group_stats ), a read-side estimate for the queries that wanted the index,
+and it says nothing at all about the write cost you are adding to every insert, update and delete on the table.
+
+In the real world: a performance sprint opened by sorting the missing-index DMV by impact and creating the top twenty suggestions verbatim, in one migration, on a Friday. Read latency did improve on the queries that had generated them, the DMV was not lying.
+Insert throughput on the busiest table collapsed the same afternoon, because six of the twenty were near-duplicates of one another and of indexes already present, several INCLUDE -ing the same wide columns, each one a full extra structure to maintain per row.
+The rollback was politically awkward in a way that is worth anticipating: dropping indexes the DMV was still actively recommending looked like undoing the fix, and it took a week of measurement to establish which four of the twenty were doing the work.
+The discipline that would have prevented it fits in three lines.
+Before creating any suggestion: check whether an existing index already leads with the same columns and could simply be widened; reorder the equality columns yourself; and look up how many writes per second the table takes, because the DMV never will.
+
+-- pause --
+Section 13. Real-World Scenarios.
+
+-- pause --
+Scenario 1: E-Commerce Platform.
+
+️ One defect in that DDL, and one thing to watch.
+
+The defect: Amount DECIMAL has no precision or scale, and sequel Server's default is DECIMAL(18, 0), zero decimal places. Every amount is silently rounded to whole currency units on insert.
+This is not an indexing bug, but it is in a money column in an orders table on a page about production systems, and it is exactly the class of thing that survives review because it reads as though it says something. Write DECIMAL(19, 4) or whatever your domain needs, always explicitly.
+
+The thing to watch: none of those four indexes is currently redundant, no key list is a prefix of another. But IX_TenantId_Status becomes redundant the moment someone adds (TenantId, Status, OrderDate) to let the admin dashboard sort, because (TenantId, Status) is a strict prefix of it.
+That is exactly the shape query 2 in the previous section is written to catch, and the point of running it periodically rather than once.
+
+In the real world: a month-end finance report was why checkout failed on the first of the month, twice, on sequel Server.
+The report scanned the orders table under the on-premises default, locking read committed, with a non-SARGable date predicate ( WHERE YEAR(OrderDate) = @yr AND MONTH(OrderDate) = @mo ).
+It therefore took shared locks on every row it read, not every row it returned, crossed the escalation threshold at around 5,000 locks on one table in one statement, and held a table lock for the length of the aggregation.
+The database was never "down" and no error was logged on the reporting side; it was doing precisely what read committed asks of it.
+Three fixes were proposed and eventually all three were applied, and the order mattered more than the list:
+first a covering index plus a SARGable rewrite so the report read the rows it needed instead of the table, then RCSI so readers stopped taking shared locks at all, then a read replica so the report stopped competing with checkout for anything.
+Enabling RCSI first, the tempting one, because it is a single ALTER DATABASE, would have moved the cost into the tempdb version store while the query still read a table's worth of rows to return a page of totals.
+Note the engine dependency in all of this: Postgres Q L's MVCC means readers never block writers to begin with, so this incident cannot happen there, and new Azure sequel Database databases have RCSI on by default, so the same code will not reproduce it on Azure.
+
+-- pause --
+Scenario 3: High-Volume Log Table.
+
+In the real world: an ActivityLogs table taking roughly ten million rows a day was indexed exactly as and performed well for a quarter. Then support asked for "search logs by user across all time", and an index went on (UserId, Timestamp DESC).
+Insert throughput dropped immediately and visibly, because UserId is effectively random across concurrent requests, every insert now had to find a different leaf page in the new index and split it, on a table whose whole design premise was append-only sequential writes.
+The team had correctly reasoned about the number of indexes and not at all about their shape.
+What shipped instead was partitioning by month, dropping the UserId index, and pointing the support query at a nightly-refreshed copy in the reporting database, where a random-ordered index costs nothing because nothing writes to it in real time.
+The general shape of the lesson: on a high-write table, the cost of an index is not "one more structure", it is "one more structure written in this access pattern". A second sequential index is nearly free. A random-ordered one on the same table is not, and the index count is identical either way.
+
+️ Details NVARCHAR(MAX) on a table taking ten million rows a day deserves a second look regardless of indexing.
+LOB values over ~8,000 bytes move off-row into a separate allocation unit, so every read of a row that needs Details costs an extra I O;
+values under it stay in-row and consume the 8 kilobytes page budget that determines how many rows fit per page, and therefore how many pages every scan of the table has to read.
+Neither is wrong, but on a table this size it is a decision, not a default.
+
+-- pause --
+Section 14. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, B+ tree page splits and fillfactor.
+
+Q: What happens when you insert into a full B+ tree leaf page?-- think --
+
+A: Page split. The engine allocates a new page, moves half the existing keys plus the new key to it, and updates the parent node to point at both pages. If the parent is full too, the split cascades upward; at worst, the root splits and the tree grows a level.
+Cost: extra I O during the split, fragmentation (the two new pages are at ~50% fill), and write amplification.
+
+Cross-Q: How does FILLFACTOR prevent splits?-- think --
+
+A: FILLFACTOR = 80 tells the engine to leave 20% of each page empty when creating or rebuilding the index. New inserts fit into the slack without splitting until the page reaches capacity.
+Trade-off: 25% larger index from the start (you reserved space), more I O per scan, but far fewer splits during writes.
+Microsoft's guidance is narrower than the folklore:
+it "doesn't recommend setting fill factor to values other than 100 or 0, except in certain cases for indexes experiencing a high number of page splits", its own example being a frequently modified index whose leading column holds nonsequential GUIDs (Microsoft Learn, Maintain indexes optimally).
+
+Cross-Q²: When does FILLFACTOR backfire?-- think --
+
+A: When inserts are monotonically increasing (for example, IDENTITY column, sequential GUID, timestamp). New rows always land at the rightmost page; there's no need for slack in older pages. FILLFACTOR < 100 just wastes space and adds I O without preventing any splits.
+For append-only patterns, use FILLFACTOR = 100. Random-insert patterns (GUID PK, hash-distributed keys) are the one case Microsoft documents as an exception, and even there, set the value from that index's measured page-split rate rather than from a rule of thumb.
+
+-- pause --
+Drill 2, Hash indexes versus B-tree.
+
+Q: When would you reach for a hash index instead of a B-tree?-- think --
+
+A: Pure equality lookups with no range queries, where the hash's O(1) average beats the B-tree's O(log N). Postgres Q L hash indexes (since v10 write-ahead log-logged), Hekaton hash indexes in sequel Server in-memory tables.
+Hash indexes can't help with ranges ( >, <, BETWEEN ) or ordered scans ( ORDER BY ), those need a B-tree.
+
+Cross-Q: Why do hash indexes have a bad reputation despite better complexity?-- think --
+
+A: Constants matter. B-tree depth is ~4-5 for billion-row tables, that's 4-5 cache-friendly node reads. Hash index lookup is one hash computation + one bucket read, but the bucket is often a less cache-friendly memory access, and hash collisions add chain traversal.
+On modern hardware, B-tree's predictable access pattern often beats hash. Hash also doesn't support partial matches, prefix searches, or any operator other than =.
+
+Cross-Q²: What's the killer use case for hash indexes today?-- think --
+
+A: In-memory O L T P. sequel Server Hekaton tables: lock-free hash indexes give microsecond-level lookups for trading platforms, ticket auctions, hot caches. Postgres Q L hash indexes mostly outperform B-tree on extremely uniform hash distributions with huge tables (billions of rows, equality-only).
+For disk-backed B-trees versus disk-backed hash, B-tree usually wins because the cache locality advantage is bigger than the algorithmic difference. For in-memory hash, the algorithmic advantage dominates.
+
+-- pause --
+Drill 3, GIN / GiST / BRIN.
+
+Q: Explain GIN, GiST, and BRIN, three Postgres-specific index types.-- think --
+
+A: GIN (Generalized Inverted Index), inverted index, like a search engine: each value points to all rows containing it. Used for JSONB containment ( @> ), array operators, full-text tsvector. Big indexes, slow writes, fast reads on multi-value columns.
+GiST (Generalized Search Tree), balanced tree with custom inner-node predicates; supports range types, geometric types, full-text. PostGIS uses GiST.
+BRIN (Block Range Index), stores min or max per block range (default 128 pages); tiny index, very fast to build, useful when data is physically clustered on the indexed column.
+
+Cross-Q: What's the killer use case for BRIN?-- think --
+
+A: Time-series tables where rows are appended in created_at order. A B-tree on created_at for a 1TB table is huge; a BRIN on created_at is tiny (~few megabytes) and can quickly identify which block ranges might contain rows in a date range. The query reads only matching blocks.
+Doesn't work if data isn't physically clustered, random insertion order means each block range covers the full date range, and BRIN can't prune anything.
+
+Cross-Q²: When does GIN's write cost become unbearable?-- think --
+
+A: Very high write rates on multi-value columns. Each insert or update touches every key in the indexed value (every word in a tsvector, every key in a JSONB).
+GIN updates are batched via the "pending list" (controlled by fastupdate and gin_pending_list_limit ), but the pending list must eventually flush. For write-heavy log tables with JSONB metadata, GIN can become the bottleneck. Mitigation: drop the GIN index during bulk loads, rebuild after.
+
+-- pause --
+Drill 4, Columnstore: compression + segment elimination.
+
+Q: How does a columnstore index achieve up to 10 times data compression?-- think --
+
+A: Columnstore stores values column-by-column instead of row-by-row. Each column's values are similar (same type, often similar distribution) to highly compressible.
+Techniques: dictionary encoding (replace strings with short integer codes), run-length encoding (compress repeating values), bit-packing (use only enough bits per value).
+A column of "Status" with five distinct values across a billion rows is almost entirely dictionary plus run-length codes, which is where the ratio comes from.
+Quote Microsoft's published figure, "up to 10 times the data compression over the uncompressed data size", and not the 100 times or 90% numbers that circulate unsourced (see the columnstore section above).
+
+Cross-Q: What's segment elimination?-- think --
+
+A: Columnstore segments group ~1M rows. Each segment stores min or max per column. A query WHERE created_at > '2025-01-01' checks each segment's min or max, segments entirely before 2025-01-01 are skipped without reading their data.
+Combined with high compression, a 10TB columnstore table can answer aggregate queries by reading 1-2 gigabytes of data. For analytical queries, columnstore is the right answer.
+
+Cross-Q²: When is columnstore the wrong choice?-- think --
+
+A: O L T P point lookups. Reading a single row by PK requires decompressing the segment containing that row, expensive versus a B-tree's direct row fetch. Updates also struggle: columnstore segments are largely immutable; updates go to a delta store that's periodically merged in.
+High-frequency updates create a large delta store and degrade scan performance. Rule: columnstore for O L A P (analytics, dashboards), B-tree for O L T P (transactional reads or writes). sequel Server's HTAP via "real-time operational analytics" combines both, but most workloads should pick one.
+
+-- pause --
+Drill 5, Bitmap indexes.
+
+Q: What's a bitmap index and where is it useful?-- think --
+
+A: An index where each distinct value maps to a bitmap, one bit per row, set if that row has the value. Best for low-cardinality columns. WHERE gender = 'F' AND status = 'Active' to AND two bitmaps together to done. Lightning fast for combining multiple low-cardinality predicates.
+Oracle has them; Postgres Q L has bitmap index scans (different, a runtime hybrid using B-tree results).
+
+Cross-Q: Why aren't bitmap indexes used for O L T P?-- think --
+
+A: Update cost. Modifying a row's value requires updating two bitmaps (clear old, set new) for every indexed column. With concurrent writers, locking entire bitmaps causes massive contention. Bitmap indexes are designed for O L A P / data warehouses with bulk loads and read-heavy workloads.
+Most modern data warehouses (Snowflake, BigQuery, Redshift) use columnstore + zone maps instead, same idea, different implementation.
+
+Cross-Q²: What's a "bitmap index scan" in Postgres Q L?-- think --
+
+A: Different concept. The planner uses a B-tree (or other) index to produce a list of matching tuple IDs, then builds an in-memory bitmap of pages to visit. Sorts the bitmap into physical order, scans those pages sequentially.
+Combines well with multiple indexes (BitmapAnd / BitmapOr operators), the planner can use indexes on gender and status separately, AND their bitmaps, then fetch only matching rows. Not a persistent bitmap index, but achieves similar AND or OR semantics at query time.
+
+-- pause --
+Drill 6, Index union versus intersection.
+
+Q: I have indexes on (a) and (b). My query is WHERE a = 1 AND b = 2. Does sequel Server use both?-- think --
+
+A: Sometimes, via index intersection. The optimizer can seek index A for rows matching a set to 1, seek index B for rows matching b set to 2, and intersect the two result sets. Often cheaper than scanning one index and filtering.
+The plan operator is "Hash Match (Inner Join)" between two Index Seeks.
+
+Cross-Q: When does intersection lose to a single composite index?-- think --
+
+A: When the composite (a, b) exists. A composite index seeks to (1, 2) directly, one seek, one read. Intersection does two seeks plus a join, two reads minimum, plus join cost. The composite wins for known query shapes.
+Intersection is the fallback when you have many one-column indexes and the composite for this specific shape doesn't exist.
+
+Cross-Q²: Why prefer intersection over creating every possible composite?-- think --
+
+A: Composite indexes are specialized. Three single-column indexes serve 7 query shapes (each individual column + all subsets). Three two-column composites + originals would cover all six pairs but at much higher write cost and storage.
+For workloads with diverse query shapes (many ad-hoc queries), individual column indexes + intersection give better coverage per byte. For workloads with a small set of hot queries, targeted composites win. Profile to choose.
+
+-- pause --
+Drill 7, Locking on index pages.
+
+Q: Does sequel Server lock index pages or only table rows?-- think --
+
+A: Both. Index pages are locked at multiple granularities (key locks, page locks, range locks for serializable). Reads take S locks (or use row versions under RCSI). Writes take X locks.
+Range queries under SERIALIZABLE take range locks covering the predicate range to prevent phantoms, these can block insertions of new matching rows by other transactions.
+
+Cross-Q: What's a "key lock" versus a "page lock"?-- think --
+
+A: Key locks ( KEY ) lock a specific index key entry. Page locks ( PAGE ) lock the entire 8KB page.
+The engine prefers row or key locks for concurrency; it may choose page granularity up front for a statement it expects to read most of an object, but under memory pressure or past the fine-grained-lock threshold it escalates to a table lock, never to a page lock (Microsoft Learn, kilobytes 323630).
+Page locks are coarser but cheaper to track. Application impact: a page lock can block updates to other rows on the same page even when they're unrelated.
+
+Cross-Q²: How does latch contention differ from lock contention?-- think --
+
+A: Latches are short-lived, in-memory synchronization primitives protecting buffer pool pages. Held for microseconds during a memory operation. Locks are logical, transaction-scoped, held for milliseconds-to-seconds.
+Latch contention shows as PAGELATCH_* waits and indicates "many threads hitting the same hot page", common with monotonically increasing PKs (last page hotspot). Lock contention shows as LCK_M_* waits.
+Fix latch contention with hash-partitioned indexes or by changing insert patterns; fix lock contention with shorter transactions, RCSI, or lower isolation.
+
+-- pause --
+Drill 8, Latch contention on hot pages.
+
+Q: What's the "last-page insertion contention" problem?-- think --
+
+A: With a monotonically increasing PK (IDENTITY, sequential GUID, timestamp), every new INSERT writes to the same rightmost leaf page. Under high concurrency, threads pile up on a latch protecting that page.
+Symptom: high PAGELATCH_EX waits, dropping insert throughput dramatically as concurrency increases.
+
+Cross-Q: How do you mitigate it?-- think --
+
+A: Several approaches: (1) hash-partition the index, OPTIMIZE_FOR_SEQUENTIAL_KEY = ON in sequel Server 2019+ reduces contention by quasi-randomizing inserts; (2) use a UUIDv4 PK (random) instead of sequential, spreads inserts across all leaves but kills cache locality;
+(3) batch inserts in larger transactions to reduce latch acquire or release frequency; (4) shard the table, multiple tables with different PK seeds, application picks one.
+
+Cross-Q²: Why is this a worse problem than it used to be?-- think --
+
+A: Hardware. Modern servers have 64-128+ cores. With 100 threads inserting concurrently, even a 100-nanosecond latch acquire-release serializes them. On a 4-core 2010 server, the contention was hidden by C P U bottleneck elsewhere.
+Modern CPUs are fast enough that latch contention becomes the dominant cost. sequel Server's OPTIMIZE_FOR_SEQUENTIAL_KEY was added specifically for this, it batches threads into "queues" that grab the latch in order, reducing CAS contention.
+
+-- pause --
+Drill 9, Page-level versus row-level locking.
+
+Q: When does an engine pick page locks over row locks?-- think --
+
+A: At lock-granularity selection time, not by escalation, and keeping those two apart is the whole answer.
+sequel Server allocates ~96 bytes per lock; with 5,000 row locks held that is ~500 kilobytes for one statement, so the engine will start a statement at page or table granularity when it expects to touch most of an object (bulk inserts, full scans, a PAGLOCK / TABLOCK hint).
+What it will not do is convert row locks into page locks afterwards. Microsoft Learn's Transaction locking and row versioning guide is explicit: "The Database Engine doesn't escalate row or key-range locks to page locks, but escalates them directly to table locks.
+Similarly, page locks are always escalated to table locks." Escalation itself fires when a single statement acquires at least 5,000 locks on one nonpartitioned table or index (retried every 1,250 new locks if the first attempt is blocked),
+or on the lock-memory threshold, and the result is a table lock, with no page-lock stop on the way.
+kilobytes 323630 says it in one line: "Lock escalation always escalates to a table lock, and never to a page lock."
+
+Cross-Q: Can you force row-level only?-- think --
+
+A: ALTER TABLE. SET (LOCK_ESCALATION = DISABLE), but it's rarely a win. Disabling escalation means lock memory can grow unbounded, leading to out-of-memory errors. WITH (ROWLOCK) hint per query is similarly fragile, engine can ignore it under pressure.
+Better fix: rewrite the operation to touch fewer rows per transaction, or restructure the schema to localize hot updates.
+
+Cross-Q²: How does Postgres differ?-- think --
+
+A: Postgres uses row-level locks tracked via in-row metadata (xmax) plus a dedicated multixact structure for shared locks. No escalation. Locks are tied to MVCC row versions.
+Trade-off: Postgres can have very high lock counts without memory issues, but bulk updates create many dead tuples that VACUUM must clean up. sequel Server escalates to save memory; Postgres pays in VACUUM workload instead.
+
+-- pause --
+Drill 10, Lock escalation due to scan.
+
+Q: My UPDATE statement is supposed to touch 100 rows. Why is it suddenly locking the whole table?-- think --
+
+A: Probably an unindexed predicate. UPDATE orders SET status = 'X' WHERE customer_id = 7, if there's no index on customer_id, the engine scans the entire table to find matches. It locks every row it scans (to ensure consistency), millions of locks to escalation to table lock.
+The "100 rows updated" is the visible outcome; the locking footprint is the entire table.
+
+Cross-Q: How would you diagnose this in production?-- think --
+
+A: sys.dm_tran_locks for the running session shows current lock counts and resources. sp_WhoIsActive (Adam Machanic's free tool) shows blocking + locks per session. Or examine the execution plan, a Clustered Index Scan + Update indicates the lock footprint matches the scan, not the rowcount.
+The fix is the missing index, which makes both the query fast AND limits the lock footprint to seek's worth of rows.
+
+Cross-Q²: Why does scan-then-update lock everything instead of releasing as it moves?-- think --
+
+A: Isolation guarantees. Under REPEATABLE READ or SERIALIZABLE, locks must be held until commit to prevent phantoms or non-repeatable reads.
+Even under READ COMMITTED, the engine holds U (update intent) locks throughout the scan to prevent another transaction from modifying rows the scan hasn't yet evaluated. Releasing locks mid-scan would allow other transactions to modify rows the update was about to skip, breaking consistency.
+The engine prioritizes correctness over lock-footprint optimization.
+
+-- pause --
+Drill 11, KEY_LOOKUP versus RID_LOOKUP.
+
+Q: In sequel Server execution plans, when do you see KEY_LOOKUP versus RID_LOOKUP?-- think --
+
+A: KEY_LOOKUP appears on tables with a clustered index, the nonclustered index leaf holds the clustered key, and the lookup uses that key to find the row in the clustered index B-tree.
+RID_LOOKUP appears on heap tables (no clustered index), the nonclustered index leaf holds a Row Identifier (file:page:slot), and the lookup goes directly to that physical location.
+
+Cross-Q: Is one faster than the other?-- think --
+
+A: RID_LOOKUP is slightly faster on a per-lookup basis (direct page access versus B-tree traversal) but only by a few microseconds. The much bigger consideration is whether the lookup happens at all, covering indexes eliminate both.
+For heap tables, scans and lookups are common; for tables with proper clustered indexes, RID_LOOKUP shouldn't exist. Seeing RID_LOOKUP often means "this should have a clustered index."
+
+Cross-Q²: Why might you intentionally keep a heap (no clustered index)?-- think --
+
+A: Rare cases: (1) ETL staging tables where bulk inserts dominate, heaps insert slightly faster than clustered indexes because there's no PK B-tree to maintain; (2) tables where every query reads via covering nonclustered indexes, clustered index is dead weight;
+(3) very small tables (< 8 pages) where scan is always cheap.
+Most production O L T P tables should have a clustered index. The default "heap unless you have a reason" rule has reversed to "clustered unless you have a reason."
+
+-- pause --
+Drill 12, Included columns versus key columns size impact.
+
+Q: I want to add (status, total) to my index on (customer_id). Should I extend the key or use INCLUDE?-- think --
+
+A: INCLUDE almost always. Adding to the key bloats every level of the B-tree, inner nodes hold key values to direct seeks, so wider keys mean fewer keys per inner page, which means a taller tree, more I O per seek, slower writes.
+INCLUDE columns only sit at the leaf level, they bloat the leaves but inner nodes stay slim. Use the key for columns you filter, sort, or join on; use INCLUDE for columns you only need to return.
+
+Cross-Q: When would adding to the key actually be better?-- think --
+
+A: When you also need to filter or sort by those columns. WHERE customer_id = 7 AND status = 'Paid' ORDER BY total DESC, putting status in the key (after customer_id ) lets the engine seek directly to that status.
+Putting status in INCLUDE means the engine seeks to customer_id then filters status in memory, scanning all of that customer's orders. The wider key adds tree-depth cost but eliminates scan cost, net win when the predicate is selective enough.
+
+Cross-Q²: How does the size impact compound across many indexes?-- think --
+
+A: Per-table index size = sum across all indexes; each indexed table contributes to total disk and memory footprint. A wide-key composite index might be 30% the size of the heap; adding 5 such indexes can make the table's index footprint 2-3 times the heap.
+Buffer pool fills with indexes, kicking out hot data, causing physical I O. Audit sys.dm_db_index_physical_stats for page_count, if total index pages > heap pages by 5 times, you have too much or wrong-shaped indexing.
+
+-- pause --
+Drill 13, Online index rebuild internals.
+
+Q: How does ALTER INDEX. REBUILD WITH (ONLINE = ON) work?-- think --
+
+A: sequel Server uses a "side-by-side" pattern: builds the new index alongside the old one while the table remains writable. Three concurrent structures: the old index (writable, source of truth), the new index (being built), and a "deletion bitmap" tracking which rows changed during the build.
+After the bulk build completes, a brief Sch-M lock swaps in the new index and discards the old. Total online except for the swap (milliseconds).
+
+Cross-Q: What's the catch?-- think --
+
+A: Three costs: (1) disk space, both indexes coexist during the build, ~2 times the index size temporarily; (2) write amplification, every UPDATE during the build must touch both indexes; (3) sort operations may spill to tempdb.
+Long online rebuilds also accumulate version history that VACUUM-like processes need to clean. Postgres Q L's REINDEX CONCURRENTLY uses a similar pattern with similar costs.
+
+Cross-Q²: When does the optimizer pick a non-resumable rebuild over resumable?-- think --
+
+A: Resumable rebuilds (sequel Server 2017+) checkpoint progress and allow pause or resume, useful for huge indexes that don't fit in a maintenance window. Costs more than non-resumable: each checkpoint creates additional log records, and the build runs slightly slower because of progress tracking.
+Use resumable for indexes > 10GB or maintenance windows < the expected rebuild time. Use non-resumable (the default) for smaller indexes where the simplicity is worth it.
+
+-- pause --
+Drill 14, Partition-aligned indexes.
+
+Q: What's a partition-aligned index?-- think --
+
+A: An index whose partition scheme matches the table's. Each partition of the table has its own corresponding index partition with the same boundaries. Maintenance operations (truncate partition, switch partition out) can include the index atomically.
+Queries hitting one partition use only that partition's index, partition elimination at the index level.
+
+Cross-Q: Why does it matter for query performance?-- think --
+
+A: Partition elimination. A query with WHERE partition_key = 'X' reads only the matching partition's index, not the entire index. For tables partitioned by month with 24 partitions, the engine skips 23 or 24 of the index, massive I O reduction.
+Non-aligned indexes can't benefit; the entire index is searched regardless of the partition predicate.
+
+Cross-Q²: When would you use a non-aligned index intentionally?-- think --
+
+A: When the index must enforce uniqueness across all partitions globally. A unique index on email across all rows can't be partition-aligned by created_at (because the same email could appear in different time partitions and the partitioned uniqueness check wouldn't catch it).
+Non-aligned unique indexes work but can't be switched in or out partition-by-partition, every partition operation triggers a full index rebuild. Trade-off: global uniqueness versus partition agility.
+
+-- pause --
+Drill 15, Sorted versus unsorted writes.
+
+Q: Why are sequential inserts orders of magnitude faster than random inserts on a B-tree index?-- think --
+
+A: Sequential inserts all hit the rightmost leaf page, that page stays cached, fits in C P U cache, page splits are rare and predictable. Random inserts scatter across the tree, causing constant page reads (often physical I O), constant splits, fragmentation.
+On disk-backed indexes, the difference is 10-100 times write throughput. Even on SSDs, random inserts to a tree-structured index are slower due to write amplification.
+
+Cross-Q: How does this affect GUID PK choice?-- think --
+
+A: Random GUIDs (UUIDv4) cause maximum random-insert pain on clustered indexes, every insert hits a different page. Sequential GUIDs (UUIDv7, NEWSEQUENTIALID() ) preserve insertion order, behaving like IDENTITY for write performance while keeping the unique-across-systems property.
+Many modern systems migrating to UUIDv7 specifically to fix this. Postgres Q L with heap-organized tables suffers less (heap inserts are always sequential), but secondary indexes on random GUIDs still fragment.
+
+Cross-Q²: What about read patterns, is sequential always better for reads too?-- think --
+
+A: Yes for range scans ( ORDER BY pk benefits from clustering by PK). Equal for point lookups (the B-tree handles both equally). Worse only when reads benefit from data being co-located by a different column than the PK, for example, reads almost always filter by customer_id but PK is id.
+Then clustering by customer_id (or using a covering index on it) wins. The "monotonic PK is always best" rule is for writes; reads sometimes prefer a clustering choice that matches access patterns.
+
+-- pause --
+Section 15. Summary and Decision Matrix.
+
+-- pause --
+When to Use Each Index Type.
+
+Single column WHERE, Non-clustered single, Fast, low overhead.
+Multiple column WHERE, Composite, Matches query pattern.
+Need SELECT columns with WHERE, Covering, Eliminates table access.
+Primary Key, Clustered, Natural table structure.
+Full table scan better, None, Sometimes better than index!.
+O L T P high volume writes, Few indexes, and sequentially-ordered ones, Minimize write amplification.
+O L A P data warehouse, Clustered columnstore, not many B-trees, Compression + rowgroup elimination beat any number of B-trees for scans.
+
+️ "O L A P data warehouse to many indexes" was the original advice and it is a decade out of date.
+Piling B-tree indexes onto a fact table gives you write amplification during the load and does nothing for the scan-and-aggregate queries a warehouse actually runs, because those queries touch a large fraction of the rows and a few of the columns, the exact case a rowstore index is worst at.
+The modern answer is a clustered columnstore index, whose column-wise storage, compression and rowgroup min or max metadata attack all three costs at once, plus a small number of B-trees only where the warehouse also serves point lookups.
+
+-- pause --
+Index Budget.
+
+️ This section used to give a table of index counts by row count, and it disagreed with Recommended Index Limits earlier on the page, 5-15 here versus 8-20 there for tables over 10M rows, which is the clearest possible evidence that neither was measured.
+The table has been replaced with what actually decides the budget; the other one is left in place, annotated, as the exhibit.
+Row count is the wrong axis anyway, a 50-million-row append-only table can carry many indexes cheaply, while a 2-million-row table taking a thousand updates a second can be brought down by three. What actually sets the budget:
+
+-- pause --
+Section 16. Conclusion.
+
+Understanding sequel indexes is critical for database performance:
+
+A seek's cost grows with the log of the row count; a scan's grows with the row count. That difference in growth rate is the whole value proposition, not any multiplier.
+Every INSERT maintains every index. An UPDATE maintains the indexes whose key or INCLUDE columns it changed, which is why indexing narrow, stable columns is cheap and indexing volatile ones is not.
+Column order is set by equality-before-range, then by which queries need the leading column, not by "most selective first", which is folklore.
+Covering removes the per-row lookup, which is why it matters most for queries returning many rows and barely at all for ones returning five. On Postgres Q L it only works when VACUUM has kept the visibility map current.
+Too many indexes do not "confuse" a cost-based optimizer, it still costs every candidate. They cost you write amplification, buffer pool, and longer compile times, and they make redundancy hard to spot. Those are the real reasons to prune.
+Fragmentation is the least important index metric you can name. Page density matters more, statistics freshness matters far more, and on flash storage the sequential-versus-random argument mostly evaporates.
+A bad plan is usually a good decision made on a bad estimate. Fix the estimate, statistics, SARGability, correlated columns, before you reach for a hint.
+
+Golden Rules:
+Index the predicates your hot queries actually use, in the order equality-then-range.
+Prefer widening an existing index to adding a new one.
+Read rows-read-per-row-returned before reading the operator name.
+Keep the clustered key narrow, unique and ideally sequential, every non-clustered index carries a copy of it.
+Drop unused indexes, but only after uptime long enough to include month-end.
+Say which engine you mean; sequel Server, Postgres Q L and MySQL disagree on clustering, on NULLs in unique indexes, and on INCLUDE.
+
+-- pause --
+Section 17. Self-test.
+
+A row locator, and what it holds depends on the table. If the table has a clustered index, the locator is the clustered index key; if the table is a heap, it is a RID (file:page:slot). Microsoft Learn, Index architecture and design guide, states both.
+Three consequences: the clustered key's width is copied into every non-clustered index; the locator columns are appended to the index key (non-unique index) or to the includes (unique index);
+and because the clustered key is physically present at the leaf, you can filter and sort on it without adding it to the definition.
+This is why "keep the clustered key narrow" is advice about the other indexes.
+
+At the split between seek predicate and residual predicate. The seek establishes a range; anything it can't bound is applied afterwards to rows already fetched.
+In sequel Server the operator properties show Seek Predicates versus Predicate, and an actual plan exposes Number of Rows Read next to Actual Number of Rows. In Postgres Q L it is Index Cond versus Filter plus Rows Removed by Filter.
+The fix is to move the residual column into the index key so it bounds the scan, which usually means placing it before any range-predicate column.
+
+The range predicate sits in the middle of the key. A seek boundary can use a run of equality predicates plus at most one range predicate; everything after the range column stops bounding the seek.
+So Status becomes a residual filter and the seek reads every row for that tenant since @d, discarding the non-Active ones. Reorder to (TenantId, Status, CreatedAt) and all three predicates bound the seek.
+Same columns, same selectivity, very different work, this is why "most selective column first" is the wrong rule.
+
+Depends entirely on the engine, and this one catches people who develop on Postgres Q L and deploy to sequel Server. sequel Server permits at most one NULL: "You cannot create a unique index on a single column if that column contains NULL in more than one row.
+These are treated as duplicate values for indexing purposes" (Microsoft Learn, Create a unique index). Postgres Q L and MySQL permit any number, per the ANSI reading that NULLs aren't equal; Postgres Q L 15 added NULLS NOT DISTINCT to opt into sequel Server's behaviour.
+On sequel Server the fix is a filtered index: CREATE UNIQUE INDEX. ON Users(Email) WHERE Email IS NOT NULL.
+
+The optimizer must prove the query's predicate implies the index's predicate at compile time, and the plan it compiles is cached for later calls with other values of @status. It can't prove it, so it won't risk it.
+Fix with a literal in a dedicated query, or OPTION (RECOMPILE), which embeds the value at compile time. sequel Server records the near-miss in the plan X M L's element.
+Separately, filtered indexes need ANSI_NULLS, ANSI_PADDING, ANSI_WARNINGS, QUOTED_IDENTIFIER, ARITHABORT, CONCAT_NULL_YIELDS_NULL ON and NUMERIC_ROUNDABORT OFF, and for stored procedures, ANSI_NULLS and QUOTED_IDENTIFIER are fixed at creation time, not taken from the session.
+
+(a) Non-SARGable predicate, the column is wrapped in a function or cast ( YEAR(CreatedAt) = 2026, CAST(x AS date) =. ), so the B-tree's sort order is unusable.
+(b) Implicit conversion, a varchar column compared to an nvarchar parameter, the default for a string property in E F Core, converts the column per row; the plan shows CONVERT_IMPLICIT inside the predicate. Fix with .IsUnicode(false).
+(c) The tipping point, the optimizer estimated enough rows that a seek-plus-lookup plan costs more than a scan, so it chose the scan on purpose. Only (c) is the optimizer being right; for (a) and (b) it has no choice.
+
+The estimated row count at which seek-plus-key-lookup stops being cheaper than a clustered index scan. Lookups cost one tree descent per row returned, so that plan's cost rises linearly while the scan's stays roughly flat; the lines cross.
+The counter-intuitive part, from Kimberly Tripp's work at SQLskills, is that it is expressed in pages of the table, not rows, roughly, lookups survive ~25% of the table's page count and a scan wins ~33%. Because a page holds many rows, that can be a very small percentage of the rows.
+A covering index removes the per-row lookup and so removes the cliff entirely.
+
+Most likely refreshing statistics, not defragmenting. A rowstore rebuild updates the index's statistics by scanning every row, equivalent to UPDATE STATISTICS. WITH FULLSCAN, which recompiles the plans referencing them.
+Microsoft says this outright: improvements after a rebuild "are unrelated to reducing fragmentation or increasing page density. the same benefit can often be achieved at a much lower resource cost by updating statistics instead" (Microsoft Learn, Maintain indexes optimally).
+Test it by replacing the rebuild with UPDATE STATISTICS for a week. Note the asymmetry: REORGANIZE does not update statistics at all, so a reorganize-based script gets none of this benefit.
+
+avg_page_space_used_in_percent, page density.
+Microsoft: "In many workloads, increasing page density results in a greater positive performance impact than reducing fragmentation." Low density means more pages for the same rows, so more I O, more buffer pool consumed, and a higher estimated I O cost that can change the plan the optimizer picks.
+Two practical notes: LIMITED mode of sys.dm_db_index_physical_stats does not return it, use SAMPLED or DETAILED, and both numbers are noise roughly 1,000 pages, because small indexes historically sat on mixed extents, which Microsoft describes as "shared by up to eight objects".
+
+Postgres Q L: CREATE INDEX CONCURRENTLY. A plain CREATE INDEX holds a SHARE lock that blocks every writer for the whole build. Concurrent builds cost two table passes, cannot run inside a transaction block, and leave an invalid index behind on failure (drop and retry).
+sequel Server: WITH (ONLINE = ON), Enterprise edition only, so verify the target edition, not just the dev instance; add RESUMABLE = ON for builds that won't fit a window, and WAIT_AT_LOW_PRIORITY if long transactions are likely.
+Watch the version split on RESUMABLE: " ALTER INDEX starting with sequel Server 2017 (14.x), and CREATE INDEX starting with sequel Server 2019 (15.x)" (Microsoft Learn, Guidelines for online index operations), so for adding an index, as here, the floor is 2019, not 2017.
+Budget disk for two copies of the index during the build. MySQL or InnoDB: ALTER TABLE. ADD INDEX., ALGORITHM set to INPLACE, LOCK set to NONE, so the statement errors rather than silently copying the whole table.
+
+That Postgres Q L has no maintained clustered index.
+Tables are always heaps; CLUSTER table USING index is a one-shot physical reorder, "Clustering is a one-time operation:
+when the table is subsequently updated, the changes are not clustered" (Postgres Q L docs, CLUSTER), and it takes an ACCESS EXCLUSIVE lock that "prevents any other database operations (both reads and writes)".
+MySQL or InnoDB is the opposite extreme: it always clusters, on the primary key, or the first UNIQUE NOT NULL index, or a hidden 6-byte row ID, with no way to opt out. Only sequel Server gives you the choice between a heap and a clustered index.
+
+Not as emitted.
+Microsoft's own limitations list says the feature "is not intended to fine tune an indexing configuration" and "does not specify an order for columns to be used in an index", the equality_columns come out in column-id order, so you must reorder them yourself (equality before inequality first;
+selectivity only as a tiebreak within the equality columns).
+It tracks at most 500 missing index groups and returns at most 600 rows, ignores trivial plans, never suggests filtered indexes, and gives poor costs for inequality-only predicates.
+It also does not persist: the counters reset on restart, so check sys dm os sys info sqlserver start time before trusting them. The limitation Microsoft doesn't list is the worst: it does not consider indexes that already exist, so it will happily recommend a near-duplicate of one you have.
+Check whether an existing index is one column away from serving the query, reorder the keys, and weigh the write cost the DMV never mentions.
+
+Barely. B-tree leaf pages are doubly linked, so sequel Server reads an ascending index backwards at essentially the same cost, there is no "reverse scan penalty" to avoid.
+DESC genuinely matters in two cases: mixed sort directions in a composite index ( ORDER BY TenantId ASC, CreatedAt DESC cannot be served by an all-ASC index in either direction), and parallelism (sequel Server will not produce a parallel plan for a backward ordered scan,
+so matching the index direction is what lets a large scan go parallel).
+Engine note: MySQL ignored DESC in index definitions entirely before 8.0.
+
+Two compounding mechanisms. Fanout: a wider key means fewer entries per 8 kilobytes page, so lower fanout, so a deeper tree, so more page reads on every seek of that index.
+Propagation: the clustered key is the row locator, so it is duplicated into every leaf row of every non-clustered index on the table, a 400-byte key on a table with six non-clustered indexes is stored seven times per row.
+That is why a wide natural key as the PK can inflate an entire table's index footprint without anyone adding an index. sequel Server's ceilings, 900 bytes clustered, 1,700 non-clustered since 2016, describe the envelope the engine expects.
+InnoDB has the same propagation problem with no INCLUDE to soften it.
