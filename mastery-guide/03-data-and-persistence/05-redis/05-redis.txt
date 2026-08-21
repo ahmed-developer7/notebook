@@ -1,0 +1,866 @@
+-- pause --
+Section 1. Why it matters.
+
+Redis is the de-facto in-memory data store: caching, session storage, rate-limiting counters, leaderboards, message queues, distributed locks. Sub-millisecond latency, millions of ops or sec per node, rich data structures (not just key-value). Almost every modern stack has Redis somewhere.
+
+The deep-dive's Caching Strategies covers Redis as one of three cache tiers. this session extends to Redis-specific concerns: data types beyond strings, persistence trade-offs, clustering for horizontal scale, pub or sub versus Streams, and distributed locking patterns.
+
+Why interviewers ask: Redis questions reveal how candidates think about caching, scale, and consistency. Knowing eviction policies and persistence trade-offs separates "I've used Redis" from "I've operated Redis."
+
+When NOT to choose: as a primary database for durable data (RDBMSs are better at acid and complex queries). For analytical workloads (use a columnar store). When data exceeds RAM and you can't shard or buy bigger memory.
+
+"Redis" is no longer one thing, and interviewers ask. In March 2024 Redis Ltd. moved off the 3-clause BSD licence; from Redis 7.4 onward releases were dual source-available under RSALv2 or SSPLv1, neither OSI-approved.
+The Linux Foundation forked the last BSD release, Redis 7.2.4, as Valkey, backed by A W S, Google and Oracle.
+In May 2025 Redis added AGPLv3 as an option starting with Redis 8, and folded the former Redis Stack modules (Jason, Time Series, probabilistic types, the query engine) into core (Redis blog, Redis is now available under the AGPLv3 open source license).
+The wire protocol and the data model are shared, so StackExchange.Redis talks to all of them. What differs is who ships your security patches, what your legal team signed, and, for the module features, whether they are present at all.
+
+In the real world: a platform team ran the same Helm chart with the redis:7 image in every product namespace. After the 2024 relicence, legal asked one question, are we offering Redis as a service?, and the answer was no, so the source-available terms never bit.
+What did bite was quieter: the Linux distributions the base images were built from had switched their redis-server package to Valkey, so a routine base-image bump silently changed which project's CVE feed the team needed to watch.
+They standardised deliberately, Valkey for the self-hosted platform and managed Redis where the cloud provider carried the licence, and not one line of application code changed.
+The lesson is that this fork is a supply-chain and procurement question wearing a database costume; nobody is going to ask you to migrate SET calls.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+Data types.
+
+Redis is much more than a string-key-value store. The full type catalog:
+
+Examples (StackExchange.Redis in dot NET):
+
+The type you pick is a commitment to a complexity class, and every command page on redis.io states its own.
+HGET is O(1); ZADD is O(log N); ZRANGE is O(log N + M) for M returned; LRANGE is O(S+N) where S is the offset from the nearest end, which is why LRANGE mylist 0 9 is cheap and LRANGE mylist 100000 100009 is not.
+SMEMBERS, HGETALL and LRANGE key 0 -1 are all O(N) over the whole collection, so their cost is set by how big you let the key grow, not by how you call them.
+
+HyperLogLog deserves its own note because it is the one type whose accuracy is documented: the Redis implementation "uses up to 12 kilobytes of memory and provides a standard error rate of 0.81%" (redis.io, HyperLogLog).
+Twelve kilobytes for a count of distinct visitors, at any cardinality, is the trade, you can never enumerate the members, only count them, and you can PFMERGE two sketches to union them.
+
+In the real world: a "recently viewed products" feature was built with a Redis List and an LPUSH on every product page view. Correct, obvious, and shipped. Nobody wrote the LTRIM.
+Months later the profile endpoint, which did LRANGE key 0 -1 and rendered the first ten, started timing out for exactly the customers the business cared about most,
+because those lists had tens of thousands of entries and the O(N) read was pulling all of them across the network to throw away all but ten.
+Two fixes were needed and only one was obvious: LTRIM key 0 49 after every push to bound the key, and LRANGE key 0 9 on the read path so the query asks for what it renders.
+The bug was not the data structure; it was that nothing in the code said what the maximum size of that key was, so the maximum was "however long the customer stays a customer".
+
+-- pause --
+Expiration and eviction policies.
+
+Two ways data leaves Redis:
+
+T T L (time-to-live) on keys, explicit expiry:
+
+A T T L is a deletion deadline, not a deletion schedule.
+Redis documents two mechanisms working together: "A key is passively expired when a client tries to access it and the key is timed out", and because keys that are never accessed again would otherwise leak, "periodically, Redis tests a few keys at random amongst the set of keys with an expiration.
+All the keys that are already expired are deleted from the keyspace" (redis.io, EXPIRE, Appendix: Redis expires).
+The sampling loop lives in activeExpireCycle in Redis's expire.c: it samples a bounded batch of volatile keys per database per cycle and repeats while the fraction found expired stays high, and it runs at the server's background frequency hz (default 10). The consequences you can be asked about:
+
+Memory is released when the key is deleted, not when its T T L reaches zero. A dataset of cold keys with short TTLs holds memory for as long as the sampler takes to find them.
+expired keyspace events fire on deletion, too.
+Redis is explicit: "Expired ( expired ) events are generated when the Redis server deletes the key and not when the time to live theoretically reaches the value of zero", and "there can be a significant delay between the time the key time to live drops to zero,
+and the time the expired event is generated" (redis.io, Keyspace notifications).
+Anyone building a delayed-job queue on expiry events is building on a best-effort timer.
+Notifications are also off by default ( notify-keyspace-events empty), delivered over ordinary fire-and-forget Pub or Sub, and in Cluster mode "keyspace events are node-specific", you must subscribe to every node.
+Writes that replace the value clear the T T L. SET k v removes an existing expiry; SET k v KEEPTTL (Redis 6.0+) preserves it. Commands that mutate in place, INCR, LPUSH, HSET, leave the timeout untouched.
+
+Eviction policy, what to do when memory is full (configured globally):
+
+noeviction, maps to, Return errors on writes when full. Default.
+allkeys-lru, maps to, Evict any key, least-recently-used first. Most common for cache.
+allkeys-lfu, maps to, Evict any key, least-frequently-used first.
+volatile-lru, maps to, Same but only keys with T T L set.
+volatile-lfu, maps to, Same but only keys with T T L set.
+volatile-ttl, maps to, Evict keys with shortest T T L first.
+allkeys-random / volatile-random, maps to, Random eviction.
+
+Set in redis.conf:
+
+Use allkeys-lru for pure cache deployments. Use volatile-lru if you mix cached data (with T T L) and durable data (no T T L, never evicted).
+
+Four details that separate "I set the policy" from "I understand it":
+
+* volatile- degrades to noeviction.** Redis states it flatly:
+"The volatile-xxx policies behave like noeviction if no keys have an associated expiration." Fill the instance with T T L-less keys under volatile-lru and writes start failing with OOM command not allowed when used memory > 'maxmemory' while the eviction counter stays at zero.
+LRU and LFU are both approximations. Redis samples rather than maintaining a true ordering, and maxmemory-samples (default 5 in Redis Open Source) tunes how many candidates it inspects per eviction.
+LFU uses "a probabilistic counter, called a Morris counter, to estimate the object access frequency using just a few bits per object, combined with a decay period", tuned by lfu-log-factor (default 10) and lfu-decay-time (default 1 minute).
+Because the counter is a few bits inside metadata Redis already keeps, choosing LFU over LRU is not a per-key memory trade (redis.io, Key eviction).
+Redis 8.6 added allkeys-lrm / volatile-lrm, least recently modified, which updates its timestamp on writes only, so read traffic can't keep a stale key resident. Check your server version before quoting it.
+Managed services change the default. Redis Open Source ships maxmemory-policy noeviction.
+Azure Cache for Redis defaults to volatile-lru and additionally reserves memory you can't use for data:
+maxmemory-reserved and maxfragmentationmemory-reserved each default to 10% of maxmemory, and CONFIG is disabled entirely, so you set the policy through the portal or ARM, not CONFIG SET (Microsoft Learn, How to configure Azure Cache for Redis).
+
+In the real world: a cache wrapper that had run for years against a self-hosted instance with allkeys-lru was lifted onto a managed cache, and within a week writes started failing with OOM errors while the eviction metric sat at zero, the shape that makes people suspect a memory leak.
+The managed default was volatile-lru, and the wrapper had one overload that set a value without a T T L, used by exactly one code path: a config blob refreshed on deploy.
+Under allkeys-lru those keys were evictable like everything else and nobody noticed; under volatile-lru they were permanently resident, and once enough of them accumulated there was nothing left with a T T L to evict, so the policy silently became noeviction.
+The fix was to make the T T L a required parameter of the wrapper rather than to change the policy back.
+The general shape is worth keeping: eviction policy is a contract between the server and every write path in your application, and one path that doesn't hold up its end converts a cache into a full disk.
+
+-- pause --
+Persistence modes (RDB, AOF).
+
+RDB (Redis Database file), periodic point-in-time snapshots to disk:
+Configurable: "save snapshot if N changes in M seconds."
+Compact, fast restart.
+Trade-off: can lose minutes of data on crash.
+
+AOF (Append-Only File), log every write operation:
+Configurable fsync: every write (durable, slow), every second (default, ~1 sec data loss), never.
+Larger files, slower restart, but minimal data loss.
+
+Both can be combined,
+and for anything you'd be sad to lose you should:
+"The general indication you should use both persistence methods is if you want a degree of data safety comparable to what Postgres Q L can provide you." Note that this is not the shipped default, the stock redis.conf has appendonly no and RDB save points only,
+so out of the box you are running snapshot-only durability.
+
+For pure cache, you may disable persistence entirely ( save "" and appendonly no ) for max performance, losing the cache on restart is acceptable.
+
+Both mechanisms are built on fork() and copy-on-write, and that is where the operational surprise lives. When Redis snapshots, "Redis forks. We now have a child and a parent process. The child starts to write the dataset to a temporary RDB file.
+This method allows Redis to benefit from copy-on-write semantics." The child sees a frozen view of memory for free, until the parent writes.
+Every page the parent modifies while the child is running has to be duplicated, so a write-heavy instance mid-snapshot needs headroom its dataset size, and the docs are blunt about the fork itself:
+"fork() can be time consuming if the dataset is big, and may result in Redis stopping serving clients for some milliseconds or even for one second if the dataset is very big and the C P U performance is not great" (redis.io, Redis persistence).
+AOF rewrite forks too, just less often.
+
+Since Redis 7.0 the AOF is a multi-part structure, a base file plus incremental files tracked by a manifest in the appenddirname directory, which removed the pre-7.0 behaviour where writes arriving during a rewrite were buffered in memory and written to disk twice.
+
+Two things appendfsync always does not buy you. First, fsync hands data to the device, not necessarily to the platter; a drive with a volatile write cache can still lose it.
+Second, Redis notes that always "supports group commit, so if there are multiple parallel writes Redis will try to perform a single fsync operation", the commands are appended after a batch of commands from multiple clients has executed,
+so "every write is fsynced" is really "every batch is fsynced".
+
+In the real world: a cache node was sized so its dataset sat at roughly two-thirds of the V M's memory, with the default save points left in place because nobody had thought about persistence either way. It ran for months.
+Then a bulk re-pricing job started rewriting a large fraction of the keyspace, a save point tripped mid-job, and the fork's copy-on-write duplicated pages faster than the child could finish writing, the kernel OOM-killer took the process, the cache came back empty,
+and every request behind it went to the database at once.
+Nothing in the Redis logs said "out of memory", because it wasn't Redis that ran out. The fix was to decide what the node was for: save "" and appendonly no on the cache tier, with a warm-up job on start, and persistence kept only on the separate instance holding state that couldn't be recomputed.
+Provision for peak, not for steady state, the peak of a persisted Redis includes a copy of everything you write during the snapshot.
+
+-- pause --
+Replication and Sentinel.
+
+Replication: primary to replicas, async. Reads can be served by replicas; writes must go to primary.
+
+Sentinel monitors primaries and promotes a replica on failure:
+
+For high availability without manual ops:
+Redis Sentinel: classic HA setup.
+Redis Cluster: built-in, also supports sharding (next).
+Managed Redis (Azure Cache, A W S ElastiCache): pay-the-cloud-and-forget.
+
+Replicas are read-only by default ( replica-read-only yes since Redis 2.6), and writable replicas exist "only for historical reasons", the docs recommend against them because a write applied locally will diverge from the command stream arriving from the primary.
+Replicas also ignore maxmemory by default: "the eviction of keys will be handled by the master, sending the DEL commands to the replica as keys evict in the master side", which keeps the two copies identical but means a replica can legitimately use more memory than the configured limit.
+
+In the real world: a checkout service used SET NX on an idempotency key to make sure a payment was attempted once, and, because the read was "just a check" and reads were cheap on replicas, it did the existence check against a read replica before the SET.
+Duplicate charges appeared at a low but non-zero rate, always under load, never reproducible in staging.
+Replication is asynchronous, so the window between the primary accepting the key and the replica receiving it is exactly the window in which a retry from an impatient client can read "not present" and try again.
+The code was correct in the sense that SET NX is atomic; the deployment made the atomic operation irrelevant by asking a different machine.
+Read-your-own-writes does not survive a replica, and the rule that falls out of it is simple: anything whose correctness depends on what you just wrote goes to the primary, and replicas are for reads that can be a little bit behind.
+
+-- pause --
+Redis Cluster (sharding).
+
+Distributes data across multiple shards. Each shard is a primary + replicas. Keys are mapped to one of 16,384 slots via CRC16(key) % 16384; each shard owns a slot range.
+
+Implications:
+Multi-key operations (MGET, transactions) only work if all keys hash to the same slot.
+Hash tags force keys to the same slot: user:{42}:profile and user:{42}:settings both hash by 42.
+Client-side awareness: clients learn the slot map and route requests to the right shard.
+Only database 0. Cluster mode has no SELECT; the multi-database namespace you may have been using to separate concerns disappears the moment you shard.
+Node bookkeeping. Each node opens a second TCP port for the cluster bus, "set by adding 10000 to the data port (for example, 16379)" unless overridden by cluster-port.
+It carries failure detection, configuration updates and failover authorisation, clients never touch it, but your firewall rules must.
+cluster-require-full-coverage defaults to yes: "the cluster stops accepting writes if some percentage of the key space is not covered by any node." Losing one shard and its replicas takes the whole cluster's write path down unless you deliberately set this to no and accept partial service.
+
+StackExchange.Redis handles cluster routing transparently: it caches the slot map, follows MOVED (permanent, update the map) and ASK (in-flight migration, follow for this one request only, don't update the map).
+
+Hash tags are the feature most often used one step too eagerly. The tag is the shard key, so {tenant} in every key means one tenant equals one slot equals one shard, and a shard is a single-threaded process no matter how many you add.
+
+In the real world: a multi-tenant SaaS put {tenant Id} in every Redis key from day one so that MGET and MULTI would never trip a CROSSSLOT error. It worked, and it was even defensible when tenants were small and similar.
+Then one enterprise customer arrived whose traffic dwarfed the rest of the book, and every one of its keys hashed to a single slot, which lives on a single primary.
+Doubling the shard count moved other tenants around and did nothing at all for the one that mattered, the busy shard's C P U stayed pinned while the new nodes idled.
+Removing the tag from all but the handful of key groups that genuinely needed atomic multi-key access spread that tenant across the whole cluster, and the MGET s it broke were replaced by pipelined individual GET s, which still cost one network round trip.
+The trade is worth stating out loud in an interview: a hash tag buys you atomicity across keys and sells you the ability to spread their load, and you should only pay when you actually need the atomicity.
+
+-- pause --
+Pub or Sub and Streams.
+
+Two messaging primitives.
+
+Pub or Sub, fire-and-forget broadcast. No persistence, no consumer groups. Subscribers must be connected when message published; otherwise they miss it.
+
+Use case: live notifications, cache invalidation broadcasts.
+
+Two properties bite people. Pub or Sub messages are not stored anywhere, there is no offset, no acknowledgement, no replay, and a subscriber that reconnects has simply missed whatever happened while it was away.
+And a slow subscriber is a memory problem for the server, because undelivered messages accumulate in that client's output buffer; client-output-buffer-limit pubsub exists to disconnect such clients rather than let them exhaust the instance.
+Redis documents the Pub or Sub default as "a default hard limit of 32 megabytes and a soft limit of 8 megabytes per 60 seconds", the 32mb 8mb 60 you will see in CONFIG GET, and Azure Cache for Redis ships the same values.
+
+In the real world: a pricing service invalidated its product cache by publishing the changed SKU on a Pub or Sub channel, and every A P I pod subscribed and deleted its local copy. Correct on a good day.
+During a rolling deploy each pod is, for a few seconds, not subscribed to anything, and a promotion that went live during a deploy was invalidated for the pods that happened to be up and missed entirely by the ones that were restarting.
+Those pods then served the old price for the remainder of a fifteen-minute T T L, so support tickets arrived about a checkout total that disagreed with the product page, and the logs showed the invalidation had been published exactly once, successfully.
+Pub or Sub had done precisely what it promises.
+The repair was to stop invalidating at all: the cache key became product:42:v17, with the version bumped in the pricing store on every change, so a stale key is simply never asked for again and ages out on its own. Fire-and-forget delivery is fine for a hint and unusable as a correctness mechanism.
+
+Streams (Redis 5+), persistent log with consumer groups. Like a tiny Kafka.
+
+Use case: lightweight event streaming where you don't need full Kafka infrastructure.
+
+-- pause --
+Pipelining and transactions.
+
+Pipelining, send multiple commands without waiting for individual replies. What it removes is round trips, not server work: a hundred pipelined SET s still cost a hundred SET s of C P U, but one network latency instead of a hundred.
+On a 1 millisecond link that is the whole difference between a hundred milliseconds and one.
+
+The Task s must be collected before Execute() and awaited after, await ing each one as you create it serialises the batch back into individual round trips, which is the single most common way this A P I is misused.
+StackExchange.Redis also pipelines implicitly: concurrent operations from different threads on the shared multiplexer are already written to the socket together, so CreateBatch is for guaranteeing contiguity, not for enabling pipelining.
+
+In the real world: a nightly job warmed a cache with a few hundred thousand entries and took most of an hour, and the Redis C P U graph was flat the whole time.
+It was a foreach with await db.StringSetAsync(.) inside it, running from a datacentre one region away from the cache, so the job's runtime was almost exactly the number of keys multiplied by the round-trip time, and the server was idle waiting for the next request to arrive.
+Chunking the loop into batches of a few hundred and awaiting Task.WhenAll at the end of each chunk cut the wall clock to minutes without touching a single Redis setting.
+The diagnostic that gets you there is worth remembering: when the client is slow and the server is idle, you are measuring the network, and no amount of server tuning will move it.
+
+Transactions ( MULTI or EXEC ), atomic execution of multiple commands. Not full acid, no rollback on partial failure inside the block, but commands run as one unit without other clients interleaving.
+
+Errors behave differently depending on when they are detected, and the distinction is a standard follow-up:
+
+Detected at queue time (unknown command, wrong arity, or an out-of-memory condition): "Starting with Redis 2.6.5, the server will detect an error during the accumulation of commands.
+It will then refuse to execute the transaction returning an error during EXEC, discarding the transaction." Nothing runs.
+Detected at execution time (a WRONGTYPE, a list operation against a string): the failing command returns an error inside the EXEC reply array and every other command still runs.
+"It's important to note that even when a command fails, all the other commands in the queue are processed, Redis will not stop the processing of commands."
+
+There is no rollback, and Redis says why: "Redis does not support rollbacks of transactions since supporting rollbacks would have a significant impact on the simplicity and performance of Redis." A WRONGTYPE inside a transaction is a programming error,
+and the design decision is that programming errors should be caught in test, not compensated at runtime.
+
+Optimistic concurrency via WATCH, EXEC returns a null reply and nothing executes if any watched key changed first.
+Two subtleties: the abort is triggered by "modifications made by the client, like write commands, and by Redis itself, like expiration or eviction", so a watched key that simply expires kills your transaction;
+and "when EXEC is called, all keys are UNWATCH ed, regardless of whether the transaction was aborted or not", so a retry loop must re-issue the WATCH on every attempt.
+
+-- pause --
+Distributed locks (Redlock).
+
+Redis is commonly used for distributed locking. The simple pattern:
+
+Redlock algorithm (multiple Redis nodes for stronger guarantees), controversial; Martin Kleppmann argued against, antirez (Redis author) defended. For most apps, single-node Redis lock with T T L + token verification is sufficient.
+For mission-critical (financial), prefer a real consensus system (etcd, ZooKeeper, Consul).
+
+Libraries: RedLock.net for the multi-node algorithm.
+
+The honest framing for an interview is that a T T L is a bet on how long your work takes, and there is no way for the lock holder to know it lost that bet.
+A stop-the-world garbage collector pause, a hypervisor steal, or one slow database call is enough to push the holder past the T T L; the key expires, a second worker acquires it legitimately, and now two processes each believe they hold the lock.
+The token check on release protects you from the release being wrong, the first holder won't delete someone else's lock, but nothing in Redis stops it from continuing to do work. Mutual exclusion has already been lost by the time the token is consulted.
+
+Extending the T T L from a background "watchdog" reduces the odds and doesn't change the shape, because a process that is paused cannot renew.
+The only construction that closes the hole moves the check to the resource being protected: a fencing token, monotonically increasing, that the protected store rejects if it is older than the last one it saw.
+
+In the real world: a settlement job ran once a night behind a Redis lock with a 30-second T T L, chosen because the job had always finished in a few seconds.
+Month-end arrived, the working set was much larger, one query went from fast to slow, and the job crossed 30 seconds, so the scheduler's next node acquired the lock and started the same run while the first was still inside it. Both wrote.
+The report that caught it was reconciliation, days later, and the Redis logs showed two clean, correct lock acquisitions because that is exactly what happened. Nobody had a bug in the locking code.
+The repair was to stop asking the lock to guarantee exclusivity and start asking the database: each run took a token from INCR settlement:fence, carried it into every write, and the write was conditional on the stored token being lower. The second run's writes were rejected on arrival.
+If a candidate tells you a Redis lock gives them mutual exclusion, the useful follow-up is "what happens if the holder is paused for longer than the T T L?", and the only good answer names the resource, not the lock.
+
+-- pause --
+The threading model, what actually blocks.
+
+"Redis is single-threaded" is true of the part that matters and false as a description of the process, and interviewers use the gap.
+
+Command execution is serialised on one thread. That is the guarantee everything else is built on: no locks in the data structures, and INCR, Lua scripts and MULTI or EXEC are atomic for free.
+Since Redis 6 the io-threads setting can move socket reads and writes, and, in newer versions, some protocol parsing, onto additional threads, but the main thread still executes every command;
+the shipped redis.conf leaves threading disabled and suggests enabling it "only in machines that have at least 4 or more cores".
+Turning it on does not make two commands run at once.
+
+Plenty of work already happens off that thread, which is the part people miss:
+
+Lazy freeing is the lever worth knowing by name. Deleting a key with millions of elements is O(N) in the main thread, DEL on a huge hash stalls the server for as long as it takes to walk it.
+UNLINK instead unlinks the key from the keyspace immediately and hands the reclamation to a background thread. The same choice exists for the deletions Redis performs on your behalf, and the shipped defaults are all no:
+
+FLUSHALL ASYNC / FLUSHDB ASYNC are the same idea, on demand.
+
+How you find the blocker, in order of usefulness:
+
+SLOWLOG GET, Redis records commands exceeding slowlog-log-slower-than, which defaults to 10000 microseconds (10 milliseconds), keeping the last slowlog-max-len (default 128). The recorded time excludes network I O, so anything in here is genuinely the server.
+LATENCY LATEST / LATENCY DOCTOR, the latency-monitoring framework, off by default ( latency-monitor-threshold 0 ), which attributes spikes to specific events: fork, expire-cycle, aof-fsync-always, command. This is how you distinguish "a slow command" from "the snapshot forked".
+redis-cli --latency, measures PING round trips, so it includes the network. redis-cli --intrinsic-latency measures what the machine itself can do and "must be executed on the computer that runs the Redis server instance"; it establishes the floor which Redis cannot go.
+INFO commandstats, per-command call counts and cumulative microseconds, which turns "the cache is slow" into a ranked list of which command is spending the server's time. Usually one line dominates and nobody had guessed it.
+
+In the real world: an unrelated service's health checks started failing intermittently, always for a second or two, always across every pod at once, the signature of something shared.
+Redis C P U was unremarkable on average and the dashboards showed nothing, which is what sent the investigation towards the network for two days.
+It was a cleanup job issuing DEL against a per-tenant hash holding millions of fields; the delete was O(N) on the main thread, and while it ran every other client simply waited.
+Note what the dashboards could not show: the commands that timed out were fast commands, because SLOWLOG records execution time and not time spent queued behind somebody else's command, so every victim looked innocent and the one guilty entry was sitting in SLOWLOG GET, which nobody had run.
+Swapping DEL for UNLINK moved the reclamation to a background thread and the stalls stopped that afternoon.
+The generalisable lesson is the one that makes the single-threaded model useful rather than trivia: on a shared Redis, your O(N) command is everybody's latency, and the cost is paid by services that have never heard of your feature.
+
+-- pause --
+Memory: accounting, fragmentation, encodings.
+
+maxmemory is not the number your monitoring is showing you, and getting these three apart is a senior-level answer on its own.
+
+used_memory, maps to, What the allocator says Redis asked for. This is what maxmemory is compared against.
+used_memory_rss, maps to, Resident set size, pages the operating system has actually given the process. This is what the OOM-killer and your container limit look at.
+mem_fragmentation_ratio, maps to, used_memory_rss / used_memory.
+mem_not_counted_for_evict, maps to, Replication and AOF buffers, deliberately excluded from the eviction calculation.
+
+The gap between the first two is not a bug. Redis documents it plainly: "Redis will not always free up (return) memory to the operating system when keys are removed. if you fill an instance with 5GB worth of data, and then remove the equivalent of 2GB of data, the Resident Set Size.
+will probably still be around 5GB, even if Redis will claim that the user memory is around 3GB. This happens because the underlying allocator can't easily release the memory." Two consequences follow. Provision for peak usage, not steady state.
+And the fragmentation ratio is untrustworthy after a peak, a high ratio may mean genuine fragmentation, or it may just mean you deleted a lot of data recently. Redis ships an active defragmentation facility ( activedefrag, which relies on its jemalloc allocator) for the genuine case.
+
+Client memory is the part people forget to budget for. Query buffers and output buffers belong to connections, and a client that asks for a huge value or subscribes to a firehose it can't drain can consume a great deal of them.
+That memory counts toward used_memory, which is exactly why Redis describes the aggregate cost of many connections as "leading to data eviction or out-of-memory errors", while replica and AOF buffers are the ones deliberately excluded via mem_not_counted_for_evict.
+Redis 7 added maxmemory-clients, client eviction, which disconnects the heaviest clients once their aggregate usage crosses a threshold, and it is off by default ( 0 ), with the docs recommending a non-zero value such as 5% for large deployments.
+
+Encodings are where a lot of memory goes, invisibly. Small aggregates are not stored as hash tables and skip lists; they are stored as flat, cache-friendly listpacks (called ziplists before Redis 7.0) or, for all-integer sets, an intset.
+Redis documents the saving as "up to 10 times less memory (with 5 times less memory used being the average saving)". The thresholds, with shipped defaults:
+
+Cross either threshold and "Redis will automatically convert it into normal encoding", and it does not convert back when the key shrinks again. OBJECT ENCODING key tells you which representation a live key is using; it is the fastest way to check whether a memory assumption still holds.
+
+Diagnosing a bloated instance, with the distinction that trips people:
+
+redis-cli --bigkeys, "Sample Redis keys looking for keys with many elements (complexity)." Element counts and lengths, not bytes.
+redis-cli --memkeys, "Sample Redis keys looking for keys consuming a lot of memory." This is the one that reports bytes, via MEMORY USAGE.
+redis-cli --keystats, both, plus a distribution and a top-N table.
+redis-cli --hotkeys, access frequency, and it "only works when maxmemory-policy is *lfu ", because it reads the LFU counter.
+
+All of them iterate with SCAN, so they are safe against a live server; -i 0.1 throttles them further.
+
+In the real world: a team split a single per-user hash into one Redis key per field, on the reasoning that smaller keys are tidier and let each field expire independently. Memory went up, substantially, and stayed up.
+Each of those hashes had been a handful of fields, comfortably inside hash-max-listpack-entries, so Redis had been storing the whole object as one flat listpack with one key's worth of overhead.
+Splitting it produced a dozen top-level keys, each carrying its own key string, its own object header and its own slot in the main dictionary, to store the same bytes. OBJECT ENCODING user:42 would have said listpack before the change and the argument would have ended in a minute.
+The rule that comes out of it is the one the Redis docs lead with: "Small hashes are encoded in a very small space, so you should try representing your data using hashes whenever possible", grouping related fields under one key is a memory optimisation, not just a naming convention.
+
+-- pause --
+What "acknowledged" means, async replication and lost writes.
+
+This is the topic that most reliably separates candidates who have run Redis from candidates who have used it, and it underpins everything about locks, idempotency keys and queues.
+
+Redis replication is asynchronous by default, and the docs do not soften what that costs. From the Cluster documentation: "Redis Cluster does not guarantee strong consistency.
+In practical terms this means that under certain conditions it is possible that Redis Cluster will lose writes that were acknowledged by the system to the client." The sequence is spelled out:
+
+The same is true of Sentinel-managed standalone replication; Cluster just documents it more bluntly.
+
+WAIT numreplicas timeout is the lever, and it is a probability improvement rather than a guarantee.
+It "blocks the current client until all the previous write commands are successfully transferred and acknowledged by at least the number of replicas you specify",
+returning the number that actually acknowledged, "the client should check that the returned value is equal or greater to the replication level it demanded", because WAIT returns the count on timeout too.
+Redis is careful about what it buys you: " WAIT does not make Redis a strongly consistent store. it is possible to still lose a write synchronously replicated to multiple replicas", and in Cluster, "Redis Cluster does not implement strong consistency even when synchronous replication is used".
+Redis 7 added WAITAOF for the equivalent question about local and replica AOF fsyncs.
+
+min-replicas-to-write / min-replicas-max-lag attack the problem from the other end: refuse writes when there aren't enough sufficiently-caught-up replicas to accept them.
+Redis frames it exactly right, "a best effort data safety mechanism, where consistency is not ensured for a given write, but at least the time window for data loss is restricted to a given number of seconds. In general bound data loss is better than unbound one."
+
+Expiry is master-driven, and replicas lie in a specific, useful direction. "Replicas don't expire keys, instead they wait for masters to expire the keys.
+When a master expires a key (or evict it because of LRU), it synthesizes a DEL command which is transmitted to all the replicas." A replica can therefore be holding keys that are logically expired, so it "uses its logical clock to report that a key does not exist only for read operations".
+Reads are safe; DBSIZE and memory on a replica can legitimately disagree with the primary. Once promoted, "it will start to expire keys independently, and will not require any help from its old master."
+
+Put together, the interview answer is: Redis's replication model is designed for availability and latency, and every durability feature it offers, WAIT, min-replicas-to-write, AOF always, narrows the window rather than closing it.
+If a correctness property must survive a failover, it belongs in a system that was built to give it to you, and Redis holds the fast copy.
+
+In the real world: a background-job system used a Redis list as its queue, LPUSH to enqueue, BRPOPLPUSH into a processing list to make the dequeue safe.
+The processing-list trick was there specifically because someone had thought about crashes, which made the failure that arrived so hard to accept: after a routine managed-service failover, a batch of jobs enqueued in the seconds beforehand simply did not exist. They had been acknowledged.
+There was no crash on the worker side, no error in any log, no poison message. The primary had accepted the LPUSH, replied +OK, and died before the replica received it, and the promoted replica's list was a few entries shorter than the one the A P I had been told about.
+BRPOPLPUSH protects a job from a worker dying; nothing in Redis protects it from the acknowledgement being a lie.
+The system now writes the job to Postgres in the same transaction as the work that creates it and uses Redis only as the dispatch hint, which is slower to enqueue and has not lost a job since.
+
+-- pause --
+Scripting: EVAL, EVALSHA and Functions.
+
+Lua is the only way to do read-decide-write inside Redis without a network round trip in the middle, and the guarantee is strong: "Redis guarantees the script's atomic execution.
+While executing the script, all server activities are blocked during its entire runtime." That is also the warning, a script is a global lock on the server for as long as it runs.
+
+EVAL sends the source; EVALSHA sends a SHA1. SCRIPT LOAD caches the source and returns the digest. The trap is that this cache is not part of the database: "The Redis script cache is always volatile. It isn't considered as a part of the database and is not persisted.
+The cache may be cleared when the server restarts, during fail-over when a replica assumes the master role, or explicitly by SCRIPT FLUSH." A missing digest gets you (error) NOSCRIPT No matching script.
+Redis notes that "most of Redis' clients already provide utility A P Is for doing that automatically", recovering by loading the script and retrying, but that is a client feature, so check yours rather than assuming it.
+
+Declare your keys. "All names of keys that a script accesses must be explicitly provided as input key arguments.
+The script should only access keys whose names are given as input arguments." This is not style advice: it is what lets a Cluster client route the call, and a script that builds key names from data it read cannot be routed at all.
+Scripts that opt into Redis 7 shebang flags ( #!lua flags set to no-writes ) inherit stricter defaults and, unlike plain scripts, cannot touch keys in different hash slots.
+
+Replication changed, and the old rules with it. Verbatim replication, shipping the script to replicas to re-execute, required every write script to be deterministic.
+Effects replication became the default in Redis 5.0 and verbatim replication was removed entirely in Redis 7.0: only the write commands a script actually performed are propagated, wrapped in MULTI or EXEC.
+The practical consequence is that TIME, SRANDMEMBER and Lua's PRNG are now safe to use inside write scripts. Anyone still quoting the determinism rules is describing Redis 4.
+
+Killing a stuck script is conditional. SCRIPT KILL "can be used only with scripts that did not modify the dataset during their execution (since stopping a read-only script does not violate the scripting engine's guaranteed atomicity)".
+A script that has already written and then hangs leaves you SHUTDOWN NOSAVE, you take the data loss to get the server back. Write scripts short, or don't write them.
+
+redis.call versus redis.pcall: errors from call go straight back to the client and abort the script; pcall returns the error into Lua for you to handle.
+And under memory pressure, "the first write command encountered in the script that uses additional memory will cause the script to abort (unless redis.pcall was used)".
+
+Redis Functions (Redis 7+) fix the volatility problem rather than working around it.
+A library is loaded once with FUNCTION LOAD and called by name with FCALL, and crucially, "functions are also persisted to the AOF file and replicated from master to replicas, so they are as durable as the data itself." No digests, no NOSCRIPT, meaningful names in MONITOR,
+and FCALL_RO runs against a replica if the function was registered with the no-writes flag.
+The one thing Redis will not do for you is propagate them across a Cluster: "it is also necessary to load functions to all cluster nodes. This is not handled automatically by Redis Cluster."
+
+In the real world: a service released its distributed locks with the standard compare-token-then-delete Lua script, loaded once at startup with SCRIPT LOAD and invoked by digest thereafter. It ran without incident for a year.
+Then the managed cache failed over during a maintenance window, and every lock release in the fleet began returning NOSCRIPT, because the promoted replica's script cache had never contained that script, and the application only loaded it during startup, which had happened months earlier.
+Locks stopped being released, so they were held until their TTLs expired, and throughput collapsed in a way that looked like a deadlock.
+The immediate fix was a rolling restart; the real fix was to stop treating "loaded at startup" as a durable fact and let the client's EVALSHA-with-fallback path do its job.
+The version of this you can say in an interview: the script cache is per-process and volatile, so any code path that assumes a script is loaded must have an answer for the process it is talking to being a different one than it was a second ago.
+
+-- pause --
+Redis from dot NET, the client is the hard part.
+
+Most production Redis incidents in a dot NET shop are not Redis incidents. They are StackExchange.Redis incidents, and the library's own documentation is the best source on why.
+
+ConnectionMultiplexer is shared, not created. It is expensive to construct, thread-safe, and multiplexes every logical operation over a small number of physical connections, so the per-request using block that feels correct for SqlConnection is exactly wrong here.
+Register it as a singleton (or a Lazy ); GetDatabase() returns a lightweight handle over the same underlying connection and may be called freely.
+
+Timeouts are usually about your process, not the server. RedisTimeoutException messages carry counters worth reading rather than skimming:
+
+qs, the library documents it as "operations currently awaiting replies from redis server": sent to the server, response not yet read. A growing qs means a backlog, not necessarily a slow server.
+Head-of-line blocking. "StackExchange.Redis uses a single TCP connection and can only read one response at a time", so one multi-megabyte value in flight delays every small GET queued behind it.
+This is the mechanism behind "everything timed out at once", and it is why the library's guidance includes splitting large payloads into smaller ones.
+Thread-pool starvation.
+The library's timeout guidance is explicit that "when the number of Busy threads is greater than Min threads, you are likely paying a 500 milliseconds delay before network traffic is processed", the dot NET thread pool injects threads slowly,
+so a burst of blocked work delays the continuation that would have completed your Redis call.
+The classic cause is sync-over-async ( .Result, .Wait() ) somewhere upstream. The library's own remedies are raising ThreadPool.SetMinThreads, splitting large payloads, and, where a single connection genuinely isn't enough, "a pool of ConnectionMultiplexer objects.
+and choose the 'least loaded' ConnectionMultiplexer when sending a new request."
+
+IDistributedCache over Redis does not store strings.
+Microsoft.Extensions.Caching.StackExchangeRedis stores each entry as a hash with three fields, absexp (absolute expiration in ticks), sldexp (sliding expiration in ticks) and data (your bytes), plus a T T L on the key itself ( RedisCache.cs, dotnet or aspnetcore). Two things follow.
+Reading such an entry with StringGetAsync doesn't quietly return nil, GET only operates on strings, so it fails with WRONGTYPE Operation against a key holding the wrong kind of value; HashGetAsync(key, "data") is what actually reads it.
+(Watch the key name too: RedisCacheOptions.InstanceName is prefixed to every key, so the Redis key is not the string you handed IDistributedCache.) And sliding expiration makes every read a write:
+the getter reissues an expiry to slide the window, so a "read-only" cache hit mutates the key, it must go to the primary, it replicates, and it is not something you can serve from a read replica.
+If you don't need sliding expiration, don't set it.
+
+For new code the guide's Caching Strategies covers HybridCache (dot NET 9+), which puts an in-process L1 in front of Redis and deduplicates concurrent misses per key, the stampede protection you would otherwise hand-roll with a lock.
+
+Client-side caching is not available here yet. Redis's server-assisted client-side caching ( CLIENT TRACKING over RESP3, covered in the drills below) is implemented by redis-py, Jedis, node-redis and go-redis; support in StackExchange.Redis is an open request (issue #2583), not a shipped feature.
+Redis warns generally that "some other clients support the CLIENT TRACKING command to configure CSC on the server, but this does not mean they support the features required for CSC themselves", sending the command without a client that handles the invalidation pushes gives you a stale cache,
+not a fast one.
+
+In the real world: an A P I started throwing RedisTimeoutException in bursts during morning traffic, and the cache's own metrics, server C P U, ops or sec, latency percentiles, were all healthy through every burst, which is what kept the investigation pointed at the network for a week.
+The exception text had the answer in it: the WORKER section showed busy threads well the configured minimum, and the timeouts clustered on the endpoints that called a legacy synchronous helper deep in a shared library.
+Nothing was wrong with Redis; the continuation that would have completed the Redis call was queued behind thread-pool growth caused by blocked threads elsewhere in the process. Raising the minimum thread count stopped the bleeding within a deploy, and removing the sync-over-async call fixed it.
+The habit worth forming is to read the whole timeout message before forming a hypothesis, that exception is a diagnostic report, and most people treat it as an error string.
+
+-- pause --
+Section 3. Code and diagrams.
+
+-- pause --
+Sample latency for common ops.
+
+Don't memorise latency figures, they belong to somebody else's hardware and network.
+Memorise the documented complexity (every command page on redis.io states it), because that is the part that is true everywhere, then measure your own floor with redis-cli --intrinsic-latency on the server host and your own round trip with redis-cli --latency.
+
+Two O(N)s in that table are not equivalent. HGETALL is O(N) in one key you control; KEYS is O(N) in the entire keyspace and grows with everyone else's data.
+
+-- pause --
+Section 4. Common pitfalls.
+
+* KEYS in production.** Blocks the single-threaded server while iterating all keys. Use SCAN with a cursor, but know what SCAN actually promises, because the guarantees are weaker than most people assume.
+Redis guarantees a full iteration returns every element present from start to end, and never returns one that was absent throughout. It explicitly does not guarantee uniqueness, "a given element may be returned multiple times.
+It is up to the application to handle the case of duplicated elements", and elements that came or went mid-iteration "may be returned or not: it is undefined." COUNT is "just a hint", not a page size. So SCAN is safe for anything idempotent and wrong for anything that counts.
+Big keys. A single key holding a 100 megabytes list pauses the server when read and when deleted. Split into smaller keys. Use the right detector: redis-cli --bigkeys finds keys with many elements, --memkeys finds keys consuming the most bytes, --keystats reports both.
+Reaching for --bigkeys when the problem is memory is a common wrong turn.
+No T T L on cached data. Cache grows unbounded to eviction kicks in randomly. Always set T T L appropriate to data freshness needs.
+Cache stampede. T T L expires to 1000 concurrent requests all miss and hit DB. Mitigate with: lock-on-miss, stale-while-refresh, jittered TTLs.
+Storing serialized objects you don't decode. Storing Jason when you only need one field wastes bandwidth and C P U. Use Hash fields.
+Multi-key ops in cluster mode. MGET key1 key2 fails if keys hash to different slots. Use hash tags ( user:{42}:x, user:{42}:y ) to colocate.
+Pub or Sub for reliable messaging. No persistence; offline subscribers miss messages. Use Streams for at-least-once delivery.
+Distributed lock without T T L. Holder crashes to lock stuck forever. Always set T T L on locks; verify token before release.
+Treating Redis as a primary database. No complex queries, no joins, simple persistence. Use it for cache and ephemeral state; durable data belongs in an RDBMS.
+FLUSHALL in shared dev environment. Wipes everything across all databases. Use FLUSHDB (single DB) at most.
+No memory limit set. Redis happily uses all RAM and gets OOM-killed.
+Set maxmemory + eviction policy, and leave headroom it, because the eviction calculation excludes replication and AOF buffers ( mem_not_counted_for_evict ), and nothing at all accounts for the copy-on-write pages a snapshot fork produces.
+Forgetting command execution is single-threaded. One slow Lua script blocks ALL clients. Profile scripts; avoid KEYS, SORT, SMEMBERS on big sets. io-threads parallelises socket I O only, it does not let two commands run at once.
+Assuming an acknowledged write is a durable write. Replication is asynchronous; a primary can reply +OK and die before any replica sees it. WAIT narrows the window and doesn't close it. Anything whose loss you'd have to explain belongs in a database.
+EVALSHA without a fallback. The script cache is volatile and is empty on a restarted server or a freshly promoted replica. Loading scripts once at startup guarantees a NOSCRIPT storm after the first failover.
+Sliding expiration on IDistributedCache. Every cache read issues an expiry write against the primary. Fine at low volume, a self-inflicted write workload on a hot key.
+
+-- pause --
+Section 5. Interview-ready summary.
+
+In-memory data store with rich types: strings, hashes, lists, sets, sorted sets, streams, et cetera
+T T L for expiration; eviction policies ( allkeys-lru is the cache default) for memory pressure.
+Persistence: RDB (snapshots) + AOF (write log). Pure cache to disable both for speed.
+Replication primary to replicas; Sentinel for HA failover; Redis Cluster for sharding.
+Pub or Sub = ephemeral broadcast; Streams = persistent log with consumer groups.
+Distributed locks via SET NX with T T L + token verification, and a fencing token at the protected resource if the exclusivity actually has to hold.
+Command execution is single-threaded; io-threads parallelises socket I O only. Your O(N) command is everyone's latency.
+Acknowledged not equal to durable: replication is asynchronous, WAIT narrows the loss window without closing it.
+Memory is used_memory (what maxmemory limits) versus used_memory_rss (what the OOM-killer sees); allocators don't hand pages back, so provision for peak.
+
+Expected interview questions:
+
+"How would you cache hot product data?", Cache-aside pattern: app reads cache; on miss, fetch from DB and SET with T T L. On product update, DEL the cache entry. Use allkeys-lru eviction.
+"What's a cache stampede?", Many concurrent requests miss the cache simultaneously (T T L just expired). Solutions: lock-on-miss (one fetcher), stale-while-revalidate (serve stale, refresh in background), jittered TTLs (avoid synchronized expiry).
+"RDB versus AOF?", RDB: periodic snapshot; compact, fast restart, can lose minutes. AOF: log every write; minimal data loss, larger files, slower restart. Combine for production durability.
+"How does Redis Cluster shard data?", 16384 slots; key hashed via CRC16 modulo 16384. Each shard owns a range. Multi-key ops require all keys in same slot, use hash tags {xxx} to force.
+"How do you implement a leaderboard?", Sorted Set ( ZADD ) with player ID as member, score as score. ZRANGE. REV to get top N, ZRANK for player position.
+"How do you implement rate limiting?", Token bucket: per-user counter + T T L. INCR rate:user:42 to if value > limit, reject. EXPIRE rate:user:42 60 on first hit. Or use sorted set with timestamps.
+"Single-node Redis lock, pitfalls?", Holder crash to lock stuck unless T T L. Race conditions if release isn't atomic (delete only if you still own it, Lua script).
+And the one that isn't fixable inside Redis: if the holder is paused past the T T L, two processes hold the lock and neither knows, you need a fencing token checked by the resource being protected.
+"Is Redis single-threaded?", Command execution is, which is where its atomicity guarantees come from. Socket I O can be threaded ( io-threads, off by default); fsync, lazy frees and snapshot or AOF-rewrite children run elsewhere.
+The useful version of the question is which of your commands are O(N) and how big N gets.
+"Redis replied OK. Is my write safe?", No. Replication is asynchronous; the primary can acknowledge and die before any replica sees it, and Redis Cluster documents that acknowledged writes can be lost. WAIT and min-replicas-to-write bound the window; nothing makes it zero.
+"Why did our memory usage stay high after we deleted half the keys?", used_memory fell, used_memory_rss didn't, because the allocator doesn't return pages to the operating system. Provision for peak; treat mem_fragmentation_ratio after a peak as unreliable rather than as evidence of fragmentation.
+
+-- pause --
+Section 6. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Data structures beyond strings.
+
+Q: When would you choose a Sorted Set over a Hash for storing user data?-- think --
+
+A: Sorted Set when you need ranked or range queries (leaderboards, time-ordered feeds, priority queues), every member has a numeric score the engine keeps sorted. Hash when you need O(1) field lookup under a single key (user profile with name or email or plan) without ordering.
+
+Cross-Q: How is a Sorted Set implemented internally and what does that mean for ZADD performance?-- think --
+
+A: the listpack threshold a Sorted Set is a skip list (for ordered range traversal) plus a hash table (for O(1) score lookup by member), the dual structure is why it costs more per member than a plain set.
+ZADD is O(log N) because the skip-list insertion walks ~log N levels; ZRANGEBYSCORE is O(log N + M) where M is the number of elements returned. zset-max-listpack-entries (default 128) it is neither: it's a flat listpack, and OBJECT ENCODING will tell you which one you have.
+
+Cross-Q²: If I have a very large leaderboard and only need the top 1000 displayed, is a Sorted Set still the right call?-- think --
+
+A: For the access pattern, yes, ZREVRANGE leaderboard 0 999 is O(log N + 1000), so the tree descent grows logarithmically and the rest is the 1000 elements you asked for.
+The cost that actually scales is memory, which is linear in members and which you should measure rather than estimate: MEMORY USAGE leaderboard on a representative sample, or redis-cli --memkeys.
+If it doesn't fit, two patterns help: (1) tier, keep the top N in Redis and the full ranking in Postgres; or (2) only ZADD scores a cutoff, accepting that you can't answer "what rank am I" for everyone. HyperLogLog is wrong here, it counts distinct members and cannot rank them.
+
+-- pause --
+Drill 2, RDB versus AOF persistence.
+
+Q: Walk me through RDB versus AOF and when you'd use each.-- think --
+
+A: RDB takes periodic point-in-time snapshots (binary dump of dataset). Fast restart, compact files, but can lose minutes of data on crash. AOF logs every write operation; configurable fsync (always or everysec or no). Slower restart, larger files, but ~1 second max data loss with everysec.
+Production usually combines both.
+
+Cross-Q: Why does fsync set to always not actually give zero data loss?-- think --
+
+A: fsync flushes the operating system page cache to the disk controller, but the controller has its own write cache (battery-backed on enterprise SSDs, volatile on commodity drives). Power loss between controller-cache and platter still loses data unless the controller is BBWC.
+Also, AOF rewrite (compaction) holds a fork; very rare crash windows during rewrite can corrupt the file. True zero data loss requires synchronous replication to a second node confirming write-receipt, not just fsync.
+
+Cross-Q²: For a pure cache that loses data on restart anyway, what's the optimal persistence config?-- think --
+
+A: Disable both, save "" and appendonly no.
+The cost of persistence on a cache is not mainly throughput, it's latency spikes and memory headroom: RDB forks, and Redis documents that "fork() can be time consuming if the dataset is big, and may result in Redis stopping serving clients for some milliseconds or even for one second";
+copy-on-write then duplicates every page the parent writes while the child runs, so a write-heavy instance needs headroom its dataset size.
+A pure cache repopulates from the origin on miss; durability is the origin's job. The trade-off: a cold start has a poor hit rate until warm. Mitigate with a warmup job that pre-loads hot keys on start, and confirm the origin can survive one cold cache, that is the failure you're choosing.
+
+-- pause --
+Drill 3, Eviction policy choice.
+
+Q: I have a Redis instance storing both cached lookups (with T T L) and session data (no T T L, must persist for user lifetime). Which maxmemory-policy ?-- think --
+
+A: volatile-lru, only evicts keys that have a T T L set, leaving sessions untouched. Sessions stay in memory; cache entries cycle out on pressure.
+
+Cross-Q: What happens if memory fills entirely with T T L-less sessions and volatile-lru can't find anything to evict?-- think --
+
+A: It behaves as noeviction, returns OOM command not allowed when used memory > 'maxmemory' on new writes. Sessions become "sticky" and crowd out the cache entirely.
+The fix is operational: separate caches and sessions into two Redis instances (or two logical databases on the same instance with different memory budgets), or set a hard upper bound on session count ( MAXIMUM_SESSIONS per app).
+
+Cross-Q²: When is allkeys-lfu better than allkeys-lru ?-- think --
+
+A: LFU (Least Frequently Used) outperforms LRU when the access pattern has scan-resistant hotspots, for example, a few keys hit constantly plus occasional bulk scans. LRU would evict the hot keys after a scan because they look "older" than the just-scanned keys.
+LFU maintains a frequency counter that decays over time, so one-time scans don't push out frequent items. Available since Redis 4.0.
+It is not a per-key memory cost worth worrying about: Redis describes it as "a probabilistic counter, called a Morris counter, to estimate the object access frequency using just a few bits per object, combined with a decay period".
+Tune it with lfu-log-factor (default 10, how many accesses saturate the 0, 255 counter) and lfu-decay-time (default 1 minute; 0 means never decay). One practical bonus: redis-cli --hotkeys only works under an *-lfu policy, because it reads that counter.
+
+-- pause --
+Drill 4, Cluster mode and slot routing.
+
+Q: How does Redis Cluster route a GET user:42 request from a cluster-aware client?-- think --
+
+A: Client computes CRC16("user:42") % 16384 = slot, looks up which shard owns that slot from its cached slot map, and sends the request directly to that shard's primary. If the slot moved (resharding) the shard replies MOVED and the client retries against the new host and refreshes its map.
+
+Cross-Q: I do MGET user:42 user:43 and get CROSSSLOT error. Why and how to fix?-- think --
+
+A: user:42 and user:43 hash to different slots to live on different shards to multi-key ops can't run atomically across shards. The fix is hash tags: MGET user:{42}:profile user:{42}:settings, the {42} part is what's hashed, so both keys land in the same slot.
+The trade-off is you've coupled their physical placement, which can cause hot-slot problems if {tenant} is a popular tag.
+
+Cross-Q²: A new shard joins the cluster. Walk me through what happens to in-flight requests during slot migration.-- think --
+
+A: Cluster admin runs CLUSTER SETSLOT MIGRATING on source and IMPORTING on dest. During migration, the source serves reads or writes for keys it still owns; ASK redirects to dest for keys already migrated.
+Client follows ASK for that one request without updating its slot map (since migration is in flight). Once all keys move, CLUSTER SETSLOT NODE finalizes; subsequent requests get MOVED and clients update permanently.
+Gossip protocol (cluster bus on port +10000) propagates topology changes to all nodes.
+
+-- pause --
+Drill 5, Sentinel versus Cluster.
+
+Q: When would you choose Sentinel over Cluster mode?-- think --
+
+A: When the dataset fits in one node's RAM and you only need HA + read replicas, not sharding. Sentinel is simpler, 3 sentinel processes monitor a primary + replicas and perform automated failover.
+Cluster mode adds operational complexity (slot management, hash tags, cluster-aware clients) for the win of horizontal write scale.
+
+Cross-Q: Sentinel says it does "automated failover." What's the actual quorum + election process?-- think --
+
+A: Sentinels monitor the primary with periodic pings. When one sentinel sees subjectively down (sdown), it asks others. If quorum sentinels agree to objectively down (odown).
+Then sentinels run a Raft-like leader election: one sentinel becomes the leader for this failover, picks the best replica (highest replication offset, lowest priority number), promotes it via REPLICAOF NO ONE, reconfigures others to replicate from new primary, and updates clients via pub or sub.
+Split-brain risk: if the network partitions sentinels from the primary but clients can still reach it, you can briefly have two primaries until the old one reconnects and demotes itself.
+
+Cross-Q²: How does the StackExchange.Redis client find the current primary after failover?-- think --
+
+A: Client connects to any sentinel, runs SENTINEL get-master-addr-by-name to discover current primary, and subscribes to the +switch-master channel for failover notifications. On failover event, it reconnects to the new primary transparently.
+If you bypass sentinel and hard-code the primary address, you'll silently write to a stale replica after failover, a classic bug.
+
+-- pause --
+Drill 6, Pipelining versus transactions versus Lua.
+
+Q: I need to atomically check-and-decrement an inventory counter. Pipeline, MULTI or EXEC, or Lua?-- think --
+
+A: Lua script, it runs atomically server-side (Redis is single-threaded; the script blocks all other commands until complete). Read counter, branch on value, decrement if positive, return success, one round trip, no race window. MULTI or EXEC can't conditional-decrement (no IF logic).
+Pipelining is just batched commands without atomicity.
+
+Cross-Q: What's wrong with WATCH counter; MULTI; DECR counter; EXEC; to achieve the same?-- think --
+
+A: It's optimistic, if counter changed between WATCH and EXEC, the transaction aborts and returns nil. You then retry. Under contention, the retry storm can be worse than just locking. Lua wins because it's pessimistic + atomic in one shot: no retry loop, no extra round trips.
+WATCH or MULTI is fine for low-contention scenarios but loses to Lua on hot keys.
+
+Cross-Q²: A Lua script does a KEYS * pattern match across a 10M-key database. What's the impact?-- think --
+
+A: Catastrophic, Redis is single-threaded, the Lua script runs in the main thread, and KEYS is O(N). For 10M keys this blocks the server for seconds. All other clients block.
+The Lua script also can't be killed mid-execution without SCRIPT KILL (which only works if the script hasn't written anything; otherwise you SHUTDOWN NOSAVE ). Rule: Lua scripts must be short and key-set-bounded, use explicit KEYS[1], KEYS[2] for inputs, never KEYS or SCAN inside the script.
+
+-- pause --
+Drill 7, Distributed locking.
+
+Q: Show me a correct single-node Redis distributed lock.-- think --
+
+A: SET lock:resource NX EX 30, atomic acquire with T T L. Holder does work, releases via Lua: if GET == token then DEL. Token prevents accidental release by a different holder if the first holder's T T L expired and another grabbed the lock.
+
+Cross-Q: What's the Redlock controversy?-- think --
+
+A: Antirez (Redis author) proposed Redlock: acquire from N independent Redis nodes; lock is held if majority confirm within a tight time bound.
+Martin Kleppmann critiqued: under garbage collector pauses or network partitions, two clients can both believe they hold the lock (the timing assumptions break).
+Antirez responded that fencing tokens fix the partition issue. The consensus today: for mission-critical mutual exclusion (financial settlements, leader election), use a real consensus system (etcd, Consul, ZooKeeper).
+For most app-level locks (preventing duplicate emails), single-node Redis lock + T T L + token is fine.
+
+Cross-Q²: How do fencing tokens fix the garbage collector-pause problem?-- think --
+
+A: Each successful lock acquisition returns a monotonically increasing token (use INCR lock-counter:resource ). Holder passes the token to the protected resource (DB, S three). The resource rejects writes with stale tokens.
+So even if a paused client wakes up still thinking it holds the lock, its write carries an older token and gets rejected.
+The downside: the protected resource must support fencing-token checks, most DBs don't natively, so you need an application-layer guard (for example, a conditional write with WHERE token > last_seen_token ).
+
+-- pause --
+Drill 8, Cache stampede.
+
+Q: A popular product page hits Redis with T T L set to 300 seconds. When T T L expires, 5000 concurrent requests all miss and hammer the DB. What's this called and how do you fix it?-- think --
+
+A: Cache stampede (or dogpile / thundering herd). Three standard fixes: (1) single-flight lock, first miss grabs a Redis lock, fetches from DB, populates cache; others wait or serve stale.
+(2) Probabilistic early expiration, refresh in background as T T L approaches (for example, XFetch algorithm); cache never actually expires under load. (3) Stale-while-revalidate, serve stale for a grace period while a background task refreshes.
+
+Cross-Q: Walk me through the XFetch / probabilistic early expiration math.-- think --
+
+A: Store (value, expiry, computation_time) in cache. On read, compute now + computation_time beta log(random()). If this is past expiry, refresh now even though T T L hasn't formally expired. beta (typically 1) tunes how aggressively to refresh early.
+Result: refresh probability rises smoothly as expiry approaches, so the refresh load is distributed in time rather than concentrated at the exact expiry moment. Reference: Vattani et al., "Optimal Probabilistic Cache Stampede Prevention," 2015.
+
+Cross-Q²: How does jittered T T L help, and why isn't it enough on its own?-- think --
+
+A: Adding random jitter to T T L (for example, 300 + rand(-30, +30) seconds) prevents synchronized expiry across keys, important when 1000 keys were populated at the same time.
+But jitter doesn't help a single hot key: when that one product page's cache entry expires, the stampede still happens for that key alone. Jitter is a complement to single-flight or probabilistic refresh, not a replacement.
+
+-- pause --
+Drill 9, Cache invalidation strategies.
+
+Q: Compare T T L, write-through, write-behind, and explicit invalidation.-- think --
+
+A: T T L: passive expiry; simple; bounded staleness. Write-through: app writes to cache and DB synchronously; strong consistency; cache write latency added to every write. Write-behind: app writes to cache; cache flushes to DB async; fastest writes; risk of data loss if cache fails before flush.
+Explicit invalidation: app DELs cache keys on relevant DB writes; correct but error-prone (every write path must remember).
+
+Cross-Q: I have multi-region Redis with explicit invalidation. How do I propagate invalidations across regions?-- think --
+
+A: Three options: (1) Versioned keys, keys include a version like product:42:v17; updates increment the version in a control plane, old keys become orphaned and T T L-evict. No invalidation needed.
+(2) Pub or Sub on a control channel, but pub or sub is fire-and-forget, regions disconnected at the moment of invalidation miss the message. (3) Redis Streams with consumer groups per region, durable invalidation queue, regions consume at their own pace.
+(1) is usually the cleanest because it sidesteps coordination entirely.
+
+Cross-Q²: With write-through, what happens if cache write succeeds but DB write fails?-- think --
+
+A: Cache now has data the DB doesn't, phantom write. Two patterns to handle: (a) DB-first write-through: write to DB first, then cache. If cache fails, retry or delete (cache miss falls back to DB). If DB fails, no cache pollution. (b) Cache-aside is safer, write only to DB, then invalidate cache.
+Read path repopulates. Most production systems do cache-aside + T T L precisely to avoid the write-through failure mode.
+
+-- pause --
+Drill 10, Pub or Sub versus Streams.
+
+Q: I need to broadcast cache invalidations to 50 app instances. Pub or Sub or Streams?-- think --
+
+A: Streams if any subscriber being disconnected at the moment of invalidation is unacceptable. Pub or Sub is fire-and-forget: subscribers not connected when PUBLISH runs miss the message. Streams persist the message and consumer groups track per-consumer position.
+Trade-off: Streams uses more memory and requires explicit XACK for acknowledgment.
+
+Cross-Q: A Stream consumer crashes after reading 100 messages but before ack-ing them. What happens?-- think --
+
+A: The messages stay in the Pending Entries List (PEL) for that consumer group. Either the same consumer (with same name) reconnects and XREADGROUP returns the pending messages, or another consumer XCLAIM s them after a timeout ( min-idle-time ).
+PEL prevents at-most-once delivery; at-least-once is the guarantee. Handler must be idempotent (use message ID as dedup key).
+
+Cross-Q²: A Stream has 1M unprocessed messages and consumers are slow. What happens to memory?-- think --
+
+A: Stream grows indefinitely, Redis doesn't auto-trim unless you tell it. Options: (1) XADD events MAXLEN ~ 100000, cap stream at ~100K entries (the ~ is approximate trim for performance). Old messages dropped when cap reached. (2) XADD events MINID ~, drop messages older than a cutoff.
+(3) Manual XTRIM. Without a cap, a runaway producer or stuck consumer fills RAM and triggers eviction or OOM. Default a MAXLEN on every Stream unless you have explicit reason not to.
+
+-- pause --
+Drill 11, Hot key and big key problems.
+
+Q: One product page generates 200K Redis ops or sec on a single key. Latency is climbing. Why and fix?-- think --
+
+A: Hot key. Command execution is serialised on one thread, so one key's traffic saturates it; io-threads doesn't help, because it only parallelises socket I O. In Cluster mode the entire shard owning that slot is the bottleneck regardless of how many other shards are idle.
+Fixes: (1) an in-process cache in front of Redis, HybridCache or IMemoryCache with a short T T L removes the round trip entirely for the hottest key; (2) client-side caching (Redis 6 RESP3 tracking) where your client library implements it;
+(3) replica reads, fan reads across replicas, accepting replication lag; (4) key splitting, write the value to product:42:copy:0. product:42:copy:9 and have each reader pick one at random, so the load spreads across ten keys and (in Cluster) ten slots.
+Note the deliberate absence of {} in those names: braces are hash-tag syntax, and tagging the copies would defeat the point by forcing them all back into one slot.
+
+Cross-Q: What's the big-key problem and how does it differ from hot-key?-- think --
+
+A: Big key = a single key holding too much data (a hash with millions of fields, a list holding hundreds of megabytes). A hot key is a rate problem, a big key is a size problem, and the tells differ.
+Reading a big key is O(N) on the execution thread, so it stalls every other client; deleting one is O(N) too, which is what UNLINK exists for; and in Cluster mode a big key can't be migrated quickly during resharding, because a slot migration moves keys one at a time.
+Detect with redis-cli --memkeys (bytes) or --bigkeys (element counts), the two answer different questions and people reach for the wrong one. MEMORY USAGE key gives the number for one key, with a SAMPLES option because it estimates on large aggregates.
+Fix by paging the key: user:42:posts:page:0, user:42:posts:page:1.
+Rather than quoting a size limit, set the bound the workload needs and enforce it in code, an LTRIM after every push, a cap on hash fields, because the limit that matters is "how much can we afford to block on when this is read or deleted".
+
+Cross-Q²: How does Redis 6's client-side caching ( CLIENT TRACKING ) work for hot keys?-- think --
+
+A: The client opts in with CLIENT TRACKING ON. "The Redis server remembers or tracks the set of keys that each client connection has previously read.
+When any client writes new data to a tracked key, the server sends an invalidation message to all clients that have accessed that key previously", delivered as a RESP3 push. Reads then hit local process memory and only invalidations cross the network.
+Trade-offs: server memory for the tracking table, a stale-read window between the write and the invalidation arriving, and the fact that "if any connection from a client gets disconnected. then the client will flush all keys from the client-side cache".
+Check your client before promising this in dot NET: Redis documents CSC support in redis-py, Jedis, node-redis and go-redis; StackExchange.Redis has an open feature request (#2583), not an implementation.
+In dot NET today the equivalent win comes from an explicit L1, HybridCache, where you control invalidation instead of the server pushing it.
+
+-- pause --
+Drill 12, Expire versus persist.
+
+Q: I SET k v EX 60 then later realize this key should be permanent. How?-- think --
+
+A: PERSIST k, removes the T T L. Subsequent T T L k returns -1 (no expiry). The key stays until evicted or explicitly deleted.
+
+Cross-Q: I run SET k newvalue on a key that had T T L set to 60. What happens to the T T L?-- think --
+
+A: T T L is removed, SET without KEEPTTL (Redis 6+) or EX clears it. The key now has no expiry until you set one. Common bug: refresh script reads-modifies-writes and silently makes ephemeral keys permanent.
+Use SET k newvalue KEEPTTL to preserve the original expiry, or SET k newvalue EX 60 to reset it.
+
+Cross-Q²: How does Redis actually expire keys, does it scan every second?-- think --
+
+A: Two strategies combined. (1) Lazy (passive) expiration, "A key is passively expired when a client tries to access it and the key is timed out." Free for keys you touch, useless for keys you never touch again.
+(2) Active expiration, "periodically, Redis tests a few keys at random amongst the set of keys with an expiration. All the keys that are already expired are deleted from the keyspace" (redis.io, EXPIRE).
+The implementation is activeExpireCycle in Redis's expire.c:
+it samples a bounded batch of volatile keys per database and keeps going while the proportion it finds expired stays high, so the cycle does more work exactly when there is more to reclaim, and it runs at the server frequency hz (default 10 in the shipped redis.conf ).
+The consequences to name: memory is released when the key is deleted, not when its T T L hits zero, so a large population of cold expired keys holds memory until the sampler reaches it;
+and because the cycle runs on the execution thread, a mass expiry is a latency event, watch expired_keys in INFO stats and, if you've enabled latency-monitor-threshold, the expire-cycle event in LATENCY LATEST.
+This is also why expired keyspace notifications are late: "Expired ( expired ) events are generated when the Redis server deletes the key and not when the time to live theoretically reaches the value of zero."
+
+-- pause --
+Drill 13, Redis modules.
+
+Q: I need full-text search in Redis. What are my options?-- think --
+
+A: The Redis Query Engine (the feature formerly packaged as the RediSearch module), inverted indexes, exact + prefix + fuzzy + numeric range search, aggregations. Define a schema with FT.CREATE, query with FT.SEARCH.
+Trade-offs: the index is an additional in-memory structure on top of the data it indexes, so budget for it and measure with FT.INFO rather than guessing; queries are far heavier than KV ops, so they compete with everything else on the single execution thread.
+Version-and-distribution caveat matters here: it was a loadable module needing Redis Stack, and it ships inside core Redis from Redis 8 under AGPLv3. Managed services and forks differ, check before you design around it.
+For a corpus large enough that the index dominates your memory bill, dedicated search (Elasticsearch, OpenSearch) wins.
+
+Cross-Q: What's the difference between RedisJSON and just storing Jason strings in regular keys?-- think --
+
+A: RedisJSON stores Jason natively as a tree, allows path-based read or update without round-tripping the whole document. Jason.SET user:42 $.email "x@y.com" updates one field; the plain-string equivalent is GET to parse to mutate to SET (3 round trips, race window, full document re-serialization).
+Memory is comparable. The module also enables JSONPath queries and integrates with RediSearch for indexed Jason fields. Production tip: only worth the module dependency if you have frequent partial updates to large Jason docs.
+
+Cross-Q²: Should I run my own Redis with RediSearch + RedisJSON + RedisTimeSeries, or use Redis Stack / Redis Cloud?-- think --
+
+A: The question has partly been answered for you by the packaging change:
+Redis 8 folded the former Redis Stack technologies, Jason, Time Series, probabilistic types and the query engine, into core, under AGPLv3 (Redis blog, May 2025), so "which modules do I load" is increasingly "which Redis distribution am I on".
+That makes the decision a distribution decision: core Redis 8+ gets you these features in one binary; older self-hosted Redis means managing module builds pinned to server versions;
+forks such as Valkey and provider-managed offerings each have their own answer, and several don't have these features at all.
+Check what your managed service actually exposes before you design a query around FT.SEARCH, discovering it isn't there is a rewrite, not a config change.
+
+-- pause --
+Drill 14, Primary store versus cache.
+
+Q: Can I use Redis as my primary database instead of Postgres?-- think --
+
+A: For very specific workloads, yes. Redis with AOF + replication can be durable.
+But you lose: complex queries (no JOINs, no aggregations beyond what specific data types offer), transactional consistency across many keys, mature backup or PITR tooling, and the ability to query data outside the patterns you indexed when designing keys.
+The "Redis as primary" path is suitable for: session stores, leaderboards, real-time counters, simple key-value lookups. Not suitable for: anything you'd want ad-hoc reporting on.
+
+Cross-Q: But Redis has SAVE, replication, and AOF, isn't that durable enough?-- think --
+
+A: Durable yes, queryable no.
+The bigger problem is schema flexibility on the query side: if a year from now you need "all users who haven't logged in in 30 days," that's trivial in Postgres ( WHERE last_login < now() - interval '30 days' ) and near-impossible in Redis unless you pre-built a sorted set keyed by login timestamp.
+With a real DB, you can answer questions you didn't anticipate. With Redis, you can only answer questions you designed indexes for. This is the canonical reason to use Redis as a cache in front of a real DB, not instead of one.
+
+Cross-Q²: When is Redis-as-primary actually the right call?-- think --
+
+A: High-velocity, narrow-access-pattern workloads where the data is recomputable: session stores (regenerate on next login), real-time analytics counters, rate-limit counters, distributed locks, queues.
+Also: edge use cases where Postgres latency is unacceptable but data is small and access patterns are fixed. The discipline is recognizing that you're making a deliberate trade, speed and simplicity now, harder future evolution.
+Worth it for things that genuinely won't change shape; bad bet for evolving domains.
+
+-- pause --
+Drill 15, Client-side caching (RESP3 tracking).
+
+Q: How does CLIENT TRACKING reduce Redis load for read-heavy clients?-- think --
+
+A: With tracking enabled, the client maintains a local cache of recently-read keys. Redis tracks which keys each client connection has read; when one changes, Redis pushes an invalidation message and the client drops its copy.
+Subsequent reads are satisfied from process memory instead of crossing the network.
+How much it saves is entirely a function of your read:write ratio on the tracked keys, Redis frames the applicable case as the standard one, "where a small subset of the data is accessed much more frequently than the rest", and you can verify it is working with MONITOR:
+the first read of a key shows up at the server, subsequent ones shouldn't.
+
+Cross-Q: What's the consistency model, can clients ever read stale data?-- think --
+
+A: Yes, there's a brief window between (a) writer mutates the key on the server and (b) tracking-invalidation message arrives at the reader. During that window, the reader's local cache returns the old value. Bounded staleness, typically sub-millisecond on LAN, but real.
+For strict consistency, disable tracking or use CLIENT TRACKING ON BCAST with version checks. Most caching scenarios tolerate this; financial reads should not.
+
+Cross-Q²: Can tracking cause memory issues on the Redis server?-- think --
+
+A: Yes, Redis maintains a table mapping key to set of clients tracking it. With many clients tracking many keys, this table grows.
+BCAST mode (broadcast) trades precision for memory: clients subscribe to prefixes (for example, user: ), Redis broadcasts invalidations matching the prefix without per-key bookkeeping. Cheaper for the server, but clients receive irrelevant invalidations.
+Choose default tracking (per-key precision) for small caches, BCAST for large ones. Configure tracking-table-max-keys to cap server memory.
+
+-- pause --
+Section 7. Cheat Sheet.
+
+Single-threaded execution: one slow command blocks every client; io-threads moves socket I O only. Profile Lua and avoid KEYS *.
+UNLINK over DEL for large collections: DEL frees O(N) on the execution thread, UNLINK hands it to a background thread.
+--bigkeys counts elements, --memkeys counts bytes, --hotkeys needs an LFU policy. Pick the one that matches the question.
+WAIT is not durability: it reports how many replicas acknowledged; acknowledged writes can still be lost in a failover.
+Script cache is volatile: EVALSHA returns NOSCRIPT after a restart or failover. Redis 7 Functions are replicated and persisted; Eval scripts are not.
+used_memory versus used_memory_rss: maxmemory limits the first, the OOM-killer watches the second.
+T T L + NX: SET k v NX EX 30 is the building block for distributed locks and idempotent caches.
+allkeys-lru: standard cache eviction; volatile-lru for mixed cache or durable, noeviction for durable-only.
+Hash tags: {tenant} in keys forces them into one cluster slot for multi-key ops.
+Pipelining: batches commands without round trips; one of the biggest throughput wins.
+Pub or Sub versus Streams: pub or sub is fire-and-forget broadcast; streams persist with consumer groups (Kafka-lite).
+RDB versus AOF: snapshots versus append log; combine for production, disable both for pure cache.
+Cache stampede: jitter TTLs, single-flight locks, stale-while-revalidate to absorb mass-miss spikes.
+Big key smell: redis-cli --bigkeys; a 100MB hash freezes the server when accessed.
+Cluster routing: 16384 slots via CRC16(key) % 16384; clients learn the slot map and reroute on MOVED.
+
+-- pause --
+Section 8. Walkthrough, TTLs evaporating mid-flight.
+
+Problem: Engineers report "Redis cache misses growing." Every cached item is meant to live one hour, but OBJECT IDLETIME shows keys vanish within seconds. DB load is climbing; pod C P U is fine.
+
+Diagnosis: The senior connects with redis-cli and runs INFO memory. used_memory_human is at the maxmemory ceiling, and evicted_keys in INFO stats is climbing steadily. CONFIG GET maxmemory-policy returns allkeys-lru.
+So Redis is under memory pressure and evicting to stay under the limit, the TTLs are irrelevant, the keys are being pushed out early.
+Next they run redis-cli --memkeys, which samples for the keys consuming the most memory (as opposed to --bigkeys, which ranks by element count), and one hash dominates the summary: session:debug:dump, a debug feature shipped last week that stores raw request bodies.
+MEMORY USAGE session:debug:dump confirms it is holding a large fraction of the instance on its own.
+
+Fix: Two parts. Immediate: drop the offending key and disable the debug dump. Use UNLINK, not DEL, freeing a hash this large is O(N) on the execution thread, and UNLINK hands the reclamation to a background thread instead of stalling every other client while it walks the structure:
+
+Then size correctly and add a guard:
+
+Track redis_evicted_keys_total in Prometheus and alert when zero for cache deployments.
+
+Why it works: Eviction is a memory-pressure response, not a T T L feature. Removing the bloating key restores headroom; the size guard stops a single offender from poisoning the cache for everyone else.
+
+-- pause --
+Section 9. Self-test.
+
+The cluster has reshuffled slot ownership and the client's slot map is stale. StackExchange.Redis and most cluster-aware clients automatically follow the redirect and refresh their map.
+Continuous MOVED traffic suggests an in-flight resharding; transient ASK redirects also show during slot migration.
+
+Two round trips and a race window. If the client crashes between calls, the key persists forever. The combined SET. EX is atomic.
+
+Cache-aside is simpler, the cache can be down without breaking writes, and stale reads are bounded by T T L. Write-through guarantees the cache is always fresh after a write but couples write latency to the cache and adds a second failure mode (cache write fails -> what does the app do?).
+Cache-aside is the default; write-through suits read-heavy hot keys.
+
+Use SET email:welcome:{user Id} 1 NX EX 86400. If it returns OK, send the email; if nil, another worker already claimed it. The T T L covers the case where sending fails midway, allowing a retry after a day. For perpetual idempotence, omit EX but persist the marker durably elsewhere too.
+
+Pub or Sub is fire-and-forget. A node that's restarting or temporarily disconnected misses the invalidation and serves stale data until its T T L expires. For correctness use Streams with consumer groups, or a versioned key ( product:42:v3 ) so old keys naturally fall out of cache.
+
+volatile-* policies can only evict keys that have a T T L. If everything resident has no expiry, there is nothing eligible, and Redis documents that "the volatile-xxx policies behave like noeviction if no keys have an associated expiration", hence write errors with no evictions.
+Either give every cached key a T T L, or move to allkeys-lru. Note that Azure Cache for Redis defaults to volatile-lru, so this bites teams migrating from a self-hosted instance configured with allkeys-lru.
+
+Freeing the structure is O(N) and happens on the thread that executes every other command, so the server stalls for the duration and every client sees it. UNLINK removes the key from the keyspace immediately and reclaims the memory on a background thread.
+The same behaviour is available for Redis's own deletions via lazyfree-lazy-eviction, lazyfree-lazy-expire, lazyfree-lazy-server-del and lazyfree-lazy-user-del (all no in the shipped config), and on demand with FLUSHDB ASYNC.
+
+Maybe not. Replication is asynchronous: the primary acknowledges before replicas have the data, so a promoted replica can be missing writes the client was told succeeded.
+Redis Cluster states this directly, it "does not guarantee strong consistency" and "will lose writes that were acknowledged by the system to the client".
+WAIT numreplicas timeout blocks until N replicas acknowledge and returns the count actually reached (check it, it returns on timeout too), and min-replicas-to-write / min-replicas-max-lag refuse writes when too few replicas are caught up. Both bound the window; neither makes Redis a CP store.
+
+The service used EVALSHA with a digest from a SCRIPT LOAD performed at startup. The script cache "is always volatile. not persisted" and can be cleared on restart, on SCRIPT FLUSH, or when a replica is promoted, the new primary has never seen your script.
+The fix is a client path that reloads on NOSCRIPT and retries (most clients do this; verify yours), or Redis 7 Functions, which are "persisted to the AOF file and replicated from master to replicas, so they are as durable as the data itself".
+
+Microsoft.Extensions.Caching.StackExchangeRedis does not store a string. It stores a hash with fields absexp, sldexp and data, plus a T T L on the key, so the value lives in the data field, not at the key, and GET against a hash is a type error rather than a miss.
+Read it with HashGetAsync(key, "data"), and remember that RedisCacheOptions.InstanceName prefixes the key. The corollary worth knowing: with a sliding expiration configured, the read path issues an expiry refresh, so every cache hit is also a write against the primary.
+
+That it is safe for the server but weaker than people assume for the caller.
+A full iteration returns everything present throughout and nothing absent throughout, but "a given element may be returned multiple times", elements added or removed mid-iteration "may be returned or not: it is undefined", and COUNT is "just a hint", not a page size.
+So SCAN is fine to drive an idempotent operation and wrong to drive a count or a one-shot migration without deduplication.

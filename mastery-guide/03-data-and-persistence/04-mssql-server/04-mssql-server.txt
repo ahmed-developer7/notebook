@@ -1,0 +1,1004 @@
+-- pause --
+Section 1. Why it matters.
+
+sequel Server is Microsoft's flagship RDBMS and the dominant database in dot NET shops. It has had decades of polish: world-class query optimizer, integrated full-text search, in-memory tables (Hekaton), columnstore indexes for analytics, Always On for HA, and tight tooling integration with Azure.
+If you're building enterprise dot NET apps, you're going to deploy on sequel Server (or Azure sequel).
+
+Why interviewers ask: sequel Server proficiency separates engineers who treat the DB as a black box from those who can read execution plans, design indexes, and tune for production load.
+T sequel is its own dialect with rich features (window functions before standard sequel had them, Jason support, temporal tables), knowing the strengths is part of the value.
+
+When NOT to choose: cross-platform / Linux-first projects where Postgres is more idiomatic. Tiny apps where SQLite suffices. Massive analytics where a columnar store (Snowflake, BigQuery) wins.
+
+In the real world: the question that separates candidates on this topic is not "what is a clustered index", everyone has that answer.
+It is "here is the plan, tell me why it chose that." Ten-year dot NET engineers routinely fail it, not because they don't know what a Key Lookup is, but because they have never once opened a plan for a query they wrote and had to defend the shape of it.
+The tell in an interview is the pronoun: candidates who have done it say "the optimizer estimated 50 and got 180,000"; candidates who haven't say "sequel Server was being slow." Everything else on this page is downstream of being able to read one plan properly.
+
+-- pause --
+Section 2. Core concepts.
+
+-- pause --
+Editions and licensing.
+
+sequel Server Express, Dev, small apps (10 gigabytes max DB), Free.
+sequel Server Developer, Full features, dev or test only, Free.
+sequel Server Standard, Mid-tier production, Per-core, sold in 2-core packs.
+sequel Server Enterprise, All features, large deployments, Per-core, several times Standard.
+Azure sequel Database, PaaS managed, Per-v Core or DTU.
+Azure sequel Managed Instance, Lift-and-shift to PaaS, Per-v Core.
+
+Licensing is per-core, sold in two-core packs, with a minimum of four core licenses per physical processor (not per server, the minimum applies to each socket). Don't quote per-core list prices from memory in an interview; quote the model and say prices change.
+
+The documented scale limits, from Microsoft Learn's Editions and supported features of sequel Server 2022, are the ones worth remembering because they change architecture:
+
+Max relational database size, 524 PB, 524 PB, 10 gigabytes.
+Max buffer pool memory per instance, operating system maximum, 128 gigabytes, 1,410 megabytes.
+Max compute capacity, operating system maximum, lesser of 4 sockets / 24 cores, lesser of 1 socket / 4 cores.
+
+Editions gate features, not just size, and several of the gates catch teams mid-incident.
+From the same source: Always On availability groups are Enterprise-only (Standard gets basic availability groups, two replicas, one database, no readable secondary);
+online index create and rebuild is Enterprise-only, as are resumable online index rebuilds, Resource Governor, memory-optimized tempdb metadata, and most of the batch-mode Intelligent Query Processing features.
+Scalar UDF inlining, Query Store, PSP optimization, columnstore, In-Memory O L T P, Always Encrypted, row-level security and Accelerated Database Recovery are available on Standard.
+
+For new projects, Azure sequel (PaaS) is the modern default, automatic backups, point-in-time restore, geo-replication, all without managing VMs.
+
+In the real world: a team sized a new production instance on Standard edition because the licensing spreadsheet said Standard, and the design review only checked database size against the 524 PB figure. Two things bit them, six months apart.
+First, the server had 512 gigabytes of RAM and the buffer pool refused to use more than 128 gigabytes, so the hot working set kept getting evicted and PAGEIOLATCH_SH climbed while the operating system reported gigabytes of free memory, the machine was not memory-starved, the edition was.
+Second, the runbook for the quarterly index rebuild had WITH (ONLINE = ON) copied from a blog post, and the maintenance window failed with an edition error at 2am, so the on-call engineer removed ONLINE = ON to make it run, and took an exclusive lock on the largest table for forty minutes.
+The transferable lesson: edition is a design input, not a procurement detail. Before you write ONLINE = ON, ALTER RESOURCE GOVERNOR RECONFIGURE, or an availability-group topology, check which column of the editions table you are actually in.
+
+-- pause --
+T sequel extensions over standard sequel.
+
+Microsoft's dialect adds significant features:
+
+Engine caveat on MERGE. It is ANSI, but the dialects diverge on what you'd actually reach for. sequel Server has had MERGE since 2008 and it is the idiom most dot NET codebases use. Postgres Q L only gained MERGE in version 15; before that (and still, for most upserts) the idiom is INSERT.
+ON CONFLICT (key) DO UPDATE. MySQL has no MERGE at all, the idiom is INSERT. ON DUPLICATE KEY UPDATE. If you say "I'd just use MERGE" in an interview about a Postgres system, expect the follow-up.
+
+In the real world: an order-import job used MERGE to upsert line items and ran cleanly for a year on a single worker. Scaling the importer to four parallel workers produced duplicate-key violations on a table with a unique constraint, intermittently, on maybe one batch in fifty.
+The team's first theory was a bug in their partitioning of the input. It was not: two sessions can both evaluate WHEN NOT MATCHED before either one's INSERT commits, because under the default READ COMMITTED the read half of the MERGE takes no lock that survives to the write.
+The unique constraint was the only thing catching it, which is why it surfaced as an exception rather than as duplicate rows. MERGE INTO target WITH (HOLDLOCK) closed it by taking a range lock on the key being probed.
+The durable point is that MERGE reads as one atomic statement and is not one by default, a lot of seniors avoid it for upserts entirely and write INSERT. WHERE NOT EXISTS under SERIALIZABLE, precisely so the locking is visible in the code.
+
+Jason support (since sequel Server 2016):
+
+Temporal tables (system-versioned):
+
+Free time-travel queries, invaluable for audit, debugging, "what changed?" investigations. Not free in storage, though: every UPDATE and DELETE writes a row to the history table, and nothing removes it unless you say so. sequel Server 2017 added a retention policy for exactly this:
+
+Microsoft Learn notes that a finite retention policy requires the history table to have a clustered index (B+ tree or columnstore); cleanup then runs as a background task.
+
+In the real world: a team turned system versioning on for an orders table to satisfy an audit requirement, and the feature did exactly what it promised.
+Eighteen months later the database was several times its expected size and nobody could account for it, because the history table doesn't appear in the object explorer under the same name people were looking at and sp_spaceused on orders doesn't include it.
+The row that made it expensive was a nightly job that re-stamped a LastSyncedAt column on every order every night, an update that changed nothing anybody cared about, and wrote a full historical version of every row, every night.
+Two changes fixed it: move the churn column out of the versioned table, and set a HISTORY_RETENTION_PERIOD. The generic lesson is that system versioning charges you per update, not per meaningful change, so before you enable it, go and find out which columns your application writes on a timer.
+
+-- pause --
+Indexes, clustered versus non-clustered.
+
+Every sequel Server table has at most one clustered index. The clustered index is the table, rows are physically stored in clustered-index order. By default, the primary key is clustered (so rows are stored in PK order).
+
+Choosing a clustered key is one of the most consequential design decisions. Microsoft Learn's Index Architecture and Design Guide tabulates six properties of a good clustered index key and gives the mechanical reason for each. Four of them drive the design:
+
+Narrow. "The clustered index key is a part of any nonclustered index on the same base table." Every extra byte in the clustered key is paid for again in every non-clustered index on the table. An int costs 4 bytes, a bigint 8, a uniqueidentifier 16.
+Unique. "If the clustered index isn't unique, a 4-byte internal uniqueifier column is automatically added to the index key to ensure uniqueness", and it is then carried in every non-clustered index too.
+Ever-increasing. Inserts land on the last page, so pages fill rather than split.
+Immutable. Changing a clustered key column rewrites the entry in every non-clustered index, because the clustered key is the row locator.
+
+The other two are cheaper wins the guide also lists: not nullable only (a nullable column forces a 3, 4 byte NULL block per row) and fixed-width columns only ( varchar / nvarchar cost an extra 2 bytes per value versus a fixed-width type).
+
+Learn's own worked conclusion:
+"a clustered index key with a single int or bigint not nullable column has all of these properties if it's populated by an IDENTITY clause or a default constraint using a sequence and isn't updated after a row is inserted." A uniqueidentifier fails narrow at 16 bytes and,
+unless generated with NEWSEQUENTIALID(), fails ever-increasing too.
+
+What the non-clustered leaf actually contains is the part most candidates get half-right, and it is what makes covering indexes make sense:
+
+Heap, non-unique, RID (file:page:slot) added to the key columns.
+Heap, unique, RID added to the included columns.
+Unique clustered index, non-unique, clustered index key added to the key columns.
+Unique clustered index, unique, clustered index key added to the included columns.
+Non-unique clustered index, either, as, plus the uniqueifier when present.
+
+The rule underneath the table: the row locator has to make each non-clustered index row unique, so it joins the key when the index is not itself unique, and rides along as an included column when it is.
+
+So a non-clustered index on orders(customer_id), over a table clustered on id, physically stores (customer_id, id). That's why WHERE customer_id = 7 can return id for free, and why asking for total as well forces a Key Lookup into the clustered index, once per qualifying row.
+
+Key column order is not arbitrary.
+The design guide's rule: "The column that is used in the query predicate in an equality ( = ), inequality ( >, >=, = @from, an index on (status, created_at) seeks straight to status = 'Pending' and then reads one contiguous created_at range inside it, both predicates are seek predicates.
+Reverse the key to (created_at, status) and you still get a seek, but only on created_at >= @from; status degrades to a residual predicate applied to every row in that range.
+Be precise about this in an interview: the wrong key order usually doesn't turn a seek into a scan, it turns a narrow seek into a wide one, and the plan still says "Index Seek" while reading a hundred times the rows.
+Compare Seek Predicates with Predicate in the operator's properties to tell them apart.
+
+SARGability, and the dot NET trap. A predicate is searchable (SARGable) if the engine can compare the parameter against the indexed column as stored. Wrap the column in anything and it can't:
+
+The one that actually bites dot NET teams is invisible in the C sharp. ADOdot NET sends a dot NET string as nvarchar unless you tell it otherwise.
+sequel Server's documented data-type precedence ranks nvarchar varchar, and "the data type with the lower precedence is first converted to the data type with the higher precedence", so comparing an nvarchar parameter to a varchar column converts the column, on every row:
+
+The fix is on the dot NET side, not the sequel side:
+
+There is a collation nuance worth knowing because it explains why this bug is intermittent across servers: Jonathan Kehayias (SQLskills, Implicit Conversions that cause Index Scans) shows that with a Windows collation on the varchar column the optimizer can still seek despite the conversion,
+while with a sequel collation ( SQL_Latin1_General_CP1_CI_AS, still the default on many legacy instances) it degrades to a scan.
+Same code, same schema, different server, different plan.
+
+Engine differences. "The clustered index is the table" is a sequel Server and MySQL or InnoDB fact, not a general sequel one:
+
+Table storage, clustered index, or a heap if none, always clustered by PK (or a hidden rowid), always a heap.
+Secondary index leaf, clustered key (or RID), primary key value, physical tuple id ( ctid ).
+"Cluster the table", CREATE CLUSTERED INDEX, maintained, implicit, maintained, CLUSTER, a one-off reorganisation, not maintained.
+Covering index, INCLUDE (non-key columns), no INCLUDE; extra columns must be key columns, INCLUDE since Postgres Q L 11.
+
+The practical consequence: Postgres Q L's index-only scans depend on the visibility map rather than on the index owning the rows, and Postgres Q L has no permanently-clustered table, advice about "choose your clustered key carefully" simply doesn't transfer.
+
+In the real world: an Orders table used uniqueidentifier defaulting to NEWID() as its primary key, and therefore as its clustered key, because the architects wanted IDs generated in the application. It behaved for two years at low volume.
+What changed was not the schema but the insert rate: at a few hundred orders a minute, each new random key landed in the middle of the B-tree, split a page,
+and the table's page density collapsed while write latency climbed, and every one of the six non-clustered indexes on the table got 16 bytes wider per row, because the clustered key is the row locator.
+The team's first instinct was to schedule index rebuilds nightly, which restored density for about four hours a day. The actual fix was to keep the GUID as a unique non-clustered key for the external contract and add an INT IDENTITY as the clustered key. Nothing the data layer changed.
+The lesson is that "we generate IDs client-side" is a requirement about uniqueness, and people satisfy it by accidentally making a decision about physical storage order as well.
+
+In the real world: a customer-lookup endpoint went from milliseconds to seconds after a release that "only added Dapper alongside E F Core".
+The sequel was identical to the EF query, the index on Email was untouched, and SET STATISTICS IO ON showed logical reads that matched a full scan of the table.
+The plan had CONVERT_IMPLICIT(nvarchar(200),[Email],0) on the column side and a yellow warning triangle on the SELECT operator.
+E F Core had been configured with IsUnicode(false) in the model years earlier, so its parameters arrived as varchar; the hand-written Dapper query passed a bare string and got nvarchar.
+Both were "parameterised", the security property everyone checks was fine, and the performance property nobody checks was not. The permanent fix was a Dapper type handler that maps string to DbString { IsAnsi = true } by default.
+The diagnostic worth keeping: when a query scans an index that clearly covers it, read the predicate text in the plan, not just the operator name.
+
+In the real world: a Database Engine Tuning Advisor run on a reporting workload produced eleven index recommendations, and a well-meaning engineer applied all eleven to the O L T P Orders table over a weekend. Reports got faster.
+Checkout got slower, and the pattern was maddening, p50 unchanged, p99 up by an order of magnitude, worst during the nightly import.
+Every INSERT now had to maintain twelve B-trees, every UPDATE to an indexed column had to move entries in several of them, and the import's lock footprint grew with the write amplification.
+sys.dm_db_index_usage_stats after two weeks showed four of the new indexes with zero user_seeks and millions of user_updates: pure cost.
+The lesson is that missing-index tooling scores the benefit to one query and never scores the cost to the write path, so its output is a list of candidates, not a plan.
+Read user_seeks + user_scans + user_lookups against user_updates before you keep an index, and remember that the DMV resets on instance restart, judge it over a full business cycle, not a Monday.
+
+-- pause --
+Execution plans and statistics.
+
+Read execution plans to understand query performance.
+
+In sequel Server Management Studio (SSMS): Ctrl+M (include actual execution plan), then run. The plan diagram shows:
+
+Look for:
+Index Scan on big tables = missing or unusable index.
+Sort consuming most of the cost = consider an index that already sorts that way.
+Hash Match for joins is fine for big sets; Nested Loops for small.
+Estimated versus Actual rows widely different = stale statistics. UPDATE STATISTICS table_name; or EXEC sp_updatestats;.
+Key Lookup = non-covering index forced row fetches. Add covering INCLUDE.
+
+sys.dm_db_missing_index_details and sys.dm_db_index_usage_stats show suggested and actual index usage.
+
+What an "estimate" actually is. Every estimated row count traces back to a statistics object.
+Per Microsoft Learn's Statistics article, a statistics object holds two things:
+a histogram on the first key column only, aggregated into "a maximum of 200 contiguous histogram steps", and a density vector, one density per prefix of the key columns, where density is defined as "1/(number of distinct values)".
+Multiply density by the row count and you get the average number of rows per distinct value, which is the estimate the optimizer actually uses. It reads the histogram when it knows the value it is looking for, and falls back to the density vector when it doesn't.
+That single sentence explains most cardinality surprises, including the next one.
+
+Parameter sniffing is the mechanism a senior interview will actually push on, and it is worth being able to explain end to end.
+
+The optimizer compiles a plan for a parameterised statement once, using the parameter values present at compile time, Microsoft Learn's Query Processing Architecture Guide calls this sniffing:
+the engine "sniffs" the current parameter values during compilation and passes them to the optimizer "so that they can be used to generate potentially more efficient query execution plans." Values are sniffed for stored procedures, sp_executesql, and prepared queries.
+The resulting plan goes in the cache and is reused for every subsequent set of values.
+
+That is a feature when the data is evenly distributed and a landmine when it is skewed:
+
+Compiled first with @customer Id = 90210, a customer with 3 orders to the histogram says 3 rows to Index Seek + Key Lookup, nested loops. Correct and fast.
+Reused with @customer Id = 1, the house account with 4 million orders to the same plan does 4 million Key Lookups, one per row. The plan is not wrong for the value it was built for; it is catastrophic for this one.
+Compile it the other way round first and you get the mirror image: a scan-and-hash plan that is right for the house account and needlessly heavy for everybody else.
+
+The symptom in production is the giveaway: a procedure that is fast for months, then slow after a restart, a failover, a statistics update, or an index rebuild, all of which evict or invalidate the cached plan, so the next caller's values become the ones the plan is built for.
+Nothing in the application changed, which is why it gets reported as "the database got slow."
+
+Diagnosing it: pull the cached plan and compare the compiled parameter values with the runtime ones.
+
+The cached plan only carries ParameterCompiledValue.
+To see both sides of the comparison you need an actual plan, SSMS's "Include Actual Execution Plan" (Ctrl+M), then right-click the SELECT operator to Properties to Parameter List, which shows Parameter Compiled Value next to Parameter Runtime Value. A large gap between them is the diagnosis.
+
+The remedies, in the order a senior would reach for them:
+
+Fix the real cause, An index that makes both shapes cheap; refresh stale stats, Best, slowest.
+OPTION (RECOMPILE), Compiles per execution with the actual values as constants; no plan is cached, C P U per call; fine for a low-frequency report, bad for a 10k or s endpoint.
+OPTIMIZE FOR (@p = ), Pins the plan to a value you choose, You now own that choice forever.
+OPTIMIZE FOR UNKNOWN, Ignores the sniffed value; estimates from the density vector (average rows per distinct value), Deliberately mediocre for everyone, a fair plan, never a great one.
+Local variable copy inside the proc, Same effect as OPTIMIZE FOR UNKNOWN, by accident, Invisible in the code; the classic "why is this slow" landmine.
+Query Store plan forcing, Freezes a known-good plan, A stopgap; audit is_forced_plan = 1 or it rots.
+Split the procedure, Branch on the skewed value into two procs, each with its own cache entry, Ugly, effective, entirely under your control.
+
+Note the local-variable row, because it is the trick people apply without knowing what it does.
+Assigning a parameter to a local variable defeats sniffing, and the guide is explicit about what you get instead: "When a query uses local variables, sequel Server can't sniff their values at compile time, so it estimates cardinality using available statistics or heuristics.
+it typically uses the All Density value (also known as average density)." If no statistics exist at all it falls back to fixed guesses, 10% selectivity for equality, 30% for inequality and range predicates.
+
+Version gate worth knowing.
+sequel Server 2022 (16.x) under database compatibility level 160 adds Parameter Sensitive Plan (PSP) optimization: the first compilation produces a dispatcher plan that bucketises at-risk predicates into cardinality ranges and routes each execution to a query variant with its own cached plan.
+Microsoft Learn states the limits plainly, it "currently only works with equality predicates", it evaluates "up to three" at-risk predicates, and it is disabled if parameter sniffing is off ( PARAMETER_SNIFFING scoped configuration, trace flag 4136, or the DISABLE_PARAMETER_SNIFFING hint).
+sequel Server 2025 (17.x) at compatibility level 170 extends it to INSERT / UPDATE / DELETE / MERGE. So "sequel Server 2022 fixed parameter sniffing" is wrong in an interview; "2022 fixes the equality-predicate case if you're on compat 160" is right.
+
+Memory grants and spills. Every plan with a Sort or a Hash operator asks for a memory grant before it runs, sized from the estimated row count and row width. Two failure modes follow directly:
+
+Under-estimate to spill. The grant is too small, the operator spills its workspace to tempdb, and the actual plan marks that operator with a spill warning ("Operator used tempdb to spill data during execution"); the matching Extended Events are sort_warning and hash_warning.
+A query with a good plan can still be slow purely because it is sorting on disk.
+Over-estimate to queueing. The grant is far larger than needed, and because grants come from a fixed pool, other queries wait for one. That wait is RESOURCE_SEMAPHORE, and it looks like the whole instance stalled rather than one query misbehaving.
+
+sys.dm_exec_query_memory_grants shows what is granted and what is waiting. sequel Server 2017 (batch mode, compat 140) and 2019 (row mode, compat 150) added memory grant feedback, which corrects a repeating query's grant on subsequent executions.
+Know the limitation, because it is the follow-up question: in 2017 and 2019 the corrected grant lives in the cached plan only, "feedback isn't persisted if the plan is evicted from cache", and it is also lost on failover.
+sequel Server 2022 added persistence and percentile mode, which stores the feedback in Query Store (so it survives eviction) and sizes from a percentile of recent executions rather than only the last one; that variant requires Query Store enabled and in read-write state.
+All of these are Enterprise-edition features.
+
+Start with waits, not with queries. Before opening any plan, ask the instance what it spent its time waiting on. sys.dm_os_wait_stats accumulates since the last restart or DBCC SQLPERF('sys.dm_os_wait_stats', CLEAR); sys.dm_exec_session_wait_stats scopes it to a session.
+The waits that change your diagnosis:
+
+PAGEIOLATCH_SH, waiting on a buffer that "is in an I O request. a mode used when the buffer is being read from disk", storage, or a working set that doesn't fit in the buffer pool.
+PAGELATCH_UP, latch on an in-memory page, "commonly. when a system page (buffer) like PFS, GAM, SGAM is latched", tempdb allocation contention.
+LCK_M_X, "waiting to acquire an Exclusive lock", blocking, go to sys.dm_exec_requests.
+RESOURCE_SEMAPHORE, waiting for a memory grant, over-estimating plans.
+CXPACKET / CXCONSUMER, parallelism exchange, MAXDOP and cost threshold, not necessarily a problem.
+ASYNC_NETWORK_IO, "the task is blocked waiting for the client application to acknowledge that it has processed all the data sent to it", your dot NET app, not the database.
+
+That last row is the one dot NET engineers should have memorised.
+Microsoft Learn's own list of causes reads like a code review of a data-access layer: "writing results to a file while the results arrive, waiting for user input, client-side filtering on a large dataset instead of server-side filtering."
+
+In the real world: a nightly billing procedure ran in about ninety seconds for a year, then started taking forty minutes, always after a Sunday-night failover, never on a Monday when the team looked at it, and never reproducible on a restored copy.
+Query Store showed two plans for the same query with a hundredfold difference in duration and no change to the sequel text.
+The parameter list in the slow plan's X M L told the story: Parameter Compiled Value = 1, the internal system tenant with most of the rows, because the first call after failover was a health-check job that always passed tenant 1. Every other tenant then ran a plan built for the biggest one.
+The fix that shipped was two lines, the health check stopped using the production procedure, and the procedure got OPTIMIZE FOR UNKNOWN on the tenant parameter, and the lesson the team kept was subtler:
+whatever calls your procedure first after a plan-cache eviction decides the plan for everybody, so a synthetic monitoring call is a production performance decision.
+
+In the real world: a support escalation said "the database is slow" and pointed at a report endpoint taking two minutes. sys.dm_exec_requests showed the session in ASYNC_NETWORK_IO for almost the entire duration and the query's own C P U time was under a second.
+The database had finished; it was waiting for the client to consume rows. The application was streaming 400,000 rows into a List, then filtering and aggregating them in C sharp because that code predated the reporting requirement and nobody had revisited it.
+The database team was three days into a storage investigation before anyone read the wait type. Moving the filter and the aggregate into the query took the result set to a few hundred rows and the endpoint to under a second.
+The transferable habit: read the wait type before you form a theory, because ASYNC_NETWORK_IO is the engine telling you the bottleneck is on your side of the wire.
+
+-- pause --
+Stored procedures, functions, triggers.
+
+T sequel syntax. For vendor-neutral coverage (Postgres Q L plpgsql, when stored procs are the right choice versus when they're an anti-pattern), see sequel Mastery, Stored procedures, functions, triggers.
+
+Stored procedure: named T sequel block, compiled and cached:
+
+Stored proc versus ad-hoc sequel, debate that's mostly resolved. Modern dot NET apps with E F Core mostly use ad-hoc sequel (parameterized). Stored procs still useful for:
+Complex multi-step business logic that needs to run server-side.
+Performance-critical queries where you want hand-tuned sequel.
+Security (grant EXEC on procs without table access).
+
+Dynamic sequel: EXEC versus sp_executesql. Any procedure that builds sequel as a string has to choose, and the choice is both a security and a performance decision:
+
+Concatenation gives you an injection vector and a plan cache full of single-use plans, which evicts the plans that matter.
+sys.dm_exec_cached_plans WHERE usecounts = 1 is where that shows up; the server-level optimize for ad hoc workloads setting caches a small stub on first execution instead of the full plan, which limits the damage without fixing the cause.
+
+User-defined functions:
+
+Scalar: returns a single value.
+Microsoft Learn's Scalar UDF Inlining article gives four reasons they historically performed badly, "iterative invocation" (once per qualifying row, with context switching), "lack of costing" (the optimizer costs relational operators, not scalar ones),
+"interpreted execution" (statement by statement, no cross-statement optimization), and "serial execution": "sequel Server doesn't allow intra-query parallelism in queries that invoke UDFs."
+Version gate. sequel Server 2019 (15.x) at database compatibility level 150 automatically inlines eligible scalar UDFs, transforming them into scalar expressions or subqueries so the optimizer can cost them and the plan can go parallel.
+Eligibility is narrow and has been tightened by cumulative updates, a UDF that calls GETDATE() or NEWSEQUENTIALID(), references table variables, uses EXECUTE AS other than CALLER, or contains multiple RETURN statements (CU5) is not inlineable.
+Check sys sql modules is inlineable, and confirm per-query by looking for the absence of a node in the plan X M L. So "scalar UDFs kill parallelism" is a pre-2019 / pre-compat-150 claim, and saying it flatly is a good way to get corrected.
+Inline table-valued (iTVF): a parameterised view, the body is expanded into the calling query and optimized with it. Still the right answer when you want reusable logic without a performance cliff.
+Multi-statement table-valued (mTVF): the optimizer can't see inside, so it uses a fixed cardinality guess of 100 rows (and 1 row before sequel Server 2014) regardless of what the function actually returns.
+sequel Server 2017 (compat level 140) added interleaved execution: optimization pauses, the function is materialised, the real row count is fed back, and optimization resumes for everything downstream.
+It only helps read-only MSTVFs, and only when the skew actually changes the plan, Microsoft Learn notes "a basic SELECT * from an MSTVF doesn't benefit."
+
+In the real world: a dbo.fn_GetCustomerTier(@customer Id) scalar function was written for a display column, then reused in a WHERE clause on a reporting query, the same function, in a different position. On the display query it ran once per returned row and nobody noticed.
+In the predicate it ran once per candidate row, over the whole table, and the plan went serial because a scalar UDF was present. The report took eleven minutes on an instance with 32 cores that were doing nothing.
+The engineer who inherited it upgraded to sequel Server 2019 expecting inlining to fix it and it didn't, because the function called GETDATE() to decide the tier as of today, a time-dependent intrinsic, which the documentation lists as disqualifying.
+sys sql modules is inlineable returned 0 and said so in a second. The fix was to pass the date in as a parameter, which made the function inlineable and the plan parallel.
+The transferable point: a scalar UDF's cost depends on where in the query it appears, and inlining is a checklist you can query, not a promise.
+
+Triggers: auto-fire on INSERT or UPDATE or DELETE. Use sparingly:
+Audit logging (better as a separate event-sourcing pattern).
+Cascading updates (often handled by FK constraints).
+Enforcing complex constraints not expressible in CHECK.
+
+Triggers add hidden behavior; modern preference is to do this in app code or events.
+
+-- pause --
+Locking, blocking, deadlocks.
+
+sequel Server uses pessimistic locking by default. Operations acquire locks:
+Shared (S): for reads.
+Exclusive (X): for writes.
+Update (U): intent to upgrade to X.
+Intent (IS / IX): signal at higher granularity.
+
+Isolation levels, what sequel Server actually does. The engine implements the four ISO levels plus two row-versioning levels. From Microsoft Learn's Transaction Locking and Row Versioning Guide:
+
+READ UNCOMMITTED, yes, yes, yes, no shared locks; NOLOCK is this per-table.
+READ COMMITTED (default), no, yes, yes, shared locks held only for the duration of the read.
+REPEATABLE READ, no, no, yes, read and write locks held to end of transaction; no range locks.
+SERIALIZABLE, no, no, no, adds range locks on WHERE ranges.
+READ COMMITTED SNAPSHOT (RCSI), no, yes, yes, row versions; statement-level read consistency.
+SNAPSHOT, no, no, no, row versions; transaction-level read consistency.
+
+Two things in that table decide real designs:
+
+RCSI is a database option, not a level you SET. ALTER DATABASE. SET READ_COMMITTED_SNAPSHOT ON changes what READ COMMITTED means for every existing query, no code changes.
+Readers stop taking shared locks (only a schema-stability Sch-S lock) and read the last committed version instead, so readers no longer block writers and writers no longer block readers.
+SNAPSHOT is opt-in per transaction ( SET TRANSACTION ISOLATION LEVEL SNAPSHOT, after ALTER DATABASE. SET ALLOW_SNAPSHOT_ISOLATION ON ) and gives the whole transaction one consistent view.
+The price is a failure mode RCSI doesn't have: if two snapshot transactions modify the same row, the second gets error 3960, "Snapshot isolation transaction aborted due to update conflict", a first-committer-wins abort your application must catch and retry, exactly like a deadlock.
+Update conflicts arise only when you write under SNAPSHOT; RCSI readers can't hit them.
+
+Both versioning modes store the versions in tempdb, which is why enabling either one turns tempdb sizing into a capacity decision.
+
+Engine differences, the trap. None of the defaults are "how sequel works":
+
+sequel Server, READ COMMITTED with locking (RCSI off), yes, unless RCSI is on, genuine dirty reads, possible.
+Azure sequel Database, READ COMMITTED with RCSI on by default, no, as, possible.
+Postgres Q L, READ COMMITTED, MVCC always, no, for plain reads, "behaves like Read Committed", dirty reads are not implemented, not possible; Postgres Q L's Repeatable Read is snapshot isolation.
+MySQL / InnoDB, REPEATABLE READ, MVCC, no, for plain reads, supported, prevented for locking reads via gap / next-key locks.
+
+Two of these are direct interview traps. First: the same code deployed to sequel Server on-premises and to Azure sequel Database runs at different effective isolation, because Azure sequel Database ships with READ_COMMITTED_SNAPSHOT ON and sequel Server and Managed Instance ship with it OFF.
+Second:
+"add NOLOCK for a fast dirty read" is meaningless advice on Postgres Q L, whose documentation states that Read Uncommitted "behaves like Read Committed" because that "is the only sensible way to map the standard isolation levels to Postgres Q L's multiversion concurrency control architecture."
+
+Lock escalation is the mechanism behind most "one query took the whole database out" incidents, and it is a specific, documented threshold rather than a vague resource limit.
+From the same guide: escalation triggers when "a single Transact-sequel statement acquires at least 5,000 locks on a single nonpartitioned table or index";
+if escalation is blocked by a conflicting lock, the engine retries "at every 1,250 new locks acquired." There's also a memory trigger, with the default locks setting of 0, escalation fires when lock objects consume 24 percent of Database Engine memory.
+
+Escalation goes row or page to table (or partition, with LOCK_ESCALATION = AUTO on a partitioned table). It does not go to page first.
+So a DELETE that touches 5,000 rows on a busy table can convert thousands of harmless row locks into one exclusive table lock, and every other session on that table stops.
+
+Note what RCSI does not fix: it removes shared locks from readers, so escalation on a read is no longer a concern, but a DELETE or UPDATE still takes exclusive locks and still escalates. Row versioning is not a substitute for batching your writes.
+
+Blocking = one transaction waiting for another's lock. Normal for short transactions; problematic when long-running blockers stall the system.
+
+Deadlock = two transactions each holding a lock the other wants. sequel Server auto-detects and kills one (the "deadlock victim").
+
+Mitigations:
+Consistent lock order. If T1 locks A then B, T2 must do the same.
+Short transactions. Long ones widen the deadlock window.
+Lower isolation level if business logic permits.
+Read Committed Snapshot Isolation (RCSI): versioning-based reads, no shared locks for SELECT. Often dramatically reduces blocking.
+
+RCSI is the most-recommended default tweak for high-concurrency apps. Three things to say about it in an interview so it doesn't sound like a slogan:
+
+It shifts cost to tempdb, every version chain lives there, and a long-running reader keeps versions alive for as long as it runs. sys.dm_tran_version_store_space_usage and sys.dm_tran_active_snapshot_database_transactions are where you watch it.
+It adds 14 bytes of versioning overhead to each modified row, a 6-byte transaction sequence number plus an 8-byte pointer to the versioned row, per Microsoft's Overhead of Row Versioning engine post.
+On tables whose pages were previously packed full, the first update of each row grows it and can split the page, so a one-off burst of fragmentation after enabling RCSI is expected, not a bug.
+It changes read semantics: a reader now sees the state at the start of its statement, not the state after the blocking writer commits. Code that relied on readers queueing behind writers, a poll-and-claim queue table, say, can start handing the same row to two workers.
+Under locking READ COMMITTED the second reader waited; under RCSI it reads the old version and proceeds. If a query's correctness depends on blocking, say so explicitly with UPDLOCK, READPAST rather than relying on the isolation level to enforce it.
+
+In the real world: a monthly reconciliation report was moved into a maintenance window because "it locks the database", and it did, a single SELECT across a year of orders under the default locking READ COMMITTED took shared locks,
+and because the scan covered essentially the whole table the engine ended up holding a table-level shared lock rather than millions of row locks, which blocked every writer for the eleven minutes it ran.
+(Worth being precise in an interview: escalation is counted on locks a statement holds, and locking READ COMMITTED releases each shared lock as soon as the row is read, so escalation is far more often a writer's problem.
+A big reader gets you there by the lock manager choosing table granularity for a full scan.) Checkout timed out; the incident was filed against checkout.
+The team's first fix was WITH (NOLOCK) on the report, which worked in the sense that the blocking stopped and failed in the sense that the finance numbers stopped reconciling, allocation-order scans under read-uncommitted can miss rows and count others twice when pages move underneath them.
+What actually fixed it was enabling RCSI, after which the report took no shared locks at all and needed no hint. The lesson is that NOLOCK and RCSI look like the same fix from the outside, "readers stop blocking writers", and only one of them still returns correct rows.
+
+In the real world: a data-retention job deleted old rows with a single DELETE FROM events WHERE created_at < @cutoff, which had been fine for two years because the nightly volume was a few thousand rows. Someone paused the job for a fortnight during a migration.
+When it resumed it matched about 900,000 rows in one statement, escalated to an exclusive table lock, and held it while the transaction log grew to fill the disk, at which point the delete rolled back, taking roughly as long again, still holding the lock.
+Total outage on that table: over an hour, for a maintenance job nobody thought of as risky.
+The rewrite was five lines: DELETE TOP (2000) in a loop with a short WAITFOR between batches, each batch its own transaction, so no statement approached 5,000 locks and the log could be truncated between them.
+The habit worth taking: any statement whose row count depends on how long since it last ran needs a batch loop, because "it has always been small" is not a property of the statement.
+
+-- pause --
+Backup, restore, point-in-time recovery.
+
+Three backup types:
+Full: entire database.
+Differential: changes since last full.
+Log: transaction log (only meaningful in FULL recovery model).
+
+Recovery models:
+Simple: log truncated automatically; no point-in-time recovery. OK for dev.
+Bulk-Logged: for bulk operations.
+Full (production default): log preserved; can restore to any point in time.
+
+Why the transaction log exists, and why it grows. sequel Server is a write-ahead logging engine: a change is written to the log and hardened to disk before the data page is written, which is what makes COMMIT durable without waiting for a random write to the data file.
+The log is a circular structure of virtual log files (VLFs); a VLF can be reused once its records are no longer needed for recovery, replication or a backup. "The log file is full" almost never means the disk is full, it means something is preventing reuse, and sequel Server will tell you what:
+
+LOG_BACKUP, FULL recovery model, and nobody is taking log backups, take log backups on a schedule, this is the most common answer by a wide margin.
+ACTIVE_TRANSACTION, an open transaction is pinning the log, find it ( DBCC OPENTRAN, sys.dm_tran_active_transactions ), usually a BEGIN TRAN someone never committed.
+AVAILABILITY_REPLICA, a secondary hasn't hardened the log records yet, fix replication lag or the replica's health.
+REPLICATION / CHECKPOINT, log reader agent behind, or checkpoint pending, investigate the specific subsystem.
+NOTHING, log is reusable, your growth is genuine, size the file properly.
+
+The mistake to avoid: shrinking the log file.
+Shrinking releases space that the workload immediately re-grows, and log growth is expensive because the new space has to be zero-initialised, instant file initialization skips that zeroing for data files,
+but only when the service account holds the Perform volume maintenance tasks ( SE_MANAGE_VOLUME_NAME ) privilege, and only from sequel Server 2022 (16.x) does it apply to log autogrowth at all, then only for growth events up to 64 megabytes, and without needing that privilege.
+Repeated shrink-and-grow also produces thousands of tiny VLFs, which slows recovery and log backups. Shrink once after a genuine one-off event, then set the file to the size it actually needs and give it a fixed growth increment rather than a percentage.
+
+A backup you have not restored is not a backup. BACKUP. WITH CHECKSUM and RESTORE VERIFYONLY catch media problems but do not prove the chain restores; only restoring it does.
+The two numbers to be able to state in an interview are RPO (how much data you can afford to lose, set by log-backup frequency) and RTO (how long a restore takes, set by database size, and by whether anyone has ever timed it).
+
+Azure sequel automates this: every database gets automatic full, differential and log backups, with point-in-time restore retention of 7 days by default, configurable between 1 and 35 days (Basic-tier databases: 1 to 7 days), per Microsoft Learn's Automatic, geo-redundant backups article.
+Longer retention needs a separate long-term retention policy, up to 10 years. You cannot download or directly access those backups, they exist only to restore from, which matters if your compliance requirement is "hand the auditor a .bak."
+
+In the real world: a team discovered during an incident that their production database had been in SIMPLE recovery for three years. It was restored from a template created for a development environment, and nothing in the deployment pipeline asserted the recovery model.
+Nightly full backups were running and monitored and green, so every dashboard said backups were healthy. They were: the team could restore to 01:00 and no later, and the incident happened at 16:00.
+Fifteen hours of orders were unrecoverable from backups and had to be reconstructed from the payment provider's records over four days.
+The two-line postmortem action was a nightly check comparing sys databases recovery model desc and the age of the last log backup against expectations, alerting on drift.
+Backup monitoring that only watches the backup job answers "did it run", which is not the question, the question is "what is my worst-case data loss right now", and that is a query, not a job status.
+
+In the real world: an on-call engineer was paged for "transaction log full, database read-only" on a Sunday, found a 400 gigabytes log next to a 60 gigabytes database, and did the thing every search result suggests: switched to SIMPLE, shrank the log, switched back to FULL.
+Service returned in ten minutes and the incident was closed. It had also silently broken the log chain, so the next log backup had nothing to chain to and point-in-time recovery was gone until the next full backup ran, twelve hours later, a window nobody knew existed.
+log_reuse_wait_desc would have said ACTIVE_TRANSACTION and DBCC OPENTRAN would have named a session left open by a deployment script that had crashed on Friday. Killing that one session would have released the log in seconds with no side effects.
+The point isn't that shrinking is always wrong; it's that the field telling you the actual cause takes five seconds to read and the reflex fix costs you your recovery point.
+
+-- pause --
+Always On Availability Groups.
+
+High availability + disaster recovery feature, Enterprise edition only, Standard edition gets basic availability groups, which are two replicas, one database, and no readable secondary. On Enterprise:
+Up to 8 secondary replicas (nine availability replicas in total).
+Read the synchronous limit carefully, because it is stated including the primary: sequel Server 2019 (15.x) raised the maximum to five synchronous-commit replicas including the current primary, one primary plus four synchronous secondaries, up from three in sequel Server 2017 (14.x).
+Everything that count must be asynchronous.
+Synchronous (commit waits for the secondary to harden the log, RPO 0) or asynchronous (commit returns immediately, RPO > 0) replication.
+Automatic failover requires all of: synchronous-commit availability mode, failover mode set to automatic on both the primary and that secondary, the secondary already synchronized, and WSFC quorum plus the availability group's flexible failover policy conditions.
+There is no approval step, if those conditions hold, the cluster fails over on its own; if any of them doesn't, the AG will not fail over automatically no matter what the configuration screen says. Anything else is a manual (or forced, with possible data loss) failover.
+Note also that a replica hosted on a failover cluster instance can only be configured for manual failover.
+Read-only routing for read replicas.
+
+The dot NET side of an AG is two connection-string keywords, and both are routinely missed:
+
+In Azure sequel: built-in geo-replication serves the same purpose with simpler ops.
+
+In the real world: a team built an availability group specifically to move reporting off the primary, configured read-only routing, ran the reports, and measured no change in primary C P U.
+The reports were connecting through the listener with a default connection string, so ApplicationIntent was absent and every query landed on the primary, read-only routing had been configured correctly and was never invoked, because routing is triggered by the client's declared intent,
+not by the query.
+Nothing errored, nothing logged, and the secondary sat idle for four months. sys.dm_exec_sessions on the primary, grouped by program_name, found it in a minute once someone thought to look.
+The second half of the lesson arrived a week after they fixed the connection string: an async secondary is behind by an amount that varies with write load, so an operations report that had always agreed with the admin screen started disagreeing during the nightly import.
+Read replicas are a consistency decision wearing the costume of an infrastructure decision.
+
+-- pause --
+Section 3. Code and diagrams.
+
+-- pause --
+A worked plan, before and after.
+
+The query: "orders for one customer in the last 30 days, newest first."
+
+Before, the only useful index is ix_orders_customer ON orders(customer_id):
+
+Three separate signals, all visible without touching a stopwatch:
+
+Estimate 50, actual 28,400. The optimizer chose Nested Loops + Key Lookup because it expected 50 rows; a lookup per row is cheap 50 times and ruinous 28,400 times. Either the statistics are stale or the parameter was sniffed for a customer with almost no orders.
+The date filter can't be evaluated at the seek at all. created_at isn't in ix_orders_customer, not as a key column, not as an included column, so it can't be a seek predicate or a residual predicate on the seek.
+It becomes a predicate on the Key Lookup: the engine fetches all 28,400 of the customer's rows from the clustered index and then throws away the 27,200 that fall outside the window. Reading which operator carries the predicate is the whole diagnosis.
+A Sort at 22% of cost for an ORDER BY that an index could have satisfied for free.
+
+After, one index that carries the range column in the key and the projection in INCLUDE:
+
+No Key Lookup (the INCLUDE columns cover the projection), no Sort (the index is already in the requested order), and the seek reads only the qualifying range instead of the customer's whole history.
+Note the key order, equality column first, range column second, and that DESC in the index definition is what removes the Sort rather than merely reducing it.
+
+-- pause --
+Connection from dot NET.
+
+For Azure sequel: use Microsoft Entra (Active Directory) authentication via Managed Identity, no passwords in config.
+
+-- pause --
+Section 4. Common pitfalls.
+
+GUID clustered key without NEWSEQUENTIALID. Random inserts cause massive page splits. Use INT or BIGINT identity, or sequential GUIDs.
+Leaving tables as heaps. No clustered index = a "heap".
+The specific problem isn't that scans are inherently slower, it's forwarded records:
+when an update widens a row past what its page can hold, the row moves and a forwarding pointer is left behind, so every read that arrives via a non-clustered index (whose leaf holds a RID) takes an extra hop, forever, until the heap is rebuilt.
+sys.dm_db_index_physical_stats(., 'DETAILED') reports forwarded_record_count. Add a clustered key (the PK usually works).
+Indexing every column. Each index has insert or update or delete cost. Profile actual query patterns; remove unused indexes ( sys.dm_db_index_usage_stats ).
+Stale statistics. Optimizer picks bad plans. Auto-update stats helps; for very large tables, add scheduled UPDATE STATISTICS WITH FULLSCAN.
+Implicit type conversion in WHERE. WHERE int_column = '7' (string literal) forces conversion to no index seek. Match types exactly.
+NOLOCK everywhere. "Magic faster" hint = read uncommitted = potentially incorrect data (dirty reads, double-count rows due to scans). Use RCSI instead.
+Long open transactions. Acquired locks held to blocking spreads. Keep transactions narrow; never include user-input wait inside.
+Mixing transactions with H T T P calls. "Begin TX to call payment A P I to commit", connection held for the A P I duration. Pre-commit, then call; or use sagas.
+MERGE in concurrency. Has known race conditions in some isolation levels. Use explicit INSERT. WHERE NOT EXISTS or MERGE with HOLDLOCK hint when needed.
+Stored procs with sensitive logic but no version control. "Last edited in SSMS by some intern in 2017." Treat schema and procs as code; check into git.
+Recovery model "Simple" in production. No log backups to no point-in-time recovery. Use FULL with regular log backups.
+Never running DBCC CHECKDB. Detects on-disk corruption. Run weekly on production.
+dot NET strings against varchar columns. ADOdot NET sends string as nvarchar; nvarchar outranks varchar in data-type precedence, so the column gets converted and the seek becomes a scan.
+Fix in the client ( SqlDbType.VarChar, Dapper's DbString { IsAnsi = true }, E F Core's IsUnicode(false) ), not by rewriting the sequel.
+Single-statement bulk deletes and updates. At 5,000 locks on one table sequel Server escalates to a table lock. Batch anything whose row count grows with elapsed time since the last run.
+Assuming Azure sequel Database and sequel Server behave the same under concurrency. Azure sequel Database ships with READ_COMMITTED_SNAPSHOT ON; sequel Server and Managed Instance ship with it OFF. The same code runs at different effective isolation in each.
+Scheduled shrinks. DBCC SHRINKDATABASE / SHRINKFILE on a timer releases space the workload immediately re-grows, and shrinking a data file fragments every index in it as a side effect (the shrink moves pages to the front of the file with no regard for index order).
+Shrink once after a genuine one-off deletion, then leave it alone.
+Treating a green backup job as a recovery plan. The job status answers "did it run", not "what is my worst-case data loss" and not "how long does a restore take". Both of those are only answerable by restoring.
+
+-- pause --
+Section 5. Interview-ready summary.
+
+Editions: Express (free, 10 gigabytes), Standard (128 gigabytes buffer pool, no Always On AGs, no online index rebuild), Enterprise (full features). Azure sequel = PaaS.
+Indexes: clustered = the table itself (one per table). Non-clustered = separate B-tree whose leaf holds the clustered key (or a RID on a heap). Key order: equality columns, then the range column, then INCLUDE for the projection.
+T sequel extras: TOP, MERGE, OUTPUT, table-valued parameters, Jason support, temporal tables.
+Statistics: histogram of at most 200 steps on the leading column, plus a density vector. The optimizer uses the histogram when it knows the value and the density vector when it doesn't.
+Parameter sniffing: one plan is compiled for the first values seen and reused for all. Remedies: RECOMPILE, OPTIMIZE FOR, OPTIMIZE FOR UNKNOWN, plan forcing, splitting the proc, or PSP optimization on sequel Server 2022 at compat 160, equality predicates only.
+Locking: S or X or U or IS or IX. RCSI = versioned reads, no shared locks for SELECT, statement-level consistency. SNAPSHOT = transaction-level consistency plus update conflicts (error 3960). Escalation to a table lock at 5,000 locks in one statement.
+HA or DR: Always On Availability Groups (Enterprise, on-prem); geo-replication (Azure sequel).
+Backups: Full + Differential + Log to point-in-time recovery (FULL recovery model). log_reuse_wait_desc tells you why the log won't truncate.
+
+Expected interview questions:
+
+"Clustered versus non-clustered index?", Clustered: rows physically sorted by index key; one per table. Non-clustered: separate B-tree with pointers (clustered key) back to rows. Covering index with INCLUDE avoids the lookup.
+"What's RCSI and when to use it?", Read Committed Snapshot Isolation: SELECTs use row versions instead of shared locks, dramatically reducing blocking. Enable on most production databases.
+"How do you find slow queries?", sys.dm_exec_query_stats for top consumers; SSMS Activity Monitor; Query Store (built-in performance history); execution plans.
+"How do you avoid deadlocks?", Consistent lock ordering across transactions. Keep transactions short. Use RCSI to reduce shared-lock contention. Set deadlock priority for important sessions.
+"GUID versus INT for primary key?", INT identity for performance and clustered-key efficiency. GUID if you need cross-server uniqueness or to generate IDs client-side. If GUID, use NEWSEQUENTIALID to avoid fragmentation.
+"What's the difference between TRUNCATE and DELETE?", TRUNCATE deallocates pages (fast, can't filter, can't be in some replication scenarios). DELETE removes rows (logs each, can WHERE-filter, triggers fire).
+"What's a Key Lookup and how do you eliminate it?", Non-clustered index has a key but query needs additional columns to sequel Server fetches each row from clustered index. Eliminate with INCLUDE covering index, or use index intersection.
+"A stored procedure was fast for months and is slow since Sunday, with no code change. What happened?", Parameter sniffing. A restart, failover, statistics update or index rebuild evicted the cached plan, and whoever called first supplied atypical values.
+Confirm by comparing "Parameter Compiled Value" with "Parameter Runtime Value" in the plan properties, or by diffing the two plans in Query Store. Then choose a remedy deliberately rather than sprinkling RECOMPILE.
+"Difference between RCSI and SNAPSHOT isolation?", Both read row versions from tempdb. RCSI is a database option that redefines READ COMMITTED and gives statement-level consistency; SNAPSHOT is opt-in per transaction and gives transaction-level consistency.
+Only SNAPSHOT produces update conflicts (error 3960), because only SNAPSHOT lets a transaction write against a snapshot taken earlier.
+"One report brought the whole database to a halt.
+How?", Table-level shared locking under locking READ COMMITTED:
+a full-table scan either takes table granularity outright or escalates to it (escalation triggers at 5,000 locks held by one statement, retried every 1,250 thereafter), and a shared table lock blocks every writer for as long as the statement runs.
+The mirror-image answer for writes is the same mechanism: a bulk DELETE / UPDATE holds its exclusive row locks to the end of the transaction, so it reaches 5,000 easily. Fixes: RCSI so readers take no shared locks, batching for writes, or a readable secondary for reporting.
+NOLOCK also stops the blocking, and gives you dirty reads, missed rows and double-counted rows in exchange.
+"Why might a query with a perfect index still be slow?", Several answers, and a good candidate names more than one: it spilled its sort or hash to tempdb because the memory grant was undersized (warning on the operator in the actual plan); it waited on RESOURCE_SEMAPHORE for a grant;
+it's SARGable in appearance but the plan shows CONVERT_IMPLICIT on the column; or the wait is ASYNC_NETWORK_IO and the engine finished long ago while the client consumed rows one at a time.
+
+-- pause --
+Section 6. Interview Cross-Questioning Drill.
+
+️ Honest caveat: reading this once doesn't make you interview-ready. Cover the answers, write them cold, then check. Pair with a senior for live mock cross-questioning. The guide removes "I never thought about that" surprises; mock interviews convert knowledge into reflex. Both are needed.
+
+Each drill is Q to A to Cross-Q to A to Cross-Q² to A.
+
+-- pause --
+Drill 1, Query Store.
+
+Q: What is Query Store and what problem does it solve?-- think --
+
+A: A built-in feature (sequel Server 2016+, on by default in Azure sequel, and on by default for all newly created databases from sequel Server 2022 (16.x), older databases upgraded in place still need it enabled) that captures query plans and runtime statistics over time.
+It records every query's compile time, execution count, C P U, IO, and stores the plans themselves.
+The problem it solves: "the query was fast yesterday and slow today", without Query Store you have no plan history; with it, you can see exactly which plan was used when and force the old plan if a regression hits. Persistent across restarts and contained in user databases.
+
+Cross-Q: A query that ran in 50 milliseconds now runs in 8 seconds after a sequel Server upgrade. How does Query Store help you fix it?-- think --
+
+A: Open the "Regressed Queries" report in SSMS, it ranks queries by performance change. Find the offender; you'll see two plans: yesterday's fast one and today's slow one.
+The cardinality estimator (CE) likely picked a different plan after the upgrade (CE versions change between sequel Server major releases). Force the old plan: EXEC sp_query_store_force_plan @query_id, @plan_id.
+The optimizer will use that plan for matching queries until you unforce or it becomes invalid. Buy time to investigate the root cause without rolling back the upgrade.
+
+Cross-Q²: When does forcing a plan backfire?-- think --
+
+A: When the forced plan is good for the parameter values you tested but bad for others (parameter sniffing in reverse). Or when underlying data distribution changes, the forced plan was great for 1M rows but is terrible at 50M.
+Or when you forget about the forced plan and it silently slows down years later as workloads evolve. Forced plans are a stopgap, not a fix. The real fix is updating stats, adding indexes, or rewriting the query so the optimizer naturally picks the right plan.
+Periodically audit sys.query_store_plan WHERE is_forced_plan = 1 to find forced plans that should be retired.
+
+-- pause --
+Drill 2, Columnstore indexes and segment elimination.
+
+Q: What's the difference between a clustered columnstore and a non-clustered columnstore index?-- think --
+
+A: Clustered columnstore, the entire table is stored in columnar format. Best for fact tables in data warehouses that are append-mostly and queried with aggregates. Non-clustered columnstore, a secondary index alongside a regular B-tree rowstore.
+Used for hybrid transactional or analytical workloads (HTAP), the row-store handles O L T P point lookups; the columnstore handles analytical queries on the same table without ETL to a separate warehouse.
+
+Cross-Q: Explain segment elimination in a columnstore.-- think --
+
+A: Columnstore data is stored in row groups of ~1M rows each. For every column in every row group, sequel Server records min or max in metadata.
+When a query has WHERE order_date >= '2025-01-01', the optimizer checks each row group's min or max for order_date and skips groups whose max is before 2025, never reads those segments. Massively reduces IO for date-filtered queries on time-series fact tables.
+
+Cross-Q²: Segment elimination only works if data is loaded in a way that aligns with query filters. What does that mean in practice?-- think --
+
+A: Load fact_sales in date order (or partition by date) so each row group contains a contiguous date range. Then WHERE date BETWEEN A AND B prunes to a few segments.
+Load randomly (interleaved dates across all row groups) and every segment spans the entire date range, segment elimination is useless because every group's min or max covers the filter. The practical pattern: partition by date, load partitions in batch order, and the columnstore naturally aligns.
+Since sequel Server 2022 (16.x) you can also state the intent directly with an ordered clustered columnstore index, CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.fact_sales ORDER (order_date), which sorts during the build so row-group min or max ranges are tight and overlap less.
+Note the option syntax: MAXDOP is an index option, so it goes in the WITH clause of CREATE INDEX ( WITH (MAXDOP = 1) ), not in a query OPTION clause. Use it, because "when MAXDOP is greater than 1, each thread. sorts it locally.
+There's no global sorting across data sorted by different threads", parallel threads finish faster but leave more overlapping segments, which is the opposite of the point.
+A fully ordered index with no overlap needs either WITH (ONLINE = ON, MAXDOP = 1) (sequel Server 2025, which spills the sort to tempdb ) or an offline build at MAXDOP = 1 where the sort fits in workspace memory; everything else yields a partial order, which still eliminates segments, just less well.
+sequel Server 2022 also extended segment elimination to string, binary and GUID types (and datetimeoffset with scale greater than two), and added row-group elimination for prefix LIKE predicates such as column LIKE 'string%', but not for LIKE '%string'.
+Existing indexes don't get the string min or max benefit until they're rebuilt. (Do not reach for OPTIMIZE_FOR_SEQUENTIAL_KEY here, that is an unrelated sequel Server 2019 index option for last-page insert contention on B-tree indexes, and it does nothing for columnstore ordering.)
+
+-- pause --
+Drill 3, In-memory O L T P (Hekaton).
+
+Q: What are memory-optimized tables and when do you use them?-- think --
+
+A: Tables stored entirely in memory with lock-free / latch-free access (uses optimistic multi-version concurrency control internally). Originally codenamed Hekaton. Designed for ultra-high-throughput O L T P scenarios, staging tables, session state, IoT ingestion buffers, hot caches.
+The reason it can be faster for write-heavy concurrent workloads is structural rather than a matter of degree: disk-based tables serialise concurrent writers on page latches, and memory-optimized tables have no pages and therefore no page latches.
+Don't quote a multiplier, the honest answer is "it removes a specific bottleneck", and the follow-up question is whether that bottleneck is the one you have.
+
+Cross-Q: If they're so fast, why isn't everything memory-optimized?-- think --
+
+A: Trade-offs. (1) Memory constraint, the table must fit in RAM (with overhead for the in-memory engine). 100GB tables don't fit on 32GB servers.
+(2) Limited features, no clustered indexes (only hash and range), no FILESTREAM, no FK to disk tables in some versions, some T sequel constructs unsupported.
+(3) Backup and restore are harder, durability is via SCHEMA_AND_DATA or SCHEMA_ONLY; the latter loses data on restart (acceptable for cache scenarios). (4) Operational complexity, sizing memory, monitoring, knowing when a workload outgrows it.
+The sweet spot is narrow: hot write workloads on small tables.
+
+Cross-Q²: When would you choose memory-optimized over just adding more RAM and letting buffer pool cache the disk tables?-- think --
+
+A: When the bottleneck is latching (page latch contention), not IO. Adding RAM lets the buffer pool keep more pages cached, eliminating disk reads.
+But page latches (lightweight in-memory locks on each 8KB page) still serialize writers to the same page, a hot table with 1000 concurrent inserts gets latch waits even when fully cached.
+Memory-optimized tables use lock-free data structures, per the Hekaton SIGMOD paper, hash indexes are lock-free hash tables and range indexes are Bw-trees, a lock-free B-tree variant, so there is no page to latch. So: buffer pool fixes IO; memory-optimized fixes latch contention.
+Profile sys.dm_os_wait_stats, if you see PAGELATCH_EX as a top wait on a hot table, Hekaton is one answer;
+on a B-tree index with an ever-increasing key, the cheaper answer is often the sequel Server 2019 index option OPTIMIZE_FOR_SEQUENTIAL_KEY = ON, which throttles threads competing for the last page instead of re-architecting the table.
+
+-- pause --
+Drill 4, AlwaysOn AG versus Mirroring versus FCI.
+
+Q: sequel Server has Failover Cluster Instances (FCI), Database Mirroring, and AlwaysOn Availability Groups. What's the difference and which do you use in 2026?-- think --
+
+A: FCI (Failover Cluster Instance), Windows clustering at the instance level; shared storage; one active node at a time. Whole-instance failover.
+Mirroring, deprecated since sequel Server 2012 but still shipping (it is still listed in the sequel Server 2022 editions table, marked deprecated); database-level mirror with witness; superseded by AG.
+AlwaysOn AG, modern (sequel 2012+); database group with up to 8 secondary replicas; readable secondaries; automatic failover within a group; no shared storage; Enterprise edition (Standard gets basic AGs: two replicas, one database, no readable secondary).
+In 2026, AG is the default for HA or DR; FCI for niche cases requiring shared-storage semantics (some legacy apps); Mirroring is deprecated and only seen in old systems, so plan migrations off it rather than building on it.
+
+Cross-Q: Synchronous versus asynchronous replicas in an AG, what's the trade-off?-- think --
+
+A: Synchronous, the primary waits for the secondary to harden the log before acknowledging the commit. Zero data loss on failover (RPO = 0) but commits are slow (network round-trip per transaction). Limited to ~5 synchronous replicas.
+Asynchronous, primary commits immediately; secondary catches up best-effort. Commits are fast but failover can lose seconds of transactions (RPO > 0). Practical pattern: one synchronous secondary in the same datacenter for zero-loss HA + one or more async secondaries in remote datacenters for DR.
+
+Cross-Q²: A readable secondary serves read queries, what's the gotcha?-- think --
+
+A: (1) Latency, async secondaries can be seconds or minutes behind; queries see stale data. Even synchronous secondaries have small delays after the log block hardens but before the redo thread applies it.
+(2) Snapshot isolation forced on secondary, readable secondaries automatically use snapshot, which means tempdb grows on the secondary (version store), sizing must account for this.
+(3) Auto-create statistics on secondaries, happens on primary only and replicates; secondaries get the stats too but you can't UPDATE STATISTICS on a readable secondary.
+(4) Connection routing, apps need ApplicationIntent set to ReadOnly in the connection string to route to the secondary; otherwise they hit the primary. Many bugs surface from forgetting this.
+
+-- pause --
+Drill 5, TempDB contention.
+
+Q: What is PFS or GAM or SGAM contention in tempdb and why does it matter?-- think --
+
+A: TempDB uses three allocation bitmaps per data file: PFS (Page Free Space, one bit per page tracking free versus used), GAM (Global Allocation Map, tracks 64-page extents that are entirely free), SGAM (Shared GAM, tracks mixed-use extents with at least one free page).
+Every allocation or deallocation hits these pages.
+Under high concurrency (many transactions creating temp tables simultaneously), workers serialize on PFS or GAM or SGAM latches, showing up as PAGELATCH_UP waits on pages 2:1:1, 2:1:2, 2:1:3 et cetera Manifests as overall slowness, not localized to a query.
+
+Cross-Q: How do you fix it?-- think --
+
+A: Three steps. (1) Multiple tempdb data files, historically 1 file per C P U core up to 8; modern guidance is "equal-sized files, 4-8 to start, increase if PFS waits persist." This spreads allocation across multiple bitmap pages.
+(2) Trace flag 1118 (pre-sequel 2016) or MIXED_PAGE_ALLOCATION OFF (default in sequel 2016+), disables mixed-extent allocation so SGAM contention disappears. (3) Reduce temp table usage, table variables in some cases, or restructure the query.
+sequel Server 2019+ has memory-optimized tempdb metadata which reduces metadata contention further.
+
+Cross-Q²: A query is slow and sys.dm_exec_session_wait_stats shows PAGELATCH_SH on tempdb, but it's not on the bitmap pages. What now?-- think --
+
+A: That's tempdb metadata contention, sequel Server tracks every temp object in tempdb sys objects (and friends). Workers creating or dropping temp tables fight over the metadata pages.
+Fix: enable memory-optimized tempdb metadata (sequel Server 2019+ Enterprise), moves metadata to in-memory tables that have lock-free access.
+Without that feature, reduce temp object churn: prefer table variables for small results, reuse cached temp tables in stored procs (they're cached if eligible), avoid creating temp tables inside loops.
+
+-- pause --
+Drill 6, sp_who2 versus sp_whoisactive.
+
+Q: When investigating blocking, why do most DBAs reach for sp_whoisactive instead of sp_who2 ?-- think --
+
+A: sp_who2 is built-in but shows minimal info, session_id, login, host, command, status, blocked_by. You see that session 53 is blocked by 51, but not what either is doing.
+sp_whoisactive is a community tool by Adam Machanic (free, widely deployed) that shows the actual sequel text, query plan, wait stats, transaction state, tempdb usage, and blocking chains, all in one row per active session. It's the single most useful third-party tool in the sequel Server world.
+
+Cross-Q: How do you install and use it in production?-- think --
+
+A: Download the latest sp_whoisactive.sql from whoisactive.com, run it once in master (or a admin database) to install the procedure. Then EXEC sp_whoisactive shows current activity.
+Parameters: @get_plans = 1 to include execution plans, @get_locks = 1 for lock info, @find_block_leaders = 1 to highlight the root blocker in a chain. Many shops have it pre-installed on every server and bind a keyboard shortcut in SSMS to it.
+
+Cross-Q²: A senior says "use Extended Events instead of sp_whoisactive for production monitoring." Why?-- think --
+
+A: sp_whoisactive is a point-in-time snapshot, you run it when something is happening. For continuous monitoring or post-mortem analysis ("why was the system slow last Tuesday at 3am?"), you need historical data.
+Extended Events (XE) is the modern lightweight tracing mechanism that can capture sessions, deadlocks, blocking, query stats over time. Configure XE to log to a file or ring buffer; query historical data later. sp_whoisactive for interactive investigation; XE for production observability.
+They complement each other.
+
+-- pause --
+Drill 7, Deadlock graph analysis.
+
+Q: sequel Server tells you "transaction was deadlocked." How do you investigate?-- think --
+
+A: Enable deadlock capture via the system_health Extended Event session (on by default since sequel 2012).
+Query the X M L deadlock report: SELECT XEvent.query('.') FROM (SELECT CAST(target_data AS X M L) AS x FROM sys.dm_xe_session_targets WHERE target_name = 'ring_buffer') t CROSS APPLY x.nodes('//event[@name="xml_deadlock_report"]') AS X(XEvent).
+Open the X M L graphically in SSMS (right-click, "View Deadlock Graph"), shows the two processes, the resources they hold, the resources they want, and which one was killed (the victim).
+
+Cross-Q: The deadlock graph shows two UPDATEs on orders and customers deadlocking. What's the most common root cause?-- think --
+
+A: Inconsistent lock order. Transaction T1 updates customers then orders; T2 updates orders then customers. T1 holds customers' X lock and wants orders'; T2 holds orders' X lock and wants customers'. Classic deadly embrace.
+The fix: pick a canonical order (for example, always lower-numbered table first, or always by table ID) and refactor all transactions to follow it. The other common cause is a long-running scanning transaction acquiring locks on many rows and short transactions blocking on those.
+
+Cross-Q²: Deadlock recovery makes T1 the victim. T1's user sees an error. How do you handle this in app code?-- think --
+
+A: Catch SqlException with Number = 1205 (deadlock victim) and retry the transaction, deadlocks are transient. The retry must include the entire transaction (BEGIN. COMMIT), not just the failed statement, because all of T1's prior work was rolled back.
+Use exponential backoff (50 milliseconds, 100 milliseconds, 200 milliseconds) to avoid retry storms when many sessions deadlock simultaneously. E F Core's EnableRetryOnFailure handles this. Don't retry beyond 3-5 attempts, at that point something deeper is wrong (lock-order bug, hot row).
+
+-- pause --
+Drill 8, sequel Server versus Azure sequel DB versus Managed Instance.
+
+Q: A team is choosing between sequel Server on V M, Azure sequel DB, and Azure sequel Managed Instance. What are the trade-offs?-- think --
+
+A: sequel Server on V M (IaaS), full control; you manage operating system, patches, backups, HA. Most flexible, most operationally heavy. Choose for: legacy apps needing specific configs, compliance requiring full control, lift-and-shift with no changes.
+Azure sequel Database (PaaS), Microsoft manages everything; you get a database endpoint. Single database or elastic pool. Limited surface, no cross-DB queries, no sequel Agent, no FILESTREAM. Best for new cloud-native apps.
+Azure sequel Managed Instance (PaaS), closest to on-prem sequel Server; supports sequel Agent, cross-DB queries, C L R, Service Broker. Designed for lift-and-shift to PaaS without code changes.
+
+Cross-Q: What specifically doesn't work in Azure sequel DB that works in Managed Instance?-- think --
+
+A: (1) sequel Agent jobs, Azure sequel DB has Elastic Jobs (separate service); MI has built-in sequel Agent. (2) Cross-database queries, MI supports them; DB requires Elastic Queries or app-side joins.
+(3) Server-level objects, logins, server roles, linked servers, MI has them; DB has only database-level. (4) C L R and Service Broker, MI yes; DB no. (5) Mail (sp_send_dbmail), MI yes; DB requires Azure Logic Apps.
+The rule: if your existing app uses these features, MI; if you're greenfield and don't, DB is simpler and cheaper.
+
+Cross-Q²: Cost models differ, explain DTU versus v Core.-- think --
+
+A: DTU (Database Throughput Unit), bundled metric combining C P U, IO, memory into a single "tier" (Basic, Standard, Premium). Simpler pricing; you pick a tier. Hard to right-size because you can't independently scale C P U versus IO.
+v Core, explicit vCPU count, with separate storage and IO tier choices.
+Maps to physical resources, supports Azure Hybrid Benefit (bring your existing sequel Server licenses), allows up to 80 cores per database. Modern recommendation: v Core for production; DTU for small dev or test where simplicity wins. Most large customers are on v Core.
+
+-- pause --
+Drill 9, change data capture versus Change Tracking.
+
+Q: sequel Server has both Change Data Capture and Change Tracking (CT). When do you use each?-- think --
+
+A: Change Tracking (CT), lightweight; records that a row changed and which columns, with version numbers. Consumer queries current state. Used for sync scenarios: mobile apps pulling deltas since last sync token, cache invalidation, search index updates.
+Change Data Capture, heavyweight; records the before-and-after values of every UPDATE plus INSERT or DELETE. Provides full change history. Used for: replication, audit, event sourcing, feeding Debezium or Kafka pipelines.
+
+Cross-Q: How do they differ in performance overhead?-- think --
+
+A: CT adds a few bytes per row change (version numbers in shadow tables). Negligible overhead.
+change data capture reads the transaction log asynchronously and writes change rows to change data capture tables, so the writing transaction isn't slowed, but the change data capture capture process consumes C P U and storage.
+For high-throughput systems, change data capture's storage grows fast and the capture job can lag. CT is the right default unless downstream consumers genuinely need the full change history.
+
+Cross-Q²: A team uses triggers on every table to audit changes. Why might you replace them with change data capture?-- think --
+
+A: Triggers run synchronously inside the writing transaction, every UPDATE pays the trigger cost in commit latency, and the trigger's own locks are held until the writer commits, so trigger cost is also blocking cost.
+change data capture reads asynchronously from the transaction log, so the writer's critical path is unaffected; the cost moves to a capture job that consumes C P U and storage and can fall behind.
+The other advantage: triggers can be silently bypassed ( DISABLE TRIGGER, or BULK INSERT without FIRE_TRIGGERS, which does not fire them by default); the log records everything regardless.
+The trade-off: change data capture is harder to configure, is Enterprise or Standard edition only, and is less selective than custom trigger logic, it captures the configured columns for every change, where a trigger can decide what is worth recording.
+
+-- pause --
+Drill 10, Partition switching.
+
+Q: How does partition switching let you archive old data without a DELETE?-- think --
+
+A: A partitioned table can SWITCH an entire partition to another empty table, metadata operation, instant, no row-by-row IO. Workflow: (1) Create archive table with identical schema and matching partition function.
+(2) ALTER TABLE orders SWITCH PARTITION 5 TO orders_archive PARTITION 5, the partition's data is now "in" the archive table; the original partition is empty. (3) Backup or detach the archive table. (4) Drop the partition definition from the source if no longer needed.
+The data move is instantaneous because only metadata changes, the data pages stay where they are, just owned by a different table.
+
+Cross-Q: What are the requirements for partition switching to work?-- think --
+
+A: (1) Both tables must be on the same filegroup. (2) Schemas must match exactly, same columns, types, constraints, indexes (including index alignment with the partition). (3) Target partition must be empty. (4) CHECK constraints on the source must guarantee values fit the target partition's range.
+The "schemas must match" requirement is the most painful in practice, even a missed default on one column blocks the switch. Many teams have automation that builds the archive table from the source with SELECT * INTO. WHERE 1 set to 0 plus index recreation.
+
+Cross-Q²: How does this compare to Postgres Q L's DETACH PARTITION ?-- think --
+
+A: Postgres Q L 11+ has ALTER TABLE. DETACH PARTITION which is conceptually similar, the partition becomes a standalone table. Modern Postgres (14+) supports CONCURRENTLY for non-blocking detach.
+sequel Server's SWITCH is older (2005+), more mature, and supports SWITCH IN (moving a standalone table into a partition slot) as well as SWITCH OUT. Both engines treat partition swap as a metadata operation; the operational pattern is the same: archive old data instantly without DELETE storms.
+
+-- pause --
+Drill 11, Filegroups and FILESTREAM.
+
+Q: What are filegroups and when do you create multiple?-- think --
+
+A: A filegroup is a logical container for data files. By default a database has one filegroup ( PRIMARY ).
+Multiple filegroups let you (a) place tables or indexes on different physical storage (hot data on SSD, archive on spinning disk), (b) parallelize backup or restore (backup individual filegroups), (c) implement filegroup-level recovery (restore one filegroup independently).
+For large databases (>1TB), multiple filegroups are standard.
+
+Cross-Q: What's FILESTREAM and when do you use it?-- think --
+
+A: FILESTREAM stores BLOB data (PDFs, images, videos) on the NTFS filesystem while keeping it transactionally consistent with the database. You declare varbinary(max) FILESTREAM and sequel Server stores the data as a file in a designated FILESTREAM filegroup, with the file path managed internally.
+Benefits: BLOBs > 1MB don't bloat the data files; native Windows file A P Is can read them (low latency). Trade-offs: complex backup, requires NTFS, not available in Azure sequel DB.
+
+Cross-Q²: For a modern app needing to store user-uploaded files, would you use FILESTREAM?-- think --
+
+A: Usually no. The 2026 default is object storage (Azure Blob Storage, S three), store BLOBs there, store the blob URL or key in the DB. Benefits: cheaper storage, C D N integration, independent scaling, doesn't bloat backups, works with PaaS DBs (Azure sequel DB doesn't support FILESTREAM).
+FILESTREAM made sense in 2008-2015 when on-prem sequel Server was the default and BLOB storage was per-instance. Now object storage is universal.
+FILESTREAM is reserved for legacy systems, regulated environments where files must live in the transactional database, or specific compliance requirements.
+
+-- pause --
+Drill 12, Statistics auto-update threshold.
+
+Q: When does sequel Server automatically update column statistics, and why does it sometimes update too late?-- think --
+
+A: The documented thresholds (Microsoft Learn, Statistics) are exact, so quote them exactly. Up to sequel Server 2014, or on compatibility level 120 and, a permanent table with more than 500 rows recomputes at 500 + (0.20 * n) modifications. For a 1M-row table that is 200,500 rows, easy to hit.
+For a 1B-row table it is 200 million, so the statistics can be wildly stale for the first 199 million changes. Starting with sequel Server 2016 (13.x) at compatibility level 130, the threshold becomes the minimum of the old value and a square-root term: MIN( 500 + (0.20 n), SQRT(1000 n) ).
+Learn's own worked example: at 2 million rows that is MIN(400,500, 44,721) = 44,721 modifications, so large tables update roughly an order of magnitude more often.
+Where the dynamic threshold doesn't apply, sequel Server 2008 R2 through 2014, or 2016 and later running at compatibility level 120 or lower, trace flag 2371 turns it on.
+Note the second half of that sentence: an instance on sequel Server 2022 left at compat 120 for an old application is still on the legacy threshold.
+
+Cross-Q: Auto-update fires synchronously by default. Why is that a problem?-- think --
+
+A: When the auto-update triggers, the query that requested the stat waits for the stat to refresh, which on a billion-row table can be seconds or minutes (full scan to compute the histogram). The user-facing query that happened to be the first to need the stat takes the latency hit.
+The fix: enable AUTO_UPDATE_STATISTICS_ASYNC ON so updates happen in the background; the triggering query uses the stale stat (mild plan suboptimality) but doesn't pay the update cost. Almost always the right choice for production.
+
+Cross-Q²: When do you manually update stats versus trust auto-update?-- think --
+
+A: Manual update via UPDATE STATISTICS table_name WITH FULLSCAN (or WITH SAMPLE 50 PERCENT for big tables) when: (1) Bulk loads, after inserting millions of rows that didn't trigger the threshold.
+(2) Deployment validation, after a release, refresh stats so the new query patterns get accurate cardinality. (3) Investigating regressions, if a plan went bad, refreshed stats might fix it. Auto-update is fine for steady-state O L T P; manual updates are for known-disruption events.
+Set up a weekly Ola Hallengren-style maintenance plan to refresh fragmented stats and indexes.
+
+-- pause --
+Drill 13, Resource Governor.
+
+Q: What is Resource Governor and what does it solve?-- think --
+
+A: Resource Governor (Enterprise edition) lets you partition C P U, memory, and IO among workload groups within a single sequel Server instance.
+You define resource pools (for example, "report users get max 30% C P U"), workload groups (for example, "ETL jobs"), and a classifier function that assigns incoming sessions to groups based on login name, app name, et cetera Solves the noisy-neighbor problem: a runaway report can't starve O L T P.
+
+Cross-Q: A consultant says "use it to throttle the reports team." What's the practical pattern?-- think --
+
+A: Create a resource pool Reports with MAX_CPU_PERCENT = 30 and MAX_MEMORY_PERCENT = 40. Create a workload group Reports_WG in that pool. Write a classifier function that returns Reports_WG when APP_NAME() = 'Tableau' or LOGIN_NAME() LIKE 'rpt%'. Activate Resource Governor.
+Now Tableau queries can't consume more than 30% C P U regardless of how many run, and O L T P keeps the rest. The "MAX" is a cap when others need it, if O L T P is idle, Reports can use 100%. So it's a fairness mechanism, not a hard reservation.
+
+Cross-Q²: Why do most shops not use Resource Governor even though it's free with Enterprise?-- think --
+
+A: (1) Operational complexity, classifier functions, pools, groups; mis-configuration silently degrades performance. (2) Modern alternative is separate instances or replicas, readable secondary in an AG isolates reports from O L T P at the infrastructure level.
+(3) Resource Governor doesn't isolate everything, tempdb, transaction log, lock manager are shared across groups. So a runaway report can still pollute tempdb. (4) Enterprise-only, Standard edition customers can't use it.
+The modern answer is usually "separate workloads onto separate replicas or instances" rather than partitioning one instance.
+
+-- pause --
+Drill 14, Extended Events versus sequel Trace.
+
+Q: sequel Trace and Profiler are deprecated. What replaces them and why?-- think --
+
+A: Extended Events (XE) introduced in sequel 2008 and the recommended tracing mechanism since 2012. sequel Trace and Profiler are deprecated (still functional but marked for removal).
+XE is lightweight (lower overhead per event), more granular (capture only what you need), and runs in-process with the engine, Profiler was a separate process consuming the trace stream over the network, which dropped events under load.
+
+Cross-Q: How do you set up a long-running XE session to capture deadlocks?-- think --
+
+A: Use SSMS: Object Explorer to Management to Extended Events to New Session. Pick the xml_deadlock_report event, add a file target writing to disk, start the session.
+Or T sequel: CREATE EVENT SESSION deadlocks ON SERVER ADD EVENT sqlserver.xml_deadlock_report ADD TARGET package0.event_file (SET filename = 'C:\xe\deadlocks.xel') WITH (STARTUP_STATE = ON); ALTER EVENT SESSION deadlocks ON SERVER STATE = START.
+Note system_health session already captures deadlocks by default, most teams don't need a custom one for deadlocks specifically.
+
+Cross-Q²: A team wants to monitor every query exceeding 5 seconds with the full sequel text and plan. What XE session do you build?-- think --
+
+A: Event: sqlserver.rpc_completed and sqlserver.sql_batch_completed with a filter ( WHERE duration > 5000000, XE durations are microseconds, so 5 seconds = 5,000,000). Actions: sql_text, client_app_name, query_plan_hash, database_name. Target: ring_buffer or event_file.
+Be careful about overhead, capturing the full query plan on every long query has cost. Most production sessions log just the lightweight fields and let users join to Query Store for the plan. The combo "XE for events, Query Store for plans" covers most observability needs.
+
+-- pause --
+Drill 15, Accelerated Database Recovery (ADR).
+
+Q: What is Accelerated Database Recovery and what problem does it solve?-- think --
+
+A: sequel Server 2019+ feature that makes database recovery (after crash, restart, or failover) near-instant regardless of transaction log size.
+Traditionally, recovery has three phases: analysis (read log to find committed or uncommitted txns), redo (replay committed changes), undo (rollback uncommitted txns).
+The undo phase scales with the longest open transaction, a stuck transaction can take hours to roll back, delaying database availability after restart. ADR uses a persistent version store + logical revert to make undo instant.
+
+Cross-Q: How does ADR achieve instant undo?-- think --
+
+A: ADR stores row versions in a persistent version store ( sys.dm_tran_persistent_version_store ) for every modified row. Instead of rolling back by walking the transaction log backwards, ADR's "logical revert" looks up the prior version and stamps the row back to it, O(1) per modified row.
+The version store is persistent (survives restarts), so even after a crash, recovery can find the right versions. Transaction log can be truncated even with long open transactions because rollback no longer needs the log.
+
+Cross-Q²: ADR sounds free, what's the cost?-- think --
+
+A: (1) Disk space for the persistent version store, versioned rows are stored in the database, so a write-heavy workload trades log space and recovery time for data-file space. Size it from your own workload; published percentages vary too much to be worth memorising.
+(2) Write overhead, every update writes both the new row and a version, so there is a per-modification cost on the hot path.
+(3) Long-running open transactions hold versions, a transaction open for hours keeps the version store growing until it commits or rolls back, which is the same failure mode as RCSI's tempdb growth, just in a different place. Mitigation: hunt and kill long open transactions.
+ADR is on by default in Azure sequel Database and Managed Instance; opt-in on the boxed product ( ALTER DATABASE. SET ACCELERATED_DATABASE_RECOVERY = ON ), and available on Enterprise, Standard and Web editions.
+
+-- pause --
+Drill 16, Encrypting sensitive columns.
+
+Q: The compliance team says "encrypt the customer PII". Walk me through the options in sequel Server and what each one actually protects against.-- think --
+
+A: Four features that are routinely confused because they all say "protect data", and they defend against different attackers. TDE (Transparent Data Encryption) encrypts the data files, log files and backups at rest. It defends against someone walking off with a .bak or a detached .mdf.
+It does nothing against anyone who can connect and run SELECT, including the DBA, because decryption happens in the engine, the query.
+Always Encrypted encrypts values in the client driver; per Microsoft Learn, it ensures "encryption keys are never exposed to the Database Engine", separating "those who own the data and can view it, and those who manage the data but should have no access:
+on-premises database administrators, cloud database operators".
+That is the only one of the four that defends against a privileged insider on the server. Row-Level Security is an access-control predicate, not encryption, it filters which rows a principal sees.
+Dynamic Data Masking obfuscates values in query results for users without the UNMASK permission; the data on disk is unchanged.
+
+Cross-Q: A colleague proposes Dynamic Data Masking to hide salaries from the support team. Is that sufficient?-- think --
+
+A: No, and Microsoft Learn says so directly: DDM "shouldn't be used alone to fully secure sensitive data from users running ad hoc queries".
+Its own documented example is a user with SELECT but not UNMASK running SELECT ID, Name, Salary FROM Employees WHERE Salary > 99999 AND Salary < 100001, the Salary column comes back masked as 0, but the WHERE clause is evaluated against the real value,
+so the rows that come back tell you the salary anyway.
+Binary-search that predicate and you have the exact figure in a handful of queries. DDM is appropriate for preventing accidental exposure in an application that issues known queries; it is not a boundary against anyone who can write their own sequel.
+Also note that admins with CONTROL SERVER or database-level CONTROL (sysadmin, db_owner) see unmasked data by design. sequel Server 2022 added granular UNMASK grants at database, schema, table and column scope, which makes the permission model usable, but doesn't change the inference weakness.
+
+Cross-Q²: What breaks in the application when you turn on Always Encrypted?-- think --
+
+A: More than teams expect, and the restrictions are the reason it is often rejected.
+Encryption type decides everything:
+deterministic encryption produces the same ciphertext for the same plaintext, so it supports equality point lookups, IN, GROUP BY, DISTINCT, and indexing, and nothing else, at the cost of leaking equality patterns (a Yes or No column encrypted deterministically has two distinct ciphertexts).
+Randomized encryption leaks nothing and supports no operations at all, no searching, sorting, joining, or indexing.
+Beyond that: you can't compare an encrypted column to a literal or to a plaintext column (you get "Operand type clash"), so every value must arrive as a SqlParameter; string columns must use a _BIN2 collation; IDENTITY, computed columns, and check constraints on encrypted columns are out;
+table-valued parameters targeting encrypted columns aren't supported; and initial encryption moves all the data out of the database and back, which for a large table is an outage-shaped operation.
+On the dot NET side it is one keyword, Column Encryption Setting set to enabled in the connection string (or SqlConnectionStringBuilder.ColumnEncryptionSetting ), and the driver then calls sys.sp_describe_parameter_encryption per query shape and caches the result.
+Always Encrypted with secure enclaves (sequel Server 2019+ and Azure sequel Database) relaxes the big restrictions: pattern matching, comparison operators and in-place encryption become possible because the engine can process the values inside a protected memory region.
+
+-- pause --
+Drill 17, Parallelism: MAXDOP and cost threshold.
+
+Q: An instance shows CXPACKET as its top wait. Is that a problem, and what do you change?-- think --
+
+A: On its own, no, CXPACKET means parallel plans are running, which is what parallelism looks like. Microsoft Learn's description is "waiting to synchronize the Query Processor Exchange Iterator.
+and when producing and consuming rows", and since sequel Server 2016 SP2 / 2017 CU3 the consumer side is tracked separately as CXCONSUMER, which is explicitly "a normal part of parallel query execution".
+The signal to act on is CXPACKET dominating alongside evidence that trivial queries are going parallel.
+Two knobs: cost threshold for parallelism decides whether a query goes parallel (the optimizer only considers parallel plans when the best serial plan's estimated cost exceeds it), and MAXDOP decides how wide it goes when it does.
+
+Cross-Q: What are the defaults, and are they right?-- think --
+
+A: cost threshold for parallelism defaults to 5, and the documentation is unusually blunt about it: "The default value of 5 is a starting point, not a recommendation.
+On modern sequel Server systems, raising it can help to keep smaller O L T P queries executing with serial plans." Note what the number is: Learn defines cost as "the sum of estimated operator costs in a query plan" and "a relative measure used only for plan selection;
+it doesn't measure actual runtime", so 5 is not five seconds, and the default has not moved in decades of hardware improvement, which is why so many O L T P instances parallelise queries that would finish serially in milliseconds and pay thread-coordination cost for nothing.
+MAXDOP defaults to 0 (all processors up to 64), which the docs also call out as "not the recommended value for most cases"; sequel Server 2019 setup began recommending a value based on detected cores.
+Learn's guidance table: single NUMA node with at most 8 logical processors, MAXDOP at or under that count; single node with more, keep it at 8; multiple NUMA nodes with at most 16 logical processors per node, at or under the per-node count;
+more than 16 per node, half the per-node count with a maximum of 16.
+Azure sequel Database and Managed Instance default MAXDOP to 8 for new databases, and Azure sequel Database doesn't expose cost threshold at all.
+
+Cross-Q²: How do you tell whether you set them too high?-- think --
+
+A: Learn gives the symptom pairs. Cost threshold too low: many Query Store plans with is_parallel_plan = 1, CXPACKET / CXCONSUMER dominating, possibly THREADPOOL and SOS_SCHEDULER_YIELD.
+Cost threshold too high: C P U-heavy queries stuck serial, C P U utilisation higher than it should be, SOS_SCHEDULER_YIELD dominating. Change in small increments and watch a full business cycle, a Tuesday afternoon proves nothing about a month-end close.
+Also know the newer options before you reach for the server-wide knobs: MAXDOP can be set per database (scoped configuration), per query ( OPTION (MAXDOP n) ), per Query Store hint, and per Resource Governor workload group, and sequel Server 2022 added DOP feedback,
+which lowers the degree of parallelism for repeating queries that demonstrably don't benefit from it, Enterprise edition, Query Store required.
+
+-- pause --
+Drill 18, Index fragmentation and the maintenance ritual.
+
+Q: Your predecessor left a nightly job that rebuilds every index with fragmentation 5%. Keep it?-- think --
+
+A: Almost certainly not as written. Two distinct things get conflated under "fragmentation". Logical fragmentation, leaf pages out of physical order, mattered enormously when read-ahead on spinning disks depended on sequential IO.
+On SSDs and on SANs that virtualise the layout anyway, it matters much less, and the job is paying real cost for it: a rebuild is a full write of the index, which means transaction log, which means log backups, which on an availability group means replicating all of it to every secondary.
+Low page density (rows per page) is the part that still matters on any storage, because a half-empty index costs you buffer pool: the same rows occupy twice the memory.
+sys.dm_db_index_physical_stats reports both, avg_fragmentation_in_percent and avg_page_space_used_in_percent, and a 5% threshold on the first one rebuilds essentially everything, every night, for nothing.
+
+Cross-Q: What replaces it?-- think --
+
+A: A tiered policy on real numbers, which is what the widely-used Ola Hallengren maintenance scripts implement:
+leave indexes a low fragmentation threshold alone, REORGANIZE in the middle band, REBUILD only at the top, and only a minimum page count (fragmentation percentages on an index of eight pages are noise).
+Reorganize is online, incremental and interruptible; rebuild is a single operation that is only online on Enterprise edition ( WITH (ONLINE = ON) ), and Enterprise also offers RESUMABLE = ON so a rebuild interrupted by the end of a maintenance window can continue rather than roll back.
+Critically, keep the statistics update, the reason the nightly rebuild often appears to help is that a rebuild updates that index's statistics with a full scan as a side effect,
+so teams who delete the job without adding an explicit statistics job see regressions and conclude fragmentation mattered after all.
+
+Cross-Q²: How does FILLFACTOR relate to this?-- think --
+
+A: Fill factor is the deliberate creation of free space in the leaf pages at build time, so that later inserts and row-widening updates have somewhere to go without splitting a page. The default is 0, which means 100%, pack the pages full.
+That is right for an index on an ever-increasing key, where new rows go on the end and interior pages never split; it is wrong for an index on something like customer_id or a GUID, where inserts land in the middle.
+Lowering fill factor there trades memory and IO (every page is partly empty, always, including in the buffer pool) for fewer page splits.
+It is a per-index decision driven by the insert pattern, and setting it globally to a folk value like 80 is how instances end up using 20% more memory than they need for indexes that never split.
+Note the interaction with the earlier RCSI point: enabling row versioning adds 14 bytes per modified row, which can start causing splits in indexes built at 100% fill factor that were previously stable.
+
+-- pause --
+Section 7. Cheat Sheet.
+
+Clustered index: one per table; leaf level is the rows; choose narrow, monotonic, stable keys.
+Non-clustered: separate B-tree; leaf stores clustered key as pointer; lookups become Key Lookups without INCLUDE.
+RCSI: READ_COMMITTED_SNAPSHOT ON makes readers use row versions; eliminates blocking on SELECT.
+Filtered index: WHERE clause on the index; small, focused, ideal for "active" rows in a sea of soft-deleted ones.
+Implicit conversion: type mismatch in WHERE forces table scan; check WarningType="ConvertIssue" in the plan.
+Statistics: optimizer uses these; stale stats cause cardinality misestimates; UPDATE STATISTICS WITH FULLSCAN for big tables.
+NOLOCK: read uncommitted; allows dirty reads, missed rows, double-counted rows during scans.
+Query Store: built-in plan history; sys.query_store_* DMVs to find regressed plans after upgrades.
+TVPs: pass a table to a stored proc with one round trip; far faster than 1000 individual INSERT s.
+DBCC CHECKDB: detects on-disk corruption; schedule weekly; run on a restored backup to avoid IO hit on prod.
+Index key order: equality predicates first, then the single range predicate, then INCLUDE. (status, created_at) seeks for status = @s AND created_at >= @d; (created_at, status) does not.
+Lock escalation: 5,000 locks in one statement on one table to table lock; retried every 1,250 further locks. Batch big DML.
+Isolation defaults: sequel Server READ COMMITTED + locking; Azure sequel Database READ COMMITTED + RCSI; Postgres Q L READ COMMITTED + MVCC; MySQL or InnoDB REPEATABLE READ.
+SNAPSHOT conflict: error 3960, "Snapshot isolation transaction aborted due to update conflict", retryable, like 1205.
+Parameter sniffing: compare ParameterCompiledValue and ParameterRuntimeValue in the plan X M L. OPTIMIZE FOR UNKNOWN = estimate from the density vector.
+Statistics thresholds: 500 + 0.20n legacy; MIN(500 + 0.20n, SQRT(1000n)) from sequel Server 2016 at compat 130.
+log_reuse_wait_desc: the one column that tells you why the transaction log won't truncate. Read it before shrinking anything.
+ASYNC_NETWORK_IO: the server is waiting for your application to consume rows. Not a database problem.
+Version gates worth quoting: scalar UDF inlining 2019 or compat 150; interleaved execution for MSTVFs 2017 or compat 140; table variable deferred compilation 2019 or compat 150; PSP optimization 2022 or compat 160; ordered clustered columnstore 2022.
+
+-- pause --
+Section 8. Walkthrough, Key Lookups tanking the orders search.
+
+Problem: A customer-facing search "orders by customer email last 30 days" used to take 200 milliseconds; today it takes 11 seconds. No code or schema change since last week.
+
+Diagnosis: The senior pulls the actual plan in SSMS (Ctrl+M, then run). The plan shows a non-clustered Index Seek on IX_Orders_CustomerEmail followed by a Key Lookup that consumes 92% of the cost. Estimated rows: 50; Actual rows: 180,000. Stale stats.
+sys.dm_db_index_usage_stats confirms the index is heavily used; sys.dm_db_missing_index_details suggests an INCLUDE list. The statistics age comes from sys.dm_db_stats_properties, not from sys.stats (which has no date column):
+
+last_updated is three weeks old and modification_counter is large but under the threshold, on a table this size, MIN(500 + 0.20n, SQRT(1000n)) still needs tens of thousands of modifications, and the churn is concentrated in new rows rather than spread across the table.
+
+Fix: Two changes. First refresh stats, then add a covering index:
+
+Latency drops to 80 milliseconds. The plan now shows pure Index Seek, no Key Lookup, no Sort.
+
+Why it works: A covering index satisfies the query entirely from the non-clustered B-tree leaves, skipping the Key Lookup back to the clustered index.
+CustomerEmail is the equality predicate so it leads the key; CreatedAt DESC is the range predicate and the sort order, so it follows and removes the Sort. Refreshed stats let the optimizer pick the right access path in the first place.
+
+-- pause --
+Section 9. Self-test.
+
+RCSI stores row versions in tempdb for the duration of any reading transaction. Long-running readers force version chains to grow.
+Look for sessions with transaction_begin_time minutes old via sys.dm_tran_active_snapshot_database_transactions; usually it's a forgotten BEGIN TRAN or a reporting query that should have used a read replica.
+
+Identity INT is narrow, monotonic, and stable -> ideal for clustering and minimal page splits. Natural keys are searchable directly but often wider and may change. Modern preference: identity for the clustered key, unique non-clustered index on the natural key.
+The natural key still gets fast lookups; the clustered tree stays compact.
+
+Without HOLDLOCK or SERIALIZABLE, two sessions can both pass the "WHEN NOT MATCHED" check before either insert commits. Add MERGE INTO target WITH (HOLDLOCK) or use INSERT. WHERE NOT EXISTS inside SERIALIZABLE. Many seniors avoid MERGE entirely for upserts because of these footguns.
+
+Pull sys.dm_exec_query_stats ordered by total_worker_time to find top C P U consumers. Cross-reference with Query Store regressions ( sys.query_store_runtime_stats ).
+Common culprits: a parameter-sniffed plan compiled for a rare value, a deployment that increased call rate, or stats refresh that flipped a join order.
+
+Always On AG when you need cross-availability zone HA on self-managed sequel Server (Linux or Windows VMs, on-prem, or specific compliance demands), and note it is an Enterprise edition feature; Standard only offers basic availability groups (two replicas, one database, no readable secondary).
+Azure sequel geo-replication when you're already on PaaS and want managed failover with a built-in D N S endpoint. The decision is mostly ops-model rather than capability.
+
+ADOdot NET sent the dot NET string as nvarchar. sequel Server's data type precedence ranks nvarchar varchar, and the lower-precedence side is converted, which is the column, on every row, so the predicate stops being SARGable.
+Fix it on the client: SqlDbType.VarChar on the parameter, Dapper's DbString { IsAnsi = true }, or E F Core's IsUnicode(false) on the property. The reverse direction (a varchar parameter against an nvarchar column) is harmless, there the parameter is converted, not the column.
+There's also a collation nuance: with a Windows collation on the column the optimizer can often still seek; with a sequel collation it scans, which is why the same code performs differently on different servers.
+
+Lock escalation. A single statement acquiring at least 5,000 locks on one table escalates them to a table lock (retried every 1,250 further locks if escalation is initially blocked), so an exclusive table lock replaces thousands of row locks and every other session on the table stops.
+It also ran as one transaction, so the log couldn't truncate until it finished. The change is a batch loop, DELETE TOP (n) per transaction, each the threshold, with a short delay between batches, not a hint and not an isolation-level change.
+RCSI does not help here: it removes shared locks from readers, and this is a writer.
+
+DDM masks the value in the result set, but predicates are evaluated against the real value, so anyone who can write ad hoc sequel can infer it: WHERE Salary BETWEEN 99999 AND 100001 returns the row with a masked 0 in the column and tells you the salary anyway.
+Microsoft Learn documents exactly this and states DDM "shouldn't be used alone to fully secure sensitive data from users running ad hoc queries." It's a defence against accidental exposure in an application with known queries, not a security boundary.
+Also, sysadmin, db_owner, and anyone with CONTROL see unmasked data by design. If the requirement is that privileged operators genuinely cannot see the values, that's Always Encrypted, with the application changes it implies.
+
+Injection is the first and obvious one: concatenation makes the value part of the statement text. The second is the plan cache.
+Every distinct concatenated string is a distinct batch, so each gets its own cached plan; a high-cardinality parameter produces thousands of single-use plans that evict the plans other workloads depend on.
+You find it with sys.dm_exec_cached_plans WHERE usecounts = 1, and the symptom is that unrelated queries get slower. optimize for ad hoc workloads at the server level caches a stub instead of a full plan on first execution, which limits the memory damage without fixing the cause.
+
+Benefit: readers stop taking shared locks and stop blocking writers, which removes a whole class of blocking without touching application code.
+Costs and risks, in order: (1) version chains live in tempdb, so tempdb sizing and monitoring become load-bearing, and a long-running reader pins versions for its whole duration;
+(2) 14 bytes of versioning overhead per modified row can cause page splits in indexes built at 100% fill factor, so expect a one-off fragmentation event;
+(3) read semantics change, code that relied on readers queueing behind a writer, such as a poll-and-claim queue table, may now hand the same row to two workers, and needs explicit UPDLOCK, READPAST;
+(4) the ALTER DATABASE statement itself requires exclusive database access, so it needs WITH ROLLBACK IMMEDIATE and a real maintenance window.
+Also worth stating: if this is Azure sequel Database, RCSI is already on by default and there is nothing to change.
